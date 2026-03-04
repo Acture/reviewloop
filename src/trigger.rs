@@ -48,11 +48,13 @@ pub fn run_git_tag_trigger(config: &Config, db: &Db) -> Result<()> {
     if !config.trigger.git.enabled {
         return Ok(());
     }
+    let repo_dir = config.trigger.git.repo_dir.trim();
+    let repo_dir = if repo_dir.is_empty() { "." } else { repo_dir };
 
     let output = Command::new("git")
-        .args(["tag", "--list", "review-*"])
+        .args(["-C", repo_dir, "tag", "--list", "review-*"])
         .output()
-        .context("failed to list git tags")?;
+        .with_context(|| format!("failed to list git tags in repo_dir={repo_dir}"))?;
 
     if !output.status.success() {
         return Ok(());
@@ -64,7 +66,7 @@ pub fn run_git_tag_trigger(config: &Config, db: &Db) -> Result<()> {
             continue;
         }
 
-        let commit = resolve_tag_commit(tag).unwrap_or_else(|| "unknown".to_string());
+        let commit = resolve_tag_commit(repo_dir, tag).unwrap_or_else(|| "unknown".to_string());
         if let Some(parsed) = parse_review_tag(tag) {
             if let Some(paper) = select_paper(config, &parsed) {
                 enqueue_for_paper(
@@ -130,9 +132,9 @@ fn select_paper<'a>(config: &'a Config, parsed: &ParsedTag) -> Option<&'a PaperC
     config.first_paper_for_backend(&parsed.backend)
 }
 
-fn resolve_tag_commit(tag: &str) -> Option<String> {
+fn resolve_tag_commit(repo_dir: &str, tag: &str) -> Option<String> {
     let output = Command::new("git")
-        .args(["rev-list", "-n", "1", tag])
+        .args(["-C", repo_dir, "rev-list", "-n", "1", tag])
         .output()
         .ok()?;
     if !output.status.success() {
