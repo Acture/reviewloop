@@ -62,26 +62,8 @@ pub fn run_git_tag_trigger(config: &Config, db: &Db) -> Result<()> {
 
     let tags = String::from_utf8_lossy(&output.stdout);
     for tag in tags.lines().map(str::trim).filter(|v| !v.is_empty()) {
-        if db.is_tag_seen(tag)? {
-            continue;
-        }
-
         let commit = resolve_tag_commit(repo_dir, tag).unwrap_or_else(|| "unknown".to_string());
-        if let Some(parsed) = parse_review_tag(tag) {
-            if let Some(paper) = select_paper(config, &parsed) {
-                enqueue_for_paper(
-                    config,
-                    db,
-                    paper,
-                    JobStatus::Queued,
-                    Some(tag.to_string()),
-                    Some(commit.clone()),
-                    "git_tag_trigger",
-                )?;
-            }
-        }
-
-        db.mark_tag_seen(tag, &commit)?;
+        process_tag_entry(config, db, tag, &commit)?;
     }
 
     Ok(())
@@ -149,6 +131,29 @@ fn resolve_tag_commit(repo_dir: &str, tag: &str) -> Option<String> {
     }
 }
 
+fn process_tag_entry(config: &Config, db: &Db, tag: &str, commit: &str) -> Result<()> {
+    if db.is_tag_seen(tag)? {
+        return Ok(());
+    }
+
+    if let Some(parsed) = parse_review_tag(tag) {
+        if let Some(paper) = select_paper(config, &parsed) {
+            enqueue_for_paper(
+                config,
+                db,
+                paper,
+                JobStatus::Queued,
+                Some(tag.to_string()),
+                Some(commit.to_string()),
+                "git_tag_trigger",
+            )?;
+        }
+    }
+
+    db.mark_tag_seen(tag, commit)?;
+    Ok(())
+}
+
 fn enqueue_for_paper(
     config: &Config,
     db: &Db,
@@ -207,7 +212,38 @@ fn provider_venue(config: &Config, backend: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_review_tag;
+    use super::{parse_review_tag, process_tag_entry};
+    use crate::{
+        config::{Config, PaperConfig},
+        db::Db,
+        model::JobStatus,
+    };
+    use anyhow::Context;
+    use std::{fs, path::Path};
+
+    fn setup_simulation_context() -> anyhow::Result<(tempfile::TempDir, Config, Db)> {
+        let tmp = tempfile::tempdir()?;
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir)?;
+
+        let pdf_path = tmp.path().join("main.pdf");
+        fs::write(&pdf_path, b"%PDF-1.4\n%%EOF\n")?;
+
+        let mut config = Config::default();
+        config.core.state_dir = state_dir.to_string_lossy().to_string();
+        config.trigger.git.enabled = false;
+        config.trigger.pdf.enabled = false;
+        config.providers.stanford.email = "test@example.edu".to_string();
+        config.papers = vec![PaperConfig {
+            id: "main".to_string(),
+            pdf_path: pdf_path.to_string_lossy().to_string(),
+            backend: "stanford".to_string(),
+        }];
+
+        let db = Db::new(Path::new(&config.core.state_dir));
+        db.init_schema()?;
+        Ok((tmp, config, db))
+    }
 
     #[test]
     fn parses_full_tag_format() {
@@ -226,5 +262,31 @@ mod tests {
     #[test]
     fn rejects_non_review_tag() {
         assert!(parse_review_tag("v1.2.3").is_none());
+    }
+
+    #[test]
+    fn simulated_tag_entry_enqueues_once_and_deduplicates() -> anyhow::Result<()> {
+        let (_tmp, config, db) = setup_simulation_context()?;
+        let tag = "review-stanford/main/sim";
+
+        process_tag_entry(&config, &db, tag, "deadbeef")?;
+
+        let job = db
+            .find_latest_open_job_for_paper("main")?
+            .context("expected queued job for simulated tag")?;
+        assert_eq!(job.status, JobStatus::Queued);
+        assert_eq!(job.git_tag.as_deref(), Some(tag));
+        assert_eq!(job.git_commit.as_deref(), Some("deadbeef"));
+        assert!(db.is_tag_seen(tag)?);
+
+        process_tag_entry(&config, &db, tag, "deadbeef")?;
+        let rows = db.list_status_views(Some("main"))?;
+        assert_eq!(
+            rows.len(),
+            1,
+            "simulated duplicate tag should not enqueue twice"
+        );
+
+        Ok(())
     }
 }
