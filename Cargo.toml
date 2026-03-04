@@ -23,4 +23,5 @@ imap = "2.4"
 native-tls = "0.2"
 
 [dev-dependencies]
+axum = "0.8"
 tempfile = "3.14"
