@@ -48,7 +48,11 @@ pub async fn run_tick(config: &Config, db: &Db) -> Result<()> {
 }
 
 pub async fn process_submissions(config: &Config, db: &Db) -> Result<()> {
-    let jobs = db.list_ready_queued(config.core.max_concurrency, Utc::now())?;
+    let per_tick_budget = usize::min(
+        config.core.max_concurrency,
+        config.core.max_submissions_per_tick,
+    );
+    let jobs = db.list_ready_queued(per_tick_budget, Utc::now())?;
     for job in jobs {
         submit_job(config, db, &job.id).await?;
     }

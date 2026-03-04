@@ -74,7 +74,11 @@ pub fn run_pdf_trigger(config: &Config, db: &Db) -> Result<()> {
         return Ok(());
     }
 
-    for paper in &config.papers {
+    for paper in config
+        .papers
+        .iter()
+        .take(config.trigger.pdf.max_scan_papers)
+    {
         let path = Path::new(&paper.pdf_path);
         if !path.exists() {
             continue;

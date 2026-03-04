@@ -48,8 +48,14 @@ impl Config {
         if self.core.max_concurrency == 0 {
             return Err(anyhow!("core.max_concurrency must be >= 1"));
         }
+        if self.core.max_submissions_per_tick == 0 {
+            return Err(anyhow!("core.max_submissions_per_tick must be >= 1"));
+        }
         if self.polling.schedule_minutes.is_empty() {
             return Err(anyhow!("polling.schedule_minutes cannot be empty"));
+        }
+        if self.trigger.pdf.max_scan_papers == 0 {
+            return Err(anyhow!("trigger.pdf.max_scan_papers must be >= 1"));
         }
         if self.providers.stanford.email.trim().is_empty() {
             return Err(anyhow!(
@@ -86,6 +92,7 @@ impl Config {
 pub struct CoreConfig {
     pub state_dir: String,
     pub max_concurrency: usize,
+    pub max_submissions_per_tick: usize,
     pub review_timeout_hours: u64,
 }
 
@@ -94,6 +101,7 @@ impl Default for CoreConfig {
         Self {
             state_dir: ".reviewloop".to_string(),
             max_concurrency: 2,
+            max_submissions_per_tick: 1,
             review_timeout_hours: 48,
         }
     }
@@ -154,6 +162,7 @@ impl Default for GitTriggerConfig {
 pub struct PdfTriggerConfig {
     pub enabled: bool,
     pub auto_submit_on_change: bool,
+    pub max_scan_papers: usize,
 }
 
 impl Default for PdfTriggerConfig {
@@ -161,6 +170,7 @@ impl Default for PdfTriggerConfig {
         Self {
             enabled: true,
             auto_submit_on_change: false,
+            max_scan_papers: 10,
         }
     }
 }
@@ -253,6 +263,8 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.polling.schedule_minutes, vec![10, 20, 40, 60]);
         assert_eq!(cfg.trigger.git.repo_dir, ".");
+        assert_eq!(cfg.core.max_submissions_per_tick, 1);
+        assert_eq!(cfg.trigger.pdf.max_scan_papers, 10);
     }
 
     #[test]
@@ -280,6 +292,20 @@ mod tests {
     fn validate_rejects_empty_stanford_email() {
         let mut cfg = Config::default();
         cfg.providers.stanford.email = "   ".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_submissions_per_tick() {
+        let mut cfg = Config::default();
+        cfg.core.max_submissions_per_tick = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_pdf_scan_limit() {
+        let mut cfg = Config::default();
+        cfg.trigger.pdf.max_scan_papers = 0;
         assert!(cfg.validate().is_err());
     }
 }
