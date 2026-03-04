@@ -3,6 +3,10 @@ name = "reviewloop"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+imap-listener = ["dep:imap", "dep:native-tls"]
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
@@ -19,8 +23,8 @@ tokio = { version = "1.46", features = ["full"] }
 toml = "0.8"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 thiserror = "2.0"
-imap = "2.4"
-native-tls = "0.2"
+imap = { version = "2.4", optional = true }
+native-tls = { version = "0.2", optional = true }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

@@ -68,6 +68,11 @@ If you run daemon in background/service mode, set `logging.output = "file"` to p
 
 ### IMAP token matching (default + override)
 
+IMAP listener is an optional build feature.
+
+- Enable IMAP support: `cargo run --features imap-listener -- daemon run`
+- Default build (without this feature) skips IMAP polling and avoids pulling IMAP parser dependencies.
+
 `imap.backend_patterns` maps backend name -> regex. The first capture group is treated as token.
 
 Default includes Stanford:
