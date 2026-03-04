@@ -47,6 +47,8 @@ Key defaults:
 - `polling.jitter_percent = 10`
 - `trigger.git.tag_pattern = "review-<backend>/<paper-id>/*"`
 - `trigger.git.repo_dir = "."`
+- `trigger.git.auto_create_tags_on_pdf_change = false`
+- `trigger.git.auto_delete_processed_tags = false`
 - `trigger.pdf.auto_submit_on_change = false`
 - `trigger.pdf.max_scan_papers = 10` (only first N configured papers scanned per tick)
 - `logging.level = "info"`
@@ -97,6 +99,11 @@ Supported formats:
 Example:
 
 - `review-stanford/main/v1`
+
+Optional automation:
+
+- If `trigger.git.auto_create_tags_on_pdf_change = true`, PDF-change trigger auto-creates local tags like `review-stanford/main/auto-<timestamp_ms>` before enqueuing jobs.
+- If `trigger.git.auto_delete_processed_tags = true`, tags are deleted locally after they are consumed by git trigger.
 
 ### PDF Change Trigger
 

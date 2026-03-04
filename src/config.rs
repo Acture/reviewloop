@@ -183,6 +183,8 @@ pub struct GitTriggerConfig {
     pub enabled: bool,
     pub tag_pattern: String,
     pub repo_dir: String,
+    pub auto_create_tags_on_pdf_change: bool,
+    pub auto_delete_processed_tags: bool,
 }
 
 impl Default for GitTriggerConfig {
@@ -191,6 +193,8 @@ impl Default for GitTriggerConfig {
             enabled: true,
             tag_pattern: "review-<backend>/<paper-id>/*".to_string(),
             repo_dir: ".".to_string(),
+            auto_create_tags_on_pdf_change: false,
+            auto_delete_processed_tags: false,
         }
     }
 }
@@ -303,6 +307,8 @@ mod tests {
         assert_eq!(cfg.trigger.git.repo_dir, ".");
         assert_eq!(cfg.core.max_submissions_per_tick, 1);
         assert_eq!(cfg.trigger.pdf.max_scan_papers, 10);
+        assert!(!cfg.trigger.git.auto_create_tags_on_pdf_change);
+        assert!(!cfg.trigger.git.auto_delete_processed_tags);
         assert_eq!(cfg.logging.output, "stdout");
     }
 

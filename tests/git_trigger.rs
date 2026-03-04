@@ -3,7 +3,7 @@ use reviewloop::{
     config::{Config, PaperConfig},
     db::Db,
     model::JobStatus,
-    trigger::run_git_tag_trigger,
+    trigger::{run_git_tag_trigger, run_pdf_trigger},
 };
 use std::{
     fs,
@@ -164,6 +164,68 @@ fn git_trigger_ignores_tags_without_matching_backend() -> Result<()> {
     assert!(
         jobs.is_empty(),
         "unknown backend tags must not enqueue jobs"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn git_trigger_auto_delete_processed_tag_removes_local_tag() -> Result<()> {
+    let mut ctx = GitTriggerTestContext::new()?;
+    ctx.config.trigger.git.auto_delete_processed_tags = true;
+    ctx.create_tag("review-stanford/main/cleanup")?;
+
+    run_git_tag_trigger(&ctx.config, &ctx.db)?;
+
+    let output = Command::new("git")
+        .args([
+            "-C",
+            ctx.repo_dir.to_string_lossy().as_ref(),
+            "tag",
+            "--list",
+        ])
+        .output()?;
+    let tags = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !tags
+            .lines()
+            .any(|t| t.trim() == "review-stanford/main/cleanup"),
+        "processed tag should be deleted when auto_delete_processed_tags is enabled"
+    );
+    Ok(())
+}
+
+#[test]
+fn pdf_trigger_auto_create_tag_records_git_metadata_on_job() -> Result<()> {
+    let mut ctx = GitTriggerTestContext::new()?;
+    ctx.config.trigger.git.auto_create_tags_on_pdf_change = true;
+    ctx.config.trigger.pdf.enabled = true;
+
+    run_pdf_trigger(&ctx.config, &ctx.db)?;
+
+    let job = ctx
+        .db
+        .find_latest_open_job_for_paper("main")?
+        .context("expected job from pdf trigger")?;
+    let tag = job
+        .git_tag
+        .clone()
+        .context("expected auto-created git tag")?;
+    assert!(tag.starts_with("review-stanford/main/auto-"));
+    assert!(job.git_commit.as_deref().unwrap_or_default().len() >= 7);
+
+    let output = Command::new("git")
+        .args([
+            "-C",
+            ctx.repo_dir.to_string_lossy().as_ref(),
+            "tag",
+            "--list",
+        ])
+        .output()?;
+    let tags = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        tags.lines().any(|t| t.trim() == tag),
+        "auto-created tag should exist in git repository"
     );
 
     Ok(())

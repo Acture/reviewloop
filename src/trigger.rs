@@ -5,8 +5,10 @@ use crate::{
     util::sha256_file,
 };
 use anyhow::{Context, Result};
+use chrono::Utc;
 use serde_json::json;
 use std::{path::Path, process::Command};
+use tracing::warn;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTag {
@@ -63,7 +65,12 @@ pub fn run_git_tag_trigger(config: &Config, db: &Db) -> Result<()> {
     let tags = String::from_utf8_lossy(&output.stdout);
     for tag in tags.lines().map(str::trim).filter(|v| !v.is_empty()) {
         let commit = resolve_tag_commit(repo_dir, tag).unwrap_or_else(|| "unknown".to_string());
-        process_tag_entry(config, db, tag, &commit)?;
+        let processed = process_tag_entry(config, db, tag, &commit)?;
+        if processed && config.trigger.git.auto_delete_processed_tags {
+            if let Err(err) = delete_local_tag(repo_dir, tag) {
+                warn!(tag, error = %err, "failed to auto-delete processed git tag");
+            }
+        }
     }
 
     Ok(())
@@ -100,7 +107,28 @@ pub fn run_pdf_trigger(config: &Config, db: &Db) -> Result<()> {
             JobStatus::PendingApproval
         };
 
-        enqueue_for_paper(config, db, paper, status, None, None, "pdf_change_trigger")?;
+        let (auto_tag, auto_commit) = match maybe_create_auto_tag(config, paper) {
+            Ok(v) => v.unwrap_or((None, None)),
+            Err(err) => {
+                warn!(
+                    paper_id = %paper.id,
+                    backend = %paper.backend,
+                    error = %err,
+                    "failed to create auto git tag; continuing without git tag metadata"
+                );
+                (None, None)
+            }
+        };
+
+        enqueue_for_paper(
+            config,
+            db,
+            paper,
+            status,
+            auto_tag,
+            auto_commit,
+            "pdf_change_trigger",
+        )?;
     }
 
     Ok(())
@@ -135,9 +163,9 @@ fn resolve_tag_commit(repo_dir: &str, tag: &str) -> Option<String> {
     }
 }
 
-fn process_tag_entry(config: &Config, db: &Db, tag: &str, commit: &str) -> Result<()> {
+fn process_tag_entry(config: &Config, db: &Db, tag: &str, commit: &str) -> Result<bool> {
     if db.is_tag_seen(tag)? {
-        return Ok(());
+        return Ok(false);
     }
 
     if let Some(parsed) = parse_review_tag(tag) {
@@ -155,6 +183,53 @@ fn process_tag_entry(config: &Config, db: &Db, tag: &str, commit: &str) -> Resul
     }
 
     db.mark_tag_seen(tag, commit)?;
+    Ok(true)
+}
+
+fn maybe_create_auto_tag(
+    config: &Config,
+    paper: &PaperConfig,
+) -> Result<Option<(Option<String>, Option<String>)>> {
+    if !config.trigger.git.auto_create_tags_on_pdf_change {
+        return Ok(None);
+    }
+
+    let repo_dir = config.trigger.git.repo_dir.trim();
+    let repo_dir = if repo_dir.is_empty() { "." } else { repo_dir };
+    let tag = format!(
+        "review-{}/{}/auto-{}",
+        paper.backend,
+        paper.id,
+        Utc::now().timestamp_millis()
+    );
+
+    let output = Command::new("git")
+        .args(["-C", repo_dir, "tag", &tag])
+        .output()
+        .with_context(|| format!("failed to create auto git tag: {tag}"))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "auto git tag command failed for {tag}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let commit = resolve_tag_commit(repo_dir, &tag);
+    Ok(Some((Some(tag), commit)))
+}
+
+fn delete_local_tag(repo_dir: &str, tag: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["-C", repo_dir, "tag", "-d", tag])
+        .output()
+        .with_context(|| format!("failed to run git tag -d for tag={tag}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git tag -d failed for {tag}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     Ok(())
 }
 
@@ -273,7 +348,8 @@ mod tests {
         let (_tmp, config, db) = setup_simulation_context()?;
         let tag = "review-stanford/main/sim";
 
-        process_tag_entry(&config, &db, tag, "deadbeef")?;
+        let processed = process_tag_entry(&config, &db, tag, "deadbeef")?;
+        assert!(processed);
 
         let job = db
             .find_latest_open_job_for_paper("main")?
@@ -283,7 +359,8 @@ mod tests {
         assert_eq!(job.git_commit.as_deref(), Some("deadbeef"));
         assert!(db.is_tag_seen(tag)?);
 
-        process_tag_entry(&config, &db, tag, "deadbeef")?;
+        let processed = process_tag_entry(&config, &db, tag, "deadbeef")?;
+        assert!(!processed);
         let rows = db.list_status_views(Some("main"))?;
         assert_eq!(
             rows.len(),
