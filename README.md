@@ -44,6 +44,7 @@ Key defaults:
 - `polling.schedule_minutes = [10, 20, 40, 60]`
 - `polling.jitter_percent = 10`
 - `trigger.git.tag_pattern = "review-<backend>/<paper-id>/*"`
+- `trigger.git.repo_dir = "."`
 - `trigger.pdf.auto_submit_on_change = false`
 
 `providers.stanford`:

@@ -136,6 +136,7 @@ impl Default for TriggerConfig {
 pub struct GitTriggerConfig {
     pub enabled: bool,
     pub tag_pattern: String,
+    pub repo_dir: String,
 }
 
 impl Default for GitTriggerConfig {
@@ -143,6 +144,7 @@ impl Default for GitTriggerConfig {
         Self {
             enabled: true,
             tag_pattern: "review-<backend>/<paper-id>/*".to_string(),
+            repo_dir: ".".to_string(),
         }
     }
 }
@@ -250,6 +252,7 @@ mod tests {
     fn defaults_start_polling_at_ten_minutes() {
         let cfg = Config::default();
         assert_eq!(cfg.polling.schedule_minutes, vec![10, 20, 40, 60]);
+        assert_eq!(cfg.trigger.git.repo_dir, ".");
     }
 
     #[test]
