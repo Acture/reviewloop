@@ -192,6 +192,10 @@ stanford = "(?is)(from:\\s*.*mail\\.paperreview\\.ai|subject:\\s*.*paper review 
 stanford = "https?://paperreview\\.ai/review\\?token=([A-Za-z0-9_-]+)"
 ```
 
+You can also provide credentials via environment variables:
+- `REVIEWLOOP_GMAIL_CLIENT_ID`
+- `REVIEWLOOP_GMAIL_CLIENT_SECRET`
+
 Then login:
 
 ```bash
