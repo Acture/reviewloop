@@ -210,7 +210,7 @@ Configure:
 enabled = true
 client_id = "your-google-oauth-client-id"
 client_secret = "your-google-oauth-client-secret"
-token_store_path = "~/.local/state/reviewloop/oauth/google_token.json" # optional
+token_store_path = "~/.review_loop/oauth/google_token.json" # optional
 poll_seconds = 300
 mark_seen = true
 max_lookback_hours = 72
@@ -261,8 +261,8 @@ Paper registration:
 Safe defaults:
 - `core.max_concurrency = 2`
 - `core.max_submissions_per_tick = 1`
-- `core.state_dir = "$XDG_STATE_HOME/reviewloop"` (or `~/.local/state/reviewloop`)
-- `core.db_path = "<global-data-dir>/reviewloop.db"`
+- `core.state_dir = "~/.review_loop"` (or `REVIEWLOOP_STATE_DIR` when set)
+- `core.db_path = "~/.review_loop/reviewloop.db"` (or `<REVIEWLOOP_STATE_DIR>/reviewloop.db`)
 - `core.review_timeout_hours = 48`
   - for `stanford`, timeout is linearly scaled by PDF page count up to 20 pages
 - `polling.schedule_minutes = [10, 20, 40, 60]`
