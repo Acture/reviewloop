@@ -10,6 +10,7 @@ use oauth2::{
 };
 use std::{
     collections::HashMap,
+    env,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -29,23 +30,38 @@ pub struct GoogleOauthProvider {
 
 impl GoogleOauthProvider {
     pub fn from_config(config: &Config) -> Result<Option<Self>> {
+        Self::from_config_with_mode(config, false)
+    }
+
+    pub fn from_config_for_login(config: &Config) -> Result<Option<Self>> {
+        Self::from_config_with_mode(config, true)
+    }
+
+    fn from_config_with_mode(config: &Config, allow_disabled: bool) -> Result<Option<Self>> {
         let Some(cfg) = &config.gmail_oauth else {
             return Ok(None);
         };
-        if !cfg.enabled {
+        if !cfg.enabled && !allow_disabled {
             return Ok(None);
         }
-        if cfg.client_id.trim().is_empty() || cfg.client_secret.trim().is_empty() {
+        let mut resolved = cfg.clone();
+        if resolved.client_id.trim().is_empty() {
+            resolved.client_id = env::var("REVIEWLOOP_GMAIL_CLIENT_ID").unwrap_or_default();
+        }
+        if resolved.client_secret.trim().is_empty() {
+            resolved.client_secret = env::var("REVIEWLOOP_GMAIL_CLIENT_SECRET").unwrap_or_default();
+        }
+        if resolved.client_id.trim().is_empty() || resolved.client_secret.trim().is_empty() {
             return Ok(None);
         }
-        let token_path = if let Some(path) = &cfg.token_store_path {
+        let token_path = if let Some(path) = &resolved.token_store_path {
             PathBuf::from(path)
         } else {
             config.state_dir().join("oauth").join("google_token.json")
         };
 
         Ok(Some(Self {
-            cfg: cfg.clone(),
+            cfg: resolved,
             token_path,
             pending: Arc::new(Mutex::new(HashMap::new())),
         }))

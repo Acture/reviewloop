@@ -597,9 +597,10 @@ async fn cmd_email_login(config: &Config, provider: &str) -> Result<()> {
         anyhow::bail!("unsupported provider: {provider}. currently supported: google");
     }
 
-    let Some(oauth_provider) = GoogleOauthProvider::from_config(config)? else {
+    let Some(oauth_provider) = GoogleOauthProvider::from_config_for_login(config)? else {
         anyhow::bail!(
-            "gmail_oauth is not fully configured. set gmail_oauth.enabled=true, client_id, and client_secret"
+            "gmail oauth credentials missing. configure gmail_oauth.client_id/client_secret \
+or set REVIEWLOOP_GMAIL_CLIENT_ID and REVIEWLOOP_GMAIL_CLIENT_SECRET"
         );
     };
 
