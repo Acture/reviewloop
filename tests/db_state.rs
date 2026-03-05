@@ -139,6 +139,7 @@ fn attach_token_moves_job_to_processing() -> Result<()> {
         .context("missing job after attach")?;
     assert_eq!(updated.status, JobStatus::Processing);
     assert_eq!(updated.token.as_deref(), Some("token-xyz"));
+    assert!(updated.started_at.is_some());
 
     Ok(())
 }

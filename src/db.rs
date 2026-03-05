@@ -49,6 +49,7 @@ impl Db {
                 git_tag TEXT,
                 git_commit TEXT,
                 attempt INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT,
                 next_poll_at TEXT,
                 last_error TEXT,
                 fallback_used INTEGER NOT NULL DEFAULT 0,
@@ -91,6 +92,7 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_jobs_paper_backend ON jobs(paper_id, backend);
             "#,
         )?;
+        ensure_column_exists(&conn, "jobs", "started_at", "TEXT")?;
         Ok(())
     }
 
@@ -103,9 +105,9 @@ impl Db {
             r#"
             INSERT INTO jobs (
                 id, paper_id, backend, pdf_path, pdf_hash, status, token, email, venue,
-                git_tag, git_commit, attempt, next_poll_at, last_error, fallback_used,
+                git_tag, git_commit, attempt, started_at, next_poll_at, last_error, fallback_used,
                 created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, 0, ?11, NULL, 0, ?12, ?12)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, 0, NULL, ?11, NULL, 0, ?12, ?12)
             "#,
             params![
                 id,
@@ -145,7 +147,7 @@ impl Db {
         if let Some(paper_id) = paper_id {
             let mut stmt = conn.prepare(
                 r#"
-                SELECT id, paper_id, backend, status, token, attempt, next_poll_at, updated_at, last_error
+                SELECT id, paper_id, backend, status, token, attempt, created_at, started_at, next_poll_at, updated_at, last_error
                 FROM jobs
                 WHERE paper_id = ?1
                 ORDER BY created_at DESC
@@ -159,7 +161,7 @@ impl Db {
         } else {
             let mut stmt = conn.prepare(
                 r#"
-                SELECT id, paper_id, backend, status, token, attempt, next_poll_at, updated_at, last_error
+                SELECT id, paper_id, backend, status, token, attempt, created_at, started_at, next_poll_at, updated_at, last_error
                 FROM jobs
                 ORDER BY created_at DESC
                 LIMIT 100
@@ -331,10 +333,11 @@ impl Db {
             UPDATE jobs
             SET status = ?2,
                 token = ?3,
+                started_at = COALESCE(started_at, ?5),
                 next_poll_at = ?4,
                 last_error = NULL,
                 attempt = 0,
-                updated_at = ?5
+                updated_at = ?6
             WHERE id = ?1
             "#,
             params![
@@ -342,6 +345,7 @@ impl Db {
                 JobStatus::Processing.as_str(),
                 token,
                 to_rfc3339(next_poll_at),
+                to_rfc3339(Utc::now()),
                 to_rfc3339(Utc::now()),
             ],
         )?;
@@ -547,6 +551,7 @@ impl Db {
 
 fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
     let status: String = row.get("status")?;
+    let started_at: Option<String> = row.get("started_at")?;
     let next_poll_at: Option<String> = row.get("next_poll_at")?;
     let created_at: String = row.get("created_at")?;
     let updated_at: String = row.get("updated_at")?;
@@ -555,6 +560,11 @@ fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         .ok_or_else(|| conversion_error(format!("invalid status: {status}")))?;
 
     let next_poll_at = next_poll_at
+        .map(|v| parse_rfc3339(&v))
+        .transpose()
+        .map_err(|e| conversion_error(e.to_string()))?;
+
+    let started_at = started_at
         .map(|v| parse_rfc3339(&v))
         .transpose()
         .map_err(|e| conversion_error(e.to_string()))?;
@@ -575,6 +585,7 @@ fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         git_tag: row.get("git_tag")?,
         git_commit: row.get("git_commit")?,
         attempt: row.get::<_, i64>("attempt")? as u32,
+        started_at,
         next_poll_at,
         last_error: row.get("last_error")?,
         fallback_used: row.get::<_, i64>("fallback_used")? == 1,
@@ -585,6 +596,8 @@ fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
 
 fn map_status_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StatusView> {
     let status: String = row.get("status")?;
+    let created_at: String = row.get("created_at")?;
+    let started_at: Option<String> = row.get("started_at")?;
     let next_poll_at: Option<String> = row.get("next_poll_at")?;
     let updated_at: String = row.get("updated_at")?;
 
@@ -595,6 +608,11 @@ fn map_status_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StatusView> {
         status,
         token: row.get("token")?,
         attempt: row.get::<_, i64>("attempt")? as u32,
+        created_at: parse_rfc3339(&created_at).map_err(|e| conversion_error(e.to_string()))?,
+        started_at: started_at
+            .map(|v| parse_rfc3339(&v))
+            .transpose()
+            .map_err(|e| conversion_error(e.to_string()))?,
         next_poll_at: next_poll_at
             .map(|v| parse_rfc3339(&v))
             .transpose()
@@ -602,6 +620,25 @@ fn map_status_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StatusView> {
         updated_at: parse_rfc3339(&updated_at).map_err(|e| conversion_error(e.to_string()))?,
         last_error: row.get("last_error")?,
     })
+}
+
+fn ensure_column_exists(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_def: &str,
+) -> Result<()> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&pragma)?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(());
+        }
+    }
+    let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {column_def}");
+    conn.execute(&alter, [])?;
+    Ok(())
 }
 
 fn conversion_error(message: String) -> rusqlite::Error {

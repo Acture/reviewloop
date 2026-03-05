@@ -385,13 +385,16 @@ fn cmd_status(db: &Db, paper_id: Option<&str>, as_json: bool) -> Result<()> {
     }
 
     println!(
-        "{:<36}  {:<16}  {:<10}  {:<18}  {:<7}  {:<20}",
-        "JOB ID", "PAPER", "BACKEND", "STATUS", "ATTEMPT", "NEXT POLL"
+        "{:<36}  {:<16}  {:<10}  {:<18}  {:<7}  {:<20}  {:<20}  {:<8}",
+        "JOB ID", "PAPER", "BACKEND", "STATUS", "ATTEMPT", "NEXT POLL", "STARTED", "ELAPSED"
     );
-    println!("{}", "-".repeat(120));
+    println!("{}", "-".repeat(160));
+    let now = Utc::now();
     for row in rows {
+        let started = row.started_at.unwrap_or(row.created_at);
+        let elapsed = format_elapsed(started, now);
         println!(
-            "{:<36}  {:<16}  {:<10}  {:<18}  {:<7}  {:<20}",
+            "{:<36}  {:<16}  {:<10}  {:<18}  {:<7}  {:<20}  {:<20}  {:<8}",
             row.id,
             row.paper_id,
             row.backend,
@@ -399,7 +402,9 @@ fn cmd_status(db: &Db, paper_id: Option<&str>, as_json: bool) -> Result<()> {
             row.attempt,
             row.next_poll_at
                 .map(|v| v.to_rfc3339())
-                .unwrap_or_else(|| "-".to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            started.to_rfc3339(),
+            elapsed
         );
         if let Some(err) = row.last_error {
             println!("  error: {err}");
@@ -407,6 +412,20 @@ fn cmd_status(db: &Db, paper_id: Option<&str>, as_json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn format_elapsed(started: chrono::DateTime<Utc>, now: chrono::DateTime<Utc>) -> String {
+    let secs = (now - started).num_seconds().max(0);
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    if secs < 3600 {
+        return format!("{}m", secs / 60);
+    }
+    if secs < 86_400 {
+        return format!("{}h{}m", secs / 3600, (secs % 3600) / 60);
+    }
+    format!("{}d{}h", secs / 86_400, (secs % 86_400) / 3600)
 }
 
 fn cmd_retry(config: &Config, db: &Db, job_id: &str) -> Result<()> {
