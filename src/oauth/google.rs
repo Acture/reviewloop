@@ -24,13 +24,22 @@ use tokio::{
     net::TcpListener,
 };
 
-const DEFAULT_GOOGLE_CLIENT_ID: &str =
-    "159112762522-82ces4lrs8hodbl79gu9usvmvs4lkmnr.apps.googleusercontent.com";
+const BUILTIN_GOOGLE_CLIENT_ID: Option<&str> = option_env!("REVIEWLOOP_GMAIL_CLIENT_ID");
+const BUILTIN_GOOGLE_CLIENT_SECRET: Option<&str> = option_env!("REVIEWLOOP_GMAIL_CLIENT_SECRET");
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://www.googleapis.com/oauth2/v3/token";
 const DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
 const SCOPE_READONLY: &str = "https://www.googleapis.com/auth/gmail.readonly";
 const SCOPE_MODIFY: &str = "https://www.googleapis.com/auth/gmail.modify";
+
+fn resolve_credential(runtime_env_key: &str, compile_default: Option<&str>) -> String {
+    if let Ok(value) = env::var(runtime_env_key)
+        && !value.trim().is_empty()
+    {
+        return value;
+    }
+    compile_default.unwrap_or_default().to_string()
+}
 
 #[derive(Clone)]
 pub struct GoogleOauthProvider {
@@ -57,11 +66,14 @@ impl GoogleOauthProvider {
         }
         let mut resolved = cfg.clone();
         if resolved.client_id.trim().is_empty() {
-            resolved.client_id = env::var("REVIEWLOOP_GMAIL_CLIENT_ID")
-                .unwrap_or_else(|_| DEFAULT_GOOGLE_CLIENT_ID.to_string());
+            resolved.client_id =
+                resolve_credential("REVIEWLOOP_GMAIL_CLIENT_ID", BUILTIN_GOOGLE_CLIENT_ID);
         }
         if resolved.client_secret.trim().is_empty() {
-            resolved.client_secret = env::var("REVIEWLOOP_GMAIL_CLIENT_SECRET").unwrap_or_default();
+            resolved.client_secret = resolve_credential(
+                "REVIEWLOOP_GMAIL_CLIENT_SECRET",
+                BUILTIN_GOOGLE_CLIENT_SECRET,
+            );
         }
         if resolved.client_id.trim().is_empty() {
             return Ok(None);

@@ -600,7 +600,8 @@ async fn cmd_email_login(config: &Config, provider: &str) -> Result<()> {
     let Some(oauth_provider) = GoogleOauthProvider::from_config_for_login(config)? else {
         anyhow::bail!(
             "gmail oauth credentials missing. configure gmail_oauth.client_id/client_secret \
-or set REVIEWLOOP_GMAIL_CLIENT_ID and REVIEWLOOP_GMAIL_CLIENT_SECRET"
+or set REVIEWLOOP_GMAIL_CLIENT_ID and REVIEWLOOP_GMAIL_CLIENT_SECRET \
+or build with these values injected at compile time"
         );
     };
 
