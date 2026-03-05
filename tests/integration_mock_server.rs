@@ -491,6 +491,40 @@ async fn integration_rate_limit_and_server_error_apply_cooldown() -> Result<()> 
 }
 
 #[tokio::test]
+async fn integration_poll_terminal_generation_error_marks_failed_needs_manual() -> Result<()> {
+    let state = Arc::new(MockState::default());
+    let server = MockServer::start(state.clone()).await?;
+
+    state.enqueue_review(
+        "tok-terminal",
+        MockReply::json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"detail": "Review generation failed. Please contact support."}),
+        ),
+    );
+
+    let ctx = TestContext::new(server.base_url.clone())?;
+    let poll_job = ctx.create_processing_job("tok-terminal")?;
+
+    worker::poll_job(&ctx.config, &ctx.db, &poll_job).await?;
+
+    let failed = ctx.db.get_job(&poll_job.id)?.context("poll job missing")?;
+    assert_eq!(failed.status, JobStatus::FailedNeedsManual);
+    assert_eq!(failed.attempt, 1);
+    assert!(failed.next_poll_at.is_none());
+    assert!(
+        failed
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Review generation failed")
+    );
+    assert_eq!(state.call_count("review:tok-terminal"), 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn integration_submit_uses_fallback_and_persists_token() -> Result<()> {
     let node_available = Command::new("node")
         .arg("--version")

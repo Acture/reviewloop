@@ -17,6 +17,20 @@ use std::{path::Path, time::Duration as StdDuration};
 use tracing::{error, info, warn};
 
 const RATE_LIMIT_COOLDOWN_MINUTES: i64 = 30;
+const TERMINAL_REVIEW_FAILURE_HINTS: [&str; 3] = [
+    "review generation failed",
+    "unable to generate review",
+    "failed to generate review",
+];
+
+fn is_terminal_review_generation_failure(body: &str) -> bool {
+    let normalized = body.to_ascii_lowercase();
+    let has_failure_hint = TERMINAL_REVIEW_FAILURE_HINTS
+        .iter()
+        .any(|hint| normalized.contains(hint));
+
+    has_failure_hint && normalized.contains("contact support")
+}
 
 pub async fn run_daemon(config: &Config, db: &Db, panel: bool) -> Result<()> {
     info!("daemon started");
@@ -310,21 +324,42 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
             )?;
             warn!(job_id = %job.id, "poll rate limited; cooldown applied");
         }
-        Err(BackendError::Server { status: _, body }) => {
-            let next = Utc::now() + Duration::minutes(RATE_LIMIT_COOLDOWN_MINUTES);
-            db.update_job_state(
-                &job.id,
-                JobStatus::Processing,
-                Some(job.attempt + 1),
-                Some(Some(next)),
-                Some(Some(body.clone())),
-            )?;
-            db.add_event(
-                Some(&job.id),
-                "poll_server_error",
-                json!({ "message": body, "next_poll_at": next.to_rfc3339() }),
-            )?;
-            warn!(job_id = %job.id, "poll server error; cooldown applied");
+        Err(BackendError::Server { status, body }) => {
+            if is_terminal_review_generation_failure(&body) {
+                let reason = format!("terminal backend error ({status}): {body}");
+                db.update_job_state(
+                    &job.id,
+                    JobStatus::FailedNeedsManual,
+                    Some(job.attempt + 1),
+                    Some(None),
+                    Some(Some(reason.clone())),
+                )?;
+                db.add_event(
+                    Some(&job.id),
+                    "poll_terminal_error",
+                    json!({ "status": status, "message": body }),
+                )?;
+                warn!(
+                    job_id = %job.id,
+                    status,
+                    "poll returned terminal review-generation failure; marked failed-needs-manual"
+                );
+            } else {
+                let next = Utc::now() + Duration::minutes(RATE_LIMIT_COOLDOWN_MINUTES);
+                db.update_job_state(
+                    &job.id,
+                    JobStatus::Processing,
+                    Some(job.attempt + 1),
+                    Some(Some(next)),
+                    Some(Some(body.clone())),
+                )?;
+                db.add_event(
+                    Some(&job.id),
+                    "poll_server_error",
+                    json!({ "status": status, "message": body, "next_poll_at": next.to_rfc3339() }),
+                )?;
+                warn!(job_id = %job.id, "poll server error; cooldown applied");
+            }
         }
         Err(err) => {
             let next = compute_next_poll_at(
