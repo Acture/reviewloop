@@ -5,72 +5,58 @@
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/github/license/Acture/review-loop)](LICENSE)
 
-> Reproducible, guardrailed automation for academic review workflows on `paperreview.ai`.
+> A production-minded Rust CLI/daemon for `paperreview.ai` submission and review retrieval.
 
-ReviewLoop is a Rust CLI/daemon for researchers and labs that need review automation with:
-- explicit state transitions
-- persistent local records
-- conservative provider-facing defaults
+Most paper review automation breaks in boring ways: duplicate submissions, lost tokens, noisy polling, and zero traceability.
 
-This project is intentionally biased toward **traceability** over throughput.
+**ReviewLoop** gives you a durable loop with guardrails:
+- Queue reviews from Git tags or PDF hash changes
+- Persist every transition in SQLite
+- Pull tokens from Gmail OAuth or IMAP
+- Write reproducible artifacts (`review.json`, `review.md`, `meta.json`)
+- Recover from failures with explicit retries and fallback submission
 
-## Why This Exists
+## Why This Project Exists
 
-In academic practice, failures are usually operational rather than algorithmic:
-- duplicate submissions after file changes
-- token links lost in email threads
-- no durable record of what was submitted and when
-- retry behavior that is hard to explain later in a methods appendix
+Reviewing pipelines are usually a pile of scripts plus cron plus hope.
+ReviewLoop is built for the opposite:
+- predictable state transitions
+- low default provider pressure
+- human approval gates where it matters
+- clear local evidence of what happened and why
 
-ReviewLoop addresses these with deterministic workflow state and artifacted outputs.
+If you want reliable, low-drama automation for `paperreview.ai`, this is the tool.
 
-## Implementation Snapshot (Current)
-
-What is implemented today:
-- Backend scope: `stanford` (`paperreview.ai`)
-- Runtime: CLI + long-running daemon (30s tick)
-- Storage: SQLite
-- Job states:
-  - `PENDING_APPROVAL`
-  - `QUEUED`
-  - `SUBMITTED`
-  - `PROCESSING`
-  - `COMPLETED`
-  - `FAILED`
-  - `FAILED_NEEDS_MANUAL`
-  - `TIMEOUT`
-- Trigger sources: Git tags and PDF hash changes
-- Token ingestion: IMAP (default enabled), Gmail OAuth (default disabled)
-- Optional submit fallback: Node + Playwright
-
-Database tables (current schema):
-- `jobs`
-- `reviews`
-- `events`
-- `seen_tags`
-- `email_tokens`
-
-## Quick Start
+## 1-Minute Quick Start
 
 ```bash
-# install (after public release)
+# 1) install (choose one)
+# after public release
 brew tap acture/ac && brew install reviewloop
-# or
+# OR
 cargo install reviewloop
 
-# create template config
-reviewloop init
+# 2) register paper (global config file is auto-created on first run)
+reviewloop paper add \
+  --paper-id main \
+  --path paper/main.pdf \
+  --backend stanford
 
-# edit reviewloop.toml
+# 3) optional: add a custom git-tag trigger for this paper
+reviewloop paper add \
+  --paper-id camera_ready \
+  --path build/camera_ready.pdf \
+  --backend stanford \
+  --tag-trigger "custom-review/camera_ready/*"
 
-# queue + run
+# 4) submit and run daemon
 reviewloop submit --paper-id main
 reviewloop daemon run
 ```
 
 ## Installation
 
-### Homebrew
+### Homebrew (recommended on macOS)
 
 ```bash
 # after public release
@@ -85,7 +71,7 @@ brew install reviewloop
 cargo install reviewloop
 ```
 
-### Build from source
+### Build From Source
 
 ```bash
 git clone https://github.com/Acture/review-loop.git
@@ -102,10 +88,11 @@ Global usage:
 reviewloop [--config /path/to/override.toml] <command>
 ```
 
-Implemented commands:
+Core commands:
 
 ```bash
-reviewloop init
+reviewloop paper add --paper-id <id> --path <pdf-or-build-artifact> --backend <backend> [--watch true|false] [--tag-trigger "<pattern>"]
+reviewloop paper watch --paper-id <id> --enabled <true|false>
 reviewloop daemon run
 reviewloop daemon run --panel false
 reviewloop submit --paper-id main [--force]
@@ -119,30 +106,38 @@ reviewloop email switch --account <account-id-or-email>
 reviewloop email logout [--account <account-id-or-email>]
 ```
 
-## Execution Semantics (Daemon Tick)
+## Runtime Model
 
-Tick interval is fixed at 30 seconds.
+Daemon tick interval: every 30 seconds.
 
-Per tick, the daemon runs in this order:
-1. Git-tag trigger scan
-2. PDF-change trigger scan
-3. Email token polling (Gmail OAuth first when enabled, then IMAP)
-4. Timeout marking (`review_timeout_hours`)
-5. Submission processing (`QUEUED -> SUBMITTED/PROCESSING`)
-6. Poll processing (`PROCESSING -> COMPLETED/FAILED/...`)
-7. Retention pruning (every `retention.prune_every_ticks` ticks)
+Each tick performs:
+1. Trigger scan (`git tags`, PDF hash changes)
+2. Optional Gmail OAuth + IMAP token ingestion
+3. Timeout marking
+4. Submission processing (`QUEUED -> SUBMITTED/PROCESSING`)
+5. Poll processing (`PROCESSING -> COMPLETED/FAILED/...`)
 
-Concurrency/throughput controls in current code:
-- submission budget per tick is `min(core.max_concurrency, core.max_submissions_per_tick)`
-- poll worker budget is `core.max_concurrency`
+Output artifacts per completed job:
+- `.reviewloop/artifacts/<job-id>/review.json`
+- `.reviewloop/artifacts/<job-id>/review.md`
+- `.reviewloop/artifacts/<job-id>/meta.json`
 
-## Triggers
+## What Makes It Reliable
+
+- **State machine, not ad-hoc scripts**: jobs move through explicit statuses (`PENDING_APPROVAL`, `QUEUED`, `PROCESSING`, `COMPLETED`, etc.)
+- **Duplicate guard**: prevents repeated submissions for the same `backend + pdf_hash`
+- **Load-aware polling**: default schedule starts at 10 minutes with jitter/cooldown behavior
+- **Recovery built in**: every transition is evented, retries are explicit
+- **Fallback path**: optional Node + Playwright submit path when provider API flow fails
+
+## Triggering Modes
 
 ### Git tag trigger
 
-Supported formats:
+Supported patterns:
 - `review-<backend>/<paper-id>/<anything>`
-- `review-<backend>/<anything>` (maps to first configured paper of that backend)
+- `review-<backend>/<anything>` (uses the first configured paper of that backend)
+- optional per-paper custom pattern via `paper add --tag-trigger "<pattern>"` (supports `*`)
 
 Example:
 
@@ -150,187 +145,159 @@ Example:
 review-stanford/main/v1
 ```
 
-### PDF hash trigger
+### PDF change trigger
 
-- computes SHA256 for configured PDFs
-- enqueues a new job on hash change
-- default queue status is `PENDING_APPROVAL` unless `trigger.pdf.auto_submit_on_change = true`
-
-## Artifacts and Audit Trail
-
-On `COMPLETED`, ReviewLoop writes:
-- `.reviewloop/artifacts/<job-id>/review.json`
-- `.reviewloop/artifacts/<job-id>/review.md`
-- `.reviewloop/artifacts/<job-id>/meta.json`
-
-This supports reproducibility and post-hoc audit of review outcomes.
-
-For lab records / methods appendices, minimally capture:
-- ReviewLoop version or git commit
-- effective config (especially concurrency and polling schedule)
-- artifact directory for each analyzed review run
-
-## Configuration (`reviewloop.toml`)
-
-`reviewloop init` writes a full template. Current default structure:
-
-```toml
-[core]
-state_dir = ".reviewloop"
-db_path = "<XDG_STATE_HOME>/reviewloop/reviewloop.db" # platform-resolved path
-max_concurrency = 2
-max_submissions_per_tick = 1
-review_timeout_hours = 48
-
-[logging]
-level = "info"
-output = "stdout" # stdout | stderr | file
-file_path = ".reviewloop/reviewloop.log"
-
-[polling]
-schedule_minutes = [10, 20, 40, 60]
-jitter_percent = 10
-
-[retention]
-enabled = true
-prune_every_ticks = 20
-email_tokens_days = 30
-seen_tags_days = 90
-events_days = 30
-terminal_jobs_days = 0
-
-[trigger.git]
-enabled = true
-tag_pattern = "review-<backend>/<paper-id>/*"
-repo_dir = "."
-auto_create_tags_on_pdf_change = false
-auto_delete_processed_tags = false
-
-[trigger.pdf]
-enabled = true
-auto_submit_on_change = false
-max_scan_papers = 10
-
-[providers.stanford]
-base_url = "https://paperreview.ai"
-fallback_mode = "node_playwright"
-fallback_script = "tools/paperreview_fallback.mjs"
-email = ""
-
-[[papers]]
-id = "main"
-pdf_path = "paper/main.pdf"
-backend = "stanford"
-
-[imap]
-enabled = true
-server = "imap.gmail.com"
-port = 993
-username = ""
-password = ""
-folder = "INBOX"
-poll_seconds = 300
-mark_seen = true
-max_lookback_hours = 72
-max_messages_per_poll = 50
-header_first = true
-
-[gmail_oauth]
-enabled = false
-client_id = ""
-client_secret = ""
-poll_seconds = 300
-mark_seen = true
-max_lookback_hours = 72
-max_messages_per_poll = 50
-header_first = true
-```
-
-Config layer precedence (low to high):
-1. global: `$XDG_CONFIG_HOME/reviewloop/reviewloop.toml` (or `~/.config/reviewloop/reviewloop.toml`)
-2. local: `./reviewloop.toml`
-3. explicit: `--config /path/to/file.toml`
+- Computes SHA256 for configured PDFs
+- New hash enqueues job
+- Default status is `PENDING_APPROVAL` (manual `approve` required)
 
 ## Email Token Ingestion
 
-### IMAP mode (default enabled)
+ReviewLoop can attach review tokens from email to open jobs.
 
-Default Stanford token pattern:
+### IMAP mode (built in)
+
+Default token pattern includes Stanford:
 
 ```toml
 [imap.backend_patterns]
 stanford = "https?://paperreview\\.ai/review\\?token=([A-Za-z0-9_-]+)"
 ```
 
-### Gmail OAuth mode (default disabled)
+Recommended defaults:
+- `imap.header_first = true` to scan headers first
+- `imap.max_lookback_hours = 72`
+- `imap.max_messages_per_poll = 50`
 
-Enable in config and run:
+### Gmail OAuth mode
+
+Configure:
+
+```toml
+[gmail_oauth]
+enabled = true
+client_id = "your-google-oauth-client-id"
+client_secret = "your-google-oauth-client-secret"
+token_store_path = ".reviewloop/oauth/google_token.json" # optional
+poll_seconds = 300
+mark_seen = true
+max_lookback_hours = 72
+max_messages_per_poll = 50
+header_first = true
+
+[gmail_oauth.backend_header_patterns]
+stanford = "(?is)(from:\\s*.*mail\\.paperreview\\.ai|subject:\\s*.*paper review is ready)"
+
+[gmail_oauth.backend_patterns]
+stanford = "https?://paperreview\\.ai/review\\?token=([A-Za-z0-9_-]+)"
+```
+
+Then login:
 
 ```bash
 reviewloop email login --provider google
 ```
 
-The daemon will use Gmail API polling first when OAuth is configured and valid, then IMAP fallback.
+ReviewLoop runs Gmail API polling first when available, then IMAP fallback.
 
-## Fallback Path
+## Configuration Highlights (`reviewloop.toml`)
 
-When primary API submit fails, a fallback submit attempt can run if:
-- backend is `stanford`
-- `providers.stanford.fallback_mode == "node_playwright"`
-- job has not already used fallback
+Global config is auto-generated at:
+- `$XDG_CONFIG_HOME/reviewloop/reviewloop.toml`
+- or `~/.config/reviewloop/reviewloop.toml`
 
-Runtime requirements:
-- Node.js
-- Playwright runtime dependencies
-- fallback script at `tools/paperreview_fallback.mjs` (or configured path)
+Config precedence (low to high):
+1. `$XDG_CONFIG_HOME/reviewloop/reviewloop.toml` (or `~/.config/reviewloop/reviewloop.toml`)
+2. `./reviewloop.toml`
+3. `--config /path/to/file.toml`
 
-## CI/CD and Distribution
+Paper registration:
+- start with an empty `papers[]`
+- add papers through `reviewloop paper add ...`
+- control PDF watcher per paper with `reviewloop paper watch ...`
 
-### CI
+Safe defaults:
+- `core.max_concurrency = 2`
+- `core.max_submissions_per_tick = 1`
+- `core.db_path = "<global-data-dir>/reviewloop.db"`
+- `core.review_timeout_hours = 48`
+- `polling.schedule_minutes = [10, 20, 40, 60]`
+- `polling.jitter_percent = 10`
+- `retention.enabled = true`
+- `retention.prune_every_ticks = 20` (10 minutes with 30s tick)
+- `retention.email_tokens_days = 30`
+- `retention.seen_tags_days = 90`
+- `retention.events_days = 30`
+- `retention.terminal_jobs_days = 0` (disabled by default)
+- `trigger.pdf.auto_submit_on_change = false`
+- `trigger.pdf.max_scan_papers = 10`
+- `trigger.git.tag_pattern = "review-<backend>/<paper-id>/*"`
+- `trigger.git.auto_create_tags_on_pdf_change = false`
+- `trigger.git.auto_delete_processed_tags = false`
 
-Workflow: `.github/workflows/ci.yml`
+`providers.stanford` defaults:
+- `base_url = "https://paperreview.ai"`
+- `fallback_mode = "node_playwright"`
+- `fallback_script = "tools/paperreview_fallback.mjs"`
+- `email` optional (falls back to active email account)
+- `venue` optional
 
-Runs on PRs and pushes to `main/master`:
+Logging:
+- `logging.output = "stdout" | "stderr" | "file"`
+- file mode default path: `.reviewloop/reviewloop.log`
+
+## CI/CD and Release Flow
+
+This repository ships with GitHub Actions for both quality gates and release automation.
+
+### CI (`.github/workflows/ci.yml`)
+
+On pull requests and pushes to `main/master`:
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo test --all-targets --locked`
 
-Platforms: Ubuntu + macOS.
+Runs on both Ubuntu and macOS.
 
-### Release
+### Release (`.github/workflows/release.yml`)
 
-Workflow: `.github/workflows/release.yml`
-
-On `vX.Y.Z` tag push:
-1. validate tag version against `Cargo.toml`
-2. run release quality gates
-3. publish to crates.io
-4. update Homebrew tap formula in `Acture/homebrew-ac`
-5. create GitHub Release notes
+On tag push like `v0.1.0`:
+1. Verify tag version matches `Cargo.toml`
+2. Run quality gates again
+3. Publish crate to crates.io
+4. Update Homebrew tap formula in `Acture/homebrew-ac`
+5. Create GitHub Release with generated notes
 
 Required secrets:
 - `CARGO_REGISTRY_TOKEN`
 - `HOMEBREW_TAP_GITHUB_TOKEN`
 
 Optional repo variables:
-- `HOMEBREW_TAP_REPO` (default `Acture/homebrew-ac`)
-- `HOMEBREW_FORMULA_PATH` (default `Formula/reviewloop.rb`)
+- `HOMEBREW_TAP_REPO` (default: `Acture/homebrew-ac`)
+- `HOMEBREW_FORMULA_PATH` (default: `Formula/reviewloop.rb`)
 
-## Scope and Non-Goals
+## Fallback Requirements
 
-Current scope:
-- one backend (`stanford`)
-- local-state architecture (SQLite + artifacts)
-- conservative polling and submit defaults
-
-Explicit non-goal:
-- high-frequency bulk automation.
+When API submit fails and fallback is enabled:
+- Node.js must be available
+- Playwright runtime dependencies must be installed
+- script path defaults to `tools/paperreview_fallback.mjs`
 
 ## Responsible Use
 
-Use ReviewLoop only for submissions/retrieval you are authorized to perform.
-Respect provider terms and fair-use limits.
-If 429/load-pressure signals appear, reduce throughput immediately.
+ReviewLoop is intentionally conservative.
+
+Please keep it that way:
+- use it only for authorized submissions/retrieval
+- keep concurrency and submit rate low unless provider approves otherwise
+- do not aggressively shorten poll cadence
+- respect provider Terms of Service and fair-use boundaries
+
+## Current Scope
+
+- Supported backend: `stanford` (`paperreview.ai`)
+- Database: SQLite (global state path by default, supports `:memory:`)
+- Interface: CLI + daemon
 
 ## License
 

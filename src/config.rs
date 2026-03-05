@@ -22,6 +22,8 @@ pub struct Config {
     pub trigger: TriggerConfig,
     pub providers: ProvidersConfig,
     pub papers: Vec<PaperConfig>,
+    pub paper_watch: BTreeMap<String, bool>,
+    pub paper_tag_triggers: BTreeMap<String, String>,
     pub imap: Option<ImapConfig>,
     pub gmail_oauth: Option<GmailOauthConfig>,
 }
@@ -35,11 +37,9 @@ impl Default for Config {
             retention: RetentionConfig::default(),
             trigger: TriggerConfig::default(),
             providers: ProvidersConfig::default(),
-            papers: vec![PaperConfig {
-                id: "main".to_string(),
-                pdf_path: "paper/main.pdf".to_string(),
-                backend: "stanford".to_string(),
-            }],
+            papers: Vec::new(),
+            paper_watch: BTreeMap::new(),
+            paper_tag_triggers: BTreeMap::new(),
             imap: Some(ImapConfig::default()),
             gmail_oauth: Some(GmailOauthConfig::default()),
         }
@@ -75,6 +75,17 @@ impl Config {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create global config dir: {}", parent.display()))?;
         Ok(Some(parent.to_path_buf()))
+    }
+
+    pub fn ensure_global_config_file() -> Result<Option<PathBuf>> {
+        let Some(path) = Self::global_config_path() else {
+            return Ok(None);
+        };
+        Self::ensure_global_config_dir()?;
+        if !path.exists() {
+            Self::save_template(&path)?;
+        }
+        Ok(Some(path))
     }
 
     pub fn global_data_dir() -> Option<PathBuf> {
@@ -137,16 +148,27 @@ impl Config {
         {
             return Err(anyhow!("gmail_oauth.max_messages_per_poll must be >= 1"));
         }
-        if self.papers.is_empty() {
-            return Err(anyhow!("papers[] must contain at least one paper"));
-        }
         Ok(())
     }
 
     pub fn save_template(path: &Path) -> Result<()> {
-        let content = toml::to_string_pretty(&Config::default())?;
+        Config::default().save(path)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create config parent directory: {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let content = toml::to_string_pretty(self)?;
         fs::write(path, content)
-            .with_context(|| format!("failed to write config template: {}", path.display()))
+            .with_context(|| format!("failed to write config file: {}", path.display()))
     }
 
     pub fn state_dir(&self) -> PathBuf {
@@ -171,6 +193,29 @@ impl Config {
 
     pub fn first_paper_for_backend(&self, backend: &str) -> Option<&PaperConfig> {
         self.papers.iter().find(|p| p.backend == backend)
+    }
+
+    pub fn is_paper_watched(&self, paper_id: &str) -> bool {
+        self.paper_watch.get(paper_id).copied().unwrap_or(true)
+    }
+
+    pub fn set_paper_watch(&mut self, paper_id: &str, enabled: bool) {
+        self.paper_watch.insert(paper_id.to_string(), enabled);
+    }
+
+    pub fn paper_tag_trigger(&self, paper_id: &str) -> Option<&str> {
+        self.paper_tag_triggers.get(paper_id).map(String::as_str)
+    }
+
+    pub fn set_paper_tag_trigger(&mut self, paper_id: &str, trigger: Option<String>) {
+        match trigger {
+            Some(value) => {
+                self.paper_tag_triggers.insert(paper_id.to_string(), value);
+            }
+            None => {
+                self.paper_tag_triggers.remove(paper_id);
+            }
+        }
     }
 
     fn load_from_paths(paths: &[PathBuf]) -> Result<Self> {
@@ -234,7 +279,7 @@ fn resolve_layered_paths(explicit_path: Option<&Path>) -> Result<Vec<PathBuf>> {
             .collect::<Vec<_>>()
             .join(", ");
         return Err(anyhow!(
-            "no config file found (looked for: {}). run `reviewloop init` or pass --config <path>",
+            "no config file found (looked for: {}). pass --config <path>",
             looked_text
         ));
     }
@@ -597,6 +642,9 @@ mod tests {
         assert!(!cfg.trigger.git.auto_create_tags_on_pdf_change);
         assert!(!cfg.trigger.git.auto_delete_processed_tags);
         assert_eq!(cfg.logging.output, "stdout");
+        assert!(cfg.papers.is_empty());
+        assert!(cfg.paper_watch.is_empty());
+        assert!(cfg.paper_tag_triggers.is_empty());
     }
 
     #[test]
@@ -688,6 +736,13 @@ mod tests {
             imap.max_messages_per_poll = 0;
         }
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_allows_empty_papers() {
+        let cfg = Config::default();
+        assert!(cfg.papers.is_empty());
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
