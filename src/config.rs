@@ -218,6 +218,17 @@ impl Config {
         }
     }
 
+    pub fn effective_stanford_venue(&self) -> String {
+        self.providers
+            .stanford
+            .venue
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or("ICLR")
+            .to_string()
+    }
+
     fn load_from_paths(paths: &[PathBuf]) -> Result<Self> {
         if paths.is_empty() {
             return Err(anyhow!("no config paths provided"));
@@ -255,12 +266,6 @@ fn resolve_layered_paths(explicit_path: Option<&Path>) -> Result<Vec<PathBuf>> {
         if global.exists() {
             push_unique(&mut layers, global);
         }
-    }
-
-    let local = PathBuf::from("reviewloop.toml");
-    push_unique(&mut looked, local.clone());
-    if local.exists() {
-        push_unique(&mut layers, local);
     }
 
     if let Some(path) = explicit_path {
@@ -340,6 +345,20 @@ fn default_db_path() -> String {
     base.join("reviewloop.db").to_string_lossy().to_string()
 }
 
+fn default_state_dir() -> String {
+    default_global_data_dir()
+        .unwrap_or_else(|| PathBuf::from(".reviewloop"))
+        .to_string_lossy()
+        .to_string()
+}
+
+fn default_log_path() -> String {
+    PathBuf::from(default_state_dir())
+        .join("reviewloop.log")
+        .to_string_lossy()
+        .to_string()
+}
+
 fn push_unique(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
     if !paths.iter().any(|p| p == &candidate) {
         paths.push(candidate);
@@ -376,7 +395,7 @@ pub struct CoreConfig {
 impl Default for CoreConfig {
     fn default() -> Self {
         Self {
-            state_dir: ".reviewloop".to_string(),
+            state_dir: default_state_dir(),
             db_path: default_db_path(),
             max_concurrency: 2,
             max_submissions_per_tick: 1,
@@ -398,7 +417,7 @@ impl Default for LoggingConfig {
         Self {
             level: "info".to_string(),
             output: "stdout".to_string(),
-            file_path: Some(".reviewloop/reviewloop.log".to_string()),
+            file_path: Some(default_log_path()),
         }
     }
 }
@@ -513,7 +532,7 @@ impl Default for StanfordProviderConfig {
             fallback_mode: "node_playwright".to_string(),
             fallback_script: "tools/paperreview_fallback.mjs".to_string(),
             email: "".to_string(),
-            venue: None,
+            venue: Some("ICLR".to_string()),
         }
     }
 }
@@ -635,6 +654,7 @@ mod tests {
         assert_eq!(cfg.polling.schedule_minutes, vec![10, 20, 40, 60]);
         assert_eq!(cfg.trigger.git.repo_dir, ".");
         assert_eq!(cfg.core.max_submissions_per_tick, 1);
+        assert!(!cfg.core.state_dir.trim().is_empty());
         assert!(!cfg.core.db_path.trim().is_empty());
         assert!(cfg.retention.enabled);
         assert_eq!(cfg.retention.prune_every_ticks, 20);
@@ -645,6 +665,13 @@ mod tests {
         assert!(cfg.papers.is_empty());
         assert!(cfg.paper_watch.is_empty());
         assert!(cfg.paper_tag_triggers.is_empty());
+    }
+
+    #[test]
+    fn default_stanford_venue_is_iclr() {
+        let cfg = Config::default();
+        assert_eq!(cfg.providers.stanford.venue.as_deref(), Some("ICLR"));
+        assert_eq!(cfg.effective_stanford_venue(), "ICLR");
     }
 
     #[test]

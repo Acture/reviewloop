@@ -109,6 +109,18 @@ fn list_ready_queued_respects_next_poll_at() -> Result<()> {
 }
 
 #[test]
+fn list_due_processing_treats_past_next_poll_as_due() -> Result<()> {
+    let ctx = DbTestContext::new()?;
+    let job = ctx.create_job(JobStatus::Queued)?;
+    let past = Utc::now() - Duration::minutes(5);
+    ctx.db.attach_token_to_job(&job.id, "tok-past-due", past)?;
+
+    let due = ctx.db.list_due_processing(10, Utc::now())?;
+    assert!(due.iter().any(|j| j.id == job.id));
+    Ok(())
+}
+
+#[test]
 fn latest_open_job_without_token_prefers_newest() -> Result<()> {
     let ctx = DbTestContext::new()?;
     let older = ctx.create_job_with_hash(JobStatus::Queued, "hash-1")?;
@@ -155,12 +167,40 @@ fn mark_timeouts_moves_old_processing_jobs_to_timeout() -> Result<()> {
     let conn = rusqlite::Connection::open(&ctx.db.path)?;
     let old = (Utc::now() - Duration::hours(49)).to_rfc3339();
     conn.execute(
-        "UPDATE jobs SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+        "UPDATE jobs SET started_at = ?1, created_at = ?1, updated_at = ?1 WHERE id = ?2",
         params![old, job.id],
     )?;
 
     worker::mark_timeouts(&ctx.config, &ctx.db)?;
 
+    let updated = ctx.db.get_job(&job.id)?.context("missing timed out job")?;
+    assert_eq!(updated.status, JobStatus::Timeout);
+
+    Ok(())
+}
+
+#[test]
+fn mark_timeouts_scales_with_pdf_pages_for_stanford() -> Result<()> {
+    let ctx = DbTestContext::new()?;
+    let mut synthetic_pdf = String::from("%PDF-1.4\n");
+    for _ in 0..10 {
+        synthetic_pdf.push_str("<< /Type /Page >>\n");
+    }
+    synthetic_pdf.push_str("%%EOF\n");
+    fs::write(&ctx.config.papers[0].pdf_path, synthetic_pdf.as_bytes())?;
+
+    let job = ctx.create_job(JobStatus::Queued)?;
+    ctx.db
+        .attach_token_to_job(&job.id, "token-scale", Utc::now() - Duration::minutes(1))?;
+
+    let conn = rusqlite::Connection::open(&ctx.db.path)?;
+    let started = (Utc::now() - Duration::hours(25)).to_rfc3339();
+    conn.execute(
+        "UPDATE jobs SET started_at = ?1, created_at = ?1, updated_at = ?1 WHERE id = ?2",
+        params![started, job.id],
+    )?;
+
+    worker::mark_timeouts(&ctx.config, &ctx.db)?;
     let updated = ctx.db.get_job(&job.id)?.context("missing timed out job")?;
     assert_eq!(updated.status, JobStatus::Timeout);
 

@@ -43,13 +43,13 @@ pub fn init_logging(config: &Config, force_stderr: bool) -> Result<()> {
                 .map_err(|e| anyhow!(e.to_string()))?;
         }
         "file" => {
-            let path = PathBuf::from(
+            let path = PathBuf::from(config.logging.file_path.clone().unwrap_or_else(|| {
                 config
-                    .logging
-                    .file_path
-                    .clone()
-                    .unwrap_or_else(|| ".reviewloop/reviewloop.log".to_string()),
-            );
+                    .state_dir()
+                    .join("reviewloop.log")
+                    .to_string_lossy()
+                    .to_string()
+            }));
             let parent = path
                 .parent()
                 .map(PathBuf::from)

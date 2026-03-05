@@ -283,16 +283,11 @@ fn resolve_mutable_config_path(config_override: Option<&Path>) -> Result<PathBuf
         return Ok(path.to_path_buf());
     }
 
-    let local = PathBuf::from("reviewloop.toml");
-    if local.exists() {
-        return Ok(local);
-    }
-
     if let Some(global) = Config::ensure_global_config_file()? {
         return Ok(global);
     }
 
-    anyhow::bail!("unable to resolve writable config path")
+    Ok(PathBuf::from("reviewloop.toml"))
 }
 
 fn load_or_create_config(path: &Path) -> Result<Config> {
@@ -806,7 +801,7 @@ async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Re
     let (email, venue) = match paper.backend.as_str() {
         "stanford" => (
             email_account::resolve_submission_email(config, "stanford", None)?,
-            config.providers.stanford.venue.clone(),
+            Some(config.effective_stanford_venue()),
         ),
         _ => (String::new(), None),
     };
@@ -895,7 +890,7 @@ fn cmd_import_token(
     let (email, venue) = match paper.backend.as_str() {
         "stanford" => (
             email_account::resolve_submission_email(config, "stanford", None)?,
-            config.providers.stanford.venue.clone(),
+            Some(config.effective_stanford_venue()),
         ),
         _ => (String::new(), None),
     };

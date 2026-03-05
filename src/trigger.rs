@@ -317,7 +317,7 @@ fn provider_email(config: &Config, backend: &str) -> Result<String> {
 
 fn provider_venue(config: &Config, backend: &str) -> Option<String> {
     match backend {
-        "stanford" => config.providers.stanford.venue.clone(),
+        "stanford" => Some(config.effective_stanford_venue()),
         _ => None,
     }
 }
