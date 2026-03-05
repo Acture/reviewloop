@@ -109,6 +109,7 @@ Core commands:
 ```bash
 reviewloop paper add --paper-id <id> --path <pdf-or-build-artifact> --backend <backend> [--watch true|false] [--tag-trigger "<pattern>"] [--submit-now] [--no-submit-prompt]
 reviewloop paper watch --paper-id <id> --enabled <true|false>
+reviewloop paper remove --paper-id <id>
 reviewloop daemon run
 reviewloop daemon run --panel false
 reviewloop daemon install [--start true]
