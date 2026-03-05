@@ -109,7 +109,7 @@ Core commands:
 ```bash
 reviewloop paper add --paper-id <id> --path <pdf-or-build-artifact> --backend <backend> [--watch true|false] [--tag-trigger "<pattern>"] [--submit-now] [--no-submit-prompt]
 reviewloop paper watch --paper-id <id> --enabled <true|false>
-reviewloop paper remove --paper-id <id>
+reviewloop paper remove --paper-id <id> [--purge-history]
 reviewloop daemon run
 reviewloop daemon run --panel false
 reviewloop daemon install [--start true]
@@ -254,6 +254,8 @@ Config precedence (low to high):
 Paper registration:
 - start with an empty `papers[]`
 - add papers through `reviewloop paper add ...`
+- remove papers through `reviewloop paper remove --paper-id ...`
+  - add `--purge-history` to also delete DB jobs/events/reviews and local artifacts for that paper
 - control PDF watcher per paper with `reviewloop paper watch ...`
 
 Safe defaults:

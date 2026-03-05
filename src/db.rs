@@ -29,6 +29,14 @@ impl PruneReport {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct PurgePaperReport {
+    pub job_ids: Vec<String>,
+    pub jobs: usize,
+    pub events: usize,
+    pub reviews: usize,
+}
+
 pub struct Db {
     pub path: PathBuf,
     dsn: String,
@@ -592,6 +600,37 @@ impl Db {
             params![token, source, to_rfc3339(Utc::now()), raw_ref],
         )?;
         Ok(())
+    }
+
+    pub fn purge_paper_history(&self, paper_id: &str) -> Result<PurgePaperReport> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+
+        let mut stmt = tx.prepare("SELECT id FROM jobs WHERE paper_id = ?1")?;
+        let iter = stmt.query_map(params![paper_id], |row| row.get::<_, String>(0))?;
+        let mut job_ids = Vec::new();
+        for id in iter {
+            job_ids.push(id?);
+        }
+        drop(stmt);
+
+        let reviews = tx.execute(
+            "DELETE FROM reviews WHERE job_id IN (SELECT id FROM jobs WHERE paper_id = ?1)",
+            params![paper_id],
+        )?;
+        let events = tx.execute(
+            "DELETE FROM events WHERE job_id IN (SELECT id FROM jobs WHERE paper_id = ?1)",
+            params![paper_id],
+        )?;
+        let jobs = tx.execute("DELETE FROM jobs WHERE paper_id = ?1", params![paper_id])?;
+
+        tx.commit()?;
+        Ok(PurgePaperReport {
+            job_ids,
+            jobs,
+            events,
+            reviews,
+        })
     }
 
     pub fn prune_retention(
