@@ -92,7 +92,12 @@ fn git_available() -> bool {
 
 fn run_git(repo_dir: &Path, args: &[&str]) -> Result<()> {
     let output = Command::new("git")
-        .args(["-C", repo_dir.to_string_lossy().as_ref()])
+        .args([
+            "-C",
+            repo_dir.to_string_lossy().as_ref(),
+            "-c",
+            "commit.gpgsign=false",
+        ])
         .args(args)
         .output()
         .with_context(|| format!("failed to execute git command: {:?}", args))?;
