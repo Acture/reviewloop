@@ -93,6 +93,12 @@ Safe defaults:
 - `core.review_timeout_hours = 48`
 - `polling.schedule_minutes = [10, 20, 40, 60]`
 - `polling.jitter_percent = 10`
+- `retention.enabled = true`
+- `retention.prune_every_ticks = 20` (daemon ticks are 30s, so default cleanup interval is 10m)
+- `retention.email_tokens_days = 30`
+- `retention.seen_tags_days = 90`
+- `retention.events_days = 30`
+- `retention.terminal_jobs_days = 0` (disabled by default; set >0 to purge old COMPLETED/FAILED/TIMEOUT jobs)
 - `trigger.pdf.auto_submit_on_change = false`
 - `trigger.pdf.max_scan_papers = 10`
 - `trigger.git.tag_pattern = "review-<backend>/<paper-id>/*"`
@@ -178,6 +184,14 @@ When a token is attached from IMAP, ReviewLoop schedules immediate polling (`nex
 If `username` / `password` are empty, IMAP polling is skipped.
 Set `max_lookback_hours = 0` only if you intentionally want no time-window limit.
 For stacked/repeated emails, token de-dup is applied and already-bound tokens are not re-attached to other jobs.
+
+## Retention Policy
+
+ReviewLoop can automatically delete stale records to keep local state compact.
+
+- Auxiliary tables (`email_tokens`, `seen_tags`, `events`) are pruned by age.
+- Terminal job cleanup (`jobs` + `reviews`) is opt-in via `retention.terminal_jobs_days`.
+- Set any `*_days = 0` to disable pruning for that category.
 
 ## Responsible Use (Important)
 

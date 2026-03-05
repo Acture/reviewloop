@@ -8,6 +8,7 @@ use reviewloop::{
     worker,
 };
 use rusqlite::params;
+use serde_json::json;
 use std::{fs, path::Path};
 
 struct DbTestContext {
@@ -223,6 +224,103 @@ fn in_memory_db_persists_across_operations_for_same_instance() -> Result<()> {
         .context("missing job from in-memory sqlite")?;
     assert_eq!(loaded.id, created.id);
     assert_eq!(loaded.status, JobStatus::Queued);
+
+    Ok(())
+}
+
+#[test]
+fn retention_prunes_stale_auxiliary_entries() -> Result<()> {
+    let mut ctx = DbTestContext::new()?;
+    let now = Utc::now();
+
+    ctx.db
+        .record_email_token("tok-old", "imap:stanford", Some("ref"))?;
+    ctx.db.mark_tag_seen("review-stanford/main/v1", "abc123")?;
+    ctx.db
+        .add_event(None, "test_event", json!({"kind":"stale"}))?;
+
+    let conn = rusqlite::Connection::open(&ctx.db.path)?;
+    let old = (now - Duration::days(120)).to_rfc3339();
+    conn.execute(
+        "UPDATE email_tokens SET matched_at = ?1 WHERE token = ?2",
+        params![old, "tok-old"],
+    )?;
+    conn.execute(
+        "UPDATE seen_tags SET seen_at = ?1 WHERE tag_name = ?2",
+        params![old, "review-stanford/main/v1"],
+    )?;
+    conn.execute("UPDATE events SET created_at = ?1", params![old])?;
+
+    ctx.config.retention.email_tokens_days = 30;
+    ctx.config.retention.seen_tags_days = 30;
+    ctx.config.retention.events_days = 30;
+    ctx.config.retention.terminal_jobs_days = 0;
+
+    let report = ctx.db.prune_retention(&ctx.config.retention, now)?;
+    assert_eq!(report.email_tokens, 1);
+    assert_eq!(report.seen_tags, 1);
+    assert_eq!(report.events, 1);
+    assert_eq!(report.jobs, 0);
+    assert_eq!(report.reviews, 0);
+
+    let remaining_tokens: i64 =
+        conn.query_row("SELECT COUNT(*) FROM email_tokens", [], |row| row.get(0))?;
+    let remaining_tags: i64 =
+        conn.query_row("SELECT COUNT(*) FROM seen_tags", [], |row| row.get(0))?;
+    let remaining_events: i64 =
+        conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+    assert_eq!(remaining_tokens, 0);
+    assert_eq!(remaining_tags, 0);
+    assert_eq!(remaining_events, 0);
+
+    Ok(())
+}
+
+#[test]
+fn retention_prunes_old_terminal_jobs_when_enabled() -> Result<()> {
+    let mut ctx = DbTestContext::new()?;
+    let now = Utc::now();
+
+    let completed = ctx.create_job_with_hash(JobStatus::Completed, "hash-completed")?;
+    let processing = ctx.create_job_with_hash(JobStatus::Processing, "hash-processing")?;
+    ctx.db
+        .upsert_review(&completed.id, "tok-completed", r#"{"ok":true}"#, "summary")?;
+    ctx.db.add_event(
+        Some(&completed.id),
+        "completed_event",
+        json!({"job":"completed"}),
+    )?;
+
+    let conn = rusqlite::Connection::open(&ctx.db.path)?;
+    let old = (now - Duration::days(10)).to_rfc3339();
+    conn.execute(
+        "UPDATE jobs SET updated_at = ?1 WHERE id = ?2",
+        params![old, completed.id],
+    )?;
+    conn.execute(
+        "UPDATE jobs SET updated_at = ?1 WHERE id = ?2",
+        params![old, processing.id],
+    )?;
+
+    ctx.config.retention.email_tokens_days = 0;
+    ctx.config.retention.seen_tags_days = 0;
+    ctx.config.retention.events_days = 0;
+    ctx.config.retention.terminal_jobs_days = 7;
+
+    let report = ctx.db.prune_retention(&ctx.config.retention, now)?;
+    assert_eq!(report.jobs, 1);
+    assert_eq!(report.reviews, 1);
+    assert_eq!(report.events, 1);
+
+    assert!(ctx.db.get_job(&completed.id)?.is_none());
+    assert!(ctx.db.get_job(&processing.id)?.is_some());
+
+    let review_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM reviews WHERE job_id = ?1",
+        params![completed.id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(review_count, 0);
 
     Ok(())
 }

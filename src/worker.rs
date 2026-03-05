@@ -39,7 +39,7 @@ pub async fn run_daemon(config: &Config, db: &Db, panel: bool) -> Result<()> {
         tick += 1;
         let mut last_tick_error: Option<String> = None;
 
-        if let Err(err) = run_tick(config, db).await {
+        if let Err(err) = run_tick_internal(config, db, Some(tick)).await {
             let msg = format!("{err:#}");
             error!(tick, error = %msg, "tick failed");
             last_tick_error = Some(msg);
@@ -63,6 +63,10 @@ pub async fn run_daemon(config: &Config, db: &Db, panel: bool) -> Result<()> {
 }
 
 pub async fn run_tick(config: &Config, db: &Db) -> Result<()> {
+    run_tick_internal(config, db, None).await
+}
+
+async fn run_tick_internal(config: &Config, db: &Db, tick: Option<u64>) -> Result<()> {
     run_git_tag_trigger(config, db)?;
     run_pdf_trigger(config, db)?;
 
@@ -71,6 +75,7 @@ pub async fn run_tick(config: &Config, db: &Db) -> Result<()> {
     mark_timeouts(config, db)?;
     process_submissions(config, db).await?;
     process_polls(config, db).await?;
+    prune_retention(config, db, tick)?;
 
     Ok(())
 }
@@ -405,5 +410,44 @@ pub fn mark_timeouts(config: &Config, db: &Db) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+pub fn prune_retention(config: &Config, db: &Db, tick: Option<u64>) -> Result<()> {
+    if !config.retention.enabled {
+        return Ok(());
+    }
+    if let Some(tick) = tick {
+        let interval = config.retention.prune_every_ticks;
+        if tick % interval != 0 {
+            return Ok(());
+        }
+    }
+
+    let report = db.prune_retention(&config.retention, Utc::now())?;
+    if report.total_deleted() == 0 {
+        return Ok(());
+    }
+
+    db.add_event(
+        None,
+        "retention_pruned",
+        json!({
+            "email_tokens": report.email_tokens,
+            "seen_tags": report.seen_tags,
+            "events": report.events,
+            "reviews": report.reviews,
+            "jobs": report.jobs
+        }),
+    )?;
+    info!(
+        deleted = report.total_deleted(),
+        email_tokens = report.email_tokens,
+        seen_tags = report.seen_tags,
+        events = report.events,
+        reviews = report.reviews,
+        jobs = report.jobs,
+        "retention pruning deleted stale records"
+    );
     Ok(())
 }

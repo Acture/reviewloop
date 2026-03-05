@@ -18,6 +18,7 @@ pub struct Config {
     pub core: CoreConfig,
     pub logging: LoggingConfig,
     pub polling: PollingConfig,
+    pub retention: RetentionConfig,
     pub trigger: TriggerConfig,
     pub providers: ProvidersConfig,
     pub papers: Vec<PaperConfig>,
@@ -30,6 +31,7 @@ impl Default for Config {
             core: CoreConfig::default(),
             logging: LoggingConfig::default(),
             polling: PollingConfig::default(),
+            retention: RetentionConfig::default(),
             trigger: TriggerConfig::default(),
             providers: ProvidersConfig::default(),
             papers: vec![PaperConfig {
@@ -116,6 +118,9 @@ impl Config {
         }
         if self.polling.schedule_minutes.is_empty() {
             return Err(anyhow!("polling.schedule_minutes cannot be empty"));
+        }
+        if self.retention.prune_every_ticks == 0 {
+            return Err(anyhow!("retention.prune_every_ticks must be >= 1"));
         }
         if self.trigger.pdf.max_scan_papers == 0 {
             return Err(anyhow!("trigger.pdf.max_scan_papers must be >= 1"));
@@ -367,6 +372,30 @@ impl Default for PollingConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetentionConfig {
+    pub enabled: bool,
+    pub prune_every_ticks: u64,
+    pub email_tokens_days: u64,
+    pub seen_tags_days: u64,
+    pub events_days: u64,
+    pub terminal_jobs_days: u64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            prune_every_ticks: 20,
+            email_tokens_days: 30,
+            seen_tags_days: 90,
+            events_days: 30,
+            terminal_jobs_days: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct TriggerConfig {
@@ -513,6 +542,8 @@ mod tests {
         assert_eq!(cfg.trigger.git.repo_dir, ".");
         assert_eq!(cfg.core.max_submissions_per_tick, 1);
         assert!(!cfg.core.db_path.trim().is_empty());
+        assert!(cfg.retention.enabled);
+        assert_eq!(cfg.retention.prune_every_ticks, 20);
         assert_eq!(cfg.trigger.pdf.max_scan_papers, 10);
         assert!(!cfg.trigger.git.auto_create_tags_on_pdf_change);
         assert!(!cfg.trigger.git.auto_delete_processed_tags);
@@ -569,6 +600,13 @@ mod tests {
     fn validate_rejects_zero_pdf_scan_limit() {
         let mut cfg = Config::default();
         cfg.trigger.pdf.max_scan_papers = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_retention_tick_interval() {
+        let mut cfg = Config::default();
+        cfg.retention.prune_every_ticks = 0;
         assert!(cfg.validate().is_err());
     }
 

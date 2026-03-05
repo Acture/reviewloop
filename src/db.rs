@@ -4,7 +4,7 @@ use crate::{
     util::{parse_rfc3339, to_rfc3339},
 };
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
 use std::{
@@ -13,6 +13,21 @@ use std::{
     time::Duration,
 };
 use uuid::Uuid;
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PruneReport {
+    pub email_tokens: usize,
+    pub seen_tags: usize,
+    pub events: usize,
+    pub reviews: usize,
+    pub jobs: usize,
+}
+
+impl PruneReport {
+    pub fn total_deleted(self) -> usize {
+        self.email_tokens + self.seen_tags + self.events + self.reviews + self.jobs
+    }
+}
 
 pub struct Db {
     pub path: PathBuf,
@@ -577,6 +592,82 @@ impl Db {
             params![token, source, to_rfc3339(Utc::now()), raw_ref],
         )?;
         Ok(())
+    }
+
+    pub fn prune_retention(
+        &self,
+        retention: &crate::config::RetentionConfig,
+        now: DateTime<Utc>,
+    ) -> Result<PruneReport> {
+        if !retention.enabled {
+            return Ok(PruneReport::default());
+        }
+
+        let mut report = PruneReport::default();
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+
+        if retention.email_tokens_days > 0 {
+            let cutoff = now - ChronoDuration::days(retention.email_tokens_days as i64);
+            report.email_tokens = tx.execute(
+                "DELETE FROM email_tokens WHERE matched_at < ?1",
+                params![to_rfc3339(cutoff)],
+            )?;
+        }
+
+        if retention.seen_tags_days > 0 {
+            let cutoff = now - ChronoDuration::days(retention.seen_tags_days as i64);
+            report.seen_tags = tx.execute(
+                "DELETE FROM seen_tags WHERE seen_at < ?1",
+                params![to_rfc3339(cutoff)],
+            )?;
+        }
+
+        if retention.events_days > 0 {
+            let cutoff = now - ChronoDuration::days(retention.events_days as i64);
+            report.events = tx.execute(
+                "DELETE FROM events WHERE created_at < ?1",
+                params![to_rfc3339(cutoff)],
+            )?;
+        }
+
+        if retention.terminal_jobs_days > 0 {
+            let cutoff = now - ChronoDuration::days(retention.terminal_jobs_days as i64);
+            let mut stmt = tx.prepare(
+                r#"
+                SELECT id
+                FROM jobs
+                WHERE status IN (?1, ?2, ?3, ?4)
+                  AND updated_at < ?5
+                "#,
+            )?;
+            let ids_iter = stmt.query_map(
+                params![
+                    JobStatus::Completed.as_str(),
+                    JobStatus::Failed.as_str(),
+                    JobStatus::FailedNeedsManual.as_str(),
+                    JobStatus::Timeout.as_str(),
+                    to_rfc3339(cutoff),
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            let mut job_ids = Vec::new();
+            for id in ids_iter {
+                job_ids.push(id?);
+            }
+            drop(stmt);
+
+            for id in job_ids {
+                report.reviews +=
+                    tx.execute("DELETE FROM reviews WHERE job_id = ?1", params![&id])?;
+                report.events +=
+                    tx.execute("DELETE FROM events WHERE job_id = ?1", params![&id])?;
+                report.jobs += tx.execute("DELETE FROM jobs WHERE id = ?1", params![&id])?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(report)
     }
 
     pub fn status_counts(&self) -> Result<BTreeMap<String, usize>> {
