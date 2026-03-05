@@ -54,6 +54,14 @@ enum Command {
         #[arg(long, default_value = "manual")]
         source: String,
     },
+    Check {
+        #[arg(long)]
+        job_id: Option<String>,
+        #[arg(long)]
+        paper_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        all_processing: bool,
+    },
     Status {
         #[arg(long)]
         paper_id: Option<String>,
@@ -214,6 +222,21 @@ async fn run() -> Result<()> {
         } => {
             let (config, db) = load_runtime(config_override.as_deref(), false)?;
             cmd_import_token(&config, &db, &paper_id, &token, &source)
+        }
+        Command::Check {
+            job_id,
+            paper_id,
+            all_processing,
+        } => {
+            let (config, db) = load_runtime(config_override.as_deref(), false)?;
+            cmd_check(
+                &config,
+                &db,
+                job_id.as_deref(),
+                paper_id.as_deref(),
+                all_processing,
+            )
+            .await
         }
         Command::Status { paper_id, json } => {
             let (_config, db) = load_runtime(config_override.as_deref(), false)?;
@@ -784,6 +807,68 @@ fn cmd_import_token(
     )?;
 
     println!("Created job {} and attached imported token", job.id);
+    Ok(())
+}
+
+async fn cmd_check(
+    config: &Config,
+    db: &Db,
+    job_id: Option<&str>,
+    paper_id: Option<&str>,
+    all_processing: bool,
+) -> Result<()> {
+    if job_id.is_some() && (paper_id.is_some() || all_processing) {
+        anyhow::bail!("--job-id cannot be combined with --paper-id or --all-processing");
+    }
+
+    let mut targets = Vec::new();
+    if let Some(job_id) = job_id {
+        let Some(job) = db.get_job(job_id)? else {
+            anyhow::bail!("job not found: {job_id}");
+        };
+        if job.token.is_none() {
+            anyhow::bail!("job {job_id} has no token; cannot poll");
+        }
+        targets.push(job);
+    } else {
+        let rows = db.list_status_views(paper_id)?;
+        for row in rows {
+            if row.status != JobStatus::Processing.as_str() {
+                continue;
+            }
+            let Some(job) = db.get_job(&row.id)? else {
+                continue;
+            };
+            if job.token.is_some() {
+                targets.push(job);
+            }
+            if !all_processing && !targets.is_empty() {
+                break;
+            }
+        }
+    }
+
+    if targets.is_empty() {
+        println!("No processing job with token found to check.");
+        return Ok(());
+    }
+
+    for job in targets {
+        reviewloop::worker::poll_job(config, db, &job).await?;
+        let Some(updated) = db.get_job(&job.id)? else {
+            continue;
+        };
+        println!(
+            "Checked job {} -> status={}{}",
+            updated.id,
+            updated.status.as_str(),
+            updated
+                .next_poll_at
+                .map(|t| format!(", next_poll_at={}", t.to_rfc3339()))
+                .unwrap_or_default()
+        );
+    }
+
     Ok(())
 }
 
