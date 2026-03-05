@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use reviewloop::config::{Config, PaperConfig};
 use reviewloop::db::Db;
 use reviewloop::email_account;
@@ -76,6 +76,21 @@ enum Command {
         #[command(subcommand)]
         command: EmailCommand,
     },
+    SelfUpdate {
+        #[arg(long, value_enum, default_value_t = UpdateMethod::Auto)]
+        method: UpdateMethod,
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum UpdateMethod {
+    Auto,
+    Brew,
+    Cargo,
 }
 
 #[derive(Debug, Subcommand)]
@@ -255,6 +270,11 @@ async fn run() -> Result<()> {
                 EmailCommand::Status => cmd_email_status(&config),
             }
         }
+        Command::SelfUpdate {
+            method,
+            yes,
+            dry_run,
+        } => cmd_self_update(method, yes, dry_run),
     }
 }
 
@@ -373,6 +393,100 @@ fn prompt_yes_no(prompt: &str) -> Result<bool> {
     std::io::stdin().read_line(&mut input)?;
     let normalized = input.trim().to_ascii_lowercase();
     Ok(matches!(normalized.as_str(), "y" | "yes"))
+}
+
+fn cmd_self_update(method: UpdateMethod, yes: bool, dry_run: bool) -> Result<()> {
+    let exe = env::current_exe().context("failed to locate current executable path")?;
+    let global_cfg = Config::global_config_path();
+    let global_data = Config::global_data_dir();
+
+    println!("Self-update will only replace the reviewloop binary.");
+    if let Some(path) = global_cfg {
+        println!("- global config: {}", path.display());
+    }
+    if let Some(path) = global_data {
+        println!("- global data dir: {}", path.display());
+    }
+    println!("- current executable: {}", exe.display());
+    println!("Config/database/artifacts are not deleted during update.");
+
+    if !yes
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && !prompt_yes_no("Proceed with self-update? [y/N]: ")?
+    {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    let selected = match method {
+        UpdateMethod::Auto => {
+            if is_brew_formula_installed("reviewloop") {
+                UpdateMethod::Brew
+            } else if command_exists("cargo") {
+                UpdateMethod::Cargo
+            } else {
+                anyhow::bail!(
+                    "no supported updater found. install via Homebrew or ensure cargo is available"
+                );
+            }
+        }
+        explicit => explicit,
+    };
+
+    match selected {
+        UpdateMethod::Auto => unreachable!("auto should be resolved"),
+        UpdateMethod::Brew => {
+            run_update_command("brew", &["upgrade", "reviewloop"], dry_run)?;
+        }
+        UpdateMethod::Cargo => {
+            run_update_command(
+                "cargo",
+                &["install", "--locked", "reviewloop", "--force"],
+                dry_run,
+            )?;
+        }
+    }
+
+    if !dry_run {
+        println!("Self-update finished.");
+    }
+    Ok(())
+}
+
+fn run_update_command(program: &str, args: &[&str], dry_run: bool) -> Result<()> {
+    println!("Running updater: {} {}", program, args.join(" "));
+    if dry_run {
+        return Ok(());
+    }
+
+    let status = ProcessCommand::new(program)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to execute updater: {program}"))?;
+    if !status.success() {
+        anyhow::bail!("updater exited with status {status}");
+    }
+    Ok(())
+}
+
+fn command_exists(program: &str) -> bool {
+    ProcessCommand::new(program)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn is_brew_formula_installed(formula: &str) -> bool {
+    if !command_exists("brew") {
+        return false;
+    }
+    ProcessCommand::new("brew")
+        .args(["list", "--formula", formula])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn cmd_daemon_install(config_override: Option<&Path>, start: bool) -> Result<()> {

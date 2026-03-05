@@ -64,11 +64,27 @@ brew tap acture/ac
 brew install reviewloop
 ```
 
+Upgrade:
+
+```bash
+reviewloop self-update --yes
+# or force Homebrew path
+reviewloop self-update --method brew --yes
+```
+
 ### Cargo
 
 ```bash
 # after public release
 cargo install reviewloop
+```
+
+Upgrade:
+
+```bash
+reviewloop self-update --yes
+# or force Cargo path
+reviewloop self-update --method cargo --yes
 ```
 
 ### Build From Source
@@ -108,7 +124,13 @@ reviewloop email login --provider google
 reviewloop email status
 reviewloop email switch --account <account-id-or-email>
 reviewloop email logout [--account <account-id-or-email>]
+reviewloop self-update [--method auto|brew|cargo] [--yes] [--dry-run]
 ```
+
+`self-update` only replaces the executable. It does not delete:
+- global config (`~/.config/reviewloop/reviewloop.toml`)
+- global data directory (database, artifacts, logs)
+- project-local configs
 
 ## Runtime Model
 
