@@ -1,0 +1,247 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify Release Inputs
+    runs-on: ubuntu-latest
+    outputs:
+      crate_name: ${{ steps.meta.outputs.crate_name }}
+      version: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate tag and collect package metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          crate_name=$(sed -nE 's/^name\s*=\s*"([^"]+)".*/\1/p' Cargo.toml | head -n1)
+          version=$(sed -nE 's/^version\s*=\s*"([^"]+)".*/\1/p' Cargo.toml | head -n1)
+          tag_version="${GITHUB_REF_NAME#v}"
+
+          if [[ -z "$crate_name" || -z "$version" ]]; then
+            echo "Failed to parse crate metadata from Cargo.toml" >&2
+            exit 1
+          fi
+
+          if [[ "$tag_version" != "$version" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}" >&2
+            exit 1
+          fi
+
+          echo "crate_name=$crate_name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Release quality gates
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --all-targets --locked
+
+  publish-crates-io:
+    name: Publish To crates.io
+    runs-on: ubuntu-latest
+    needs: verify
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Publish crate (skip if version already exists)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CRATE_NAME: ${{ needs.verify.outputs.crate_name }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "Missing required secret: CARGO_REGISTRY_TOKEN" >&2
+            exit 1
+          fi
+
+          if curl -fsSL "https://crates.io/api/v1/crates/${CRATE_NAME}/${VERSION}" >/dev/null; then
+            echo "${CRATE_NAME} ${VERSION} already published; skipping cargo publish."
+            exit 0
+          fi
+
+          cargo publish --locked --token "$CARGO_REGISTRY_TOKEN"
+
+  update-homebrew-tap:
+    name: Update Homebrew Tap
+    runs-on: ubuntu-latest
+    needs:
+      - verify
+      - publish-crates-io
+    permissions:
+      contents: read
+
+    steps:
+      - name: Validate tap publishing configuration
+        env:
+          HOMEBREW_TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO != '' && vars.HOMEBREW_TAP_REPO || 'Acture/homebrew-ac' }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${HOMEBREW_TAP_GITHUB_TOKEN:-}" ]]; then
+            echo "Missing required secret: HOMEBREW_TAP_GITHUB_TOKEN" >&2
+            exit 1
+          fi
+
+          echo "Using tap repository: ${HOMEBREW_TAP_REPO}"
+
+      - name: Resolve crate download URL and checksum
+        id: crate
+        env:
+          CRATE_NAME: ${{ needs.verify.outputs.crate_name }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          checksum=""
+          for attempt in {1..20}; do
+            response=$(curl -fsSL "https://crates.io/api/v1/crates/${CRATE_NAME}/${VERSION}" || true)
+            checksum=$(echo "$response" | jq -r '.version.checksum // empty')
+            if [[ -n "$checksum" ]]; then
+              break
+            fi
+            echo "Waiting for crates.io metadata propagation (${attempt}/20)..."
+            sleep 15
+          done
+
+          if [[ -z "$checksum" ]]; then
+            echo "Could not resolve checksum for ${CRATE_NAME} ${VERSION} from crates.io" >&2
+            exit 1
+          fi
+
+          download_url="https://crates.io/api/v1/crates/${CRATE_NAME}/${VERSION}/download"
+
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+          echo "download_url=$download_url" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tap repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.HOMEBREW_TAP_REPO != '' && vars.HOMEBREW_TAP_REPO || 'Acture/homebrew-ac' }}
+          token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          path: tap
+
+      - name: Update formula version, url and sha256
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          DOWNLOAD_URL: ${{ steps.crate.outputs.download_url }}
+          CHECKSUM: ${{ steps.crate.outputs.checksum }}
+          HOMEBREW_FORMULA_PATH: ${{ vars.HOMEBREW_FORMULA_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          formula_rel_path="${HOMEBREW_FORMULA_PATH:-Formula/reviewloop.rb}"
+          formula_file="tap/${formula_rel_path}"
+
+          if [[ ! -f "$formula_file" ]]; then
+            echo "Formula file not found: ${formula_file}" >&2
+            exit 1
+          fi
+
+          perl -0pi -e '
+            s{^\s*url\s+"[^"]+"\s*$}{  url "'"$DOWNLOAD_URL"'"}m;
+            s{^\s*sha256\s+"[^"]+"\s*$}{  sha256 "'"$CHECKSUM"'"}m;
+            s{^\s*version\s+"[^"]+"\s*$}{  version "'"$VERSION"'"}m;
+          ' "$formula_file"
+
+          if ! grep -qE '^\s*version\s+"' "$formula_file"; then
+            awk -v version="$VERSION" '
+              BEGIN { inserted = 0 }
+              {
+                print $0
+                if (!inserted && $0 ~ /^[[:space:]]*url[[:space:]]+"/) {
+                  print "  version \"" version "\""
+                  inserted = 1
+                }
+              }
+            ' "$formula_file" > "${formula_file}.tmp"
+            mv "${formula_file}.tmp" "$formula_file"
+          fi
+
+          grep -q "url \"${DOWNLOAD_URL}\"" "$formula_file"
+          grep -q "sha256 \"${CHECKSUM}\"" "$formula_file"
+          grep -q "version \"${VERSION}\"" "$formula_file"
+
+      - name: Commit and push tap update
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          HOMEBREW_FORMULA_PATH: ${{ vars.HOMEBREW_FORMULA_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          formula_rel_path="${HOMEBREW_FORMULA_PATH:-Formula/reviewloop.rb}"
+
+          cd tap
+          if git diff --quiet -- "$formula_rel_path"; then
+            echo "No formula changes detected."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "$formula_rel_path"
+          git commit -m "reviewloop ${VERSION}"
+
+          default_branch=$(git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@')
+          git push origin "HEAD:${default_branch}"
+
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - verify
+      - publish-crates-io
+      - update-homebrew-tap
+
+    steps:
+      - name: Publish GitHub release notes
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.verify.outputs.version }}
+          generate_release_notes: true

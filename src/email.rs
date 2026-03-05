@@ -490,7 +490,7 @@ mod gmail_impl {
         if cfg.max_lookback_hours == 0 {
             return "is:unread".to_string();
         }
-        let days = ((cfg.max_lookback_hours + 23) / 24).max(1);
+        let days = cfg.max_lookback_hours.div_ceil(24).max(1);
         format!("is:unread newer_than:{days}d")
     }
 }
