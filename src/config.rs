@@ -23,6 +23,7 @@ pub struct Config {
     pub providers: ProvidersConfig,
     pub papers: Vec<PaperConfig>,
     pub imap: Option<ImapConfig>,
+    pub gmail_oauth: Option<GmailOauthConfig>,
 }
 
 impl Default for Config {
@@ -40,6 +41,7 @@ impl Default for Config {
                 backend: "stanford".to_string(),
             }],
             imap: Some(ImapConfig::default()),
+            gmail_oauth: Some(GmailOauthConfig::default()),
         }
     }
 }
@@ -125,15 +127,15 @@ impl Config {
         if self.trigger.pdf.max_scan_papers == 0 {
             return Err(anyhow!("trigger.pdf.max_scan_papers must be >= 1"));
         }
-        if self.providers.stanford.email.trim().is_empty() {
-            return Err(anyhow!(
-                "providers.stanford.email is required for stanford backend"
-            ));
-        }
         if let Some(imap) = &self.imap
             && imap.max_messages_per_poll == 0
         {
             return Err(anyhow!("imap.max_messages_per_poll must be >= 1"));
+        }
+        if let Some(gmail) = &self.gmail_oauth
+            && gmail.max_messages_per_poll == 0
+        {
+            return Err(anyhow!("gmail_oauth.max_messages_per_poll must be >= 1"));
         }
         if self.papers.is_empty() {
             return Err(anyhow!("papers[] must contain at least one paper"));
@@ -465,7 +467,7 @@ impl Default for StanfordProviderConfig {
             base_url: "https://paperreview.ai".to_string(),
             fallback_mode: "node_playwright".to_string(),
             fallback_script: "tools/paperreview_fallback.mjs".to_string(),
-            email: "your.email@example.edu".to_string(),
+            email: "".to_string(),
             venue: None,
         }
     }
@@ -529,6 +531,53 @@ impl Default for ImapConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GmailOauthConfig {
+    pub enabled: bool,
+    pub client_id: String,
+    pub client_secret: String,
+    pub token_store_path: Option<String>,
+    pub poll_seconds: u64,
+    pub mark_seen: bool,
+    pub max_lookback_hours: u64,
+    pub max_messages_per_poll: usize,
+    pub header_first: bool,
+    pub backend_header_patterns: BTreeMap<String, String>,
+    pub backend_patterns: BTreeMap<String, String>,
+}
+
+impl Default for GmailOauthConfig {
+    fn default() -> Self {
+        let mut backend_header_patterns = BTreeMap::new();
+        backend_header_patterns.insert(
+            "stanford".to_string(),
+            r"(?is)(from:\s*.*mail\.paperreview\.ai|subject:\s*.*paper review is ready)"
+                .to_string(),
+        );
+
+        let mut backend_patterns = BTreeMap::new();
+        backend_patterns.insert(
+            "stanford".to_string(),
+            r"https?://paperreview\.ai/review\?token=([A-Za-z0-9_-]+)".to_string(),
+        );
+
+        Self {
+            enabled: false,
+            client_id: "".to_string(),
+            client_secret: "".to_string(),
+            token_store_path: None,
+            poll_seconds: 300,
+            mark_seen: true,
+            max_lookback_hours: 72,
+            max_messages_per_poll: 50,
+            header_first: true,
+            backend_header_patterns,
+            backend_patterns,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Config;
@@ -562,6 +611,20 @@ mod tests {
     }
 
     #[test]
+    fn default_gmail_oauth_has_stanford_pattern() {
+        let cfg = Config::default();
+        let gmail = cfg
+            .gmail_oauth
+            .expect("gmail_oauth config should exist by default");
+        assert!(gmail.backend_patterns.contains_key("stanford"));
+        assert!(gmail.backend_header_patterns.contains_key("stanford"));
+        assert!(gmail.header_first);
+        assert_eq!(gmail.max_lookback_hours, 72);
+        assert_eq!(gmail.max_messages_per_poll, 50);
+        assert!(!gmail.enabled);
+    }
+
+    #[test]
     fn validate_rejects_zero_concurrency() {
         let mut cfg = Config::default();
         cfg.core.max_concurrency = 0;
@@ -572,13 +635,6 @@ mod tests {
     fn validate_rejects_empty_poll_schedule() {
         let mut cfg = Config::default();
         cfg.polling.schedule_minutes.clear();
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_empty_stanford_email() {
-        let mut cfg = Config::default();
-        cfg.providers.stanford.email = "   ".to_string();
         assert!(cfg.validate().is_err());
     }
 
@@ -630,6 +686,15 @@ mod tests {
         let mut cfg = Config::default();
         if let Some(imap) = cfg.imap.as_mut() {
             imap.max_messages_per_poll = 0;
+        }
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_gmail_oauth_max_messages_per_poll() {
+        let mut cfg = Config::default();
+        if let Some(gmail) = cfg.gmail_oauth.as_mut() {
+            gmail.max_messages_per_poll = 0;
         }
         assert!(cfg.validate().is_err());
     }
