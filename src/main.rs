@@ -139,6 +139,8 @@ enum PaperCommand {
     Remove {
         #[arg(long)]
         paper_id: String,
+        #[arg(long, default_value_t = false)]
+        purge_history: bool,
     },
 }
 
@@ -207,7 +209,10 @@ async fn run() -> Result<()> {
                 PaperCommand::Watch { paper_id, enabled } => {
                     cmd_paper_watch(&write_path, &paper_id, enabled)
                 }
-                PaperCommand::Remove { paper_id } => cmd_paper_remove(&write_path, &paper_id),
+                PaperCommand::Remove {
+                    paper_id,
+                    purge_history,
+                } => cmd_paper_remove(&write_path, &paper_id, purge_history),
             }
         }
         Command::Daemon { command } => match command {
@@ -386,17 +391,61 @@ fn cmd_paper_watch(config_path: &Path, paper_id: &str, enabled: bool) -> Result<
     Ok(())
 }
 
-fn cmd_paper_remove(config_path: &Path, paper_id: &str) -> Result<()> {
+fn cmd_paper_remove(config_path: &Path, paper_id: &str, purge_history: bool) -> Result<()> {
     let mut config = load_or_create_config(config_path)?;
-    if !config.remove_paper(paper_id) {
+    let removed_from_config = config.remove_paper(paper_id);
+    if removed_from_config {
+        config.save(config_path)?;
+    }
+
+    let mut purge_summary: Option<(usize, usize, usize, usize)> = None;
+    if purge_history {
+        ensure_runtime_dirs(&config)?;
+        let db = Db::from_config(&config)?;
+        db.init_schema()?;
+        let report = db.purge_paper_history(paper_id)?;
+        let artifact_dirs = purge_artifacts_for_jobs(&config.state_dir(), &report.job_ids)?;
+        purge_summary = Some((report.jobs, report.reviews, report.events, artifact_dirs));
+    }
+
+    if !removed_from_config && purge_summary.is_none() {
         anyhow::bail!("paper_id not found: {paper_id}");
     }
-    config.save(config_path)?;
-    println!(
-        "Removed paper {paper_id}.\n- config: {}",
-        config_path.display()
-    );
+
+    if removed_from_config {
+        println!(
+            "Removed paper {paper_id} from config.\n- config: {}",
+            config_path.display()
+        );
+    } else {
+        println!("paper_id {paper_id} not found in config; only history purge was applied.");
+    }
+
+    if let Some((jobs, reviews, events, artifacts)) = purge_summary {
+        println!(
+            "Purged history for paper {paper_id}.\n- jobs: {jobs}\n- reviews: {reviews}\n- events: {events}\n- artifact dirs: {artifacts}"
+        );
+    } else {
+        println!(
+            "History retained. Use --purge-history to also remove jobs/events/reviews/artifacts."
+        );
+    }
+
     Ok(())
+}
+
+fn purge_artifacts_for_jobs(state_dir: &Path, job_ids: &[String]) -> Result<usize> {
+    let artifacts_root = state_dir.join("artifacts");
+    let mut removed = 0usize;
+    for job_id in job_ids {
+        let dir = artifacts_root.join(job_id);
+        if dir.exists() {
+            fs::remove_dir_all(&dir)
+                .with_context(|| format!("failed to remove artifact dir: {}", dir.display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 fn prompt_yes_no(prompt: &str) -> Result<bool> {

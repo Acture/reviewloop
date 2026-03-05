@@ -121,6 +121,66 @@ fn list_due_processing_treats_past_next_poll_as_due() -> Result<()> {
 }
 
 #[test]
+fn purge_paper_history_removes_jobs_events_reviews_for_target_paper() -> Result<()> {
+    let ctx = DbTestContext::new()?;
+    let main_job = ctx.create_job(JobStatus::Queued)?;
+    ctx.db
+        .attach_token_to_job(&main_job.id, "tok-main-purge", Utc::now())?;
+    ctx.db
+        .add_event(Some(&main_job.id), "main_event", json!({"scope":"main"}))?;
+    ctx.db
+        .upsert_review(&main_job.id, "tok-main-purge", r#"{"ok":true}"#, "summary")?;
+
+    let other_job = ctx.db.create_job(&NewJob {
+        paper_id: "other".to_string(),
+        backend: "stanford".to_string(),
+        pdf_path: ctx.config.papers[0].pdf_path.clone(),
+        pdf_hash: "other-hash".to_string(),
+        status: JobStatus::Queued,
+        email: ctx.config.providers.stanford.email.clone(),
+        venue: ctx.config.providers.stanford.venue.clone(),
+        git_tag: None,
+        git_commit: None,
+        next_poll_at: None,
+    })?;
+    ctx.db
+        .add_event(Some(&other_job.id), "other_event", json!({"scope":"other"}))?;
+
+    let report = ctx.db.purge_paper_history("main")?;
+    assert_eq!(report.jobs, 1);
+    assert_eq!(report.reviews, 1);
+    assert!(report.events >= 1);
+    assert!(report.job_ids.iter().any(|id| id == &main_job.id));
+
+    assert!(ctx.db.get_job(&main_job.id)?.is_none());
+    assert!(ctx.db.get_job(&other_job.id)?.is_some());
+
+    let conn = rusqlite::Connection::open(&ctx.db.path)?;
+    let main_reviews: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM reviews WHERE job_id = ?1",
+        params![main_job.id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(main_reviews, 0);
+
+    let main_events: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE job_id = ?1",
+        params![main_job.id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(main_events, 0);
+
+    let other_events: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE job_id = ?1",
+        params![other_job.id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(other_events, 1);
+
+    Ok(())
+}
+
+#[test]
 fn latest_open_job_without_token_prefers_newest() -> Result<()> {
     let ctx = DbTestContext::new()?;
     let older = ctx.create_job_with_hash(JobStatus::Queued, "hash-1")?;
