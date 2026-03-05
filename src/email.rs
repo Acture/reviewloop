@@ -25,7 +25,7 @@ mod imap_impl {
         token::{extract_review_token, extract_token_with_pattern},
     };
     use anyhow::{Context, Result};
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
     use native_tls::TlsConnector;
     use std::collections::HashSet;
 
@@ -118,10 +118,12 @@ mod imap_impl {
             .select(&imap_cfg.folder)
             .with_context(|| format!("failed to select IMAP folder: {}", imap_cfg.folder))?;
 
-        let unseen = session.search("UNSEEN")?;
+        let search_query = build_unseen_search_query(imap_cfg, Utc::now());
+        let unseen = session.search(search_query)?;
         let mut unseen_ids: Vec<u32> = unseen.into_iter().collect();
         // Prefer newest messages first so the latest token maps to the latest open job.
         unseen_ids.sort_unstable_by(|a, b| b.cmp(a));
+        unseen_ids.truncate(imap_cfg.max_messages_per_poll);
         let mut matches = Vec::new();
 
         for id in unseen_ids {
@@ -158,6 +160,19 @@ mod imap_impl {
 
         let _ = session.logout();
         Ok(matches)
+    }
+
+    pub(super) fn build_unseen_search_query(
+        imap_cfg: &ImapConfig,
+        now: chrono::DateTime<Utc>,
+    ) -> String {
+        if imap_cfg.max_lookback_hours == 0 {
+            return "UNSEEN".to_string();
+        }
+        let since = (now - Duration::hours(imap_cfg.max_lookback_hours as i64))
+            .format("%d-%b-%Y")
+            .to_string();
+        format!("UNSEEN SINCE {since}")
     }
 
     fn fetch_header_text(
@@ -221,6 +236,7 @@ pub async fn poll_imap_if_enabled(config: &Config, db: &Db) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::config::ImapConfig;
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn header_match_detects_stanford_sender() {
@@ -237,5 +253,27 @@ mod tests {
         let header = "From: notifications@github.com\r\nSubject: PR updated\r\n";
         let backend = super::detect_backend_from_header(header, &cfg);
         assert!(backend.is_none());
+    }
+
+    #[test]
+    fn imap_search_query_applies_lookback_window() {
+        let cfg = ImapConfig {
+            max_lookback_hours: 72,
+            ..ImapConfig::default()
+        };
+        let now = Utc.with_ymd_and_hms(2026, 3, 5, 12, 0, 0).unwrap();
+        let query = super::imap_impl::build_unseen_search_query(&cfg, now);
+        assert_eq!(query, "UNSEEN SINCE 02-Mar-2026");
+    }
+
+    #[test]
+    fn imap_search_query_can_disable_lookback() {
+        let cfg = ImapConfig {
+            max_lookback_hours: 0,
+            ..ImapConfig::default()
+        };
+        let now = Utc.with_ymd_and_hms(2026, 3, 5, 12, 0, 0).unwrap();
+        let query = super::imap_impl::build_unseen_search_query(&cfg, now);
+        assert_eq!(query, "UNSEEN");
     }
 }

@@ -109,6 +109,11 @@ impl Config {
                 "providers.stanford.email is required for stanford backend"
             ));
         }
+        if let Some(imap) = &self.imap
+            && imap.max_messages_per_poll == 0
+        {
+            return Err(anyhow!("imap.max_messages_per_poll must be >= 1"));
+        }
         if self.papers.is_empty() {
             return Err(anyhow!("papers[] must contain at least one paper"));
         }
@@ -400,6 +405,8 @@ pub struct ImapConfig {
     pub folder: String,
     pub poll_seconds: u64,
     pub mark_seen: bool,
+    pub max_lookback_hours: u64,
+    pub max_messages_per_poll: usize,
     pub header_first: bool,
     pub backend_header_patterns: BTreeMap<String, String>,
     pub backend_patterns: BTreeMap<String, String>,
@@ -429,6 +436,8 @@ impl Default for ImapConfig {
             folder: "INBOX".to_string(),
             poll_seconds: 300,
             mark_seen: true,
+            max_lookback_hours: 72,
+            max_messages_per_poll: 50,
             header_first: true,
             backend_header_patterns,
             backend_patterns,
@@ -461,6 +470,8 @@ mod tests {
         assert!(imap.backend_patterns.contains_key("stanford"));
         assert!(imap.backend_header_patterns.contains_key("stanford"));
         assert!(imap.header_first);
+        assert_eq!(imap.max_lookback_hours, 72);
+        assert_eq!(imap.max_messages_per_poll, 50);
     }
 
     #[test]
@@ -510,6 +521,15 @@ mod tests {
         let mut cfg = Config::default();
         cfg.logging.output = "file".to_string();
         cfg.logging.file_path = Some("".to_string());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_imap_max_messages_per_poll() {
+        let mut cfg = Config::default();
+        if let Some(imap) = cfg.imap.as_mut() {
+            imap.max_messages_per_poll = 0;
+        }
         assert!(cfg.validate().is_err());
     }
 

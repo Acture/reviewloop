@@ -144,6 +144,8 @@ Recommended minimal-permission mode (default):
 
 - `imap.header_first = true` (fetch only `Subject` + `From` headers first)
 - `imap.backend_header_patterns` decides whether to download that email body
+- `imap.max_lookback_hours` limits how far back to scan unseen emails (default 72h)
+- `imap.max_messages_per_poll` caps per-poll processing volume (default 50)
 - only matched emails are fetched in full and token-parsed
 
 Example:
@@ -158,6 +160,8 @@ password = "your-app-password"
 folder = "INBOX"
 poll_seconds = 300
 mark_seen = true
+max_lookback_hours = 72
+max_messages_per_poll = 50
 header_first = true
 
 [imap.backend_header_patterns]
@@ -170,6 +174,7 @@ stanford = "https?://paperreview\\.ai/review\\?token=([A-Za-z0-9_-]+)"
 Matched token for backend `X` is attached to the latest open job for backend `X` without a token.
 When a token is attached from IMAP, ReviewLoop schedules immediate polling (`next_poll_at = now`) so the same daemon tick can retrieve results.
 If `username` / `password` are empty, IMAP polling is skipped.
+Set `max_lookback_hours = 0` only if you intentionally want no time-window limit.
 For stacked/repeated emails, token de-dup is applied and already-bound tokens are not re-attached to other jobs.
 
 ## Responsible Use (Important)
