@@ -91,7 +91,6 @@ reviewloop [--config /path/to/override.toml] <command>
 Core commands:
 
 ```bash
-reviewloop init # optional template generation
 reviewloop paper add --paper-id <id> --path <pdf-or-build-artifact> --backend <backend> [--watch true|false] [--tag-trigger "<pattern>"]
 reviewloop paper watch --paper-id <id> --enabled <true|false>
 reviewloop daemon run
@@ -206,8 +205,6 @@ ReviewLoop runs Gmail API polling first when available, then IMAP fallback.
 Global config is auto-generated at:
 - `$XDG_CONFIG_HOME/reviewloop/reviewloop.toml`
 - or `~/.config/reviewloop/reviewloop.toml`
-
-`reviewloop init` remains available when you want to scaffold a local file explicitly.
 
 Config precedence (low to high):
 1. `$XDG_CONFIG_HOME/reviewloop/reviewloop.toml` (or `~/.config/reviewloop/reviewloop.toml`)

@@ -12,7 +12,7 @@ use std::{
     io::IsTerminal,
     path::{Path, PathBuf},
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Debug, Parser)]
 #[command(name = "reviewloop")]
@@ -27,10 +27,6 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Init {
-        #[arg(long)]
-        force: bool,
-    },
     Paper {
         #[command(subcommand)]
         command: PaperCommand,
@@ -139,12 +135,6 @@ async fn run() -> Result<()> {
     Config::ensure_global_data_dir()?;
 
     match command {
-        Command::Init { force } => {
-            let init_path = config
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("reviewloop.toml"));
-            cmd_init(&init_path, force)
-        }
         Command::Paper { command } => {
             let write_path = resolve_mutable_config_path(config.as_deref())?;
             match command {
@@ -211,49 +201,6 @@ async fn run() -> Result<()> {
             }
         }
     }
-}
-
-fn cmd_init(config_path: &Path, force: bool) -> Result<()> {
-    Config::ensure_global_config_dir()?;
-    Config::ensure_global_data_dir()?;
-
-    if let Some(parent) = config_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create config parent directory: {}",
-                parent.display()
-            )
-        })?;
-    }
-
-    if config_path.exists() && !force {
-        anyhow::bail!(
-            "config file already exists: {} (use --force to overwrite)",
-            config_path.display()
-        );
-    }
-
-    Config::save_template(config_path)?;
-
-    let cfg = Config::default();
-    ensure_runtime_dirs(&cfg)?;
-    let db = Db::from_config(&cfg)?;
-    db.init_schema()?;
-
-    let db_label = cfg
-        .db_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| ":memory:".to_string());
-    println!(
-        "Initialized ReviewLoop.\n- config: {}\n- state dir: {}\n- db: {}",
-        config_path.display(),
-        cfg.state_dir().display(),
-        db_label
-    );
-    println!("\n{}", render_guardrail_notice(&cfg));
-    Ok(())
 }
 
 fn resolve_mutable_config_path(config_override: Option<&Path>) -> Result<PathBuf> {
@@ -352,6 +299,7 @@ fn load_runtime(config_override: Option<&Path>, force_stderr_logs: bool) -> Resu
 
     reviewloop::logging::init_logging(&config, force_stderr_logs)?;
     tracing::info!(layers = %layer_chain, "loaded configuration layers");
+    info!("{}", render_guardrail_notice(&config));
     print_guardrail_warnings(&config);
 
     ensure_runtime_dirs(&config)?;
