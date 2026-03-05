@@ -604,7 +604,7 @@ or set REVIEWLOOP_GMAIL_CLIENT_ID and REVIEWLOOP_GMAIL_CLIENT_SECRET"
         );
     };
 
-    let active_token_path = oauth::run_device_login(&oauth_provider, config).await?;
+    let active_token_path = oauth_provider.run_browser_pkce_login().await?;
     let access_token = oauth::ensure_valid_access_token(&oauth_provider).await?;
     let email = fetch_google_profile_email(&access_token).await?;
 

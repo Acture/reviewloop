@@ -1,18 +1,27 @@
 use crate::config::{Config, GmailOauthConfig};
-use crate::oauth::{DeviceCodePoll, DeviceCodeStart, OauthProvider, OauthTokenResponse};
+use crate::oauth::{
+    DeviceCodePoll, DeviceCodeStart, OauthProvider, OauthTokenResponse, load_token_record,
+    merge_token_response, open_browser_url, save_token_record,
+};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use oauth2::basic::{BasicClient, BasicTokenType};
 use oauth2::{
-    AuthType, AuthUrl, ClientId, ClientSecret, DeviceAuthorizationUrl, DeviceCodeErrorResponseType,
-    RefreshToken, RequestTokenError, Scope, StandardDeviceAuthorizationResponse, TokenResponse,
-    TokenUrl,
+    AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
+    DeviceAuthorizationUrl, DeviceCodeErrorResponseType, PkceCodeChallenge, PkceCodeVerifier,
+    RedirectUrl, RefreshToken, RequestTokenError, Scope, StandardDeviceAuthorizationResponse,
+    TokenResponse, TokenUrl,
 };
 use std::{
     collections::HashMap,
     env,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
 };
 
 const DEFAULT_GOOGLE_CLIENT_ID: &str =
@@ -83,6 +92,194 @@ impl GoogleOauthProvider {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("failed to build oauth http client")
+    }
+
+    pub async fn run_browser_pkce_login(&self) -> Result<PathBuf> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("failed to bind local oauth callback listener")?;
+        let callback_addr = listener
+            .local_addr()
+            .context("failed to resolve local oauth callback listener address")?;
+        let redirect_uri = format!("http://{}/oauth2/callback", callback_addr);
+        let redirect = RedirectUrl::new(redirect_uri.clone()).context("invalid redirect url")?;
+        let http_client = Self::http_client()?;
+        let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+
+        let (auth_url, csrf_token) = if self.cfg.client_secret.trim().is_empty() {
+            BasicClient::new(ClientId::new(self.cfg.client_id.clone()))
+                .set_auth_uri(
+                    AuthUrl::new(AUTH_URL.to_string()).context("invalid google auth url")?,
+                )
+                .set_token_uri(
+                    TokenUrl::new(TOKEN_URL.to_string()).context("invalid google token url")?,
+                )
+                .set_redirect_uri(redirect.clone())
+                .set_auth_type(AuthType::RequestBody)
+                .authorize_url(CsrfToken::new_random)
+                .add_scope(Scope::new(self.scope().to_string()))
+                .set_pkce_challenge(pkce_challenge.clone())
+                .add_extra_param("access_type", "offline")
+                .add_extra_param("prompt", "consent")
+                .url()
+        } else {
+            BasicClient::new(ClientId::new(self.cfg.client_id.clone()))
+                .set_client_secret(ClientSecret::new(self.cfg.client_secret.clone()))
+                .set_auth_uri(
+                    AuthUrl::new(AUTH_URL.to_string()).context("invalid google auth url")?,
+                )
+                .set_token_uri(
+                    TokenUrl::new(TOKEN_URL.to_string()).context("invalid google token url")?,
+                )
+                .set_redirect_uri(redirect)
+                .set_auth_type(AuthType::RequestBody)
+                .authorize_url(CsrfToken::new_random)
+                .add_scope(Scope::new(self.scope().to_string()))
+                .set_pkce_challenge(pkce_challenge.clone())
+                .add_extra_param("access_type", "offline")
+                .add_extra_param("prompt", "consent")
+                .url()
+        };
+
+        if open_browser_url(auth_url.as_str()) {
+            println!("Opened browser for google login.");
+        } else {
+            println!("Open this URL in your browser:\n{}\n", auth_url);
+        }
+        println!("Waiting for OAuth callback on {redirect_uri} ...");
+
+        let auth_code = Self::wait_for_callback_code(listener, csrf_token.secret()).await?;
+        let old = load_token_record(self)?;
+        let pkce_verifier_secret = pkce_verifier.secret().to_string();
+
+        let token = if self.cfg.client_secret.trim().is_empty() {
+            BasicClient::new(ClientId::new(self.cfg.client_id.clone()))
+                .set_auth_uri(
+                    AuthUrl::new(AUTH_URL.to_string()).context("invalid google auth url")?,
+                )
+                .set_token_uri(
+                    TokenUrl::new(TOKEN_URL.to_string()).context("invalid google token url")?,
+                )
+                .set_redirect_uri(
+                    RedirectUrl::new(redirect_uri.clone()).context("invalid redirect url")?,
+                )
+                .set_auth_type(AuthType::RequestBody)
+                .exchange_code(AuthorizationCode::new(auth_code))
+                .set_pkce_verifier(PkceCodeVerifier::new(pkce_verifier_secret.clone()))
+                .request_async(&http_client)
+                .await
+                .context("failed to exchange authorization code")?
+        } else {
+            BasicClient::new(ClientId::new(self.cfg.client_id.clone()))
+                .set_client_secret(ClientSecret::new(self.cfg.client_secret.clone()))
+                .set_auth_uri(
+                    AuthUrl::new(AUTH_URL.to_string()).context("invalid google auth url")?,
+                )
+                .set_token_uri(
+                    TokenUrl::new(TOKEN_URL.to_string()).context("invalid google token url")?,
+                )
+                .set_redirect_uri(RedirectUrl::new(redirect_uri).context("invalid redirect url")?)
+                .set_auth_type(AuthType::RequestBody)
+                .exchange_code(AuthorizationCode::new(auth_code))
+                .set_pkce_verifier(PkceCodeVerifier::new(pkce_verifier_secret))
+                .request_async(&http_client)
+                .await
+                .context("failed to exchange authorization code")?
+        };
+
+        let scope = token.scopes().map(|scopes| {
+            scopes
+                .iter()
+                .map(|s| s.as_ref())
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        let token_type = match token.token_type() {
+            BasicTokenType::Bearer => Some("bearer".to_string()),
+            BasicTokenType::Extension(v) => Some(v.clone()),
+            _ => None,
+        };
+        let response = OauthTokenResponse {
+            access_token: token.access_token().secret().to_string(),
+            refresh_token: token.refresh_token().map(|t| t.secret().to_string()),
+            expires_in_seconds: token.expires_in().map(|d| d.as_secs()).unwrap_or(3600),
+            scope,
+            token_type,
+        };
+        let merged =
+            merge_token_response(old.as_ref().map(|t| t.refresh_token.as_str()), response)?;
+        save_token_record(self, &merged)?;
+        Ok(self.token_store_path())
+    }
+
+    async fn wait_for_callback_code(listener: TcpListener, expected_state: &str) -> Result<String> {
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(300), listener.accept())
+            .await
+            .context("oauth callback timed out waiting for browser redirect")?
+            .context("failed to accept oauth callback connection")?;
+
+        let mut buf = vec![0u8; 8192];
+        let n = socket
+            .read(&mut buf)
+            .await
+            .context("failed to read oauth callback request")?;
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let first_line = request
+            .lines()
+            .next()
+            .ok_or_else(|| anyhow!("empty oauth callback request"))?;
+        let path = first_line
+            .strip_prefix("GET ")
+            .and_then(|v| v.split(" HTTP/").next())
+            .ok_or_else(|| anyhow!("invalid oauth callback request line"))?;
+
+        let url = reqwest::Url::parse(&format!("http://localhost{path}"))
+            .context("failed to parse oauth callback url")?;
+        let mut code: Option<String> = None;
+        let mut state: Option<String> = None;
+        let mut err: Option<String> = None;
+        for (k, v) in url.query_pairs() {
+            match k.as_ref() {
+                "code" => code = Some(v.into_owned()),
+                "state" => state = Some(v.into_owned()),
+                "error" => err = Some(v.into_owned()),
+                _ => {}
+            }
+        }
+
+        if let Some(error) = err {
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nOAuth login failed. You can close this tab.",
+                )
+                .await;
+            return Err(anyhow!("oauth authorization failed: {error}"));
+        }
+
+        if state.as_deref() != Some(expected_state) {
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nOAuth state mismatch. You can close this tab.",
+                )
+                .await;
+            return Err(anyhow!("oauth state mismatch"));
+        }
+
+        let Some(code) = code else {
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nMissing authorization code. You can close this tab.",
+                )
+                .await;
+            return Err(anyhow!("oauth callback missing authorization code"));
+        };
+
+        let _ = socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nReviewLoop login completed. You can return to terminal.",
+            )
+            .await;
+        Ok(code)
     }
 }
 
