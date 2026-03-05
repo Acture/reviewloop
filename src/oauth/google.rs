@@ -122,6 +122,9 @@ impl OauthProvider for GoogleOauthProvider {
             device_code,
             user_code: details.user_code().secret().to_string(),
             verification_uri: details.verification_uri().to_string(),
+            verification_uri_complete: details
+                .verification_uri_complete()
+                .map(|v| v.secret().to_string()),
             expires_in_seconds: details.expires_in().as_secs(),
             interval_seconds: details.interval().as_secs(),
         })

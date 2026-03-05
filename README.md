@@ -202,6 +202,8 @@ Then login:
 reviewloop email login --provider google
 ```
 
+`email login` will try to open your default browser automatically and wait in CLI for OAuth completion.
+
 ReviewLoop runs Gmail API polling first when available, then IMAP fallback.
 
 ## Configuration Highlights (`reviewloop.toml`)
