@@ -16,8 +16,8 @@ use tracing::warn;
 #[command(name = "reviewloop")]
 #[command(about = "Automate paperreview.ai submission and retrieval workflows")]
 struct Cli {
-    #[arg(long, default_value = "reviewloop.toml")]
-    config: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -80,10 +80,15 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let Cli { config, command } = Cli::parse();
 
-    match cli.command {
-        Command::Init { force } => cmd_init(&cli.config, force),
+    match command {
+        Command::Init { force } => {
+            let init_path = config
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("reviewloop.toml"));
+            cmd_init(&init_path, force)
+        }
         Command::Daemon {
             command: DaemonCommand::Run { panel },
         } => {
@@ -91,15 +96,15 @@ async fn run() -> Result<()> {
             if panel && !panel_enabled {
                 eprintln!("note: panel requested but stdout is not a TTY; running without panel.");
             }
-            let (config, db) = load_runtime(&cli.config, panel_enabled)?;
+            let (config, db) = load_runtime(config.as_deref(), panel_enabled)?;
             reviewloop::worker::run_daemon(&config, &db, panel_enabled).await
         }
         Command::Submit { paper_id, force } => {
-            let (config, db) = load_runtime(&cli.config, false)?;
+            let (config, db) = load_runtime(config.as_deref(), false)?;
             cmd_submit(&config, &db, &paper_id, force).await
         }
         Command::Approve { job_id } => {
-            let (_config, db) = load_runtime(&cli.config, false)?;
+            let (_config, db) = load_runtime(config.as_deref(), false)?;
             cmd_approve(&db, &job_id)
         }
         Command::ImportToken {
@@ -107,15 +112,15 @@ async fn run() -> Result<()> {
             token,
             source,
         } => {
-            let (config, db) = load_runtime(&cli.config, false)?;
+            let (config, db) = load_runtime(config.as_deref(), false)?;
             cmd_import_token(&config, &db, &paper_id, &token, &source)
         }
         Command::Status { paper_id, json } => {
-            let (_config, db) = load_runtime(&cli.config, false)?;
+            let (_config, db) = load_runtime(config.as_deref(), false)?;
             cmd_status(&db, paper_id.as_deref(), json)
         }
         Command::Retry { job_id } => {
-            let (config, db) = load_runtime(&cli.config, false)?;
+            let (config, db) = load_runtime(config.as_deref(), false)?;
             cmd_retry(&config, &db, &job_id)
         }
     }
@@ -148,9 +153,18 @@ fn cmd_init(config_path: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn load_runtime(config_path: &Path, force_stderr_logs: bool) -> Result<(Config, Db)> {
-    let config = Config::load(config_path)?;
+fn load_runtime(config_override: Option<&Path>, force_stderr_logs: bool) -> Result<(Config, Db)> {
+    let loaded = Config::load_layered_with_metadata(config_override)?;
+    let layer_chain = loaded
+        .layers
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" -> ");
+    let config = loaded.config;
+
     reviewloop::logging::init_logging(&config, force_stderr_logs)?;
+    tracing::info!(layers = %layer_chain, "loaded configuration layers");
     print_guardrail_warnings(&config);
 
     fs::create_dir_all(config.state_dir()).with_context(|| {
