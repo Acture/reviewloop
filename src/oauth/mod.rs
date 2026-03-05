@@ -5,7 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{path::PathBuf, process::Command};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OauthTokenRecord {
@@ -22,6 +22,7 @@ pub struct DeviceCodeStart {
     pub device_code: String,
     pub user_code: String,
     pub verification_uri: String,
+    pub verification_uri_complete: Option<String>,
     pub expires_in_seconds: u64,
     pub interval_seconds: u64,
 }
@@ -132,8 +133,16 @@ pub async fn ensure_valid_access_token(provider: &dyn OauthProvider) -> Result<S
 
 pub async fn run_device_login(provider: &dyn OauthProvider, _config: &Config) -> Result<PathBuf> {
     let start = provider.start_device_flow().await?;
+    let open_url = start
+        .verification_uri_complete
+        .as_deref()
+        .unwrap_or(start.verification_uri.as_str());
+    let browser_opened = open_browser_url(open_url);
+    if browser_opened {
+        println!("Opened browser for {} login.", provider.name());
+    }
     println!(
-        "Open this URL in your browser:\n{}\n\nThen enter code: {}\n",
+        "If browser did not open, visit:\n{}\n\nDevice code: {}\n",
         start.verification_uri, start.user_code
     );
 
@@ -168,4 +177,41 @@ pub async fn run_device_login(provider: &dyn OauthProvider, _config: &Config) ->
             }
         }
     }
+}
+
+fn open_browser_url(url: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if Command::new("open")
+            .arg(url)
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            return true;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            return true;
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if Command::new("xdg-open")
+            .arg(url)
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            return true;
+        }
+    }
+
+    false
 }
