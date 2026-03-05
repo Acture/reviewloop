@@ -170,6 +170,7 @@ stanford = "https?://paperreview\\.ai/review\\?token=([A-Za-z0-9_-]+)"
 Matched token for backend `X` is attached to the latest open job for backend `X` without a token.
 When a token is attached from IMAP, ReviewLoop schedules immediate polling (`next_poll_at = now`) so the same daemon tick can retrieve results.
 If `username` / `password` are empty, IMAP polling is skipped.
+For stacked/repeated emails, token de-dup is applied and already-bound tokens are not re-attached to other jobs.
 
 ## Responsible Use (Important)
 

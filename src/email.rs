@@ -27,6 +27,7 @@ mod imap_impl {
     use anyhow::{Context, Result};
     use chrono::Utc;
     use native_tls::TlsConnector;
+    use std::collections::HashSet;
 
     #[derive(Debug, Clone)]
     struct EmailMatch {
@@ -50,12 +51,30 @@ mod imap_impl {
             .await
             .context("IMAP polling task failed to join")??;
 
+        let mut seen_tokens = HashSet::new();
         for matched in matches {
+            if !seen_tokens.insert(matched.token.clone()) {
+                continue;
+            }
+
             db.record_email_token(
                 &matched.token,
                 &format!("imap:{}", matched.backend),
                 Some("imap_unseen"),
             )?;
+
+            if let Some(existing_job) = db.find_job_by_token(&matched.token)? {
+                db.add_event(
+                    Some(&existing_job.id),
+                    "imap_token_already_bound",
+                    serde_json::json!({
+                        "token": matched.token,
+                        "backend": matched.backend,
+                        "source": "imap"
+                    }),
+                )?;
+                continue;
+            }
 
             if let Some(job) = db.find_latest_open_job_without_token(&matched.backend)? {
                 // IMAP token match should trigger immediate fetch in the same daemon tick.
@@ -100,11 +119,14 @@ mod imap_impl {
             .with_context(|| format!("failed to select IMAP folder: {}", imap_cfg.folder))?;
 
         let unseen = session.search("UNSEEN")?;
+        let mut unseen_ids: Vec<u32> = unseen.into_iter().collect();
+        // Prefer newest messages first so the latest token maps to the latest open job.
+        unseen_ids.sort_unstable_by(|a, b| b.cmp(a));
         let mut matches = Vec::new();
 
-        for id in &unseen {
+        for id in unseen_ids {
             let backend_hint = if imap_cfg.header_first {
-                fetch_header_text(&mut session, *id)
+                fetch_header_text(&mut session, id)
                     .and_then(|headers| detect_backend_from_header(&headers, imap_cfg))
             } else {
                 None

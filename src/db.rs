@@ -473,6 +473,17 @@ impl Db {
         .map_err(Into::into)
     }
 
+    pub fn find_job_by_token(&self, token: &str) -> Result<Option<Job>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT * FROM jobs WHERE token = ?1 LIMIT 1",
+            params![token],
+            map_job_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn attach_token_to_job(
         &self,
         job_id: &str,

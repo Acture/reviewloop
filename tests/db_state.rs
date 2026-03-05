@@ -164,3 +164,19 @@ fn mark_timeouts_moves_old_processing_jobs_to_timeout() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn find_job_by_token_returns_bound_job() -> Result<()> {
+    let ctx = DbTestContext::new()?;
+    let job = ctx.create_job(JobStatus::Queued)?;
+    ctx.db
+        .attach_token_to_job(&job.id, "tok-by-token", Utc::now())?;
+
+    let found = ctx
+        .db
+        .find_job_by_token("tok-by-token")?
+        .context("expected token-bound job")?;
+    assert_eq!(found.id, job.id);
+    assert_eq!(found.token.as_deref(), Some("tok-by-token"));
+    Ok(())
+}
