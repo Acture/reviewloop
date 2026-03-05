@@ -136,6 +136,10 @@ enum PaperCommand {
         #[arg(long)]
         enabled: bool,
     },
+    Remove {
+        #[arg(long)]
+        paper_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -203,6 +207,7 @@ async fn run() -> Result<()> {
                 PaperCommand::Watch { paper_id, enabled } => {
                     cmd_paper_watch(&write_path, &paper_id, enabled)
                 }
+                PaperCommand::Remove { paper_id } => cmd_paper_remove(&write_path, &paper_id),
             }
         }
         Command::Daemon { command } => match command {
@@ -376,6 +381,19 @@ fn cmd_paper_watch(config_path: &Path, paper_id: &str, enabled: bool) -> Result<
     println!(
         "Updated watch setting for paper {paper_id}: {}\n- config: {}",
         if enabled { "enabled" } else { "disabled" },
+        config_path.display()
+    );
+    Ok(())
+}
+
+fn cmd_paper_remove(config_path: &Path, paper_id: &str) -> Result<()> {
+    let mut config = load_or_create_config(config_path)?;
+    if !config.remove_paper(paper_id) {
+        anyhow::bail!("paper_id not found: {paper_id}");
+    }
+    config.save(config_path)?;
+    println!(
+        "Removed paper {paper_id}.\n- config: {}",
         config_path.display()
     );
     Ok(())

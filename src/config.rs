@@ -218,6 +218,14 @@ impl Config {
         }
     }
 
+    pub fn remove_paper(&mut self, paper_id: &str) -> bool {
+        let before = self.papers.len();
+        self.papers.retain(|p| p.id != paper_id);
+        self.paper_watch.remove(paper_id);
+        self.paper_tag_triggers.remove(paper_id);
+        self.papers.len() != before
+    }
+
     pub fn effective_stanford_venue(&self) -> String {
         self.providers
             .stanford
@@ -842,5 +850,23 @@ email = "override@example.edu"
     #[test]
     fn load_from_paths_requires_at_least_one_path() {
         assert!(Config::load_from_paths(&[]).is_err());
+    }
+
+    #[test]
+    fn remove_paper_also_cleans_watch_and_tag_trigger() {
+        let mut cfg = Config::default();
+        cfg.papers.push(super::PaperConfig {
+            id: "main".to_string(),
+            pdf_path: "paper/main.pdf".to_string(),
+            backend: "stanford".to_string(),
+        });
+        cfg.set_paper_watch("main", false);
+        cfg.set_paper_tag_trigger("main", Some("review-stanford/main/*".to_string()));
+
+        assert!(cfg.remove_paper("main"));
+        assert!(cfg.find_paper("main").is_none());
+        assert!(!cfg.paper_watch.contains_key("main"));
+        assert!(!cfg.paper_tag_triggers.contains_key("main"));
+        assert!(!cfg.remove_paper("main"));
     }
 }
