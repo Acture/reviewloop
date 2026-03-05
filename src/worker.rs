@@ -9,7 +9,7 @@ use crate::{
     model::{Job, JobStatus},
     panel::render_tick_panel,
     trigger::{run_git_tag_trigger, run_pdf_trigger},
-    util::compute_next_poll_at,
+    util::{compute_next_poll_at, estimate_pdf_page_count},
 };
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
@@ -18,6 +18,7 @@ use std::{path::Path, time::Duration as StdDuration};
 use tracing::{error, info, warn};
 
 const RATE_LIMIT_COOLDOWN_MINUTES: i64 = 30;
+const STANFORD_MAX_TIMEOUT_SCALE_PAGES: i64 = 20;
 const TERMINAL_REVIEW_FAILURE_HINTS: [&str; 3] = [
     "review generation failed",
     "unable to generate review",
@@ -118,7 +119,9 @@ pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<()> {
         "stanford" => job
             .venue
             .clone()
-            .or_else(|| config.providers.stanford.venue.clone()),
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .or_else(|| Some(config.effective_stanford_venue())),
         _ => job.venue.clone(),
     };
 
@@ -187,15 +190,20 @@ async fn handle_submit_error_with_fallback(
 
     if can_fallback {
         let email = resolve_submission_email(config, &job.backend, Some(&job.email))?;
+        let fallback_venue = job
+            .venue
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .or_else(|| Some(config.effective_stanford_venue()));
 
         match submit_with_node_playwright(
             Path::new(&config.providers.stanford.fallback_script),
             &config.providers.stanford.base_url,
             Path::new(&job.pdf_path),
             &email,
-            job.venue
-                .as_deref()
-                .or(config.providers.stanford.venue.as_deref()),
+            fallback_venue.as_deref(),
         )
         .await
         {
@@ -384,10 +392,11 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
 
 pub fn mark_timeouts(config: &Config, db: &Db) -> Result<()> {
     let now = Utc::now();
-    let timeout = Duration::hours(config.core.review_timeout_hours as i64);
 
     for job in db.list_processing_jobs()? {
-        if now - job.created_at >= timeout {
+        let timeout = timeout_for_job(config, &job);
+        let reference_start = job.started_at.unwrap_or(job.created_at);
+        if now - reference_start >= timeout {
             db.update_job_state(
                 &job.id,
                 JobStatus::Timeout,
@@ -401,6 +410,25 @@ pub fn mark_timeouts(config: &Config, db: &Db) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn timeout_for_job(config: &Config, job: &Job) -> Duration {
+    let base_hours = i64::max(config.core.review_timeout_hours as i64, 1);
+    if job.backend != "stanford" {
+        return Duration::hours(base_hours);
+    }
+
+    let pages = estimate_pdf_page_count(Path::new(&job.pdf_path))
+        .ok()
+        .unwrap_or(0);
+    if pages == 0 {
+        return Duration::hours(base_hours);
+    }
+
+    let capped_pages = i64::min(pages as i64, STANFORD_MAX_TIMEOUT_SCALE_PAGES);
+    let scaled_hours = (base_hours * capped_pages + STANFORD_MAX_TIMEOUT_SCALE_PAGES - 1)
+        / STANFORD_MAX_TIMEOUT_SCALE_PAGES;
+    Duration::hours(i64::max(scaled_hours, 1))
 }
 
 pub fn prune_retention(config: &Config, db: &Db, tick: Option<u64>) -> Result<()> {

@@ -149,9 +149,9 @@ Manual immediate poll:
 - `reviewloop check --all-processing` checks all current processing jobs
 
 Output artifacts per completed job:
-- `.reviewloop/artifacts/<job-id>/review.json`
-- `.reviewloop/artifacts/<job-id>/review.md`
-- `.reviewloop/artifacts/<job-id>/meta.json`
+- `<state_dir>/artifacts/<job-id>/review.json`
+- `<state_dir>/artifacts/<job-id>/review.md`
+- `<state_dir>/artifacts/<job-id>/meta.json`
 
 ## What Makes It Reliable
 
@@ -209,7 +209,7 @@ Configure:
 enabled = true
 client_id = "your-google-oauth-client-id"
 client_secret = "your-google-oauth-client-secret"
-token_store_path = ".reviewloop/oauth/google_token.json" # optional
+token_store_path = "~/.local/state/reviewloop/oauth/google_token.json" # optional
 poll_seconds = 300
 mark_seen = true
 max_lookback_hours = 72
@@ -248,8 +248,7 @@ Global config is auto-generated at:
 
 Config precedence (low to high):
 1. `$XDG_CONFIG_HOME/reviewloop/reviewloop.toml` (or `~/.config/reviewloop/reviewloop.toml`)
-2. `./reviewloop.toml`
-3. `--config /path/to/file.toml`
+2. `--config /path/to/file.toml`
 
 Paper registration:
 - start with an empty `papers[]`
@@ -259,8 +258,10 @@ Paper registration:
 Safe defaults:
 - `core.max_concurrency = 2`
 - `core.max_submissions_per_tick = 1`
+- `core.state_dir = "$XDG_STATE_HOME/reviewloop"` (or `~/.local/state/reviewloop`)
 - `core.db_path = "<global-data-dir>/reviewloop.db"`
 - `core.review_timeout_hours = 48`
+  - for `stanford`, timeout is linearly scaled by PDF page count up to 20 pages
 - `polling.schedule_minutes = [10, 20, 40, 60]`
 - `polling.jitter_percent = 10`
 - `retention.enabled = true`
@@ -280,11 +281,11 @@ Safe defaults:
 - `fallback_mode = "node_playwright"`
 - `fallback_script = "tools/paperreview_fallback.mjs"`
 - `email` optional (falls back to active email account)
-- `venue` optional
+- `venue = "ICLR"` (can be overridden by user config)
 
 Logging:
 - `logging.output = "stdout" | "stderr" | "file"`
-- file mode default path: `.reviewloop/reviewloop.log`
+- file mode default path: `<state_dir>/reviewloop.log`
 
 ## CI/CD and Release Flow
 

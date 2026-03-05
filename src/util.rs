@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use rand::Rng;
+use regex::bytes::Regex;
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,
@@ -26,6 +27,15 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     }
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn estimate_pdf_page_count(path: &Path) -> Result<usize> {
+    // Heuristic for page counting without pulling a full PDF parser.
+    // Works for typical PDFs where page objects contain `/Type /Page`.
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read file: {}", path.display()))?;
+    let page_re = Regex::new(r"/Type\s*/Page\b").expect("valid PDF page regex");
+    Ok(page_re.find_iter(&bytes).count())
 }
 
 pub fn to_rfc3339(ts: DateTime<Utc>) -> String {
@@ -96,5 +106,19 @@ mod tests {
     #[test]
     fn parse_rfc3339_rejects_invalid_value() {
         assert!(parse_rfc3339("not-a-timestamp").is_err());
+    }
+
+    #[test]
+    fn estimate_pdf_page_count_ignores_pages_node() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let pdf = tmp.path().join("synthetic.pdf");
+        std::fs::write(
+            &pdf,
+            b"%PDF-1.4\n<< /Type /Pages >>\n<< /Type /Page >>\n<< /Type/Page >>\n%%EOF\n",
+        )
+        .expect("write pdf");
+
+        let pages = estimate_pdf_page_count(&pdf).expect("count pages");
+        assert_eq!(pages, 2);
     }
 }
