@@ -101,6 +101,7 @@ reviewloop daemon status
 reviewloop submit --paper-id main [--force]
 reviewloop approve --job-id <job-id>
 reviewloop import-token --paper-id main --token <token> [--source email]
+reviewloop check [--job-id <job-id> | --paper-id <paper-id>] [--all-processing]
 reviewloop status [--paper-id main] [--json]
 reviewloop retry --job-id <job-id>
 reviewloop email login --provider google
@@ -119,6 +120,11 @@ Each tick performs:
 3. Timeout marking
 4. Submission processing (`QUEUED -> SUBMITTED/PROCESSING`)
 5. Poll processing (`PROCESSING -> COMPLETED/FAILED/...`)
+
+Manual immediate poll:
+- `reviewloop check --job-id <id>` forces one check now for that processing job (ignores `next_poll_at`)
+- `reviewloop check --paper-id <paper-id>` checks the latest processing job for that paper
+- `reviewloop check --all-processing` checks all current processing jobs
 
 Output artifacts per completed job:
 - `.reviewloop/artifacts/<job-id>/review.json`
