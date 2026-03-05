@@ -7,6 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
+use regex::Regex;
 use serde_json::json;
 use std::{path::Path, process::Command};
 use tracing::warn;
@@ -86,6 +87,7 @@ pub fn run_pdf_trigger(config: &Config, db: &Db) -> Result<()> {
     for paper in config
         .papers
         .iter()
+        .filter(|paper| config.is_paper_watched(&paper.id))
         .take(config.trigger.pdf.max_scan_papers)
     {
         let path = Path::new(&paper.pdf_path);
@@ -169,9 +171,7 @@ fn process_tag_entry(config: &Config, db: &Db, tag: &str, commit: &str) -> Resul
         return Ok(false);
     }
 
-    if let Some(parsed) = parse_review_tag(tag)
-        && let Some(paper) = select_paper(config, &parsed)
-    {
+    if let Some(paper) = select_paper_for_tag(config, tag) {
         enqueue_for_paper(
             config,
             db,
@@ -185,6 +185,41 @@ fn process_tag_entry(config: &Config, db: &Db, tag: &str, commit: &str) -> Resul
 
     db.mark_tag_seen(tag, commit)?;
     Ok(true)
+}
+
+fn select_paper_for_tag<'a>(config: &'a Config, tag: &str) -> Option<&'a PaperConfig> {
+    if let Some(parsed) = parse_review_tag(tag)
+        && let Some(paper) = select_paper(config, &parsed)
+    {
+        return Some(paper);
+    }
+
+    config.papers.iter().find(|paper| {
+        config
+            .paper_tag_trigger(&paper.id)
+            .is_some_and(|pattern| matches_tag_pattern(pattern, tag))
+    })
+}
+
+fn matches_tag_pattern(pattern: &str, tag: &str) -> bool {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let mut regex_pattern = String::from("^");
+    for part in trimmed.split('*') {
+        regex_pattern.push_str(&regex::escape(part));
+        regex_pattern.push_str(".*");
+    }
+    if !trimmed.ends_with('*') {
+        regex_pattern.truncate(regex_pattern.len().saturating_sub(2));
+    }
+    regex_pattern.push('$');
+
+    Regex::new(&regex_pattern)
+        .map(|re| re.is_match(tag))
+        .unwrap_or(false)
 }
 
 fn maybe_create_auto_tag(
@@ -289,7 +324,7 @@ fn provider_venue(config: &Config, backend: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_review_tag, process_tag_entry};
+    use super::{matches_tag_pattern, parse_review_tag, process_tag_entry, run_pdf_trigger};
     use crate::{
         config::{Config, PaperConfig},
         db::Db,
@@ -366,6 +401,47 @@ mod tests {
             "simulated duplicate tag should not enqueue twice"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn simulated_custom_tag_trigger_enqueues_target_paper() -> anyhow::Result<()> {
+        let (_tmp, mut config, db) = setup_simulation_context()?;
+        config.set_paper_tag_trigger("main", Some("custom/main/*".to_string()));
+
+        let processed = process_tag_entry(&config, &db, "custom/main/v3", "beadfeed")?;
+        assert!(processed);
+
+        let job = db
+            .find_latest_open_job_for_paper("main")?
+            .context("expected queued job for custom tag trigger")?;
+        assert_eq!(job.status, JobStatus::Queued);
+        assert_eq!(job.git_tag.as_deref(), Some("custom/main/v3"));
+        assert_eq!(job.git_commit.as_deref(), Some("beadfeed"));
+        Ok(())
+    }
+
+    #[test]
+    fn pattern_match_supports_wildcard() {
+        assert!(matches_tag_pattern(
+            "review-stanford/main/*",
+            "review-stanford/main/v1"
+        ));
+        assert!(matches_tag_pattern("custom-*", "custom-build-123"));
+        assert!(!matches_tag_pattern(
+            "review-stanford/main/*",
+            "review-stanford/other/v1"
+        ));
+    }
+
+    #[test]
+    fn pdf_trigger_skips_unwatched_paper() -> anyhow::Result<()> {
+        let (_tmp, mut config, db) = setup_simulation_context()?;
+        config.trigger.pdf.enabled = true;
+        config.set_paper_watch("main", false);
+
+        run_pdf_trigger(&config, &db)?;
+        assert!(db.list_status_views(Some("main"))?.is_empty());
         Ok(())
     }
 }
