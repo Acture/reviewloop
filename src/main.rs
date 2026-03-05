@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use reviewloop::config::Config;
+use reviewloop::config::{Config, PaperConfig};
 use reviewloop::db::Db;
 use reviewloop::email_account;
 use reviewloop::model::{JobStatus, NewJob};
@@ -30,6 +30,10 @@ enum Command {
     Init {
         #[arg(long)]
         force: bool,
+    },
+    Paper {
+        #[command(subcommand)]
+        command: PaperCommand,
     },
     Daemon {
         #[command(subcommand)]
@@ -78,6 +82,33 @@ enum DaemonCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum PaperCommand {
+    Add {
+        #[arg(long)]
+        paper_id: String,
+        #[arg(
+            long = "pdf-path",
+            alias = "path",
+            alias = "artifact",
+            value_name = "PATH"
+        )]
+        pdf_path: String,
+        #[arg(long)]
+        backend: String,
+        #[arg(long, default_value_t = true)]
+        watch: bool,
+        #[arg(long)]
+        tag_trigger: Option<String>,
+    },
+    Watch {
+        #[arg(long)]
+        paper_id: String,
+        #[arg(long)]
+        enabled: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum EmailCommand {
     Login {
         #[arg(long, default_value = "google")]
@@ -104,7 +135,7 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let Cli { config, command } = Cli::parse();
-    Config::ensure_global_config_dir()?;
+    Config::ensure_global_config_file()?;
     Config::ensure_global_data_dir()?;
 
     match command {
@@ -113,6 +144,28 @@ async fn run() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("reviewloop.toml"));
             cmd_init(&init_path, force)
+        }
+        Command::Paper { command } => {
+            let write_path = resolve_mutable_config_path(config.as_deref())?;
+            match command {
+                PaperCommand::Add {
+                    paper_id,
+                    pdf_path,
+                    backend,
+                    watch,
+                    tag_trigger,
+                } => cmd_paper_add(
+                    &write_path,
+                    &paper_id,
+                    &pdf_path,
+                    &backend,
+                    watch,
+                    tag_trigger.as_deref(),
+                ),
+                PaperCommand::Watch { paper_id, enabled } => {
+                    cmd_paper_watch(&write_path, &paper_id, enabled)
+                }
+            }
         }
         Command::Daemon {
             command: DaemonCommand::Run { panel },
@@ -200,6 +253,90 @@ fn cmd_init(config_path: &Path, force: bool) -> Result<()> {
         db_label
     );
     println!("\n{}", render_guardrail_notice(&cfg));
+    Ok(())
+}
+
+fn resolve_mutable_config_path(config_override: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = config_override {
+        return Ok(path.to_path_buf());
+    }
+
+    let local = PathBuf::from("reviewloop.toml");
+    if local.exists() {
+        return Ok(local);
+    }
+
+    if let Some(global) = Config::ensure_global_config_file()? {
+        return Ok(global);
+    }
+
+    anyhow::bail!("unable to resolve writable config path")
+}
+
+fn load_or_create_config(path: &Path) -> Result<Config> {
+    if path.exists() {
+        return Config::load(path);
+    }
+    let cfg = Config::default();
+    cfg.save(path)?;
+    Ok(cfg)
+}
+
+fn cmd_paper_add(
+    config_path: &Path,
+    paper_id: &str,
+    pdf_path: &str,
+    backend: &str,
+    watch: bool,
+    tag_trigger: Option<&str>,
+) -> Result<()> {
+    let mut config = load_or_create_config(config_path)?;
+    if config.find_paper(paper_id).is_some() {
+        anyhow::bail!("paper_id already exists: {paper_id}");
+    }
+
+    config.papers.push(PaperConfig {
+        id: paper_id.to_string(),
+        pdf_path: pdf_path.to_string(),
+        backend: backend.to_string(),
+    });
+    config.set_paper_watch(paper_id, watch);
+    config.set_paper_tag_trigger(
+        paper_id,
+        tag_trigger
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
+    );
+    config.save(config_path)?;
+
+    let watch_text = if watch { "enabled" } else { "disabled" };
+    if let Some(trigger) = tag_trigger {
+        println!(
+            "Added paper {paper_id}.\n- backend: {backend}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- tag trigger: {trigger}\n- config: {}",
+            config_path.display()
+        );
+    } else {
+        println!(
+            "Added paper {paper_id}.\n- backend: {backend}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- config: {}",
+            config_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_paper_watch(config_path: &Path, paper_id: &str, enabled: bool) -> Result<()> {
+    let mut config = load_or_create_config(config_path)?;
+    if config.find_paper(paper_id).is_none() {
+        anyhow::bail!("paper_id not found: {paper_id}");
+    }
+    config.set_paper_watch(paper_id, enabled);
+    config.save(config_path)?;
+    println!(
+        "Updated watch setting for paper {paper_id}: {}\n- config: {}",
+        if enabled { "enabled" } else { "disabled" },
+        config_path.display()
+    );
     Ok(())
 }
 
