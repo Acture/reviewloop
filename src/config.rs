@@ -608,7 +608,7 @@ impl Default for GmailOauthConfig {
         );
 
         Self {
-            enabled: false,
+            enabled: true,
             client_id: "".to_string(),
             client_secret: "".to_string(),
             token_store_path: None,
@@ -669,7 +669,7 @@ mod tests {
         assert!(gmail.header_first);
         assert_eq!(gmail.max_lookback_hours, 72);
         assert_eq!(gmail.max_messages_per_poll, 50);
-        assert!(!gmail.enabled);
+        assert!(gmail.enabled);
     }
 
     #[test]
