@@ -88,6 +88,7 @@ Layered config loading (low -> high precedence):
 
 Higher layers override lower layers by key, while unspecified keys are inherited.
 `reviewloop init` writes `./reviewloop.toml` by default (or the path passed via `--config`).
+ReviewLoop automatically creates the global config directory on command startup.
 
 Safe defaults:
 

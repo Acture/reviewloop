@@ -57,6 +57,22 @@ impl Config {
         Ok(LoadedConfig { config, layers })
     }
 
+    pub fn global_config_path() -> Option<PathBuf> {
+        default_global_config_path()
+    }
+
+    pub fn ensure_global_config_dir() -> Result<Option<PathBuf>> {
+        let Some(path) = Self::global_config_path() else {
+            return Ok(None);
+        };
+        let Some(parent) = path.parent() else {
+            return Ok(None);
+        };
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create global config dir: {}", parent.display()))?;
+        Ok(Some(parent.to_path_buf()))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.core.max_concurrency == 0 {
             return Err(anyhow!("core.max_concurrency must be >= 1"));
@@ -149,7 +165,7 @@ fn resolve_layered_paths(explicit_path: Option<&Path>) -> Result<Vec<PathBuf>> {
     let mut layers = Vec::new();
     let mut looked = Vec::new();
 
-    if let Some(global) = default_global_config_path() {
+    if let Some(global) = Config::global_config_path() {
         push_unique(&mut looked, global.clone());
         if global.exists() {
             push_unique(&mut layers, global);

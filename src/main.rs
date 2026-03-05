@@ -81,6 +81,7 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let Cli { config, command } = Cli::parse();
+    Config::ensure_global_config_dir()?;
 
     match command {
         Command::Init { force } => {
@@ -127,6 +128,19 @@ async fn run() -> Result<()> {
 }
 
 fn cmd_init(config_path: &Path, force: bool) -> Result<()> {
+    Config::ensure_global_config_dir()?;
+
+    if let Some(parent) = config_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create config parent directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+
     if config_path.exists() && !force {
         anyhow::bail!(
             "config file already exists: {} (use --force to overwrite)",
