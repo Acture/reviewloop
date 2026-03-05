@@ -4,6 +4,7 @@ use crate::{
     config::Config,
     db::Db,
     email::poll_imap_if_enabled,
+    email_account::resolve_submission_email,
     fallback::submit_with_node_playwright,
     model::{Job, JobStatus},
     panel::render_tick_panel,
@@ -112,20 +113,13 @@ pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<()> {
 
     let backend = build_backend(config, &job.backend)?;
 
-    let (email, venue) = match job.backend.as_str() {
-        "stanford" => {
-            let email = if job.email.trim().is_empty() {
-                config.providers.stanford.email.clone()
-            } else {
-                job.email.clone()
-            };
-            let venue = job
-                .venue
-                .clone()
-                .or_else(|| config.providers.stanford.venue.clone());
-            (email, venue)
-        }
-        _ => (job.email.clone(), job.venue.clone()),
+    let email = resolve_submission_email(config, &job.backend, Some(&job.email))?;
+    let venue = match job.backend.as_str() {
+        "stanford" => job
+            .venue
+            .clone()
+            .or_else(|| config.providers.stanford.venue.clone()),
+        _ => job.venue.clone(),
     };
 
     db.update_job_state(
@@ -192,11 +186,7 @@ async fn handle_submit_error_with_fallback(
         && config.providers.stanford.fallback_mode == "node_playwright";
 
     if can_fallback {
-        let email = if job.email.trim().is_empty() {
-            config.providers.stanford.email.clone()
-        } else {
-            job.email.clone()
-        };
+        let email = resolve_submission_email(config, &job.backend, Some(&job.email))?;
 
         match submit_with_node_playwright(
             Path::new(&config.providers.stanford.fallback_script),

@@ -17,6 +17,7 @@ ReviewLoop solves that with:
 - Duplicate guard (`backend + pdf_hash`) to prevent repeated submissions
 - Triggered workflows from Git tags or PDF hash changes
 - Optional IMAP token attachment for review links in email
+- Optional Gmail OAuth token attachment via Google Sign-In (device flow)
 - Fallback submit path (`Node + Playwright`) when provider API flow fails
 
 ## Design Principles
@@ -43,6 +44,10 @@ reviewloop approve --job-id <job-id>
 reviewloop import-token --paper-id main --token <token> [--source email]
 reviewloop status [--paper-id main] [--json]
 reviewloop retry --job-id <job-id>
+reviewloop email login --provider google
+reviewloop email status
+reviewloop email switch --account <account-id-or-email>
+reviewloop email logout [--account <account-id-or-email>]
 ```
 
 ## Quick Start
@@ -59,7 +64,7 @@ cargo run -- daemon run
 Each daemon tick (every 30s) does:
 
 1. Trigger scan (`git tags`, `pdf hash changes`)
-2. Optional IMAP token ingest
+2. Optional Gmail OAuth + IMAP token ingest
 3. Timeout marking
 4. Submission processing (`QUEUED -> SUBMITTED/PROCESSING`)
 5. Poll processing (`PROCESSING -> COMPLETED/FAILED/...`)
@@ -110,7 +115,7 @@ Safe defaults:
 - `base_url = "https://paperreview.ai"`
 - `fallback_mode = "node_playwright"`
 - `fallback_script = "tools/paperreview_fallback.mjs"`
-- `email` required
+- `email` optional (if empty, ReviewLoop will use active `email login` account)
 - `venue` optional
 
 Logging:
@@ -184,6 +189,51 @@ When a token is attached from IMAP, ReviewLoop schedules immediate polling (`nex
 If `username` / `password` are empty, IMAP polling is skipped.
 Set `max_lookback_hours = 0` only if you intentionally want no time-window limit.
 For stacked/repeated emails, token de-dup is applied and already-bound tokens are not re-attached to other jobs.
+
+## Gmail OAuth (Optional)
+
+OAuth is implemented behind an abstraction layer (`oauth` trait + provider implementation), while token-exchange internals use the [`oauth2`](https://crates.io/crates/oauth2) crate.
+This keeps provider extensibility while avoiding custom OAuth protocol code.
+
+Enable Gmail OAuth in config:
+
+```toml
+[gmail_oauth]
+enabled = true
+client_id = "your-google-oauth-client-id"
+client_secret = "your-google-oauth-client-secret"
+token_store_path = ".reviewloop/oauth/google_token.json" # optional
+poll_seconds = 300
+mark_seen = true
+max_lookback_hours = 72
+max_messages_per_poll = 50
+header_first = true
+
+[gmail_oauth.backend_header_patterns]
+stanford = "(?is)(from:\\s*.*mail\\.paperreview\\.ai|subject:\\s*.*paper review is ready)"
+
+[gmail_oauth.backend_patterns]
+stanford = "https?://paperreview\\.ai/review\\?token=([A-Za-z0-9_-]+)"
+```
+
+Then run:
+
+```bash
+reviewloop email login --provider google
+```
+
+This starts Google device flow: open verification URL, enter user code, and ReviewLoop stores refresh/access token locally.
+After login, ReviewLoop records the email account and sets it as active.
+
+You can manage accounts with:
+
+```bash
+reviewloop email status
+reviewloop email switch --account <account-id-or-email>
+reviewloop email logout [--account <account-id-or-email>]
+```
+
+When Gmail OAuth is enabled and token is present, daemon polls Gmail API first, then IMAP fallback.
 
 ## Retention Policy
 

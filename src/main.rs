@@ -3,7 +3,9 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use reviewloop::config::Config;
 use reviewloop::db::Db;
+use reviewloop::email_account;
 use reviewloop::model::{JobStatus, NewJob};
+use reviewloop::oauth::{self, google::GoogleOauthProvider};
 use reviewloop::util::{compute_next_poll_at, sha256_file};
 use std::{
     fs,
@@ -61,6 +63,10 @@ enum Command {
         #[arg(long)]
         job_id: String,
     },
+    Email {
+        #[command(subcommand)]
+        command: EmailCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -69,6 +75,23 @@ enum DaemonCommand {
         #[arg(long, default_value_t = true)]
         panel: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum EmailCommand {
+    Login {
+        #[arg(long, default_value = "google")]
+        provider: String,
+    },
+    Logout {
+        #[arg(long)]
+        account: Option<String>,
+    },
+    Switch {
+        #[arg(long)]
+        account: String,
+    },
+    Status,
 }
 
 #[tokio::main]
@@ -124,6 +147,15 @@ async fn run() -> Result<()> {
         Command::Retry { job_id } => {
             let (config, db) = load_runtime(config.as_deref(), false)?;
             cmd_retry(&config, &db, &job_id)
+        }
+        Command::Email { command } => {
+            let (config, _db) = load_runtime(config.as_deref(), false)?;
+            match command {
+                EmailCommand::Login { provider } => cmd_email_login(&config, &provider).await,
+                EmailCommand::Logout { account } => cmd_email_logout(&config, account.as_deref()),
+                EmailCommand::Switch { account } => cmd_email_switch(&config, &account),
+                EmailCommand::Status => cmd_email_status(&config),
+            }
         }
     }
 }
@@ -270,7 +302,7 @@ async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Re
 
     let (email, venue) = match paper.backend.as_str() {
         "stanford" => (
-            config.providers.stanford.email.clone(),
+            email_account::resolve_submission_email(config, "stanford", None)?,
             config.providers.stanford.venue.clone(),
         ),
         _ => (String::new(), None),
@@ -359,7 +391,7 @@ fn cmd_import_token(
 
     let (email, venue) = match paper.backend.as_str() {
         "stanford" => (
-            config.providers.stanford.email.clone(),
+            email_account::resolve_submission_email(config, "stanford", None)?,
             config.providers.stanford.venue.clone(),
         ),
         _ => (String::new(), None),
@@ -473,6 +505,168 @@ fn cmd_retry(config: &Config, db: &Db, job_id: &str) -> Result<()> {
     println!("Retry scheduled for job {job_id}");
 
     Ok(())
+}
+
+async fn cmd_email_login(config: &Config, provider: &str) -> Result<()> {
+    if provider != "google" {
+        anyhow::bail!("unsupported provider: {provider}. currently supported: google");
+    }
+
+    let Some(oauth_provider) = GoogleOauthProvider::from_config(config)? else {
+        anyhow::bail!(
+            "gmail_oauth is not fully configured. set gmail_oauth.enabled=true, client_id, and client_secret"
+        );
+    };
+
+    let active_token_path = oauth::run_device_login(&oauth_provider, config).await?;
+    let access_token = oauth::ensure_valid_access_token(&oauth_provider).await?;
+    let email = fetch_google_profile_email(&access_token).await?;
+
+    let account_token_path = google_account_token_path(config, &email);
+    copy_token_file(&active_token_path, &account_token_path)?;
+    let account = email_account::upsert_account(config, "google", &email, &account_token_path)?;
+
+    println!(
+        "Email login completed.\n- provider: google\n- email: {}\n- account id: {}\n- active token: {}\n- account token: {}",
+        account.email,
+        account.id,
+        active_token_path.display(),
+        account_token_path.display()
+    );
+    Ok(())
+}
+
+fn cmd_email_logout(config: &Config, account: Option<&str>) -> Result<()> {
+    let removed = email_account::remove_account(config, account)?;
+    let Some(removed) = removed else {
+        println!("No email account found.");
+        return Ok(());
+    };
+
+    let removed_token_path = PathBuf::from(&removed.token_path);
+    if removed_token_path.exists() {
+        let _ = std::fs::remove_file(&removed_token_path);
+    }
+
+    let active_token_path = active_google_token_path(config);
+    if let Some(active) = email_account::active_account(config)? {
+        if active.provider == "google" {
+            copy_token_file(Path::new(&active.token_path), &active_token_path)?;
+        }
+    } else if active_token_path.exists() {
+        let _ = std::fs::remove_file(&active_token_path);
+    }
+
+    println!(
+        "Email logout completed.\n- removed: {} ({})",
+        removed.email, removed.id
+    );
+    Ok(())
+}
+
+fn cmd_email_switch(config: &Config, account: &str) -> Result<()> {
+    let selected = email_account::switch_account(config, account)?;
+    if selected.provider == "google" {
+        let active_token_path = active_google_token_path(config);
+        copy_token_file(Path::new(&selected.token_path), &active_token_path)?;
+    }
+
+    println!(
+        "Switched active email account.\n- provider: {}\n- email: {}\n- id: {}",
+        selected.provider, selected.email, selected.id
+    );
+    Ok(())
+}
+
+fn cmd_email_status(config: &Config) -> Result<()> {
+    let accounts = email_account::list_accounts(config)?;
+    if accounts.is_empty() {
+        println!("No email accounts found.");
+        return Ok(());
+    }
+
+    let active_id = email_account::active_account(config)?.map(|a| a.id);
+    println!(
+        "{:<36}  {:<10}  {:<35}  {:<6}",
+        "ACCOUNT ID", "PROVIDER", "EMAIL", "ACTIVE"
+    );
+    println!("{}", "-".repeat(96));
+    for account in accounts {
+        let is_active = active_id.as_deref() == Some(account.id.as_str());
+        println!(
+            "{:<36}  {:<10}  {:<35}  {:<6}",
+            account.id,
+            account.provider,
+            account.email,
+            if is_active { "yes" } else { "no" }
+        );
+    }
+    Ok(())
+}
+
+fn google_account_token_path(config: &Config, email: &str) -> PathBuf {
+    let safe_email = email
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    config
+        .state_dir()
+        .join("oauth")
+        .join("accounts")
+        .join(format!("google_{safe_email}.json"))
+}
+
+fn active_google_token_path(config: &Config) -> PathBuf {
+    config
+        .gmail_oauth
+        .as_ref()
+        .and_then(|g| g.token_store_path.as_ref())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.state_dir().join("oauth").join("google_token.json"))
+}
+
+fn copy_token_file(from: &Path, to: &Path) -> Result<()> {
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create token target directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::copy(from, to).with_context(|| {
+        format!(
+            "failed to copy token file {} -> {}",
+            from.display(),
+            to.display()
+        )
+    })?;
+    Ok(())
+}
+
+async fn fetch_google_profile_email(access_token: &str) -> Result<String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://gmail.googleapis.com/gmail/v1/users/me/profile")
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .context("failed to fetch gmail profile")?;
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_else(|_| "".to_string());
+        anyhow::bail!("gmail profile request failed: {body}");
+    }
+    let payload: serde_json::Value = resp.json().await.context("invalid gmail profile payload")?;
+    let Some(email) = payload.get("emailAddress").and_then(|v| v.as_str()) else {
+        anyhow::bail!("gmail profile payload missing emailAddress");
+    };
+    Ok(email.to_string())
 }
 
 #[cfg(test)]

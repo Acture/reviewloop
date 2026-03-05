@@ -1,6 +1,7 @@
 use crate::{
     config::{Config, PaperConfig},
     db::Db,
+    email_account::resolve_submission_email,
     model::{JobStatus, NewJob},
     util::sha256_file,
 };
@@ -254,7 +255,7 @@ fn enqueue_for_paper(
         pdf_path: paper.pdf_path.clone(),
         pdf_hash,
         status,
-        email: provider_email(config, &paper.backend),
+        email: provider_email(config, &paper.backend)?,
         venue: provider_venue(config, &paper.backend),
         git_tag,
         git_commit,
@@ -275,11 +276,8 @@ fn enqueue_for_paper(
     Ok(())
 }
 
-fn provider_email(config: &Config, backend: &str) -> String {
-    match backend {
-        "stanford" => config.providers.stanford.email.clone(),
-        _ => String::new(),
-    }
+fn provider_email(config: &Config, backend: &str) -> Result<String> {
+    resolve_submission_email(config, backend, None)
 }
 
 fn provider_venue(config: &Config, backend: &str) -> Option<String> {
