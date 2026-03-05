@@ -84,6 +84,8 @@ impl Config {
         Self::ensure_global_config_dir()?;
         if !path.exists() {
             Self::save_template(&path)?;
+        } else {
+            let _ = migrate_legacy_global_paths(&path);
         }
         Ok(Some(path))
     }
@@ -329,23 +331,18 @@ fn default_global_config_path() -> Option<PathBuf> {
 }
 
 fn default_global_data_dir() -> Option<PathBuf> {
-    if let Some(xdg) = env::var_os("XDG_STATE_HOME") {
-        return Some(PathBuf::from(xdg).join("reviewloop"));
+    if let Some(custom) = env::var_os("REVIEWLOOP_STATE_DIR") {
+        return Some(PathBuf::from(custom));
     }
 
     #[cfg(windows)]
     {
         if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
-            return Some(PathBuf::from(local_app_data).join("reviewloop"));
+            return Some(PathBuf::from(local_app_data).join("review_loop"));
         }
     }
 
-    env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("reviewloop")
-    })
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".review_loop"))
 }
 
 fn default_db_path() -> String {
@@ -365,6 +362,115 @@ fn default_log_path() -> String {
         .join("reviewloop.log")
         .to_string_lossy()
         .to_string()
+}
+
+fn migrate_legacy_global_paths(config_path: &Path) -> Result<()> {
+    let mut cfg = match Config::load(config_path) {
+        Ok(cfg) => cfg,
+        Err(_) => return Ok(()),
+    };
+    let Some(global_state_dir) = default_global_data_dir() else {
+        return Ok(());
+    };
+
+    let mut changed = false;
+    let mut old_state_dir: Option<PathBuf> = None;
+
+    let state_trimmed = cfg.core.state_dir.trim().to_string();
+    if is_legacy_relative_state_dir(&state_trimmed) {
+        old_state_dir = Some(PathBuf::from(state_trimmed));
+        cfg.core.state_dir = global_state_dir.to_string_lossy().to_string();
+        changed = true;
+    }
+
+    if let Some(file_path) = cfg.logging.file_path.as_deref()
+        && is_legacy_relative_path(file_path)
+    {
+        cfg.logging.file_path = Some(
+            global_state_dir
+                .join("reviewloop.log")
+                .to_string_lossy()
+                .to_string(),
+        );
+        changed = true;
+    }
+
+    if let Some(gmail) = cfg.gmail_oauth.as_mut()
+        && let Some(token_path) = gmail.token_store_path.as_deref()
+        && is_legacy_relative_path(token_path)
+    {
+        gmail.token_store_path = Some(
+            global_state_dir
+                .join("oauth")
+                .join("google_token.json")
+                .to_string_lossy()
+                .to_string(),
+        );
+        changed = true;
+    }
+
+    if changed {
+        cfg.save(config_path)?;
+    }
+
+    if let Some(old_state_dir) = old_state_dir {
+        migrate_state_dir_data(&old_state_dir, &global_state_dir)?;
+    }
+
+    Ok(())
+}
+
+fn is_legacy_relative_state_dir(path: &str) -> bool {
+    let p = path.trim();
+    p == ".reviewloop" || p == ".review_loop"
+}
+
+fn is_legacy_relative_path(path: &str) -> bool {
+    let p = path.trim();
+    p.starts_with(".reviewloop/") || p.starts_with(".review_loop/")
+}
+
+fn migrate_state_dir_data(old_state_dir: &Path, new_state_dir: &Path) -> Result<()> {
+    let old_abs = if old_state_dir.is_absolute() {
+        old_state_dir.to_path_buf()
+    } else {
+        env::current_dir()?.join(old_state_dir)
+    };
+    let new_abs = if new_state_dir.is_absolute() {
+        new_state_dir.to_path_buf()
+    } else {
+        env::current_dir()?.join(new_state_dir)
+    };
+
+    if old_abs == new_abs || !old_abs.exists() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(&new_abs)?;
+    copy_dir_recursive(&old_abs, &new_abs)?;
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else if file_type.is_file() && !dst_path.exists() {
+            fs::copy(&src_path, &dst_path).with_context(|| {
+                format!(
+                    "failed to copy state file {} -> {}",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn push_unique(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
@@ -868,5 +974,19 @@ email = "override@example.edu"
         assert!(!cfg.paper_watch.contains_key("main"));
         assert!(!cfg.paper_tag_triggers.contains_key("main"));
         assert!(!cfg.remove_paper("main"));
+    }
+
+    #[test]
+    fn legacy_relative_path_migration_helpers_detect_expected_shapes() {
+        assert!(super::is_legacy_relative_state_dir(".reviewloop"));
+        assert!(super::is_legacy_relative_state_dir(".review_loop"));
+        assert!(!super::is_legacy_relative_state_dir("/tmp/reviewloop"));
+        assert!(super::is_legacy_relative_path(
+            ".reviewloop/oauth/google_token.json"
+        ));
+        assert!(super::is_legacy_relative_path(
+            ".review_loop/reviewloop.log"
+        ));
+        assert!(!super::is_legacy_relative_path("/tmp/reviewloop.log"));
     }
 }
