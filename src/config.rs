@@ -2,9 +2,15 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
 };
+
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    pub config: Config,
+    pub layers: Vec<PathBuf>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -38,12 +44,17 @@ impl Default for Config {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("failed to read config: {}", path.display()))?;
-        let cfg: Config = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse TOML config: {}", path.display()))?;
-        cfg.validate()?;
-        Ok(cfg)
+        Self::load_from_paths(&[path.to_path_buf()])
+    }
+
+    pub fn load_layered(explicit_path: Option<&Path>) -> Result<Self> {
+        Ok(Self::load_layered_with_metadata(explicit_path)?.config)
+    }
+
+    pub fn load_layered_with_metadata(explicit_path: Option<&Path>) -> Result<LoadedConfig> {
+        let layers = resolve_layered_paths(explicit_path)?;
+        let config = Self::load_from_paths(&layers)?;
+        Ok(LoadedConfig { config, layers })
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -104,6 +115,125 @@ impl Config {
 
     pub fn first_paper_for_backend(&self, backend: &str) -> Option<&PaperConfig> {
         self.papers.iter().find(|p| p.backend == backend)
+    }
+
+    fn load_from_paths(paths: &[PathBuf]) -> Result<Self> {
+        if paths.is_empty() {
+            return Err(anyhow!("no config paths provided"));
+        }
+
+        let mut merged = toml::Value::Table(toml::map::Map::new());
+        for path in paths {
+            let raw = fs::read_to_string(path)
+                .with_context(|| format!("failed to read config: {}", path.display()))?;
+            let parsed: toml::Value = toml::from_str(&raw)
+                .with_context(|| format!("failed to parse TOML config: {}", path.display()))?;
+            if !parsed.is_table() {
+                return Err(anyhow!(
+                    "config root must be a TOML table: {}",
+                    path.display()
+                ));
+            }
+            merge_toml_values(&mut merged, parsed);
+        }
+
+        let cfg: Config = merged
+            .try_into()
+            .context("failed to deserialize merged config")?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+}
+
+fn resolve_layered_paths(explicit_path: Option<&Path>) -> Result<Vec<PathBuf>> {
+    let mut layers = Vec::new();
+    let mut looked = Vec::new();
+
+    if let Some(global) = default_global_config_path() {
+        push_unique(&mut looked, global.clone());
+        if global.exists() {
+            push_unique(&mut layers, global);
+        }
+    }
+
+    let local = PathBuf::from("reviewloop.toml");
+    push_unique(&mut looked, local.clone());
+    if local.exists() {
+        push_unique(&mut layers, local);
+    }
+
+    if let Some(path) = explicit_path {
+        let explicit = path.to_path_buf();
+        push_unique(&mut looked, explicit.clone());
+        if !explicit.exists() {
+            return Err(anyhow!("config file not found: {}", explicit.display()));
+        }
+        push_unique(&mut layers, explicit);
+    }
+
+    if layers.is_empty() {
+        let looked_text = looked
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(anyhow!(
+            "no config file found (looked for: {}). run `reviewloop init` or pass --config <path>",
+            looked_text
+        ));
+    }
+
+    Ok(layers)
+}
+
+fn default_global_config_path() -> Option<PathBuf> {
+    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
+        return Some(
+            PathBuf::from(xdg)
+                .join("reviewloop")
+                .join("reviewloop.toml"),
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = env::var_os("APPDATA") {
+            return Some(
+                PathBuf::from(appdata)
+                    .join("reviewloop")
+                    .join("reviewloop.toml"),
+            );
+        }
+    }
+
+    env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".config")
+            .join("reviewloop")
+            .join("reviewloop.toml")
+    })
+}
+
+fn push_unique(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !paths.iter().any(|p| p == &candidate) {
+        paths.push(candidate);
+    }
+}
+
+fn merge_toml_values(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
+            for (key, value) in overlay_table {
+                if let Some(base_value) = base_table.get_mut(&key) {
+                    merge_toml_values(base_value, value);
+                } else {
+                    base_table.insert(key, value);
+                }
+            }
+        }
+        (base_slot, overlay_value) => {
+            *base_slot = overlay_value;
+        }
     }
 }
 
@@ -282,6 +412,8 @@ impl Default for ImapConfig {
 #[cfg(test)]
 mod tests {
     use super::Config;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn defaults_start_polling_at_ten_minutes() {
@@ -350,5 +482,68 @@ mod tests {
         cfg.logging.output = "file".to_string();
         cfg.logging.file_path = Some("".to_string());
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn layered_merge_respects_precedence_and_nested_fields() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let global = tmp.path().join("global.toml");
+        let local = tmp.path().join("local.toml");
+        let override_cfg = tmp.path().join("override.toml");
+
+        fs::write(
+            &global,
+            r#"
+[core]
+max_concurrency = 1
+
+[providers.stanford]
+email = "global@example.edu"
+venue = "acl2026"
+
+[trigger.git]
+enabled = true
+repo_dir = "/global/repo"
+"#,
+        )
+        .expect("failed to write global config");
+
+        fs::write(
+            &local,
+            r#"
+[core]
+max_concurrency = 2
+
+[trigger.git]
+repo_dir = "/local/repo"
+"#,
+        )
+        .expect("failed to write local config");
+
+        fs::write(
+            &override_cfg,
+            r#"
+[core]
+max_concurrency = 3
+
+[providers.stanford]
+email = "override@example.edu"
+"#,
+        )
+        .expect("failed to write override config");
+
+        let cfg = Config::load_from_paths(&[global, local, override_cfg])
+            .expect("failed to load layered config");
+
+        assert_eq!(cfg.core.max_concurrency, 3);
+        assert_eq!(cfg.providers.stanford.email, "override@example.edu");
+        assert_eq!(cfg.providers.stanford.venue.as_deref(), Some("acl2026"));
+        assert!(cfg.trigger.git.enabled);
+        assert_eq!(cfg.trigger.git.repo_dir, "/local/repo");
+    }
+
+    #[test]
+    fn load_from_paths_requires_at_least_one_path() {
+        assert!(Config::load_from_paths(&[]).is_err());
     }
 }
