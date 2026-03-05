@@ -181,3 +181,48 @@ fn find_job_by_token_returns_bound_job() -> Result<()> {
     assert_eq!(found.token.as_deref(), Some("tok-by-token"));
     Ok(())
 }
+
+#[test]
+fn in_memory_db_persists_across_operations_for_same_instance() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&state_dir)?;
+
+    let pdf_path = tmp.path().join("paper.pdf");
+    fs::write(&pdf_path, b"%PDF-1.4\n%%EOF\n")?;
+
+    let mut config = Config::default();
+    config.core.state_dir = state_dir.to_string_lossy().to_string();
+    config.core.db_path = ":memory:".to_string();
+    config.providers.stanford.email = "test@example.edu".to_string();
+    config.papers = vec![PaperConfig {
+        id: "main".to_string(),
+        pdf_path: pdf_path.to_string_lossy().to_string(),
+        backend: "stanford".to_string(),
+    }];
+
+    let db = Db::from_config(&config)?;
+    db.init_schema()?;
+
+    let hash = sha256_file(Path::new(&config.papers[0].pdf_path))?;
+    let created = db.create_job(&NewJob {
+        paper_id: "main".to_string(),
+        backend: "stanford".to_string(),
+        pdf_path: config.papers[0].pdf_path.clone(),
+        pdf_hash: hash,
+        status: JobStatus::Queued,
+        email: config.providers.stanford.email.clone(),
+        venue: None,
+        git_tag: None,
+        git_commit: None,
+        next_poll_at: None,
+    })?;
+
+    let loaded = db
+        .get_job(&created.id)?
+        .context("missing job from in-memory sqlite")?;
+    assert_eq!(loaded.id, created.id);
+    assert_eq!(loaded.status, JobStatus::Queued);
+
+    Ok(())
+}

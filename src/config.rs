@@ -73,7 +73,23 @@ impl Config {
         Ok(Some(parent.to_path_buf()))
     }
 
+    pub fn global_data_dir() -> Option<PathBuf> {
+        default_global_data_dir()
+    }
+
+    pub fn ensure_global_data_dir() -> Result<Option<PathBuf>> {
+        let Some(path) = Self::global_data_dir() else {
+            return Ok(None);
+        };
+        fs::create_dir_all(&path)
+            .with_context(|| format!("failed to create global data dir: {}", path.display()))?;
+        Ok(Some(path))
+    }
+
     pub fn validate(&self) -> Result<()> {
+        if self.core.db_path.trim().is_empty() {
+            return Err(anyhow!("core.db_path must not be empty"));
+        }
         if self.core.max_concurrency == 0 {
             return Err(anyhow!("core.max_concurrency must be >= 1"));
         }
@@ -128,6 +144,18 @@ impl Config {
 
     pub fn state_dir(&self) -> PathBuf {
         PathBuf::from(&self.core.state_dir)
+    }
+
+    pub fn db_in_memory(&self) -> bool {
+        self.core.db_path.trim().eq_ignore_ascii_case(":memory:")
+    }
+
+    pub fn db_path(&self) -> Option<PathBuf> {
+        if self.db_in_memory() {
+            None
+        } else {
+            Some(PathBuf::from(&self.core.db_path))
+        }
     }
 
     pub fn find_paper(&self, paper_id: &str) -> Option<&PaperConfig> {
@@ -235,6 +263,31 @@ fn default_global_config_path() -> Option<PathBuf> {
     })
 }
 
+fn default_global_data_dir() -> Option<PathBuf> {
+    if let Some(xdg) = env::var_os("XDG_STATE_HOME") {
+        return Some(PathBuf::from(xdg).join("reviewloop"));
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+            return Some(PathBuf::from(local_app_data).join("reviewloop"));
+        }
+    }
+
+    env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("reviewloop")
+    })
+}
+
+fn default_db_path() -> String {
+    let base = default_global_data_dir().unwrap_or_else(|| PathBuf::from(".reviewloop"));
+    base.join("reviewloop.db").to_string_lossy().to_string()
+}
+
 fn push_unique(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
     if !paths.iter().any(|p| p == &candidate) {
         paths.push(candidate);
@@ -262,6 +315,7 @@ fn merge_toml_values(base: &mut toml::Value, overlay: toml::Value) {
 #[serde(default)]
 pub struct CoreConfig {
     pub state_dir: String,
+    pub db_path: String,
     pub max_concurrency: usize,
     pub max_submissions_per_tick: usize,
     pub review_timeout_hours: u64,
@@ -271,6 +325,7 @@ impl Default for CoreConfig {
     fn default() -> Self {
         Self {
             state_dir: ".reviewloop".to_string(),
+            db_path: default_db_path(),
             max_concurrency: 2,
             max_submissions_per_tick: 1,
             review_timeout_hours: 48,
@@ -457,6 +512,7 @@ mod tests {
         assert_eq!(cfg.polling.schedule_minutes, vec![10, 20, 40, 60]);
         assert_eq!(cfg.trigger.git.repo_dir, ".");
         assert_eq!(cfg.core.max_submissions_per_tick, 1);
+        assert!(!cfg.core.db_path.trim().is_empty());
         assert_eq!(cfg.trigger.pdf.max_scan_papers, 10);
         assert!(!cfg.trigger.git.auto_create_tags_on_pdf_change);
         assert!(!cfg.trigger.git.auto_delete_processed_tags);
@@ -499,6 +555,13 @@ mod tests {
     fn validate_rejects_zero_submissions_per_tick() {
         let mut cfg = Config::default();
         cfg.core.max_submissions_per_tick = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_db_path() {
+        let mut cfg = Config::default();
+        cfg.core.db_path = " ".to_string();
         assert!(cfg.validate().is_err());
     }
 

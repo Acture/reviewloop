@@ -88,6 +88,8 @@ Safe defaults:
 
 - `core.max_concurrency = 2`
 - `core.max_submissions_per_tick = 1`
+- `core.db_path = "<global-data-dir>/reviewloop.db"` (XDG_STATE_HOME / `~/.local/state/reviewloop`)
+- `core.db_path = ":memory:"` for ephemeral in-memory runs (testing/debug)
 - `core.review_timeout_hours = 48`
 - `polling.schedule_minutes = [10, 20, 40, 60]`
 - `polling.jitter_percent = 10`
@@ -201,5 +203,5 @@ When API submit fails and fallback is enabled:
 ## Current Scope
 
 - Supported backend: `stanford` (`paperreview.ai`)
-- Database: local SQLite at `<state_dir>/reviewloop.db`
+- Database: SQLite (default global path via `core.db_path`, supports `:memory:`)
 - Primary interface: CLI + daemon

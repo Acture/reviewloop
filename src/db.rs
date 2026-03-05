@@ -1,10 +1,11 @@
 use crate::{
+    config::Config,
     model::{Job, JobStatus, NewJob, StatusView},
     util::{parse_rfc3339, to_rfc3339},
 };
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -13,21 +14,70 @@ use std::{
 };
 use uuid::Uuid;
 
-#[derive(Debug, Clone)]
 pub struct Db {
     pub path: PathBuf,
+    dsn: String,
+    open_flags: OpenFlags,
+    keepalive: Option<Connection>,
+}
+
+impl std::fmt::Debug for Db {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Db")
+            .field("path", &self.path)
+            .field("dsn", &self.dsn)
+            .field("open_flags", &self.open_flags.bits())
+            .field("is_in_memory", &self.keepalive.is_some())
+            .finish()
+    }
 }
 
 impl Db {
     pub fn new(state_dir: &Path) -> Self {
+        Self::new_file(state_dir.join("reviewloop.db"))
+    }
+
+    pub fn new_file(path: PathBuf) -> Self {
         Self {
-            path: state_dir.join("reviewloop.db"),
+            dsn: path.to_string_lossy().to_string(),
+            path,
+            open_flags: OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            keepalive: None,
         }
     }
 
+    pub fn new_in_memory(name: &str) -> Result<Self> {
+        let uri = format!("file:{name}?mode=memory&cache=shared");
+        let open_flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_URI;
+        let keepalive = Connection::open_with_flags(&uri, open_flags)
+            .with_context(|| format!("failed to open sqlite in-memory database: {uri}"))?;
+        keepalive.busy_timeout(Duration::from_secs(5))?;
+
+        Ok(Self {
+            path: PathBuf::from(":memory:"),
+            dsn: uri,
+            open_flags,
+            keepalive: Some(keepalive),
+        })
+    }
+
+    pub fn from_config(config: &Config) -> Result<Self> {
+        if config.db_in_memory() {
+            let memory_name = format!("reviewloop-{}", Uuid::new_v4());
+            return Self::new_in_memory(&memory_name);
+        }
+
+        let path = config
+            .db_path()
+            .ok_or_else(|| anyhow!("core.db_path must be set when db is not in-memory"))?;
+        Ok(Self::new_file(path))
+    }
+
     fn connect(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.path)
-            .with_context(|| format!("failed to open sqlite database: {}", self.path.display()))?;
+        let conn = Connection::open_with_flags(&self.dsn, self.open_flags)
+            .with_context(|| format!("failed to open sqlite database: {}", self.dsn))?;
         conn.busy_timeout(Duration::from_secs(5))?;
         Ok(conn)
     }

@@ -82,6 +82,7 @@ async fn main() {
 async fn run() -> Result<()> {
     let Cli { config, command } = Cli::parse();
     Config::ensure_global_config_dir()?;
+    Config::ensure_global_data_dir()?;
 
     match command {
         Command::Init { force } => {
@@ -129,6 +130,7 @@ async fn run() -> Result<()> {
 
 fn cmd_init(config_path: &Path, force: bool) -> Result<()> {
     Config::ensure_global_config_dir()?;
+    Config::ensure_global_data_dir()?;
 
     if let Some(parent) = config_path.parent()
         && !parent.as_os_str().is_empty()
@@ -151,17 +153,19 @@ fn cmd_init(config_path: &Path, force: bool) -> Result<()> {
     Config::save_template(config_path)?;
 
     let cfg = Config::default();
-    fs::create_dir_all(cfg.state_dir())
-        .with_context(|| format!("failed to create state dir: {}", cfg.state_dir().display()))?;
-    fs::create_dir_all(cfg.state_dir().join("artifacts"))?;
-
-    let db = Db::new(&cfg.state_dir());
+    ensure_runtime_dirs(&cfg)?;
+    let db = Db::from_config(&cfg)?;
     db.init_schema()?;
 
+    let db_label = cfg
+        .db_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| ":memory:".to_string());
     println!(
-        "Initialized ReviewLoop.\n- config: {}\n- state dir: {}",
+        "Initialized ReviewLoop.\n- config: {}\n- state dir: {}\n- db: {}",
         config_path.display(),
-        cfg.state_dir().display()
+        cfg.state_dir().display(),
+        db_label
     );
     println!("\n{}", render_guardrail_notice(&cfg));
     Ok(())
@@ -181,6 +185,14 @@ fn load_runtime(config_override: Option<&Path>, force_stderr_logs: bool) -> Resu
     tracing::info!(layers = %layer_chain, "loaded configuration layers");
     print_guardrail_warnings(&config);
 
+    ensure_runtime_dirs(&config)?;
+    let db = Db::from_config(&config)?;
+    db.init_schema()?;
+
+    Ok((config, db))
+}
+
+fn ensure_runtime_dirs(config: &Config) -> Result<()> {
     fs::create_dir_all(config.state_dir()).with_context(|| {
         format!(
             "failed to create state dir: {}",
@@ -189,10 +201,16 @@ fn load_runtime(config_override: Option<&Path>, force_stderr_logs: bool) -> Resu
     })?;
     fs::create_dir_all(config.state_dir().join("artifacts"))?;
 
-    let db = Db::new(&config.state_dir());
-    db.init_schema()?;
+    if let Some(db_path) = config.db_path()
+        && let Some(parent) = db_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create db parent directory: {}", parent.display())
+        })?;
+    }
 
-    Ok((config, db))
+    Ok(())
 }
 
 fn render_guardrail_notice(config: &Config) -> String {
