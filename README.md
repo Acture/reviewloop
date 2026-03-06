@@ -1,9 +1,9 @@
 # ReviewLoop
 
-[![CI](https://github.com/Acture/review-loop/actions/workflows/ci.yml/badge.svg)](https://github.com/Acture/review-loop/actions/workflows/ci.yml)
-[![Release](https://github.com/Acture/review-loop/actions/workflows/release.yml/badge.svg)](https://github.com/Acture/review-loop/actions/workflows/release.yml)
+[![CI](https://github.com/Acture/reviewloop/actions/workflows/ci.yml/badge.svg)](https://github.com/Acture/reviewloop/actions/workflows/ci.yml)
+[![Release](https://github.com/Acture/reviewloop/actions/workflows/release.yml/badge.svg)](https://github.com/Acture/reviewloop/actions/workflows/release.yml)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/github/license/Acture/review-loop)](LICENSE)
+[![License](https://img.shields.io/github/license/Acture/reviewloop)](LICENSE)
 
 > A production-minded Rust CLI/daemon for `paperreview.ai` submission and review retrieval.
 
@@ -90,8 +90,8 @@ reviewloop self-update --method cargo --yes
 ### Build From Source
 
 ```bash
-git clone https://github.com/Acture/review-loop.git
-cd review-loop
+git clone https://github.com/Acture/reviewloop.git
+cd reviewloop
 cargo build --release
 ./target/release/reviewloop --help
 ```
