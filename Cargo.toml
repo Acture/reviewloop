@@ -2,6 +2,15 @@
 name = "reviewloop"
 version = "0.1.1"
 edition = "2024"
+rust-version = "1.85"
+description = "Reproducible, guardrailed automation for academic review workflows on paperreview.ai"
+readme = "README.md"
+license = "GPL-3.0-only"
+repository = "https://github.com/Acture/review-loop"
+homepage = "https://github.com/Acture/review-loop"
+documentation = "https://docs.rs/reviewloop"
+keywords = ["academic", "review", "research", "cli", "automation"]
+categories = ["command-line-utilities", "science"]
 
 [dependencies]
 anyhow = "1.0"
