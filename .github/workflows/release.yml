@@ -188,38 +188,26 @@ jobs:
 
           echo "Using tap repository: ${HOMEBREW_TAP_REPO}"
 
-      - name: Resolve crate download URL and checksum
-        id: crate
+      - name: Resolve source archive URL and checksum
+        id: source
         env:
-          CRATE_NAME: ${{ needs.verify.outputs.crate_name }}
-          VERSION: ${{ needs.verify.outputs.version }}
+          TAG_NAME: ${{ needs.verify.outputs.tag_name }}
         shell: bash
         run: |
           set -euo pipefail
 
-          checksum=""
-          for attempt in {1..20}; do
-            response=$(curl -fsSL \
-              -A "reviewloop-release-workflow" \
-              -H "Accept: application/json" \
-              "https://crates.io/api/v1/crates/${CRATE_NAME}/${VERSION}" || true)
-            checksum=$(echo "$response" | jq -r '.version.checksum // empty')
-            if [[ -n "$checksum" ]]; then
-              break
-            fi
-            echo "Waiting for crates.io metadata propagation (${attempt}/20)..."
-            sleep 15
-          done
+          source_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG_NAME}.tar.gz"
+          archive_path="$(mktemp)"
 
-          if [[ -z "$checksum" ]]; then
-            echo "Could not resolve checksum for ${CRATE_NAME} ${VERSION} from crates.io" >&2
-            exit 1
-          fi
+          curl -fsSL \
+            -A "reviewloop-release-workflow" \
+            "${source_url}" \
+            -o "${archive_path}"
 
-          download_url="https://crates.io/api/v1/crates/${CRATE_NAME}/${VERSION}/download"
+          checksum="$(sha256sum "${archive_path}" | awk '{print $1}')"
 
-          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
-          echo "download_url=$download_url" >> "$GITHUB_OUTPUT"
+          echo "source_url=${source_url}" >> "$GITHUB_OUTPUT"
+          echo "checksum=${checksum}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout source repository
         uses: actions/checkout@v4
@@ -231,12 +219,12 @@ jobs:
           token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
           path: tap
 
-      - name: Update formula version, url and sha256
+      - name: Render formula
         env:
           CRATE_NAME: ${{ needs.verify.outputs.crate_name }}
           VERSION: ${{ needs.verify.outputs.version }}
-          DOWNLOAD_URL: ${{ steps.crate.outputs.download_url }}
-          CHECKSUM: ${{ steps.crate.outputs.checksum }}
+          TAG_NAME: ${{ needs.verify.outputs.tag_name }}
+          SOURCE_SHA256: ${{ steps.source.outputs.checksum }}
           HOMEBREW_FORMULA_PATH: ${{ vars.HOMEBREW_FORMULA_PATH }}
         shell: bash
         run: |
@@ -244,59 +232,12 @@ jobs:
 
           formula_rel_path="${HOMEBREW_FORMULA_PATH:-Formula/${CRATE_NAME}.rb}"
           formula_file="tap/${formula_rel_path}"
-          formula_class=$(echo "${CRATE_NAME}" | awk -F '[-_]' '{for (i=1; i<=NF; i++) printf toupper(substr($i,1,1)) substr($i,2)}')
-          description=$(sed -nE 's/^description\s*=\s*"([^"]+)".*/\1/p' Cargo.toml | head -n1)
-          homepage=$(sed -nE 's/^homepage\s*=\s*"([^"]+)".*/\1/p' Cargo.toml | head -n1)
-          license=$(sed -nE 's/^license\s*=\s*"([^"]+)".*/\1/p' Cargo.toml | head -n1)
 
-          mkdir -p "$(dirname "$formula_file")"
+          bash tools/render_homebrew_formula.sh "$formula_file"
 
-          if [[ ! -f "$formula_file" ]]; then
-            {
-              printf 'class %s < Formula\n' "${formula_class}"
-              printf '  desc "%s"\n' "${description}"
-              printf '  homepage "%s"\n' "${homepage}"
-              printf '  url "%s"\n' "${DOWNLOAD_URL}"
-              printf '  sha256 "%s"\n' "${CHECKSUM}"
-              printf '  license "%s"\n' "${license}"
-              printf '  version "%s"\n' "${VERSION}"
-              printf '\n'
-              printf '  depends_on "rust" => :build\n'
-              printf '\n'
-              printf '  def install\n'
-              printf '    system "cargo", "install", *std_cargo_args\n'
-              printf '  end\n'
-              printf '\n'
-              printf '  test do\n'
-              printf '    assert_match "%s", shell_output("#{bin}/%s --version")\n' "${VERSION}" "${CRATE_NAME}"
-              printf '  end\n'
-              printf 'end\n'
-            } > "$formula_file"
-          fi
-
-          perl -0pi -e '
-            s{^\s*url\s+"[^"]+"\s*$}{  url "'"$DOWNLOAD_URL"'"}m;
-            s{^\s*sha256\s+"[^"]+"\s*$}{  sha256 "'"$CHECKSUM"'"}m;
-            s{^\s*version\s+"[^"]+"\s*$}{  version "'"$VERSION"'"}m;
-          ' "$formula_file"
-
-          if ! grep -qE '^\s*version\s+"' "$formula_file"; then
-            awk -v version="$VERSION" '
-              BEGIN { inserted = 0 }
-              {
-                print $0
-                if (!inserted && $0 ~ /^[[:space:]]*url[[:space:]]+"/) {
-                  print "  version \"" version "\""
-                  inserted = 1
-                }
-              }
-            ' "$formula_file" > "${formula_file}.tmp"
-            mv "${formula_file}.tmp" "$formula_file"
-          fi
-
-          grep -q "url \"${DOWNLOAD_URL}\"" "$formula_file"
-          grep -q "sha256 \"${CHECKSUM}\"" "$formula_file"
-          grep -q "version \"${VERSION}\"" "$formula_file"
+          grep -Fq "url \"https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG_NAME}.tar.gz\"" "$formula_file"
+          grep -Fq "sha256 \"${SOURCE_SHA256}\"" "$formula_file"
+          grep -Fq 'system "cargo", "install", "--locked", *std_cargo_args(path: ".")' "$formula_file"
 
       - name: Commit and push tap update
         env:
