@@ -19,6 +19,10 @@ jobs:
   verify:
     name: Verify Release Inputs
     runs-on: ubuntu-latest
+    environment: release
+    env:
+      REVIEWLOOP_GMAIL_CLIENT_ID: ${{ secrets.REVIEWLOOP_GMAIL_CLIENT_ID }}
+      REVIEWLOOP_GMAIL_CLIENT_SECRET: ${{ secrets.REVIEWLOOP_GMAIL_CLIENT_SECRET }}
     outputs:
       crate_name: ${{ steps.meta.outputs.crate_name }}
       version: ${{ steps.meta.outputs.version }}
@@ -69,6 +73,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: verify
     environment: release
+    env:
+      REVIEWLOOP_GMAIL_CLIENT_ID: ${{ secrets.REVIEWLOOP_GMAIL_CLIENT_ID }}
+      REVIEWLOOP_GMAIL_CLIENT_SECRET: ${{ secrets.REVIEWLOOP_GMAIL_CLIENT_SECRET }}
     permissions:
       contents: read
 
