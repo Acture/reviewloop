@@ -252,26 +252,26 @@ jobs:
           mkdir -p "$(dirname "$formula_file")"
 
           if [[ ! -f "$formula_file" ]]; then
-            cat > "$formula_file" <<EOF
-            class ${formula_class} < Formula
-              desc "${description}"
-              homepage "${homepage}"
-              url "${DOWNLOAD_URL}"
-              sha256 "${CHECKSUM}"
-              license "${license}"
-              version "${VERSION}"
-
-              depends_on "rust" => :build
-
-              def install
-                system "cargo", "install", *std_cargo_args
-              end
-
-              test do
-                assert_match "${VERSION}", shell_output("#{bin}/${CRATE_NAME} --version")
-              end
-            end
-            EOF
+            {
+              printf 'class %s < Formula\n' "${formula_class}"
+              printf '  desc "%s"\n' "${description}"
+              printf '  homepage "%s"\n' "${homepage}"
+              printf '  url "%s"\n' "${DOWNLOAD_URL}"
+              printf '  sha256 "%s"\n' "${CHECKSUM}"
+              printf '  license "%s"\n' "${license}"
+              printf '  version "%s"\n' "${VERSION}"
+              printf '\n'
+              printf '  depends_on "rust" => :build\n'
+              printf '\n'
+              printf '  def install\n'
+              printf '    system "cargo", "install", *std_cargo_args\n'
+              printf '  end\n'
+              printf '\n'
+              printf '  test do\n'
+              printf '    assert_match "%s", shell_output("#{bin}/%s --version")\n' "${VERSION}" "${CRATE_NAME}"
+              printf '  end\n'
+              printf 'end\n'
+            } > "$formula_file"
           fi
 
           perl -0pi -e '
