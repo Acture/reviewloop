@@ -221,6 +221,9 @@ jobs:
           echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
           echo "download_url=$download_url" >> "$GITHUB_OUTPUT"
 
+      - name: Checkout source repository
+        uses: actions/checkout@v4
+
       - name: Checkout tap repository
         uses: actions/checkout@v4
         with:
