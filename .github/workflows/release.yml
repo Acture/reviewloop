@@ -322,8 +322,8 @@ jobs:
 
           git commit -m "reviewloop ${VERSION}"
 
-          default_branch=$(git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@')
-          git push origin "HEAD:${default_branch}"
+          current_branch=$(git branch --show-current)
+          git push origin "HEAD:${current_branch}"
 
   github-release:
     name: Create GitHub Release
