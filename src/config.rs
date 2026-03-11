@@ -6,15 +6,22 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const GLOBAL_CONFIG_FILE: &str = "config.toml";
+const LEGACY_GLOBAL_CONFIG_FILE: &str = "reviewloop.toml";
+const PROJECT_CONFIG_FILE: &str = "reviewloop.toml";
+
 #[derive(Debug, Clone)]
 pub struct LoadedConfig {
     pub config: Config,
-    pub layers: Vec<PathBuf>,
+    pub global_path: Option<PathBuf>,
+    pub project_path: Option<PathBuf>,
+    pub legacy_global_path: Option<PathBuf>,
+    pub compat_notice: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone)]
 pub struct Config {
+    pub project_id: String,
     pub core: CoreConfig,
     pub logging: LoggingConfig,
     pub polling: PollingConfig,
@@ -26,43 +33,98 @@ pub struct Config {
     pub paper_tag_triggers: BTreeMap<String, String>,
     pub imap: Option<ImapConfig>,
     pub gmail_oauth: Option<GmailOauthConfig>,
+    pub project_root: Option<PathBuf>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            core: CoreConfig::default(),
-            logging: LoggingConfig::default(),
-            polling: PollingConfig::default(),
-            retention: RetentionConfig::default(),
-            trigger: TriggerConfig::default(),
-            providers: ProvidersConfig::default(),
-            papers: Vec::new(),
-            paper_watch: BTreeMap::new(),
-            paper_tag_triggers: BTreeMap::new(),
-            imap: Some(ImapConfig::default()),
-            gmail_oauth: Some(GmailOauthConfig::default()),
-        }
+        let global = GlobalConfigFile::default();
+        let project = ProjectConfigFile::default();
+        Self::from_parts(global, project, None)
     }
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Self> {
-        Self::load_from_paths(&[path.to_path_buf()])
+    pub fn load_runtime(
+        explicit_project_path: Option<&Path>,
+        require_project: bool,
+    ) -> Result<Self> {
+        Ok(Self::load_runtime_with_metadata(explicit_project_path, require_project)?.config)
     }
 
-    pub fn load_layered(explicit_path: Option<&Path>) -> Result<Self> {
-        Ok(Self::load_layered_with_metadata(explicit_path)?.config)
-    }
+    pub fn load_runtime_with_metadata(
+        explicit_project_path: Option<&Path>,
+        require_project: bool,
+    ) -> Result<LoadedConfig> {
+        let global_path = Self::ensure_global_config_file()?;
+        let legacy_global_path = Self::legacy_global_config_path().filter(|path| path.exists());
+        let discovered_project_path = discover_project_config_path(explicit_project_path)?;
 
-    pub fn load_layered_with_metadata(explicit_path: Option<&Path>) -> Result<LoadedConfig> {
-        let layers = resolve_layered_paths(explicit_path)?;
-        let config = Self::load_from_paths(&layers)?;
-        Ok(LoadedConfig { config, layers })
+        let global = if let Some(path) = global_path.as_deref() {
+            GlobalConfigFile::load(path)?
+        } else {
+            GlobalConfigFile::default()
+        };
+        global.validate()?;
+
+        let project = if let Some(path) = discovered_project_path.as_deref() {
+            if legacy_global_path.is_some() {
+                return Err(anyhow!(
+                    "legacy global config {} still carries project-owned fields while project config {} exists. run `reviewloop config migrate-project --project-id <id>` and remove the legacy file",
+                    legacy_global_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    path.display()
+                ));
+            }
+            let project = ProjectConfigFile::load(path)?;
+            project.validate(true)?;
+            project
+        } else if let Some(path) = legacy_global_path.as_deref() {
+            let legacy = LegacyConfig::load(path)?;
+            let project = legacy.project_config();
+            project.validate(require_project)?;
+            let compat_notice = Some(format!(
+                "using legacy project settings from {}. migrate them into {PROJECT_CONFIG_FILE} with `reviewloop config migrate-project --project-id <id>`",
+                path.display()
+            ));
+            let config = Self::from_parts(global, project, None);
+            config.validate_runtime(require_project)?;
+            return Ok(LoadedConfig {
+                config,
+                global_path,
+                project_path: None,
+                legacy_global_path,
+                compat_notice,
+            });
+        } else {
+            let project = ProjectConfigFile::default();
+            project.validate(require_project)?;
+            project
+        };
+
+        let project_root = discovered_project_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        let config = Self::from_parts(global, project, project_root);
+        config.validate_runtime(require_project)?;
+        Ok(LoadedConfig {
+            config,
+            global_path,
+            project_path: discovered_project_path,
+            legacy_global_path,
+            compat_notice: None,
+        })
     }
 
     pub fn global_config_path() -> Option<PathBuf> {
-        default_global_config_path()
+        default_global_config_path().map(|dir| dir.join(GLOBAL_CONFIG_FILE))
+    }
+
+    pub fn legacy_global_config_path() -> Option<PathBuf> {
+        default_global_config_path().map(|dir| dir.join(LEGACY_GLOBAL_CONFIG_FILE))
     }
 
     pub fn ensure_global_config_dir() -> Result<Option<PathBuf>> {
@@ -82,11 +144,18 @@ impl Config {
             return Ok(None);
         };
         Self::ensure_global_config_dir()?;
-        if !path.exists() {
-            Self::save_template(&path)?;
-        } else {
-            let _ = migrate_legacy_global_paths(&path);
+        if path.exists() {
+            return Ok(Some(path));
         }
+
+        if let Some(legacy_path) = Self::legacy_global_config_path().filter(|p| p.exists()) {
+            let legacy = LegacyConfig::load(&legacy_path)?;
+            let global = legacy.global_config();
+            global.save(&path)?;
+            return Ok(Some(path));
+        }
+
+        GlobalConfigFile::default().save(&path)?;
         Ok(Some(path))
     }
 
@@ -103,74 +172,16 @@ impl Config {
         Ok(Some(path))
     }
 
-    pub fn validate(&self) -> Result<()> {
-        if self.core.db_path.trim().is_empty() {
-            return Err(anyhow!("core.db_path must not be empty"));
-        }
-        if self.core.max_concurrency == 0 {
-            return Err(anyhow!("core.max_concurrency must be >= 1"));
-        }
-        if self.core.max_submissions_per_tick == 0 {
-            return Err(anyhow!("core.max_submissions_per_tick must be >= 1"));
-        }
-        if !matches!(self.logging.output.as_str(), "stdout" | "stderr" | "file") {
-            return Err(anyhow!(
-                "logging.output must be one of: stdout | stderr | file"
-            ));
-        }
-        if self.logging.output == "file"
-            && self
-                .logging
-                .file_path
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("")
-                .is_empty()
-        {
-            return Err(anyhow!(
-                "logging.file_path is required when logging.output = \"file\""
-            ));
-        }
-        if self.polling.schedule_minutes.is_empty() {
-            return Err(anyhow!("polling.schedule_minutes cannot be empty"));
-        }
-        if self.retention.prune_every_ticks == 0 {
-            return Err(anyhow!("retention.prune_every_ticks must be >= 1"));
-        }
-        if self.trigger.pdf.max_scan_papers == 0 {
-            return Err(anyhow!("trigger.pdf.max_scan_papers must be >= 1"));
-        }
-        if let Some(imap) = &self.imap
-            && imap.max_messages_per_poll == 0
-        {
-            return Err(anyhow!("imap.max_messages_per_poll must be >= 1"));
-        }
-        if let Some(gmail) = &self.gmail_oauth
-            && gmail.max_messages_per_poll == 0
-        {
-            return Err(anyhow!("gmail_oauth.max_messages_per_poll must be >= 1"));
-        }
-        Ok(())
+    pub fn save_project(&self, path: &Path) -> Result<()> {
+        self.project_file().save(path)
     }
 
-    pub fn save_template(path: &Path) -> Result<()> {
-        Config::default().save(path)
+    pub fn load_project(path: &Path) -> Result<ProjectConfigFile> {
+        ProjectConfigFile::load(path)
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create config parent directory: {}",
-                    parent.display()
-                )
-            })?;
-        }
-        let content = toml::to_string_pretty(self)?;
-        fs::write(path, content)
-            .with_context(|| format!("failed to write config file: {}", path.display()))
+    pub fn load_legacy_global(path: &Path) -> Result<LegacyConfig> {
+        LegacyConfig::load(path)
     }
 
     pub fn state_dir(&self) -> PathBuf {
@@ -211,21 +222,14 @@ impl Config {
 
     pub fn set_paper_tag_trigger(&mut self, paper_id: &str, trigger: Option<String>) {
         match trigger {
-            Some(value) => {
-                self.paper_tag_triggers.insert(paper_id.to_string(), value);
+            Some(trigger) => {
+                self.paper_tag_triggers
+                    .insert(paper_id.to_string(), trigger);
             }
             None => {
                 self.paper_tag_triggers.remove(paper_id);
             }
         }
-    }
-
-    pub fn remove_paper(&mut self, paper_id: &str) -> bool {
-        let before = self.papers.len();
-        self.papers.retain(|p| p.id != paper_id);
-        self.paper_watch.remove(paper_id);
-        self.paper_tag_triggers.remove(paper_id);
-        self.papers.len() != before
     }
 
     pub fn effective_stanford_venue(&self) -> String {
@@ -239,95 +243,374 @@ impl Config {
             .to_string()
     }
 
-    fn load_from_paths(paths: &[PathBuf]) -> Result<Self> {
-        if paths.is_empty() {
-            return Err(anyhow!("no config paths provided"));
+    pub fn project_file(&self) -> ProjectConfigFile {
+        ProjectConfigFile {
+            project_id: self.project_id.clone(),
+            trigger: self.trigger.clone(),
+            providers: ProjectProvidersConfig {
+                stanford: ProjectStanfordProviderConfig {
+                    venue: self.providers.stanford.venue.clone(),
+                },
+            },
+            papers: self.papers.clone(),
+            paper_watch: self.paper_watch.clone(),
+            paper_tag_triggers: self.paper_tag_triggers.clone(),
         }
+    }
 
-        let mut merged = toml::Value::Table(toml::map::Map::new());
-        for path in paths {
-            let raw = fs::read_to_string(path)
-                .with_context(|| format!("failed to read config: {}", path.display()))?;
-            let parsed: toml::Value = toml::from_str(&raw)
-                .with_context(|| format!("failed to parse TOML config: {}", path.display()))?;
-            if !parsed.is_table() {
-                return Err(anyhow!(
-                    "config root must be a TOML table: {}",
-                    path.display()
-                ));
+    fn from_parts(
+        global: GlobalConfigFile,
+        mut project: ProjectConfigFile,
+        project_root: Option<PathBuf>,
+    ) -> Self {
+        if let Some(root) = project_root.as_deref() {
+            for paper in &mut project.papers {
+                paper.pdf_path = resolve_project_relative_path(root, &paper.pdf_path)
+                    .to_string_lossy()
+                    .to_string();
             }
-            merge_toml_values(&mut merged, parsed);
+            project.trigger.git.repo_dir =
+                resolve_project_relative_path(root, &project.trigger.git.repo_dir)
+                    .to_string_lossy()
+                    .to_string();
         }
 
-        let cfg: Config = merged
-            .try_into()
-            .context("failed to deserialize merged config")?;
-        cfg.validate()?;
-        Ok(cfg)
+        Self {
+            project_id: project.project_id,
+            core: global.core,
+            logging: global.logging,
+            polling: global.polling,
+            retention: global.retention,
+            trigger: project.trigger,
+            providers: ProvidersConfig {
+                stanford: StanfordProviderConfig {
+                    base_url: global.providers.stanford.base_url,
+                    fallback_mode: global.providers.stanford.fallback_mode,
+                    fallback_script: global.providers.stanford.fallback_script,
+                    email: global.providers.stanford.email,
+                    venue: project.providers.stanford.venue,
+                },
+            },
+            papers: project.papers,
+            paper_watch: project.paper_watch,
+            paper_tag_triggers: project.paper_tag_triggers,
+            imap: global.imap,
+            gmail_oauth: global.gmail_oauth,
+            project_root,
+        }
+    }
+
+    fn validate_runtime(&self, require_project: bool) -> Result<()> {
+        if self.core.db_path.trim().is_empty() {
+            return Err(anyhow!("core.db_path must not be empty"));
+        }
+        if self.core.max_concurrency == 0 {
+            return Err(anyhow!("core.max_concurrency must be >= 1"));
+        }
+        if self.core.max_submissions_per_tick == 0 {
+            return Err(anyhow!("core.max_submissions_per_tick must be >= 1"));
+        }
+        if self.polling.schedule_minutes.is_empty() {
+            return Err(anyhow!("polling.schedule_minutes cannot be empty"));
+        }
+        if self.retention.prune_every_ticks == 0 {
+            return Err(anyhow!("retention.prune_every_ticks must be >= 1"));
+        }
+        if self.trigger.pdf.max_scan_papers == 0 {
+            return Err(anyhow!("trigger.pdf.max_scan_papers must be >= 1"));
+        }
+        if let Some(imap) = &self.imap
+            && imap.max_messages_per_poll == 0
+        {
+            return Err(anyhow!("imap.max_messages_per_poll must be >= 1"));
+        }
+        if let Some(gmail) = &self.gmail_oauth
+            && gmail.max_messages_per_poll == 0
+        {
+            return Err(anyhow!("gmail_oauth.max_messages_per_poll must be >= 1"));
+        }
+        if require_project && self.project_id.trim().is_empty() {
+            return Err(anyhow!(
+                "project config is required here. create {} with project_id or run `reviewloop config migrate-project --project-id <id>`",
+                PROJECT_CONFIG_FILE
+            ));
+        }
+        Ok(())
     }
 }
 
-fn resolve_layered_paths(explicit_path: Option<&Path>) -> Result<Vec<PathBuf>> {
-    let mut layers = Vec::new();
-    let mut looked = Vec::new();
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GlobalConfigFile {
+    pub core: CoreConfig,
+    pub logging: LoggingConfig,
+    pub polling: PollingConfig,
+    pub retention: RetentionConfig,
+    pub providers: GlobalProvidersConfig,
+    pub imap: Option<ImapConfig>,
+    pub gmail_oauth: Option<GmailOauthConfig>,
+}
 
-    if let Some(global) = Config::global_config_path() {
-        push_unique(&mut looked, global.clone());
-        if global.exists() {
-            push_unique(&mut layers, global);
+impl Default for GlobalConfigFile {
+    fn default() -> Self {
+        Self {
+            core: CoreConfig::default(),
+            logging: LoggingConfig::default(),
+            polling: PollingConfig::default(),
+            retention: RetentionConfig::default(),
+            providers: GlobalProvidersConfig::default(),
+            imap: Some(ImapConfig::default()),
+            gmail_oauth: Some(GmailOauthConfig::default()),
+        }
+    }
+}
+
+impl GlobalConfigFile {
+    pub fn load(path: &Path) -> Result<Self> {
+        load_toml_file(path)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        save_toml_file(path, self)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(self.logging.output.as_str(), "stdout" | "stderr" | "file") {
+            return Err(anyhow!(
+                "logging.output must be one of: stdout | stderr | file"
+            ));
+        }
+        if self.logging.output == "file"
+            && self
+                .logging
+                .file_path
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            return Err(anyhow!(
+                "logging.file_path is required when logging.output = \"file\""
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectConfigFile {
+    pub project_id: String,
+    pub trigger: TriggerConfig,
+    pub providers: ProjectProvidersConfig,
+    pub papers: Vec<PaperConfig>,
+    pub paper_watch: BTreeMap<String, bool>,
+    pub paper_tag_triggers: BTreeMap<String, String>,
+}
+
+impl Default for ProjectConfigFile {
+    fn default() -> Self {
+        Self {
+            project_id: String::new(),
+            trigger: TriggerConfig::default(),
+            providers: ProjectProvidersConfig::default(),
+            papers: Vec::new(),
+            paper_watch: BTreeMap::new(),
+            paper_tag_triggers: BTreeMap::new(),
+        }
+    }
+}
+
+impl ProjectConfigFile {
+    pub fn load(path: &Path) -> Result<Self> {
+        load_toml_file(path)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        save_toml_file(path, self)
+    }
+
+    pub fn validate(&self, require_project: bool) -> Result<()> {
+        if require_project && self.project_id.trim().is_empty() {
+            return Err(anyhow!("project_id must not be empty"));
+        }
+        if self.trigger.pdf.max_scan_papers == 0 {
+            return Err(anyhow!("trigger.pdf.max_scan_papers must be >= 1"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LegacyConfig {
+    pub core: CoreConfig,
+    pub logging: LoggingConfig,
+    pub polling: PollingConfig,
+    pub retention: RetentionConfig,
+    pub trigger: TriggerConfig,
+    pub providers: ProvidersConfig,
+    pub papers: Vec<PaperConfig>,
+    pub paper_watch: BTreeMap<String, bool>,
+    pub paper_tag_triggers: BTreeMap<String, String>,
+    pub imap: Option<ImapConfig>,
+    pub gmail_oauth: Option<GmailOauthConfig>,
+}
+
+impl Default for LegacyConfig {
+    fn default() -> Self {
+        Self {
+            core: CoreConfig::default(),
+            logging: LoggingConfig::default(),
+            polling: PollingConfig::default(),
+            retention: RetentionConfig::default(),
+            trigger: TriggerConfig::default(),
+            providers: ProvidersConfig::default(),
+            papers: Vec::new(),
+            paper_watch: BTreeMap::new(),
+            paper_tag_triggers: BTreeMap::new(),
+            imap: Some(ImapConfig::default()),
+            gmail_oauth: Some(GmailOauthConfig::default()),
+        }
+    }
+}
+
+impl LegacyConfig {
+    pub fn load(path: &Path) -> Result<Self> {
+        load_toml_file(path)
+    }
+
+    pub fn global_config(&self) -> GlobalConfigFile {
+        GlobalConfigFile {
+            core: self.core.clone(),
+            logging: self.logging.clone(),
+            polling: self.polling.clone(),
+            retention: self.retention.clone(),
+            providers: GlobalProvidersConfig {
+                stanford: GlobalStanfordProviderConfig {
+                    base_url: self.providers.stanford.base_url.clone(),
+                    fallback_mode: self.providers.stanford.fallback_mode.clone(),
+                    fallback_script: self.providers.stanford.fallback_script.clone(),
+                    email: self.providers.stanford.email.clone(),
+                },
+            },
+            imap: self.imap.clone(),
+            gmail_oauth: self.gmail_oauth.clone(),
         }
     }
 
+    pub fn project_config(&self) -> ProjectConfigFile {
+        ProjectConfigFile {
+            project_id: String::new(),
+            trigger: self.trigger.clone(),
+            providers: ProjectProvidersConfig {
+                stanford: ProjectStanfordProviderConfig {
+                    venue: self.providers.stanford.venue.clone(),
+                },
+            },
+            papers: self.papers.clone(),
+            paper_watch: self.paper_watch.clone(),
+            paper_tag_triggers: self.paper_tag_triggers.clone(),
+        }
+    }
+}
+
+fn load_toml_file<T>(path: &Path) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read config: {}", path.display()))?;
+    toml::from_str(&raw).with_context(|| format!("failed to parse TOML config: {}", path.display()))
+}
+
+fn save_toml_file<T>(path: &Path, value: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create config parent directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+    let content = toml::to_string_pretty(value)?;
+    fs::write(path, content)
+        .with_context(|| format!("failed to write config file: {}", path.display()))
+}
+
+fn discover_project_config_path(explicit_path: Option<&Path>) -> Result<Option<PathBuf>> {
     if let Some(path) = explicit_path {
-        let explicit = path.to_path_buf();
-        push_unique(&mut looked, explicit.clone());
-        if !explicit.exists() {
-            return Err(anyhow!("config file not found: {}", explicit.display()));
+        if !path.exists() {
+            return Err(anyhow!("project config file not found: {}", path.display()));
         }
-        push_unique(&mut layers, explicit);
+        return Ok(Some(path.to_path_buf()));
     }
 
-    if layers.is_empty() {
-        let looked_text = looked
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(anyhow!(
-            "no config file found (looked for: {}). pass --config <path>",
-            looked_text
-        ));
+    let cwd = env::current_dir().context("failed to resolve current working directory")?;
+    let git_root = find_git_root(&cwd);
+    let mut current = cwd.as_path();
+
+    loop {
+        let candidate = current.join(PROJECT_CONFIG_FILE);
+        if candidate.exists() {
+            return Ok(Some(candidate));
+        }
+        if git_root.as_deref() == Some(current) {
+            break;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent;
     }
 
-    Ok(layers)
+    Ok(None)
+}
+
+pub fn default_project_config_path() -> Result<PathBuf> {
+    let cwd = env::current_dir().context("failed to resolve current working directory")?;
+    Ok(find_git_root(&cwd).unwrap_or(cwd).join(PROJECT_CONFIG_FILE))
+}
+
+pub fn find_git_root(start: &Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+    loop {
+        if current.join(".git").exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn resolve_project_relative_path(project_root: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        project_root.join(path)
+    }
 }
 
 fn default_global_config_path() -> Option<PathBuf> {
     if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
-        return Some(
-            PathBuf::from(xdg)
-                .join("reviewloop")
-                .join("reviewloop.toml"),
-        );
+        return Some(PathBuf::from(xdg).join("reviewloop"));
     }
 
     #[cfg(windows)]
     {
         if let Some(appdata) = env::var_os("APPDATA") {
-            return Some(
-                PathBuf::from(appdata)
-                    .join("reviewloop")
-                    .join("reviewloop.toml"),
-            );
+            return Some(PathBuf::from(appdata).join("reviewloop"));
         }
     }
 
-    env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("reviewloop")
-            .join("reviewloop.toml")
-    })
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("reviewloop"))
 }
 
 fn default_global_data_dir() -> Option<PathBuf> {
@@ -364,140 +647,8 @@ fn default_log_path() -> String {
         .to_string()
 }
 
-fn migrate_legacy_global_paths(config_path: &Path) -> Result<()> {
-    let mut cfg = match Config::load(config_path) {
-        Ok(cfg) => cfg,
-        Err(_) => return Ok(()),
-    };
-    let Some(global_state_dir) = default_global_data_dir() else {
-        return Ok(());
-    };
-
-    let mut changed = false;
-    let mut old_state_dir: Option<PathBuf> = None;
-
-    let state_trimmed = cfg.core.state_dir.trim().to_string();
-    if is_legacy_relative_state_dir(&state_trimmed) {
-        old_state_dir = Some(PathBuf::from(state_trimmed));
-        cfg.core.state_dir = global_state_dir.to_string_lossy().to_string();
-        changed = true;
-    }
-
-    if let Some(file_path) = cfg.logging.file_path.as_deref()
-        && is_legacy_relative_path(file_path)
-    {
-        cfg.logging.file_path = Some(
-            global_state_dir
-                .join("reviewloop.log")
-                .to_string_lossy()
-                .to_string(),
-        );
-        changed = true;
-    }
-
-    if let Some(gmail) = cfg.gmail_oauth.as_mut()
-        && let Some(token_path) = gmail.token_store_path.as_deref()
-        && is_legacy_relative_path(token_path)
-    {
-        gmail.token_store_path = Some(
-            global_state_dir
-                .join("oauth")
-                .join("google_token.json")
-                .to_string_lossy()
-                .to_string(),
-        );
-        changed = true;
-    }
-
-    if changed {
-        cfg.save(config_path)?;
-    }
-
-    if let Some(old_state_dir) = old_state_dir {
-        migrate_state_dir_data(&old_state_dir, &global_state_dir)?;
-    }
-
-    Ok(())
-}
-
-fn is_legacy_relative_state_dir(path: &str) -> bool {
-    let p = path.trim();
-    p == ".reviewloop" || p == ".review_loop"
-}
-
-fn is_legacy_relative_path(path: &str) -> bool {
-    let p = path.trim();
-    p.starts_with(".reviewloop/") || p.starts_with(".review_loop/")
-}
-
-fn migrate_state_dir_data(old_state_dir: &Path, new_state_dir: &Path) -> Result<()> {
-    let old_abs = if old_state_dir.is_absolute() {
-        old_state_dir.to_path_buf()
-    } else {
-        env::current_dir()?.join(old_state_dir)
-    };
-    let new_abs = if new_state_dir.is_absolute() {
-        new_state_dir.to_path_buf()
-    } else {
-        env::current_dir()?.join(new_state_dir)
-    };
-
-    if old_abs == new_abs || !old_abs.exists() {
-        return Ok(());
-    }
-
-    fs::create_dir_all(&new_abs)?;
-    copy_dir_recursive(&old_abs, &new_abs)?;
-    Ok(())
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else if file_type.is_file() && !dst_path.exists() {
-            fs::copy(&src_path, &dst_path).with_context(|| {
-                format!(
-                    "failed to copy state file {} -> {}",
-                    src_path.display(),
-                    dst_path.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn push_unique(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
-    if !paths.iter().any(|p| p == &candidate) {
-        paths.push(candidate);
-    }
-}
-
-fn merge_toml_values(base: &mut toml::Value, overlay: toml::Value) {
-    match (base, overlay) {
-        (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
-            for (key, value) in overlay_table {
-                if let Some(base_value) = base_table.get_mut(&key) {
-                    merge_toml_values(base_value, value);
-                } else {
-                    base_table.insert(key, value);
-                }
-            }
-        }
-        (base_slot, overlay_value) => {
-            *base_slot = overlay_value;
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CoreConfig {
     pub state_dir: String,
     pub db_path: String,
@@ -519,7 +670,7 @@ impl Default for CoreConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
     pub level: String,
     pub output: String,
@@ -537,7 +688,7 @@ impl Default for LoggingConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PollingConfig {
     pub schedule_minutes: Vec<u64>,
     pub jitter_percent: u8,
@@ -553,7 +704,7 @@ impl Default for PollingConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RetentionConfig {
     pub enabled: bool,
     pub prune_every_ticks: u64,
@@ -577,14 +728,14 @@ impl Default for RetentionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TriggerConfig {
     pub git: GitTriggerConfig,
     pub pdf: PdfTriggerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GitTriggerConfig {
     pub enabled: bool,
     pub tag_pattern: String,
@@ -606,7 +757,7 @@ impl Default for GitTriggerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PdfTriggerConfig {
     pub enabled: bool,
     pub auto_submit_on_change: bool,
@@ -645,13 +796,61 @@ impl Default for StanfordProviderConfig {
             base_url: "https://paperreview.ai".to_string(),
             fallback_mode: "node_playwright".to_string(),
             fallback_script: "tools/paperreview_fallback.mjs".to_string(),
-            email: "".to_string(),
+            email: String::new(),
+            venue: Some("ICLR".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct GlobalProvidersConfig {
+    pub stanford: GlobalStanfordProviderConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GlobalStanfordProviderConfig {
+    pub base_url: String,
+    pub fallback_mode: String,
+    pub fallback_script: String,
+    pub email: String,
+}
+
+impl Default for GlobalStanfordProviderConfig {
+    fn default() -> Self {
+        let base = StanfordProviderConfig::default();
+        Self {
+            base_url: base.base_url,
+            fallback_mode: base.fallback_mode,
+            fallback_script: base.fallback_script,
+            email: base.email,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectProvidersConfig {
+    pub stanford: ProjectStanfordProviderConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectStanfordProviderConfig {
+    pub venue: Option<String>,
+}
+
+impl Default for ProjectStanfordProviderConfig {
+    fn default() -> Self {
+        Self {
             venue: Some("ICLR".to_string()),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PaperConfig {
     pub id: String,
     pub pdf_path: String,
@@ -659,7 +858,7 @@ pub struct PaperConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ImapConfig {
     pub enabled: bool,
     pub server: String,
@@ -695,8 +894,8 @@ impl Default for ImapConfig {
             enabled: true,
             server: "imap.gmail.com".to_string(),
             port: 993,
-            username: "".to_string(),
-            password: "".to_string(),
+            username: String::new(),
+            password: String::new(),
             folder: "INBOX".to_string(),
             poll_seconds: 300,
             mark_seen: true,
@@ -710,7 +909,7 @@ impl Default for ImapConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GmailOauthConfig {
     pub enabled: bool,
     pub client_id: String,
@@ -742,8 +941,8 @@ impl Default for GmailOauthConfig {
 
         Self {
             enabled: true,
-            client_id: "".to_string(),
-            client_secret: "".to_string(),
+            client_id: String::new(),
+            client_secret: String::new(),
             token_store_path: None,
             poll_seconds: 300,
             mark_seen: true,
@@ -758,7 +957,10 @@ impl Default for GmailOauthConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{
+        Config, GlobalConfigFile, LegacyConfig, ProjectConfigFile, default_project_config_path,
+        find_git_root,
+    };
     use std::fs;
     use tempfile::TempDir;
 
@@ -768,225 +970,72 @@ mod tests {
         assert_eq!(cfg.polling.schedule_minutes, vec![10, 20, 40, 60]);
         assert_eq!(cfg.trigger.git.repo_dir, ".");
         assert_eq!(cfg.core.max_submissions_per_tick, 1);
-        assert!(!cfg.core.state_dir.trim().is_empty());
-        assert!(!cfg.core.db_path.trim().is_empty());
-        assert!(cfg.retention.enabled);
-        assert_eq!(cfg.retention.prune_every_ticks, 20);
-        assert_eq!(cfg.trigger.pdf.max_scan_papers, 10);
-        assert!(!cfg.trigger.git.auto_create_tags_on_pdf_change);
-        assert!(!cfg.trigger.git.auto_delete_processed_tags);
-        assert_eq!(cfg.logging.output, "stdout");
+        assert!(cfg.project_id.is_empty());
         assert!(cfg.papers.is_empty());
-        assert!(cfg.paper_watch.is_empty());
-        assert!(cfg.paper_tag_triggers.is_empty());
     }
 
     #[test]
-    fn default_stanford_venue_is_iclr() {
-        let cfg = Config::default();
-        assert_eq!(cfg.providers.stanford.venue.as_deref(), Some("ICLR"));
-        assert_eq!(cfg.effective_stanford_venue(), "ICLR");
-    }
-
-    #[test]
-    fn default_imap_has_stanford_pattern() {
-        let cfg = Config::default();
-        let imap = cfg.imap.expect("imap config should exist by default");
-        assert!(imap.backend_patterns.contains_key("stanford"));
-        assert!(imap.backend_header_patterns.contains_key("stanford"));
-        assert!(imap.header_first);
-        assert_eq!(imap.max_lookback_hours, 72);
-        assert_eq!(imap.max_messages_per_poll, 50);
-    }
-
-    #[test]
-    fn default_gmail_oauth_has_stanford_pattern() {
-        let cfg = Config::default();
-        let gmail = cfg
-            .gmail_oauth
-            .expect("gmail_oauth config should exist by default");
-        assert!(gmail.backend_patterns.contains_key("stanford"));
-        assert!(gmail.backend_header_patterns.contains_key("stanford"));
-        assert!(gmail.header_first);
-        assert_eq!(gmail.max_lookback_hours, 72);
-        assert_eq!(gmail.max_messages_per_poll, 50);
-        assert!(gmail.enabled);
-    }
-
-    #[test]
-    fn validate_rejects_zero_concurrency() {
-        let mut cfg = Config::default();
-        cfg.core.max_concurrency = 0;
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_empty_poll_schedule() {
-        let mut cfg = Config::default();
-        cfg.polling.schedule_minutes.clear();
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_zero_submissions_per_tick() {
-        let mut cfg = Config::default();
-        cfg.core.max_submissions_per_tick = 0;
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_empty_db_path() {
-        let mut cfg = Config::default();
-        cfg.core.db_path = " ".to_string();
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_zero_pdf_scan_limit() {
-        let mut cfg = Config::default();
-        cfg.trigger.pdf.max_scan_papers = 0;
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_zero_retention_tick_interval() {
-        let mut cfg = Config::default();
-        cfg.retention.prune_every_ticks = 0;
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_invalid_logging_output() {
-        let mut cfg = Config::default();
-        cfg.logging.output = "syslog".to_string();
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn validate_requires_file_path_for_file_output() {
-        let mut cfg = Config::default();
-        cfg.logging.output = "file".to_string();
-        cfg.logging.file_path = Some("".to_string());
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_zero_imap_max_messages_per_poll() {
-        let mut cfg = Config::default();
-        if let Some(imap) = cfg.imap.as_mut() {
-            imap.max_messages_per_poll = 0;
-        }
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn validate_allows_empty_papers() {
-        let cfg = Config::default();
-        assert!(cfg.papers.is_empty());
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_zero_gmail_oauth_max_messages_per_poll() {
-        let mut cfg = Config::default();
-        if let Some(gmail) = cfg.gmail_oauth.as_mut() {
-            gmail.max_messages_per_poll = 0;
-        }
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn layered_merge_respects_precedence_and_nested_fields() {
-        let tmp = TempDir::new().expect("failed to create temp dir");
-        let global = tmp.path().join("global.toml");
-        let local = tmp.path().join("local.toml");
-        let override_cfg = tmp.path().join("override.toml");
-
+    fn global_config_rejects_project_fields() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
         fs::write(
-            &global,
+            &path,
             r#"
+papers = []
+
 [core]
-max_concurrency = 1
-
-[providers.stanford]
-email = "global@example.edu"
-venue = "acl2026"
-
-[trigger.git]
-enabled = true
-repo_dir = "/global/repo"
+db_path = "db.sqlite"
 "#,
         )
-        .expect("failed to write global config");
+        .expect("write");
+        assert!(GlobalConfigFile::load(&path).is_err());
+    }
 
+    #[test]
+    fn project_config_rejects_global_fields() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("reviewloop.toml");
         fs::write(
-            &local,
+            &path,
             r#"
-[core]
-max_concurrency = 2
+project_id = "paper-a"
 
-[trigger.git]
-repo_dir = "/local/repo"
+[core]
+db_path = "db.sqlite"
 "#,
         )
-        .expect("failed to write local config");
-
-        fs::write(
-            &override_cfg,
-            r#"
-[core]
-max_concurrency = 3
-
-[providers.stanford]
-email = "override@example.edu"
-"#,
-        )
-        .expect("failed to write override config");
-
-        let cfg = Config::load_from_paths(&[global, local, override_cfg])
-            .expect("failed to load layered config");
-
-        assert_eq!(cfg.core.max_concurrency, 3);
-        assert_eq!(cfg.providers.stanford.email, "override@example.edu");
-        assert_eq!(cfg.providers.stanford.venue.as_deref(), Some("acl2026"));
-        assert!(cfg.trigger.git.enabled);
-        assert_eq!(cfg.trigger.git.repo_dir, "/local/repo");
+        .expect("write");
+        assert!(ProjectConfigFile::load(&path).is_err());
     }
 
     #[test]
-    fn load_from_paths_requires_at_least_one_path() {
-        assert!(Config::load_from_paths(&[]).is_err());
+    fn legacy_split_preserves_global_and_project_fields() {
+        let legacy = LegacyConfig::default();
+        let global = legacy.global_config();
+        let project = legacy.project_config();
+        assert!(project.project_id.is_empty());
+        assert_eq!(global.providers.stanford.base_url, "https://paperreview.ai");
+        assert_eq!(project.providers.stanford.venue.as_deref(), Some("ICLR"));
     }
 
     #[test]
-    fn remove_paper_also_cleans_watch_and_tag_trigger() {
-        let mut cfg = Config::default();
-        cfg.papers.push(super::PaperConfig {
-            id: "main".to_string(),
-            pdf_path: "paper/main.pdf".to_string(),
-            backend: "stanford".to_string(),
-        });
-        cfg.set_paper_watch("main", false);
-        cfg.set_paper_tag_trigger("main", Some("review-stanford/main/*".to_string()));
-
-        assert!(cfg.remove_paper("main"));
-        assert!(cfg.find_paper("main").is_none());
-        assert!(!cfg.paper_watch.contains_key("main"));
-        assert!(!cfg.paper_tag_triggers.contains_key("main"));
-        assert!(!cfg.remove_paper("main"));
+    fn finds_git_root_when_present() {
+        let tmp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(tmp.path().join(".git")).expect("git dir");
+        fs::create_dir_all(tmp.path().join("a/b")).expect("nested");
+        let nested = tmp.path().join("a/b");
+        assert_eq!(find_git_root(&nested).as_deref(), Some(tmp.path()));
     }
 
     #[test]
-    fn legacy_relative_path_migration_helpers_detect_expected_shapes() {
-        assert!(super::is_legacy_relative_state_dir(".reviewloop"));
-        assert!(super::is_legacy_relative_state_dir(".review_loop"));
-        assert!(!super::is_legacy_relative_state_dir("/tmp/reviewloop"));
-        assert!(super::is_legacy_relative_path(
-            ".reviewloop/oauth/google_token.json"
-        ));
-        assert!(super::is_legacy_relative_path(
-            ".review_loop/reviewloop.log"
-        ));
-        assert!(!super::is_legacy_relative_path("/tmp/reviewloop.log"));
+    fn default_project_path_uses_cwd_or_git_root() {
+        let tmp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(tmp.path().join(".git")).expect("git dir");
+        fs::create_dir_all(tmp.path().join("nested")).expect("nested");
+        let old = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(tmp.path().join("nested")).expect("set cwd");
+        let path = default_project_config_path().expect("path");
+        std::env::set_current_dir(old).expect("restore cwd");
+        assert_eq!(path, tmp.path().join("reviewloop.toml"));
     }
 }

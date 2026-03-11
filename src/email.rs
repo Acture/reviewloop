@@ -66,7 +66,7 @@ fn extract_match(
     })
 }
 
-fn bind_matches(db: &Db, source: &str, matches: Vec<EmailMatch>) -> Result<()> {
+fn bind_matches(db: &Db, project_id: &str, source: &str, matches: Vec<EmailMatch>) -> Result<()> {
     let mut seen_tokens = HashSet::new();
 
     for matched in matches {
@@ -80,7 +80,7 @@ fn bind_matches(db: &Db, source: &str, matches: Vec<EmailMatch>) -> Result<()> {
             Some(&format!("{source}_unseen")),
         )?;
 
-        if let Some(existing_job) = db.find_job_by_token(&matched.token)? {
+        if let Some(existing_job) = db.find_job_by_token(project_id, &matched.token)? {
             if should_nudge_poll_now(existing_job.status) {
                 db.update_job_state(
                     &existing_job.id,
@@ -90,6 +90,7 @@ fn bind_matches(db: &Db, source: &str, matches: Vec<EmailMatch>) -> Result<()> {
                     None,
                 )?;
                 db.add_event(
+                    None,
                     Some(&existing_job.id),
                     &format!("{source}_token_nudged_poll"),
                     serde_json::json!({
@@ -101,6 +102,7 @@ fn bind_matches(db: &Db, source: &str, matches: Vec<EmailMatch>) -> Result<()> {
                 continue;
             }
             db.add_event(
+                None,
                 Some(&existing_job.id),
                 &format!("{source}_token_already_bound"),
                 serde_json::json!({
@@ -112,10 +114,11 @@ fn bind_matches(db: &Db, source: &str, matches: Vec<EmailMatch>) -> Result<()> {
             continue;
         }
 
-        if let Some(job) = db.find_latest_open_job_without_token(&matched.backend)? {
+        if let Some(job) = db.find_latest_open_job_without_token(project_id, &matched.backend)? {
             let next_poll = Utc::now();
             db.attach_token_to_job(&job.id, &matched.token, next_poll)?;
             db.add_event(
+                None,
                 Some(&job.id),
                 &format!("{source}_token_attached"),
                 serde_json::json!({
@@ -166,7 +169,7 @@ mod imap_impl {
             .await
             .context("IMAP polling task failed to join")??;
 
-        bind_matches(db, "imap", matches)
+        bind_matches(db, &config.project_id, "imap", matches)
     }
 
     fn poll_once_blocking(imap_cfg: &ImapConfig) -> Result<Vec<EmailMatch>> {
@@ -335,7 +338,7 @@ mod gmail_impl {
         };
 
         let matches = fetch_matches(gmail_cfg, &access_token).await?;
-        bind_matches(db, "gmail", matches)
+        bind_matches(db, &config.project_id, "gmail", matches)
     }
 
     async fn fetch_matches(cfg: &GmailOauthConfig, access_token: &str) -> Result<Vec<EmailMatch>> {
@@ -605,6 +608,7 @@ mod tests {
         db.init_schema().expect("init schema");
 
         let seed = NewJob {
+            project_id: "project-email".to_string(),
             paper_id: "paper-a".to_string(),
             backend: "stanford".to_string(),
             pdf_path: "paper.pdf".to_string(),
@@ -623,6 +627,7 @@ mod tests {
 
         super::bind_matches(
             &db,
+            "project-email",
             "gmail",
             vec![super::EmailMatch {
                 backend: "stanford".to_string(),
@@ -643,6 +648,7 @@ mod tests {
         db.init_schema().expect("init schema");
 
         let seed = NewJob {
+            project_id: "project-email".to_string(),
             paper_id: "paper-b".to_string(),
             backend: "stanford".to_string(),
             pdf_path: "paper.pdf".to_string(),
@@ -669,6 +675,7 @@ mod tests {
 
         super::bind_matches(
             &db,
+            "project-email",
             "gmail",
             vec![super::EmailMatch {
                 backend: "stanford".to_string(),

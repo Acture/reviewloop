@@ -119,8 +119,10 @@ reviewloop submit --paper-id main [--force]
 reviewloop approve --job-id <job-id>
 reviewloop import-token --paper-id main --token <token> [--source email]
 reviewloop check [--job-id <job-id> | --paper-id <paper-id>] [--all-processing]
-reviewloop status [--paper-id main] [--json]
-reviewloop retry --job-id <job-id>
+reviewloop status [--paper-id main] [--json] [--show-token]
+reviewloop retry --job-id <job-id> [--override-rate-limit]
+reviewloop complete --job-id <job-id> [--summary-text <text> | --summary-url <url> | --empty-summary] [--score <value>]
+reviewloop config migrate-project --project-id <id> [--project-root <path>]
 reviewloop email login --provider google
 reviewloop email status
 reviewloop email switch --account <account-id-or-email>
@@ -129,7 +131,7 @@ reviewloop self-update [--method auto|brew|cargo] [--yes] [--dry-run]
 ```
 
 `self-update` only replaces the executable. It does not delete:
-- global config (`~/.config/reviewloop/reviewloop.toml`)
+- global config (`~/.config/reviewloop/config.toml`)
 - global data directory (database, artifacts, logs)
 - project-local configs
 
@@ -157,7 +159,7 @@ Output artifacts per completed job:
 ## What Makes It Reliable
 
 - **State machine, not ad-hoc scripts**: jobs move through explicit statuses (`PENDING_APPROVAL`, `QUEUED`, `PROCESSING`, `COMPLETED`, etc.)
-- **Duplicate guard**: prevents repeated submissions for the same `backend + pdf_hash`
+- **Duplicate guard**: prevents repeated submissions for the same `project_id + paper_id + backend + pdf_hash + version_key`
 - **Load-aware polling**: default schedule starts at 10 minutes with jitter/cooldown behavior
 - **Recovery built in**: every transition is evented, retries are explicit
 - **Fallback path**: optional Node + Playwright submit path when provider API flow fails
@@ -241,15 +243,18 @@ reviewloop email login --provider google
 
 ReviewLoop runs Gmail API polling first when available, then IMAP fallback.
 
-## Configuration Highlights (`reviewloop.toml`)
+## Configuration Highlights
 
-Global config is auto-generated at:
-- `$XDG_CONFIG_HOME/reviewloop/reviewloop.toml`
-- or `~/.config/reviewloop/reviewloop.toml`
+ReviewLoop uses two config files with separate responsibilities:
+- global config: `$XDG_CONFIG_HOME/reviewloop/config.toml` or `~/.config/reviewloop/config.toml`
+- project config: `<repo-root>/reviewloop.toml`
 
-Config precedence (low to high):
-1. `$XDG_CONFIG_HOME/reviewloop/reviewloop.toml` (or `~/.config/reviewloop/reviewloop.toml`)
-2. `--config /path/to/file.toml`
+There is no global-overrides-project merge chain. Instead:
+- global config owns machine/user concerns such as `core.*`, `logging.*`, `polling.*`, `retention.*`, `imap.*`, `gmail_oauth.*`, and Stanford provider connection defaults
+- project config owns repo concerns such as `project_id`, `papers`, `paper_watch`, `paper_tag_triggers`, `trigger.*`, and Stanford venue
+- `--config /path/to/reviewloop.toml` explicitly points to a project config file
+
+Project commands require a non-empty `project_id` in the project config. Jobs, events, dedupe, and status views are isolated inside the shared global DB by `project_id`.
 
 Paper registration:
 - start with an empty `papers[]`
@@ -284,7 +289,7 @@ Safe defaults:
 - `fallback_mode = "node_playwright"`
 - `fallback_script = "tools/paperreview_fallback.mjs"`
 - `email` optional (falls back to active email account)
-- `venue = "ICLR"` (can be overridden by user config)
+- `venue = "ICLR"` (project config)
 
 Logging:
 - `logging.output = "stdout" | "stderr" | "file"`

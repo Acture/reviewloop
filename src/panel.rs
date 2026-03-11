@@ -9,7 +9,7 @@ pub fn render_tick_panel(
     tick: u64,
     last_tick_error: Option<&str>,
 ) -> Result<()> {
-    let counts = db.status_counts()?;
+    let counts = db.status_counts(&config.project_id)?;
 
     let pending = counts.get("PENDING_APPROVAL").copied().unwrap_or(0);
     let queued = counts.get("QUEUED").copied().unwrap_or(0);
@@ -25,6 +25,7 @@ pub fn render_tick_panel(
     println!("ReviewLoop Monitor (foreground)");
     println!("time: {}", Utc::now().to_rfc3339());
     println!("tick: {tick}");
+    println!("project_id: {}", config.project_id);
     println!("backend: stanford (paperreview.ai)");
     println!();
     println!("Jobs");
