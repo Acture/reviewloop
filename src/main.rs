@@ -7,7 +7,7 @@ use reviewloop::config::{
 };
 use reviewloop::db::Db;
 use reviewloop::email_account;
-use reviewloop::model::{EventRecord, JobStatus, NewJob, StatusView};
+use reviewloop::model::{EventRecord, Job, JobStatus, NewJob, StatusView};
 use reviewloop::oauth::{self, google::GoogleOauthProvider};
 use reviewloop::util::{compute_next_poll_at, sha256_file};
 use serde_json::{Value, json};
@@ -1062,16 +1062,16 @@ async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Re
             &version_key,
         )?
     {
-        record_duplicate_skip(
+        record_duplicate_skip(DuplicateSkipContext {
             config,
             db,
             paper,
-            &pdf_hash,
-            &version_source,
-            &version_key,
-            &existing,
-            "manual_submit",
-        )?;
+            pdf_hash: &pdf_hash,
+            version_source: &version_source,
+            version_key: &version_key,
+            existing: &existing,
+            source: "manual_submit",
+        })?;
         println!(
             "Skipped submit: existing active/completed job already covers project_id={} paper_id={} backend={} hash={} version={} existing_job_id={} status={}",
             config.project_id,
@@ -1532,41 +1532,43 @@ fn version_identity(git_commit: Option<&str>, pdf_hash: &str) -> (String, String
     }
 }
 
-fn record_duplicate_skip(
-    config: &Config,
-    db: &Db,
-    paper: &PaperConfig,
-    pdf_hash: &str,
-    version_source: &str,
-    version_key: &str,
-    existing: &reviewloop::model::Job,
-    source: &str,
-) -> Result<()> {
+struct DuplicateSkipContext<'a> {
+    config: &'a Config,
+    db: &'a Db,
+    paper: &'a PaperConfig,
+    pdf_hash: &'a str,
+    version_source: &'a str,
+    version_key: &'a str,
+    existing: &'a Job,
+    source: &'a str,
+}
+
+fn record_duplicate_skip(ctx: DuplicateSkipContext<'_>) -> Result<()> {
     warn!(
-        project_id = %config.project_id,
-        paper_id = %paper.id,
-        backend = %paper.backend,
-        source = %source,
-        existing_job_id = %existing.id,
-        existing_status = %existing.status.as_str(),
+        project_id = %ctx.config.project_id,
+        paper_id = %ctx.paper.id,
+        backend = %ctx.paper.backend,
+        source = %ctx.source,
+        existing_job_id = %ctx.existing.id,
+        existing_status = %ctx.existing.status.as_str(),
         "skipped duplicate submit"
     );
-    db.add_event(
-        Some(&config.project_id),
+    ctx.db.add_event(
+        Some(&ctx.config.project_id),
         None,
         "duplicate_skipped",
         json!({
-            "project_id": config.project_id,
-            "paper_id": paper.id,
-            "backend": paper.backend,
-            "pdf_hash": pdf_hash,
-            "version_no": existing.version_no,
-            "round_no": existing.round_no,
-            "version_source": version_source,
-            "version_key": version_key,
-            "existing_job_id": existing.id,
-            "existing_job_status": existing.status.as_str(),
-            "source": source
+            "project_id": ctx.config.project_id,
+            "paper_id": ctx.paper.id,
+            "backend": ctx.paper.backend,
+            "pdf_hash": ctx.pdf_hash,
+            "version_no": ctx.existing.version_no,
+            "round_no": ctx.existing.round_no,
+            "version_source": ctx.version_source,
+            "version_key": ctx.version_key,
+            "existing_job_id": ctx.existing.id,
+            "existing_job_status": ctx.existing.status.as_str(),
+            "source": ctx.source
         }),
     )?;
     Ok(())

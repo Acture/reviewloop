@@ -250,8 +250,10 @@ impl TestContext {
         let pdf_path = tmp.path().join("paper.pdf");
         fs::write(&pdf_path, b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n")?;
 
-        let mut config = Config::default();
-        config.project_id = "project-integration".to_string();
+        let mut config = Config {
+            project_id: "project-integration".to_string(),
+            ..Config::default()
+        };
         config.core.state_dir = state_dir.to_string_lossy().to_string();
         config.core.max_concurrency = 2;
         config.polling.schedule_minutes = vec![10, 20, 40, 60];

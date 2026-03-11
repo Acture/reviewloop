@@ -40,8 +40,10 @@ impl GitTriggerTestContext {
         let state_dir = tmp.path().join("state");
         fs::create_dir_all(&state_dir)?;
 
-        let mut config = Config::default();
-        config.project_id = "project-git-trigger".to_string();
+        let mut config = Config {
+            project_id: "project-git-trigger".to_string(),
+            ..Config::default()
+        };
         config.core.state_dir = state_dir.to_string_lossy().to_string();
         config.trigger.git.enabled = true;
         config.trigger.git.repo_dir = repo_dir.to_string_lossy().to_string();

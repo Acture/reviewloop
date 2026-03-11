@@ -397,7 +397,7 @@ impl GlobalConfigFile {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectConfigFile {
     pub project_id: String,
@@ -406,19 +406,6 @@ pub struct ProjectConfigFile {
     pub papers: Vec<PaperConfig>,
     pub paper_watch: BTreeMap<String, bool>,
     pub paper_tag_triggers: BTreeMap<String, String>,
-}
-
-impl Default for ProjectConfigFile {
-    fn default() -> Self {
-        Self {
-            project_id: String::new(),
-            trigger: TriggerConfig::default(),
-            providers: ProjectProvidersConfig::default(),
-            papers: Vec::new(),
-            paper_watch: BTreeMap::new(),
-            paper_tag_triggers: BTreeMap::new(),
-        }
-    }
 }
 
 impl ProjectConfigFile {
@@ -1036,6 +1023,16 @@ db_path = "db.sqlite"
         std::env::set_current_dir(tmp.path().join("nested")).expect("set cwd");
         let path = default_project_config_path().expect("path");
         std::env::set_current_dir(old).expect("restore cwd");
-        assert_eq!(path, tmp.path().join("reviewloop.toml"));
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("reviewloop.toml")
+        );
+        assert_eq!(
+            path.parent()
+                .expect("project parent")
+                .canonicalize()
+                .expect("canonical project parent"),
+            tmp.path().canonicalize().expect("canonical tempdir")
+        );
     }
 }

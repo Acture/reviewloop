@@ -91,10 +91,7 @@ jobs:
           echo "tag_name=$tag_name" >> "$GITHUB_OUTPUT"
 
       - name: Release quality gates
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --all-targets -- -D warnings
-          cargo test --all-targets --locked
+        run: ./scripts/quality-gates.sh
 
   publish-crates-io:
     name: Publish To crates.io

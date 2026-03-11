@@ -26,8 +26,10 @@ impl DbTestContext {
         let pdf_path = tmp.path().join("paper.pdf");
         fs::write(&pdf_path, b"%PDF-1.4\n%%EOF\n")?;
 
-        let mut config = Config::default();
-        config.project_id = "project-db-state".to_string();
+        let mut config = Config {
+            project_id: "project-db-state".to_string(),
+            ..Config::default()
+        };
         config.core.state_dir = state_dir.to_string_lossy().to_string();
         config.trigger.git.enabled = false;
         config.trigger.pdf.enabled = false;
@@ -463,8 +465,10 @@ fn in_memory_db_persists_across_operations_for_same_instance() -> Result<()> {
     let pdf_path = tmp.path().join("paper.pdf");
     fs::write(&pdf_path, b"%PDF-1.4\n%%EOF\n")?;
 
-    let mut config = Config::default();
-    config.project_id = "project-db-state".to_string();
+    let mut config = Config {
+        project_id: "project-db-state".to_string(),
+        ..Config::default()
+    };
     config.core.state_dir = state_dir.to_string_lossy().to_string();
     config.core.db_path = ":memory:".to_string();
     config.providers.stanford.email = "test@example.edu".to_string();

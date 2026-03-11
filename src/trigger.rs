@@ -2,7 +2,7 @@ use crate::{
     config::{Config, PaperConfig},
     db::Db,
     email_account::resolve_submission_email,
-    model::{JobStatus, NewJob},
+    model::{Job, JobStatus, NewJob},
     util::sha256_file,
 };
 use anyhow::{Context, Result};
@@ -104,16 +104,16 @@ pub fn run_pdf_trigger(config: &Config, db: &Db) -> Result<()> {
             &hash,
             &version_key,
         )? {
-            record_duplicate_skip(
+            record_duplicate_skip(DuplicateSkipContext {
                 config,
                 db,
                 paper,
-                &hash,
-                &version_source,
-                &version_key,
-                &existing,
-                "pdf_trigger",
-            )?;
+                pdf_hash: &hash,
+                version_source: &version_source,
+                version_key: &version_key,
+                existing: &existing,
+                source: "pdf_trigger",
+            })?;
             continue;
         }
 
@@ -307,16 +307,16 @@ fn enqueue_for_paper(
         &pdf_hash,
         &version_key,
     )? {
-        record_duplicate_skip(
+        record_duplicate_skip(DuplicateSkipContext {
             config,
             db,
             paper,
-            &pdf_hash,
-            &version_source,
-            &version_key,
-            &existing,
+            pdf_hash: &pdf_hash,
+            version_source: &version_source,
+            version_key: &version_key,
+            existing: &existing,
             source,
-        )?;
+        })?;
         return Ok(());
     }
 
@@ -361,41 +361,43 @@ fn version_identity(git_commit: Option<&str>, pdf_hash: &str) -> (String, String
     }
 }
 
-fn record_duplicate_skip(
-    config: &Config,
-    db: &Db,
-    paper: &PaperConfig,
-    pdf_hash: &str,
-    version_source: &str,
-    version_key: &str,
-    existing: &crate::model::Job,
-    source: &str,
-) -> Result<()> {
+struct DuplicateSkipContext<'a> {
+    config: &'a Config,
+    db: &'a Db,
+    paper: &'a PaperConfig,
+    pdf_hash: &'a str,
+    version_source: &'a str,
+    version_key: &'a str,
+    existing: &'a Job,
+    source: &'a str,
+}
+
+fn record_duplicate_skip(ctx: DuplicateSkipContext<'_>) -> Result<()> {
     warn!(
-        project_id = %config.project_id,
-        paper_id = %paper.id,
-        backend = %paper.backend,
-        source = %source,
-        existing_job_id = %existing.id,
-        existing_status = %existing.status.as_str(),
+        project_id = %ctx.config.project_id,
+        paper_id = %ctx.paper.id,
+        backend = %ctx.paper.backend,
+        source = %ctx.source,
+        existing_job_id = %ctx.existing.id,
+        existing_status = %ctx.existing.status.as_str(),
         "skipped duplicate trigger enqueue"
     );
-    db.add_event(
-        Some(&config.project_id),
+    ctx.db.add_event(
+        Some(&ctx.config.project_id),
         None,
         "duplicate_skipped",
         json!({
-            "project_id": config.project_id,
-            "paper_id": paper.id,
-            "backend": paper.backend,
-            "pdf_hash": pdf_hash,
-            "version_no": existing.version_no,
-            "round_no": existing.round_no,
-            "version_source": version_source,
-            "version_key": version_key,
-            "existing_job_id": existing.id,
-            "existing_job_status": existing.status.as_str(),
-            "source": source
+            "project_id": ctx.config.project_id,
+            "paper_id": ctx.paper.id,
+            "backend": ctx.paper.backend,
+            "pdf_hash": ctx.pdf_hash,
+            "version_no": ctx.existing.version_no,
+            "round_no": ctx.existing.round_no,
+            "version_source": ctx.version_source,
+            "version_key": ctx.version_key,
+            "existing_job_id": ctx.existing.id,
+            "existing_job_status": ctx.existing.status.as_str(),
+            "source": ctx.source
         }),
     )?;
     Ok(())
@@ -431,8 +433,10 @@ mod tests {
         let pdf_path = tmp.path().join("main.pdf");
         fs::write(&pdf_path, b"%PDF-1.4\n%%EOF\n")?;
 
-        let mut config = Config::default();
-        config.project_id = "project-main".to_string();
+        let mut config = Config {
+            project_id: "project-main".to_string(),
+            ..Config::default()
+        };
         config.core.state_dir = state_dir.to_string_lossy().to_string();
         config.trigger.git.enabled = false;
         config.trigger.pdf.enabled = false;

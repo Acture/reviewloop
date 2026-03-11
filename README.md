@@ -308,6 +308,11 @@ On pull requests and pushes to `main/master`:
 
 Runs on both Ubuntu and macOS.
 
+The same gate is shared locally via `./scripts/quality-gates.sh`.
+To enable it in the standard `pre-commit` framework:
+- `pre-commit install`
+- commits will then run the repository-local `reviewloop quality gates` hook before creating the commit
+
 ### Release (`.github/workflows/release.yml`)
 
 On tag push like `v0.1.0`:

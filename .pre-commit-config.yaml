@@ -1,0 +1,8 @@
+repos:
+  - repo: local
+    hooks:
+      - id: reviewloop-quality-gates
+        name: reviewloop quality gates
+        entry: ./scripts/quality-gates.sh
+        language: system
+        pass_filenames: false
