@@ -87,7 +87,7 @@ pub async fn process_submissions(config: &Config, db: &Db) -> Result<()> {
         config.core.max_concurrency,
         config.core.max_submissions_per_tick,
     );
-    let jobs = db.list_ready_queued(per_tick_budget, Utc::now())?;
+    let jobs = db.list_ready_queued(&config.project_id, per_tick_budget, Utc::now())?;
     for job in jobs {
         submit_job(config, db, &job.id).await?;
     }
@@ -96,7 +96,8 @@ pub async fn process_submissions(config: &Config, db: &Db) -> Result<()> {
 }
 
 pub async fn process_polls(config: &Config, db: &Db) -> Result<()> {
-    let jobs = db.list_due_processing(config.core.max_concurrency, Utc::now())?;
+    let jobs =
+        db.list_due_processing(&config.project_id, config.core.max_concurrency, Utc::now())?;
     for job in jobs {
         poll_job(config, db, &job).await?;
     }
@@ -107,6 +108,14 @@ pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<()> {
     let Some(job) = db.get_job(job_id)? else {
         anyhow::bail!("job not found: {job_id}");
     };
+    if job.project_id != config.project_id {
+        anyhow::bail!(
+            "job {} belongs to project {} not current project {}",
+            job.id,
+            job.project_id,
+            config.project_id
+        );
+    }
 
     let paper = config
         .find_paper(&job.paper_id)
@@ -150,6 +159,7 @@ pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<()> {
             );
             db.mark_submitted_with_token(&job.id, &receipt.token, next_poll)?;
             db.add_event(
+                None,
                 Some(&job.id),
                 "submitted",
                 json!({ "backend": backend.name(), "token": receipt.token }),
@@ -167,6 +177,7 @@ pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<()> {
                 Some(Some(message.clone())),
             )?;
             db.add_event(
+                None,
                 Some(&job.id),
                 "submit_rate_limited",
                 json!({ "message": message, "cooldown_minutes": RATE_LIMIT_COOLDOWN_MINUTES }),
@@ -217,6 +228,7 @@ async fn handle_submit_error_with_fallback(
                 db.mark_fallback_used(&job.id)?;
                 db.mark_submitted_with_token(&job.id, &receipt.token, next_poll)?;
                 db.add_event(
+                    None,
                     Some(&job.id),
                     "submitted_via_fallback",
                     json!({ "token": receipt.token }),
@@ -234,6 +246,7 @@ async fn handle_submit_error_with_fallback(
                     Some(Some(reason.clone())),
                 )?;
                 db.add_event(
+                    None,
                     Some(&job.id),
                     "submit_failed_needs_manual",
                     json!({ "reason": reason }),
@@ -252,12 +265,25 @@ async fn handle_submit_error_with_fallback(
         Some(None),
         Some(Some(reason.clone())),
     )?;
-    db.add_event(Some(&job.id), "submit_failed", json!({ "reason": reason }))?;
+    db.add_event(
+        None,
+        Some(&job.id),
+        "submit_failed",
+        json!({ "reason": reason }),
+    )?;
     error!(job_id = %job.id, "submit failed");
     Ok(())
 }
 
 pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
+    if job.project_id != config.project_id {
+        anyhow::bail!(
+            "job {} belongs to project {} not current project {}",
+            job.id,
+            job.project_id,
+            config.project_id
+        );
+    }
     let token = job
         .token
         .as_deref()
@@ -281,6 +307,7 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
                 Some(None),
             )?;
             db.add_event(
+                None,
                 Some(&job.id),
                 "poll_processing",
                 json!({ "attempt": job.attempt + 1, "next_poll_at": next.to_rfc3339() }),
@@ -297,7 +324,12 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
                 Some(None),
                 Some(None),
             )?;
-            db.add_event(Some(&job.id), "review_completed", json!({ "token": token }))?;
+            db.add_event(
+                None,
+                Some(&job.id),
+                "review_completed",
+                json!({ "token": token }),
+            )?;
             info!(job_id = %job.id, "review completed and artifacts written");
         }
         Ok(ReviewFetchResult::InvalidToken) => {
@@ -308,7 +340,12 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
                 Some(None),
                 Some(Some("invalid token".to_string())),
             )?;
-            db.add_event(Some(&job.id), "invalid_token", json!({ "token": token }))?;
+            db.add_event(
+                None,
+                Some(&job.id),
+                "invalid_token",
+                json!({ "token": token }),
+            )?;
             warn!(job_id = %job.id, "invalid token reported by backend");
         }
         Err(BackendError::RateLimited(message)) => {
@@ -321,6 +358,7 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
                 Some(Some(message.clone())),
             )?;
             db.add_event(
+                None,
                 Some(&job.id),
                 "poll_rate_limited",
                 json!({ "message": message, "next_poll_at": next.to_rfc3339() }),
@@ -338,6 +376,7 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
                     Some(Some(reason.clone())),
                 )?;
                 db.add_event(
+                    None,
                     Some(&job.id),
                     "poll_terminal_error",
                     json!({ "status": status, "message": body }),
@@ -357,6 +396,7 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
                     Some(Some(body.clone())),
                 )?;
                 db.add_event(
+                    None,
                     Some(&job.id),
                     "poll_server_error",
                     json!({ "status": status, "message": body, "next_poll_at": next.to_rfc3339() }),
@@ -379,6 +419,7 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
                 Some(Some(err.to_string())),
             )?;
             db.add_event(
+                None,
                 Some(&job.id),
                 "poll_error",
                 json!({ "error": err.to_string(), "next_poll_at": next.to_rfc3339() }),
@@ -393,7 +434,7 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
 pub fn mark_timeouts(config: &Config, db: &Db) -> Result<()> {
     let now = Utc::now();
 
-    for job in db.list_processing_jobs()? {
+    for job in db.list_processing_jobs(&config.project_id)? {
         let timeout = timeout_for_job(config, &job);
         let reference_start = job.started_at.unwrap_or(job.created_at);
         if now - reference_start >= timeout {
@@ -404,7 +445,7 @@ pub fn mark_timeouts(config: &Config, db: &Db) -> Result<()> {
                 Some(None),
                 Some(Some("review timed out".to_string())),
             )?;
-            db.add_event(Some(&job.id), "timeout", json!({}))?;
+            db.add_event(None, Some(&job.id), "timeout", json!({}))?;
             warn!(job_id = %job.id, "job timed out");
         }
     }
@@ -448,6 +489,7 @@ pub fn prune_retention(config: &Config, db: &Db, tick: Option<u64>) -> Result<()
     }
 
     db.add_event(
+        None,
         None,
         "retention_pruned",
         json!({

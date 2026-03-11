@@ -96,11 +96,29 @@ pub fn run_pdf_trigger(config: &Config, db: &Db) -> Result<()> {
         }
 
         let hash = sha256_file(path)?;
-        if db.has_duplicate_guard(&paper.backend, &hash)? {
+        let (version_source, version_key) = version_identity(None, &hash);
+        if let Some(existing) = db.find_duplicate_covering_job(
+            &config.project_id,
+            &paper.id,
+            &paper.backend,
+            &hash,
+            &version_key,
+        )? {
+            record_duplicate_skip(
+                config,
+                db,
+                paper,
+                &hash,
+                &version_source,
+                &version_key,
+                &existing,
+                "pdf_trigger",
+            )?;
             continue;
         }
 
-        let latest_hash = db.latest_hash_for_paper(&paper.id, &paper.backend)?;
+        let latest_hash =
+            db.latest_hash_for_paper(&config.project_id, &paper.id, &paper.backend)?;
         if latest_hash.as_deref() == Some(hash.as_str()) {
             continue;
         }
@@ -167,7 +185,8 @@ fn resolve_tag_commit(repo_dir: &str, tag: &str) -> Option<String> {
 }
 
 fn process_tag_entry(config: &Config, db: &Db, tag: &str, commit: &str) -> Result<bool> {
-    if db.is_tag_seen(tag)? {
+    let scoped_tag = scoped_tag_name(&config.project_id, tag);
+    if db.is_tag_seen(&scoped_tag)? {
         return Ok(false);
     }
 
@@ -183,7 +202,7 @@ fn process_tag_entry(config: &Config, db: &Db, tag: &str, commit: &str) -> Resul
         )?;
     }
 
-    db.mark_tag_seen(tag, commit)?;
+    db.mark_tag_seen(&scoped_tag, commit)?;
     Ok(true)
 }
 
@@ -279,12 +298,30 @@ fn enqueue_for_paper(
     source: &str,
 ) -> Result<()> {
     let pdf_hash = sha256_file(Path::new(&paper.pdf_path))?;
+    let (version_source, version_key) = version_identity(git_commit.as_deref(), &pdf_hash);
 
-    if db.has_duplicate_guard(&paper.backend, &pdf_hash)? {
+    if let Some(existing) = db.find_duplicate_covering_job(
+        &config.project_id,
+        &paper.id,
+        &paper.backend,
+        &pdf_hash,
+        &version_key,
+    )? {
+        record_duplicate_skip(
+            config,
+            db,
+            paper,
+            &pdf_hash,
+            &version_source,
+            &version_key,
+            &existing,
+            source,
+        )?;
         return Ok(());
     }
 
     let job = db.create_job(&NewJob {
+        project_id: config.project_id.clone(),
         paper_id: paper.id.clone(),
         backend: paper.backend.clone(),
         pdf_path: paper.pdf_path.clone(),
@@ -298,6 +335,7 @@ fn enqueue_for_paper(
     })?;
 
     db.add_event(
+        None,
         Some(&job.id),
         "job_enqueued",
         json!({
@@ -308,6 +346,58 @@ fn enqueue_for_paper(
         }),
     )?;
 
+    Ok(())
+}
+
+fn scoped_tag_name(project_id: &str, tag: &str) -> String {
+    format!("{project_id}::{tag}")
+}
+
+fn version_identity(git_commit: Option<&str>, pdf_hash: &str) -> (String, String) {
+    if let Some(commit) = git_commit.map(str::trim).filter(|value| !value.is_empty()) {
+        ("git_commit".to_string(), commit.to_string())
+    } else {
+        ("pdf_hash".to_string(), pdf_hash.to_string())
+    }
+}
+
+fn record_duplicate_skip(
+    config: &Config,
+    db: &Db,
+    paper: &PaperConfig,
+    pdf_hash: &str,
+    version_source: &str,
+    version_key: &str,
+    existing: &crate::model::Job,
+    source: &str,
+) -> Result<()> {
+    warn!(
+        project_id = %config.project_id,
+        paper_id = %paper.id,
+        backend = %paper.backend,
+        source = %source,
+        existing_job_id = %existing.id,
+        existing_status = %existing.status.as_str(),
+        "skipped duplicate trigger enqueue"
+    );
+    db.add_event(
+        Some(&config.project_id),
+        None,
+        "duplicate_skipped",
+        json!({
+            "project_id": config.project_id,
+            "paper_id": paper.id,
+            "backend": paper.backend,
+            "pdf_hash": pdf_hash,
+            "version_no": existing.version_no,
+            "round_no": existing.round_no,
+            "version_source": version_source,
+            "version_key": version_key,
+            "existing_job_id": existing.id,
+            "existing_job_status": existing.status.as_str(),
+            "source": source
+        }),
+    )?;
     Ok(())
 }
 
@@ -342,6 +432,7 @@ mod tests {
         fs::write(&pdf_path, b"%PDF-1.4\n%%EOF\n")?;
 
         let mut config = Config::default();
+        config.project_id = "project-main".to_string();
         config.core.state_dir = state_dir.to_string_lossy().to_string();
         config.trigger.git.enabled = false;
         config.trigger.pdf.enabled = false;
@@ -385,16 +476,16 @@ mod tests {
         assert!(processed);
 
         let job = db
-            .find_latest_open_job_for_paper("main")?
+            .find_latest_open_job_for_paper(&config.project_id, "main")?
             .context("expected queued job for simulated tag")?;
         assert_eq!(job.status, JobStatus::Queued);
         assert_eq!(job.git_tag.as_deref(), Some(tag));
         assert_eq!(job.git_commit.as_deref(), Some("deadbeef"));
-        assert!(db.is_tag_seen(tag)?);
+        assert!(db.is_tag_seen(&format!("{}::{}", config.project_id, tag))?);
 
         let processed = process_tag_entry(&config, &db, tag, "deadbeef")?;
         assert!(!processed);
-        let rows = db.list_status_views(Some("main"))?;
+        let rows = db.list_status_views(&config.project_id, Some("main"))?;
         assert_eq!(
             rows.len(),
             1,
@@ -413,7 +504,7 @@ mod tests {
         assert!(processed);
 
         let job = db
-            .find_latest_open_job_for_paper("main")?
+            .find_latest_open_job_for_paper(&config.project_id, "main")?
             .context("expected queued job for custom tag trigger")?;
         assert_eq!(job.status, JobStatus::Queued);
         assert_eq!(job.git_tag.as_deref(), Some("custom/main/v3"));
@@ -441,7 +532,10 @@ mod tests {
         config.set_paper_watch("main", false);
 
         run_pdf_trigger(&config, &db)?;
-        assert!(db.list_status_views(Some("main"))?.is_empty());
+        assert!(
+            db.list_status_views(&config.project_id, Some("main"))?
+                .is_empty()
+        );
         Ok(())
     }
 }

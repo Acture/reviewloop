@@ -41,6 +41,7 @@ impl GitTriggerTestContext {
         fs::create_dir_all(&state_dir)?;
 
         let mut config = Config::default();
+        config.project_id = "project-git-trigger".to_string();
         config.core.state_dir = state_dir.to_string_lossy().to_string();
         config.trigger.git.enabled = true;
         config.trigger.git.repo_dir = repo_dir.to_string_lossy().to_string();
@@ -123,14 +124,16 @@ fn git_trigger_enqueues_job_and_deduplicates_seen_tag() -> Result<()> {
 
     let job = ctx
         .db
-        .find_latest_open_job_for_paper("main")?
+        .find_latest_open_job_for_paper(&ctx.config.project_id, "main")?
         .context("expected a queued job")?;
     assert_eq!(job.status, JobStatus::Queued);
     assert_eq!(job.git_tag.as_deref(), Some("review-stanford/main/v1"));
     assert!(job.git_commit.as_deref().unwrap_or_default().len() >= 7);
 
     run_git_tag_trigger(&ctx.config, &ctx.db)?;
-    let rows = ctx.db.list_status_views(Some("main"))?;
+    let rows = ctx
+        .db
+        .list_status_views(&ctx.config.project_id, Some("main"))?;
     assert_eq!(
         rows.len(),
         1,
@@ -150,7 +153,7 @@ fn git_trigger_shorthand_tag_routes_to_first_backend_paper() -> Result<()> {
 
     let job = ctx
         .db
-        .find_latest_open_job_for_paper("main")?
+        .find_latest_open_job_for_paper(&ctx.config.project_id, "main")?
         .context("expected shorthand tag to map to first stanford paper")?;
     assert_eq!(job.paper_id, "main");
     assert_eq!(job.git_tag.as_deref(), Some("review-stanford/v2"));
@@ -165,7 +168,7 @@ fn git_trigger_ignores_tags_without_matching_backend() -> Result<()> {
 
     run_git_tag_trigger(&ctx.config, &ctx.db)?;
 
-    let jobs = ctx.db.list_status_views(None)?;
+    let jobs = ctx.db.list_status_views(&ctx.config.project_id, None)?;
     assert!(
         jobs.is_empty(),
         "unknown backend tags must not enqueue jobs"
@@ -210,7 +213,7 @@ fn pdf_trigger_auto_create_tag_records_git_metadata_on_job() -> Result<()> {
 
     let job = ctx
         .db
-        .find_latest_open_job_for_paper("main")?
+        .find_latest_open_job_for_paper(&ctx.config.project_id, "main")?
         .context("expected job from pdf trigger")?;
     let tag = job
         .git_tag

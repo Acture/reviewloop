@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobStatus {
@@ -45,6 +46,7 @@ impl JobStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: String,
+    pub project_id: String,
     pub paper_id: String,
     pub backend: String,
     pub pdf_path: String,
@@ -55,6 +57,10 @@ pub struct Job {
     pub venue: Option<String>,
     pub git_tag: Option<String>,
     pub git_commit: Option<String>,
+    pub version_no: u32,
+    pub round_no: u32,
+    pub version_source: String,
+    pub version_key: String,
     pub attempt: u32,
     pub started_at: Option<DateTime<Utc>>,
     pub next_poll_at: Option<DateTime<Utc>>,
@@ -66,6 +72,7 @@ pub struct Job {
 
 #[derive(Debug, Clone)]
 pub struct NewJob {
+    pub project_id: String,
     pub paper_id: String,
     pub backend: String,
     pub pdf_path: String,
@@ -81,6 +88,7 @@ pub struct NewJob {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusView {
     pub id: String,
+    pub project_id: String,
     pub paper_id: String,
     pub backend: String,
     pub status: String,
@@ -91,4 +99,24 @@ pub struct StatusView {
     pub next_poll_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
     pub last_error: Option<String>,
+    pub pdf_hash: String,
+    pub git_tag: Option<String>,
+    pub git_commit: Option<String>,
+    pub version_no: u32,
+    pub round_no: u32,
+    pub version_source: String,
+    pub version_key: String,
+    pub score: Option<String>,
+    pub summary_md: Option<String>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventRecord {
+    pub id: i64,
+    pub project_id: String,
+    pub job_id: Option<String>,
+    pub event_type: String,
+    pub payload: Value,
+    pub created_at: DateTime<Utc>,
 }

@@ -251,6 +251,7 @@ impl TestContext {
         fs::write(&pdf_path, b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n")?;
 
         let mut config = Config::default();
+        config.project_id = "project-integration".to_string();
         config.core.state_dir = state_dir.to_string_lossy().to_string();
         config.core.max_concurrency = 2;
         config.polling.schedule_minutes = vec![10, 20, 40, 60];
@@ -289,6 +290,7 @@ impl TestContext {
         let pdf_hash = sha256_file(&self.pdf_path)?;
 
         self.db.create_job(&NewJob {
+            project_id: self.config.project_id.clone(),
             paper_id: "main".to_string(),
             backend: "stanford".to_string(),
             pdf_path: self.pdf_path.to_string_lossy().to_string(),

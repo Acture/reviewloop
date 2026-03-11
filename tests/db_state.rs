@@ -27,6 +27,7 @@ impl DbTestContext {
         fs::write(&pdf_path, b"%PDF-1.4\n%%EOF\n")?;
 
         let mut config = Config::default();
+        config.project_id = "project-db-state".to_string();
         config.core.state_dir = state_dir.to_string_lossy().to_string();
         config.trigger.git.enabled = false;
         config.trigger.pdf.enabled = false;
@@ -51,6 +52,7 @@ impl DbTestContext {
     fn create_job_with_hash(&self, status: JobStatus, hash: &str) -> Result<Job> {
         let paper = &self.config.papers[0];
         self.db.create_job(&NewJob {
+            project_id: self.config.project_id.clone(),
             paper_id: paper.id.clone(),
             backend: paper.backend.clone(),
             pdf_path: paper.pdf_path.clone(),
@@ -76,10 +78,166 @@ fn duplicate_guard_ignores_failed_jobs() -> Result<()> {
     let ctx = DbTestContext::new()?;
 
     ctx.create_job_with_hash(JobStatus::Failed, "same-hash")?;
-    assert!(!ctx.db.has_duplicate_guard("stanford", "same-hash")?);
+    assert!(
+        ctx.db
+            .find_duplicate_covering_job(
+                &ctx.config.project_id,
+                "main",
+                "stanford",
+                "same-hash",
+                "same-hash"
+            )?
+            .is_none()
+    );
 
     ctx.create_job_with_hash(JobStatus::Queued, "same-hash")?;
-    assert!(ctx.db.has_duplicate_guard("stanford", "same-hash")?);
+    assert!(
+        ctx.db
+            .find_duplicate_covering_job(
+                &ctx.config.project_id,
+                "main",
+                "stanford",
+                "same-hash",
+                "same-hash"
+            )?
+            .is_some()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn duplicate_guard_is_project_scoped() -> Result<()> {
+    let ctx = DbTestContext::new()?;
+
+    ctx.create_job_with_hash(JobStatus::Queued, "same-hash")?;
+    assert!(
+        ctx.db
+            .find_duplicate_covering_job(
+                "other-project",
+                "main",
+                "stanford",
+                "same-hash",
+                "same-hash"
+            )?
+            .is_none()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn version_and_round_progress_by_project_and_completed_rounds() -> Result<()> {
+    let ctx = DbTestContext::new()?;
+    let paper = &ctx.config.papers[0];
+
+    let first = ctx.db.create_job(&NewJob {
+        project_id: ctx.config.project_id.clone(),
+        paper_id: paper.id.clone(),
+        backend: paper.backend.clone(),
+        pdf_path: paper.pdf_path.clone(),
+        pdf_hash: "hash-v1".to_string(),
+        status: JobStatus::Queued,
+        email: ctx.config.providers.stanford.email.clone(),
+        venue: ctx.config.providers.stanford.venue.clone(),
+        git_tag: None,
+        git_commit: None,
+        next_poll_at: None,
+    })?;
+    assert_eq!(first.version_no, 1);
+    assert_eq!(first.round_no, 1);
+    assert_eq!(first.version_source, "pdf_hash");
+    assert_eq!(first.version_key, "hash-v1");
+
+    let parallel = ctx.db.create_job(&NewJob {
+        project_id: ctx.config.project_id.clone(),
+        paper_id: paper.id.clone(),
+        backend: paper.backend.clone(),
+        pdf_path: paper.pdf_path.clone(),
+        pdf_hash: "hash-v1".to_string(),
+        status: JobStatus::Queued,
+        email: ctx.config.providers.stanford.email.clone(),
+        venue: ctx.config.providers.stanford.venue.clone(),
+        git_tag: None,
+        git_commit: None,
+        next_poll_at: None,
+    })?;
+    assert_eq!(parallel.version_no, 1);
+    assert_eq!(parallel.round_no, 1);
+
+    ctx.db.update_job_state(
+        &first.id,
+        JobStatus::Completed,
+        None,
+        Some(None),
+        Some(None),
+    )?;
+
+    let next_round = ctx.db.create_job(&NewJob {
+        project_id: ctx.config.project_id.clone(),
+        paper_id: paper.id.clone(),
+        backend: paper.backend.clone(),
+        pdf_path: paper.pdf_path.clone(),
+        pdf_hash: "hash-v1".to_string(),
+        status: JobStatus::Queued,
+        email: ctx.config.providers.stanford.email.clone(),
+        venue: ctx.config.providers.stanford.venue.clone(),
+        git_tag: None,
+        git_commit: None,
+        next_poll_at: None,
+    })?;
+    assert_eq!(next_round.version_no, 1);
+    assert_eq!(next_round.round_no, 2);
+
+    let new_version = ctx.db.create_job(&NewJob {
+        project_id: ctx.config.project_id.clone(),
+        paper_id: paper.id.clone(),
+        backend: paper.backend.clone(),
+        pdf_path: paper.pdf_path.clone(),
+        pdf_hash: "hash-v2".to_string(),
+        status: JobStatus::Queued,
+        email: ctx.config.providers.stanford.email.clone(),
+        venue: ctx.config.providers.stanford.venue.clone(),
+        git_tag: None,
+        git_commit: Some("commit-v2".to_string()),
+        next_poll_at: None,
+    })?;
+    assert_eq!(new_version.version_no, 2);
+    assert_eq!(new_version.round_no, 1);
+    assert_eq!(new_version.version_source, "git_commit");
+    assert_eq!(new_version.version_key, "commit-v2");
+
+    let same_version = ctx.db.create_job(&NewJob {
+        project_id: ctx.config.project_id.clone(),
+        paper_id: paper.id.clone(),
+        backend: paper.backend.clone(),
+        pdf_path: paper.pdf_path.clone(),
+        pdf_hash: "hash-v3".to_string(),
+        status: JobStatus::Queued,
+        email: ctx.config.providers.stanford.email.clone(),
+        venue: ctx.config.providers.stanford.venue.clone(),
+        git_tag: None,
+        git_commit: Some("commit-v2".to_string()),
+        next_poll_at: None,
+    })?;
+    assert_eq!(same_version.version_no, 2);
+    assert_eq!(same_version.round_no, 1);
+
+    let other_project = ctx.db.create_job(&NewJob {
+        project_id: "other-project".to_string(),
+        paper_id: paper.id.clone(),
+        backend: paper.backend.clone(),
+        pdf_path: paper.pdf_path.clone(),
+        pdf_hash: "hash-v1".to_string(),
+        status: JobStatus::Queued,
+        email: ctx.config.providers.stanford.email.clone(),
+        venue: ctx.config.providers.stanford.venue.clone(),
+        git_tag: None,
+        git_commit: None,
+        next_poll_at: None,
+    })?;
+    assert_eq!(other_project.version_no, 1);
+    assert_eq!(other_project.round_no, 1);
 
     Ok(())
 }
@@ -100,7 +258,9 @@ fn list_ready_queued_respects_next_poll_at() -> Result<()> {
         Some(None),
     )?;
 
-    let jobs = ctx.db.list_ready_queued(10, Utc::now())?;
+    let jobs = ctx
+        .db
+        .list_ready_queued(&ctx.config.project_id, 10, Utc::now())?;
     let ids = jobs.into_iter().map(|j| j.id).collect::<Vec<_>>();
     assert!(ids.contains(&a.id));
     assert!(!ids.contains(&b.id));
@@ -115,7 +275,9 @@ fn list_due_processing_treats_past_next_poll_as_due() -> Result<()> {
     let past = Utc::now() - Duration::minutes(5);
     ctx.db.attach_token_to_job(&job.id, "tok-past-due", past)?;
 
-    let due = ctx.db.list_due_processing(10, Utc::now())?;
+    let due = ctx
+        .db
+        .list_due_processing(&ctx.config.project_id, 10, Utc::now())?;
     assert!(due.iter().any(|j| j.id == job.id));
     Ok(())
 }
@@ -126,12 +288,17 @@ fn purge_paper_history_removes_jobs_events_reviews_for_target_paper() -> Result<
     let main_job = ctx.create_job(JobStatus::Queued)?;
     ctx.db
         .attach_token_to_job(&main_job.id, "tok-main-purge", Utc::now())?;
-    ctx.db
-        .add_event(Some(&main_job.id), "main_event", json!({"scope":"main"}))?;
+    ctx.db.add_event(
+        Some(&ctx.config.project_id),
+        Some(&main_job.id),
+        "main_event",
+        json!({"scope":"main"}),
+    )?;
     ctx.db
         .upsert_review(&main_job.id, "tok-main-purge", r#"{"ok":true}"#, "summary")?;
 
     let other_job = ctx.db.create_job(&NewJob {
+        project_id: ctx.config.project_id.clone(),
         paper_id: "other".to_string(),
         backend: "stanford".to_string(),
         pdf_path: ctx.config.papers[0].pdf_path.clone(),
@@ -143,10 +310,14 @@ fn purge_paper_history_removes_jobs_events_reviews_for_target_paper() -> Result<
         git_commit: None,
         next_poll_at: None,
     })?;
-    ctx.db
-        .add_event(Some(&other_job.id), "other_event", json!({"scope":"other"}))?;
+    ctx.db.add_event(
+        Some(&ctx.config.project_id),
+        Some(&other_job.id),
+        "other_event",
+        json!({"scope":"other"}),
+    )?;
 
-    let report = ctx.db.purge_paper_history("main")?;
+    let report = ctx.db.purge_paper_history(&ctx.config.project_id, "main")?;
     assert_eq!(report.jobs, 1);
     assert_eq!(report.reviews, 1);
     assert!(report.events >= 1);
@@ -190,7 +361,7 @@ fn latest_open_job_without_token_prefers_newest() -> Result<()> {
 
     let got = ctx
         .db
-        .find_latest_open_job_without_token("stanford")?
+        .find_latest_open_job_without_token(&ctx.config.project_id, "stanford")?
         .context("expected an open job")?;
 
     assert_ne!(older.id, newer.id);
@@ -276,7 +447,7 @@ fn find_job_by_token_returns_bound_job() -> Result<()> {
 
     let found = ctx
         .db
-        .find_job_by_token("tok-by-token")?
+        .find_job_by_token(&ctx.config.project_id, "tok-by-token")?
         .context("expected token-bound job")?;
     assert_eq!(found.id, job.id);
     assert_eq!(found.token.as_deref(), Some("tok-by-token"));
@@ -293,6 +464,7 @@ fn in_memory_db_persists_across_operations_for_same_instance() -> Result<()> {
     fs::write(&pdf_path, b"%PDF-1.4\n%%EOF\n")?;
 
     let mut config = Config::default();
+    config.project_id = "project-db-state".to_string();
     config.core.state_dir = state_dir.to_string_lossy().to_string();
     config.core.db_path = ":memory:".to_string();
     config.providers.stanford.email = "test@example.edu".to_string();
@@ -307,6 +479,7 @@ fn in_memory_db_persists_across_operations_for_same_instance() -> Result<()> {
 
     let hash = sha256_file(Path::new(&config.papers[0].pdf_path))?;
     let created = db.create_job(&NewJob {
+        project_id: config.project_id.clone(),
         paper_id: "main".to_string(),
         backend: "stanford".to_string(),
         pdf_path: config.papers[0].pdf_path.clone(),
@@ -336,8 +509,12 @@ fn retention_prunes_stale_auxiliary_entries() -> Result<()> {
     ctx.db
         .record_email_token("tok-old", "imap:stanford", Some("ref"))?;
     ctx.db.mark_tag_seen("review-stanford/main/v1", "abc123")?;
-    ctx.db
-        .add_event(None, "test_event", json!({"kind":"stale"}))?;
+    ctx.db.add_event(
+        Some(&ctx.config.project_id),
+        None,
+        "test_event",
+        json!({"kind":"stale"}),
+    )?;
 
     let conn = rusqlite::Connection::open(&ctx.db.path)?;
     let old = (now - Duration::days(120)).to_rfc3339();
@@ -386,6 +563,7 @@ fn retention_prunes_old_terminal_jobs_when_enabled() -> Result<()> {
     ctx.db
         .upsert_review(&completed.id, "tok-completed", r#"{"ok":true}"#, "summary")?;
     ctx.db.add_event(
+        Some(&ctx.config.project_id),
         Some(&completed.id),
         "completed_event",
         json!({"job":"completed"}),

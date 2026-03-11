@@ -1,12 +1,16 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
-use reviewloop::config::{Config, PaperConfig};
+use reviewloop::artifact::write_review_artifacts;
+use reviewloop::config::{
+    Config, LegacyConfig, PaperConfig, ProjectConfigFile, default_project_config_path,
+};
 use reviewloop::db::Db;
 use reviewloop::email_account;
-use reviewloop::model::{JobStatus, NewJob};
+use reviewloop::model::{EventRecord, JobStatus, NewJob, StatusView};
 use reviewloop::oauth::{self, google::GoogleOauthProvider};
 use reviewloop::util::{compute_next_poll_at, sha256_file};
+use serde_json::{Value, json};
 use std::{
     env, fs,
     io::{IsTerminal, Write},
@@ -28,6 +32,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     Paper {
         #[command(subcommand)]
         command: PaperCommand,
@@ -67,10 +75,26 @@ enum Command {
         paper_id: Option<String>,
         #[arg(long)]
         json: bool,
+        #[arg(long, default_value_t = false)]
+        show_token: bool,
     },
     Retry {
         #[arg(long)]
         job_id: String,
+        #[arg(long, default_value_t = false)]
+        override_rate_limit: bool,
+    },
+    Complete {
+        #[arg(long)]
+        job_id: String,
+        #[arg(long)]
+        summary_text: Option<String>,
+        #[arg(long)]
+        summary_url: Option<String>,
+        #[arg(long, default_value_t = false)]
+        empty_summary: bool,
+        #[arg(long)]
+        score: Option<f64>,
     },
     Email {
         #[command(subcommand)]
@@ -94,6 +118,16 @@ enum UpdateMethod {
 }
 
 #[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    MigrateProject {
+        #[arg(long)]
+        project_id: String,
+        #[arg(long, value_name = "PATH")]
+        project_root: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum DaemonCommand {
     Run {
         #[arg(long, default_value_t = true)]
@@ -112,6 +146,8 @@ enum PaperCommand {
     Add {
         #[arg(long)]
         paper_id: String,
+        #[arg(long)]
+        project_id: Option<String>,
         #[arg(
             long = "pdf-path",
             alias = "path",
@@ -178,11 +214,22 @@ async fn run() -> Result<()> {
     Config::ensure_global_data_dir()?;
 
     match command {
+        Command::Config { command } => match command {
+            ConfigCommand::MigrateProject {
+                project_id,
+                project_root,
+            } => cmd_config_migrate_project(
+                config_override.as_deref(),
+                project_root.as_deref(),
+                &project_id,
+            ),
+        },
         Command::Paper { command } => {
-            let write_path = resolve_mutable_config_path(config_override.as_deref())?;
+            let write_path = resolve_mutable_project_config_path(config_override.as_deref())?;
             match command {
                 PaperCommand::Add {
                     paper_id,
+                    project_id,
                     pdf_path,
                     backend,
                     watch,
@@ -193,6 +240,7 @@ async fn run() -> Result<()> {
                     let should_submit = cmd_paper_add(PaperAddOptions {
                         config_path: &write_path,
                         paper_id: &paper_id,
+                        project_id: project_id.as_deref(),
                         pdf_path: &pdf_path,
                         backend: &backend,
                         watch,
@@ -201,7 +249,7 @@ async fn run() -> Result<()> {
                         no_submit_prompt,
                     })?;
                     if should_submit {
-                        let (config, db) = load_runtime(Some(write_path.as_path()), false)?;
+                        let (config, db) = load_runtime(Some(write_path.as_path()), false, true)?;
                         cmd_submit(&config, &db, &paper_id, false).await?;
                     }
                     Ok(())
@@ -223,7 +271,7 @@ async fn run() -> Result<()> {
                         "note: panel requested but stdout is not a TTY; running without panel."
                     );
                 }
-                let (config, db) = load_runtime(config_override.as_deref(), panel_enabled)?;
+                let (config, db) = load_runtime(config_override.as_deref(), panel_enabled, true)?;
                 reviewloop::worker::run_daemon(&config, &db, panel_enabled).await
             }
             DaemonCommand::Install { start } => {
@@ -233,19 +281,19 @@ async fn run() -> Result<()> {
             DaemonCommand::Status => cmd_daemon_status(),
         },
         Command::Submit { paper_id, force } => {
-            let (config, db) = load_runtime(config_override.as_deref(), false)?;
+            let (config, db) = load_runtime(config_override.as_deref(), false, true)?;
             cmd_submit(&config, &db, &paper_id, force).await
         }
         Command::Approve { job_id } => {
-            let (_config, db) = load_runtime(config_override.as_deref(), false)?;
-            cmd_approve(&db, &job_id)
+            let (config, db) = load_runtime(config_override.as_deref(), false, true)?;
+            cmd_approve(&config, &db, &job_id)
         }
         Command::ImportToken {
             paper_id,
             token,
             source,
         } => {
-            let (config, db) = load_runtime(config_override.as_deref(), false)?;
+            let (config, db) = load_runtime(config_override.as_deref(), false, true)?;
             cmd_import_token(&config, &db, &paper_id, &token, &source)
         }
         Command::Check {
@@ -253,7 +301,7 @@ async fn run() -> Result<()> {
             paper_id,
             all_processing,
         } => {
-            let (config, db) = load_runtime(config_override.as_deref(), false)?;
+            let (config, db) = load_runtime(config_override.as_deref(), false, true)?;
             cmd_check(
                 &config,
                 &db,
@@ -263,16 +311,42 @@ async fn run() -> Result<()> {
             )
             .await
         }
-        Command::Status { paper_id, json } => {
-            let (_config, db) = load_runtime(config_override.as_deref(), false)?;
-            cmd_status(&db, paper_id.as_deref(), json)
+        Command::Status {
+            paper_id,
+            json,
+            show_token,
+        } => {
+            let (config, db) = load_runtime(config_override.as_deref(), false, true)?;
+            cmd_status(&config, &db, paper_id.as_deref(), json, show_token)
         }
-        Command::Retry { job_id } => {
-            let (config, db) = load_runtime(config_override.as_deref(), false)?;
-            cmd_retry(&config, &db, &job_id)
+        Command::Retry {
+            job_id,
+            override_rate_limit,
+        } => {
+            let (config, db) = load_runtime(config_override.as_deref(), false, true)?;
+            cmd_retry(&config, &db, &job_id, override_rate_limit).await
+        }
+        Command::Complete {
+            job_id,
+            summary_text,
+            summary_url,
+            empty_summary,
+            score,
+        } => {
+            let (config, db) = load_runtime(config_override.as_deref(), false, true)?;
+            cmd_complete(
+                &config,
+                &db,
+                &job_id,
+                summary_text.as_deref(),
+                summary_url.as_deref(),
+                empty_summary,
+                score,
+            )
+            .await
         }
         Command::Email { command } => {
-            let (config, _db) = load_runtime(config_override.as_deref(), false)?;
+            let (config, _db) = load_runtime(config_override.as_deref(), false, false)?;
             match command {
                 EmailCommand::Login { provider } => cmd_email_login(&config, &provider).await,
                 EmailCommand::Logout { account } => cmd_email_logout(&config, account.as_deref()),
@@ -288,30 +362,67 @@ async fn run() -> Result<()> {
     }
 }
 
-fn resolve_mutable_config_path(config_override: Option<&Path>) -> Result<PathBuf> {
+fn resolve_mutable_project_config_path(config_override: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = config_override {
         return Ok(path.to_path_buf());
     }
 
-    if let Some(global) = Config::ensure_global_config_file()? {
-        return Ok(global);
+    if let Ok(loaded) = Config::load_runtime_with_metadata(None, false)
+        && let Some(project_path) = loaded.project_path
+    {
+        return Ok(project_path);
     }
 
-    Ok(PathBuf::from("reviewloop.toml"))
+    default_project_config_path()
 }
 
-fn load_or_create_config(path: &Path) -> Result<Config> {
+fn load_or_create_project_config(
+    path: &Path,
+    project_id: Option<&str>,
+) -> Result<ProjectConfigFile> {
     if path.exists() {
-        return Config::load(path);
+        let config = ProjectConfigFile::load(path)?;
+        if let Some(project_id) = project_id
+            && !project_id.trim().is_empty()
+            && config.project_id != project_id
+        {
+            anyhow::bail!(
+                "project_id mismatch for {}: file has {}, CLI requested {}",
+                path.display(),
+                config.project_id,
+                project_id
+            );
+        }
+        config.validate(true)?;
+        return Ok(config);
     }
-    let cfg = Config::default();
-    cfg.save(path)?;
-    Ok(cfg)
+
+    let Some(project_id) = project_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        anyhow::bail!(
+            "project config {} does not exist. create it with `reviewloop config migrate-project --project-id <id>` or pass --project-id on `paper add`",
+            path.display()
+        );
+    };
+
+    let config = ProjectConfigFile {
+        project_id: project_id.to_string(),
+        ..ProjectConfigFile::default()
+    };
+    config.validate(true)?;
+    Ok(config)
+}
+
+fn load_existing_project_config(path: &Path) -> Result<ProjectConfigFile> {
+    let config = ProjectConfigFile::load(path)
+        .with_context(|| format!("failed to load project config {}", path.display()))?;
+    config.validate(true)?;
+    Ok(config)
 }
 
 struct PaperAddOptions<'a> {
     config_path: &'a Path,
     paper_id: &'a str,
+    project_id: Option<&'a str>,
     pdf_path: &'a str,
     backend: &'a str,
     watch: bool,
@@ -321,8 +432,12 @@ struct PaperAddOptions<'a> {
 }
 
 fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
-    let mut config = load_or_create_config(options.config_path)?;
-    if config.find_paper(options.paper_id).is_some() {
+    let mut config = load_or_create_project_config(options.config_path, options.project_id)?;
+    if config
+        .papers
+        .iter()
+        .any(|paper| paper.id == options.paper_id)
+    {
         anyhow::bail!("paper_id already exists: {}", options.paper_id);
     }
 
@@ -331,15 +446,24 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
         pdf_path: options.pdf_path.to_string(),
         backend: options.backend.to_string(),
     });
-    config.set_paper_watch(options.paper_id, options.watch);
-    config.set_paper_tag_trigger(
-        options.paper_id,
-        options
-            .tag_trigger
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_string),
-    );
+    config
+        .paper_watch
+        .insert(options.paper_id.to_string(), options.watch);
+    match options
+        .tag_trigger
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    {
+        Some(trigger) => {
+            config
+                .paper_tag_triggers
+                .insert(options.paper_id.to_string(), trigger);
+        }
+        None => {
+            config.paper_tag_triggers.remove(options.paper_id);
+        }
+    }
     config.save(options.config_path)?;
 
     let watch_text = if options.watch { "enabled" } else { "disabled" };
@@ -377,11 +501,11 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
 }
 
 fn cmd_paper_watch(config_path: &Path, paper_id: &str, enabled: bool) -> Result<()> {
-    let mut config = load_or_create_config(config_path)?;
-    if config.find_paper(paper_id).is_none() {
+    let mut config = load_existing_project_config(config_path)?;
+    if !config.papers.iter().any(|paper| paper.id == paper_id) {
         anyhow::bail!("paper_id not found: {paper_id}");
     }
-    config.set_paper_watch(paper_id, enabled);
+    config.paper_watch.insert(paper_id.to_string(), enabled);
     config.save(config_path)?;
     println!(
         "Updated watch setting for paper {paper_id}: {}\n- config: {}",
@@ -392,19 +516,21 @@ fn cmd_paper_watch(config_path: &Path, paper_id: &str, enabled: bool) -> Result<
 }
 
 fn cmd_paper_remove(config_path: &Path, paper_id: &str, purge_history: bool) -> Result<()> {
-    let mut config = load_or_create_config(config_path)?;
-    let removed_from_config = config.remove_paper(paper_id);
+    let mut config = load_existing_project_config(config_path)?;
+    let before = config.papers.len();
+    config.papers.retain(|paper| paper.id != paper_id);
+    config.paper_watch.remove(paper_id);
+    config.paper_tag_triggers.remove(paper_id);
+    let removed_from_config = config.papers.len() != before;
     if removed_from_config {
         config.save(config_path)?;
     }
 
     let mut purge_summary: Option<(usize, usize, usize, usize)> = None;
     if purge_history {
-        ensure_runtime_dirs(&config)?;
-        let db = Db::from_config(&config)?;
-        db.init_schema()?;
-        let report = db.purge_paper_history(paper_id)?;
-        let artifact_dirs = purge_artifacts_for_jobs(&config.state_dir(), &report.job_ids)?;
+        let (runtime, db) = load_runtime(Some(config_path), false, true)?;
+        let report = db.purge_paper_history(&runtime.project_id, paper_id)?;
+        let artifact_dirs = purge_artifacts_for_jobs(&runtime.state_dir(), &report.job_ids)?;
         purge_summary = Some((report.jobs, report.reviews, report.events, artifact_dirs));
     }
 
@@ -455,6 +581,62 @@ fn prompt_yes_no(prompt: &str) -> Result<bool> {
     std::io::stdin().read_line(&mut input)?;
     let normalized = input.trim().to_ascii_lowercase();
     Ok(matches!(normalized.as_str(), "y" | "yes"))
+}
+
+fn cmd_config_migrate_project(
+    config_override: Option<&Path>,
+    project_root: Option<&Path>,
+    project_id: &str,
+) -> Result<()> {
+    let Some(legacy_path) = Config::legacy_global_config_path().filter(|path| path.exists()) else {
+        anyhow::bail!("legacy global config not found; nothing to migrate");
+    };
+    let legacy = LegacyConfig::load(&legacy_path)?;
+
+    let project_path = if let Some(path) = config_override {
+        path.to_path_buf()
+    } else if let Some(root) = project_root {
+        root.join("reviewloop.toml")
+    } else {
+        default_project_config_path()?
+    };
+    if project_path.exists() {
+        anyhow::bail!("project config already exists: {}", project_path.display());
+    }
+
+    let mut project = legacy.project_config();
+    project.project_id = project_id.to_string();
+    project.validate(true)?;
+    project.save(&project_path)?;
+
+    let global_path = Config::ensure_global_config_file()?
+        .ok_or_else(|| anyhow!("failed to determine global config path"))?;
+    legacy.global_config().save(&global_path)?;
+
+    let backup_path = legacy_path.with_file_name("reviewloop.legacy.bak.toml");
+    if backup_path.exists() {
+        fs::remove_file(&backup_path)
+            .with_context(|| format!("failed to remove old backup {}", backup_path.display()))?;
+    }
+    fs::rename(&legacy_path, &backup_path).with_context(|| {
+        format!(
+            "failed to move legacy config {} -> {}",
+            legacy_path.display(),
+            backup_path.display()
+        )
+    })?;
+
+    let (runtime, db) = load_runtime(Some(&project_path), false, true)?;
+    db.assign_unscoped_rows_to_project(&runtime.project_id)?;
+
+    println!(
+        "Migrated legacy config.\n- global config: {}\n- project config: {}\n- legacy backup: {}\n- project_id: {}",
+        global_path.display(),
+        project_path.display(),
+        backup_path.display(),
+        project_id
+    );
+    Ok(())
 }
 
 fn cmd_self_update(method: UpdateMethod, yes: bool, dry_run: bool) -> Result<()> {
@@ -556,9 +738,9 @@ fn cmd_daemon_install(config_override: Option<&Path>, start: bool) -> Result<()>
     {
         const DAEMON_LABEL: &str = "ai.reviewloop.daemon";
 
-        let cfg_path = resolve_mutable_config_path(config_override)?;
+        let cfg_path = resolve_mutable_project_config_path(config_override)?;
         let cfg_path = fs::canonicalize(&cfg_path).unwrap_or(cfg_path);
-        let config = Config::load(&cfg_path)?;
+        let (config, _db) = load_runtime(Some(&cfg_path), false, true)?;
         ensure_runtime_dirs(&config)?;
 
         let home = env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
@@ -767,18 +949,31 @@ fn xml_escape(input: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn load_runtime(config_override: Option<&Path>, force_stderr_logs: bool) -> Result<(Config, Db)> {
-    let loaded = Config::load_layered_with_metadata(config_override)?;
-    let layer_chain = loaded
-        .layers
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join(" -> ");
-    let config = loaded.config;
+fn load_runtime(
+    config_override: Option<&Path>,
+    force_stderr_logs: bool,
+    require_project: bool,
+) -> Result<(Config, Db)> {
+    let loaded = Config::load_runtime_with_metadata(config_override, require_project)?;
+    let reviewloop::config::LoadedConfig {
+        config,
+        global_path,
+        project_path,
+        legacy_global_path,
+        compat_notice,
+    } = loaded;
 
     reviewloop::logging::init_logging(&config, force_stderr_logs)?;
-    tracing::info!(layers = %layer_chain, "loaded configuration layers");
+    tracing::info!(
+        global_config = ?global_path,
+        project_config = ?project_path,
+        legacy_global_config = ?legacy_global_path,
+        project_id = %config.project_id,
+        "loaded runtime configuration"
+    );
+    if let Some(notice) = compat_notice.as_deref() {
+        warn!("{notice}");
+    }
     info!("{}", render_guardrail_notice(&config));
     print_guardrail_warnings(&config);
 
@@ -849,7 +1044,7 @@ fn print_guardrail_warnings(config: &Config) {
 async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Result<()> {
     let paper = config
         .find_paper(paper_id)
-        .with_context(|| format!("paper_id not found in config: {paper_id}"))?;
+        .with_context(|| format!("paper_id not found in project config: {paper_id}"))?;
 
     let pdf_path = Path::new(&paper.pdf_path);
     if !pdf_path.exists() {
@@ -857,10 +1052,35 @@ async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Re
     }
 
     let pdf_hash = sha256_file(pdf_path)?;
-    if !force && db.has_duplicate_guard(&paper.backend, &pdf_hash)? {
+    let (version_source, version_key) = version_identity(None, &pdf_hash);
+    if !force
+        && let Some(existing) = db.find_duplicate_covering_job(
+            &config.project_id,
+            &paper.id,
+            &paper.backend,
+            &pdf_hash,
+            &version_key,
+        )?
+    {
+        record_duplicate_skip(
+            config,
+            db,
+            paper,
+            &pdf_hash,
+            &version_source,
+            &version_key,
+            &existing,
+            "manual_submit",
+        )?;
         println!(
-            "Skipped submit: existing active/completed job already covers backend={} hash={}",
-            paper.backend, pdf_hash
+            "Skipped submit: existing active/completed job already covers project_id={} paper_id={} backend={} hash={} version={} existing_job_id={} status={}",
+            config.project_id,
+            paper.id,
+            paper.backend,
+            pdf_hash,
+            existing.version_no,
+            existing.id,
+            existing.status.as_str()
         );
         return Ok(());
     }
@@ -874,6 +1094,7 @@ async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Re
     };
 
     let job = db.create_job(&NewJob {
+        project_id: config.project_id.clone(),
         paper_id: paper.id.clone(),
         backend: paper.backend.clone(),
         pdf_path: paper.pdf_path.clone(),
@@ -887,9 +1108,10 @@ async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Re
     })?;
 
     db.add_event(
+        None,
         Some(&job.id),
         "manual_submit_requested",
-        serde_json::json!({ "paper_id": paper_id, "force": force }),
+        json!({ "paper_id": paper_id, "force": force }),
     )?;
 
     reviewloop::worker::submit_job(config, db, &job.id).await?;
@@ -897,10 +1119,8 @@ async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Re
     Ok(())
 }
 
-fn cmd_approve(db: &Db, job_id: &str) -> Result<()> {
-    let Some(job) = db.get_job(job_id)? else {
-        anyhow::bail!("job not found: {job_id}");
-    };
+fn cmd_approve(config: &Config, db: &Db, job_id: &str) -> Result<()> {
+    let job = ensure_project_job(config, db, job_id)?;
 
     if job.status != JobStatus::PendingApproval {
         anyhow::bail!(
@@ -911,7 +1131,7 @@ fn cmd_approve(db: &Db, job_id: &str) -> Result<()> {
     }
 
     db.update_job_state(job_id, JobStatus::Queued, None, Some(None), Some(None))?;
-    db.add_event(Some(job_id), "approved", serde_json::json!({}))?;
+    db.add_event(None, Some(job_id), "approved", json!({}))?;
 
     println!("Approved job {job_id}, now QUEUED");
     Ok(())
@@ -933,12 +1153,13 @@ fn cmd_import_token(
         config.polling.jitter_percent,
     );
 
-    if let Some(job) = db.find_latest_open_job_for_paper(paper_id)? {
+    if let Some(job) = db.find_latest_open_job_for_paper(&config.project_id, paper_id)? {
         db.attach_token_to_job(&job.id, token, next_poll)?;
         db.add_event(
+            None,
             Some(&job.id),
             "token_imported",
-            serde_json::json!({ "source": source, "token": token }),
+            json!({ "source": source, "token": token }),
         )?;
         println!("Attached token to existing job {}", job.id);
         return Ok(());
@@ -946,7 +1167,7 @@ fn cmd_import_token(
 
     let paper = config
         .find_paper(paper_id)
-        .with_context(|| format!("paper_id not found in config: {paper_id}"))?;
+        .with_context(|| format!("paper_id not found in project config: {paper_id}"))?;
 
     let pdf_hash = if Path::new(&paper.pdf_path).exists() {
         sha256_file(Path::new(&paper.pdf_path))?
@@ -963,6 +1184,7 @@ fn cmd_import_token(
     };
 
     let job = db.create_job(&NewJob {
+        project_id: config.project_id.clone(),
         paper_id: paper.id.clone(),
         backend: paper.backend.clone(),
         pdf_path: paper.pdf_path.clone(),
@@ -977,9 +1199,10 @@ fn cmd_import_token(
     db.attach_token_to_job(&job.id, token, next_poll)?;
 
     db.add_event(
+        None,
         Some(&job.id),
         "token_imported",
-        serde_json::json!({ "source": source, "token": token }),
+        json!({ "source": source, "token": token }),
     )?;
 
     println!("Created job {} and attached imported token", job.id);
@@ -999,20 +1222,18 @@ async fn cmd_check(
 
     let mut targets = Vec::new();
     if let Some(job_id) = job_id {
-        let Some(job) = db.get_job(job_id)? else {
-            anyhow::bail!("job not found: {job_id}");
-        };
+        let job = ensure_project_job(config, db, job_id)?;
         if job.token.is_none() {
             anyhow::bail!("job {job_id} has no token; cannot poll");
         }
         targets.push(job);
     } else {
-        let rows = db.list_status_views(paper_id)?;
+        let rows = db.list_status_views(&config.project_id, paper_id)?;
         for row in rows {
             if row.status != JobStatus::Processing.as_str() {
                 continue;
             }
-            let Some(job) = db.get_job(&row.id)? else {
+            let Some(job) = db.get_project_job(&config.project_id, &row.id)? else {
                 continue;
             };
             if job.token.is_some() {
@@ -1030,8 +1251,9 @@ async fn cmd_check(
     }
 
     for job in targets {
+        maybe_record_manual_poll_override(config, db, &job)?;
         reviewloop::worker::poll_job(config, db, &job).await?;
-        let Some(updated) = db.get_job(&job.id)? else {
+        let Some(updated) = db.get_project_job(&config.project_id, &job.id)? else {
             continue;
         };
         println!(
@@ -1048,11 +1270,35 @@ async fn cmd_check(
     Ok(())
 }
 
-fn cmd_status(db: &Db, paper_id: Option<&str>, as_json: bool) -> Result<()> {
-    let rows = db.list_status_views(paper_id)?;
+fn cmd_status(
+    config: &Config,
+    db: &Db,
+    paper_id: Option<&str>,
+    as_json: bool,
+    show_token: bool,
+) -> Result<()> {
+    let rows = db.list_status_views(&config.project_id, paper_id)?;
+
+    if let Some(paper_id) = paper_id {
+        let events = db.list_timeline_events(&config.project_id, paper_id)?;
+        if as_json {
+            let payload = json!({
+                "rows": rows.iter().map(|row| status_row_json(row, show_token)).collect::<Vec<_>>(),
+                "timeline": timeline_json(&rows, &events, show_token),
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+            return Ok(());
+        }
+        render_timeline_text(config, paper_id, &rows, &events, show_token);
+        return Ok(());
+    }
 
     if as_json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        let payload = rows
+            .iter()
+            .map(|row| status_row_json(row, show_token))
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
 
@@ -1062,28 +1308,39 @@ fn cmd_status(db: &Db, paper_id: Option<&str>, as_json: bool) -> Result<()> {
     }
 
     println!(
-        "{:<36}  {:<16}  {:<10}  {:<18}  {:<7}  {:<20}  {:<20}  {:<8}",
-        "JOB ID", "PAPER", "BACKEND", "STATUS", "ATTEMPT", "NEXT POLL", "STARTED", "ELAPSED"
+        "{:<36}  {:<16}  {:<10}  {:<18}  {:<7}  {:<8}  {:<14}  {:<20}  {:<20}  {:<8}",
+        "JOB ID",
+        "PAPER",
+        "BACKEND",
+        "STATUS",
+        "ATTEMPT",
+        "SCORE",
+        "TOKEN",
+        "NEXT POLL",
+        "STARTED",
+        "ELAPSED"
     );
-    println!("{}", "-".repeat(160));
+    println!("{}", "-".repeat(200));
     let now = Utc::now();
     for row in rows {
         let started = row.started_at.unwrap_or(row.created_at);
         let elapsed = format_elapsed(started, now);
         println!(
-            "{:<36}  {:<16}  {:<10}  {:<18}  {:<7}  {:<20}  {:<20}  {:<8}",
+            "{:<36}  {:<16}  {:<10}  {:<18}  {:<7}  {:<8}  {:<14}  {:<20}  {:<20}  {:<8}",
             row.id,
             row.paper_id,
             row.backend,
             row.status,
             row.attempt,
+            row.score.clone().unwrap_or_else(|| "-".to_string()),
+            render_token(row.token.as_deref(), show_token),
             row.next_poll_at
                 .map(|v| v.to_rfc3339())
                 .unwrap_or_else(|| "-".to_string()),
             started.to_rfc3339(),
             elapsed
         );
-        if let Some(err) = row.last_error {
+        if let Some(err) = row.last_error.clone() {
             println!("  error: {err}");
         }
     }
@@ -1105,12 +1362,75 @@ fn format_elapsed(started: chrono::DateTime<Utc>, now: chrono::DateTime<Utc>) ->
     format!("{}d{}h", secs / 86_400, (secs % 86_400) / 3600)
 }
 
-fn cmd_retry(config: &Config, db: &Db, job_id: &str) -> Result<()> {
-    let Some(job) = db.get_job(job_id)? else {
-        anyhow::bail!("job not found: {job_id}");
-    };
+async fn cmd_retry(
+    config: &Config,
+    db: &Db,
+    job_id: &str,
+    override_rate_limit: bool,
+) -> Result<()> {
+    let job = ensure_project_job(config, db, job_id)?;
 
-    if let Some(_token) = &job.token {
+    if override_rate_limit {
+        let previous_next_poll_at = job.next_poll_at.map(|value| value.to_rfc3339());
+        if job.token.is_some() {
+            if job.status != JobStatus::Processing {
+                anyhow::bail!(
+                    "--override-rate-limit for token-backed jobs only supports PROCESSING jobs"
+                );
+            }
+            db.add_event(
+                Some(&config.project_id),
+                Some(&job.id),
+                "manual_rate_limit_override",
+                json!({
+                    "paper_id": job.paper_id,
+                    "mode": "poll",
+                    "reason": "manual_override",
+                    "previous_status": job.status.as_str(),
+                    "previous_next_poll_at": previous_next_poll_at,
+                    "version_no": job.version_no,
+                    "round_no": job.round_no
+                }),
+            )?;
+            reviewloop::worker::poll_job(config, db, &job).await?;
+            println!("Immediately polled job {job_id} with rate-limit override");
+            return Ok(());
+        }
+
+        if !matches!(
+            job.status,
+            JobStatus::Queued
+                | JobStatus::Submitted
+                | JobStatus::Failed
+                | JobStatus::FailedNeedsManual
+                | JobStatus::Timeout
+        ) {
+            anyhow::bail!(
+                "--override-rate-limit for tokenless jobs only supports QUEUED/SUBMITTED/FAILED/FAILED_NEEDS_MANUAL/TIMEOUT"
+            );
+        }
+
+        db.update_job_state(&job.id, JobStatus::Queued, Some(0), Some(None), Some(None))?;
+        db.add_event(
+            Some(&config.project_id),
+            Some(&job.id),
+            "manual_rate_limit_override",
+            json!({
+                "paper_id": job.paper_id,
+                "mode": "submit",
+                "reason": "manual_override",
+                "previous_status": job.status.as_str(),
+                "previous_next_poll_at": previous_next_poll_at,
+                "version_no": job.version_no,
+                "round_no": job.round_no
+            }),
+        )?;
+        reviewloop::worker::submit_job(config, db, &job.id).await?;
+        println!("Immediately retried job {job_id} with rate-limit override");
+        return Ok(());
+    }
+
+    if job.token.is_some() {
         let next = compute_next_poll_at(
             Utc::now(),
             &config.polling.schedule_minutes,
@@ -1128,10 +1448,516 @@ fn cmd_retry(config: &Config, db: &Db, job_id: &str) -> Result<()> {
         db.update_job_state(&job.id, JobStatus::Queued, Some(0), Some(None), Some(None))?;
     }
 
-    db.add_event(Some(&job.id), "retried", serde_json::json!({}))?;
+    db.add_event(None, Some(&job.id), "retried", json!({}))?;
     println!("Retry scheduled for job {job_id}");
 
     Ok(())
+}
+
+async fn cmd_complete(
+    config: &Config,
+    db: &Db,
+    job_id: &str,
+    summary_text: Option<&str>,
+    summary_url: Option<&str>,
+    empty_summary: bool,
+    score: Option<f64>,
+) -> Result<()> {
+    let job = ensure_project_job(config, db, job_id)?;
+    if !matches!(
+        job.status,
+        JobStatus::PendingApproval
+            | JobStatus::Queued
+            | JobStatus::Submitted
+            | JobStatus::Processing
+            | JobStatus::Failed
+            | JobStatus::FailedNeedsManual
+            | JobStatus::Timeout
+    ) {
+        anyhow::bail!(
+            "job {} is in status {}; manual completion is not allowed",
+            job.id,
+            job.status.as_str()
+        );
+    }
+
+    let source_count =
+        summary_text.is_some() as u8 + summary_url.is_some() as u8 + empty_summary as u8;
+    if source_count != 1 {
+        anyhow::bail!("choose exactly one of --summary-text, --summary-url, or --empty-summary");
+    }
+
+    let (mode, source_url, raw_json) =
+        build_manual_review_payload(summary_text, summary_url, empty_summary, score).await?;
+    let token = job
+        .token
+        .clone()
+        .unwrap_or_else(|| format!("manual:{}", job.id));
+    let (_, summary_md, _) = write_review_artifacts(&config.state_dir(), &job, &token, &raw_json)?;
+    db.upsert_review(&job.id, &token, &raw_json.to_string(), &summary_md)?;
+    db.update_job_state(
+        &job.id,
+        JobStatus::Completed,
+        Some(job.attempt + 1),
+        Some(None),
+        Some(None),
+    )?;
+    db.add_event(
+        None,
+        Some(&job.id),
+        "manual_completed",
+        json!({
+            "paper_id": job.paper_id,
+            "mode": mode,
+            "source_url": source_url,
+            "score": score,
+            "version_no": job.version_no,
+            "round_no": job.round_no
+        }),
+    )?;
+    println!("Marked job {job_id} as COMPLETED");
+    Ok(())
+}
+
+fn ensure_project_job(config: &Config, db: &Db, job_id: &str) -> Result<reviewloop::model::Job> {
+    db.get_project_job(&config.project_id, job_id)?
+        .ok_or_else(|| anyhow!("job not found in project {}: {}", config.project_id, job_id))
+}
+
+fn version_identity(git_commit: Option<&str>, pdf_hash: &str) -> (String, String) {
+    if let Some(commit) = git_commit.map(str::trim).filter(|value| !value.is_empty()) {
+        ("git_commit".to_string(), commit.to_string())
+    } else {
+        ("pdf_hash".to_string(), pdf_hash.to_string())
+    }
+}
+
+fn record_duplicate_skip(
+    config: &Config,
+    db: &Db,
+    paper: &PaperConfig,
+    pdf_hash: &str,
+    version_source: &str,
+    version_key: &str,
+    existing: &reviewloop::model::Job,
+    source: &str,
+) -> Result<()> {
+    warn!(
+        project_id = %config.project_id,
+        paper_id = %paper.id,
+        backend = %paper.backend,
+        source = %source,
+        existing_job_id = %existing.id,
+        existing_status = %existing.status.as_str(),
+        "skipped duplicate submit"
+    );
+    db.add_event(
+        Some(&config.project_id),
+        None,
+        "duplicate_skipped",
+        json!({
+            "project_id": config.project_id,
+            "paper_id": paper.id,
+            "backend": paper.backend,
+            "pdf_hash": pdf_hash,
+            "version_no": existing.version_no,
+            "round_no": existing.round_no,
+            "version_source": version_source,
+            "version_key": version_key,
+            "existing_job_id": existing.id,
+            "existing_job_status": existing.status.as_str(),
+            "source": source
+        }),
+    )?;
+    Ok(())
+}
+
+fn maybe_record_manual_poll_override(
+    config: &Config,
+    db: &Db,
+    job: &reviewloop::model::Job,
+) -> Result<()> {
+    if job
+        .next_poll_at
+        .is_some_and(|next_poll_at| next_poll_at > Utc::now())
+    {
+        db.add_event(
+            Some(&config.project_id),
+            Some(&job.id),
+            "manual_rate_limit_override",
+            json!({
+                "paper_id": job.paper_id,
+                "mode": "poll",
+                "reason": "manual_check",
+                "previous_status": job.status.as_str(),
+                "previous_next_poll_at": job.next_poll_at.map(|value| value.to_rfc3339()),
+                "version_no": job.version_no,
+                "round_no": job.round_no
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn status_row_json(row: &StatusView, show_token: bool) -> Value {
+    json!({
+        "id": row.id,
+        "project_id": row.project_id,
+        "paper_id": row.paper_id,
+        "backend": row.backend,
+        "status": row.status,
+        "attempt": row.attempt,
+        "token_masked": render_token(row.token.as_deref(), false),
+        "token": show_token.then(|| row.token.clone()).flatten(),
+        "created_at": row.created_at.to_rfc3339(),
+        "started_at": row.started_at.map(|value| value.to_rfc3339()),
+        "next_poll_at": row.next_poll_at.map(|value| value.to_rfc3339()),
+        "updated_at": row.updated_at.to_rfc3339(),
+        "last_error": row.last_error,
+        "pdf_hash": row.pdf_hash,
+        "git_tag": row.git_tag,
+        "git_commit": row.git_commit,
+        "version_no": row.version_no,
+        "round_no": row.round_no,
+        "version_source": row.version_source,
+        "version_key": row.version_key,
+        "score": row.score,
+        "summary_md": row.summary_md,
+        "completed_at": row.completed_at.map(|value| value.to_rfc3339()),
+    })
+}
+
+fn timeline_json(rows: &[StatusView], events: &[EventRecord], show_token: bool) -> Vec<Value> {
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(json!({
+            "kind": "job",
+            "created_at": row.created_at.to_rfc3339(),
+            "job": status_row_json(row, show_token),
+        }));
+    }
+    for event in events {
+        entries.push(json!({
+            "kind": "event",
+            "created_at": event.created_at.to_rfc3339(),
+            "event_type": event.event_type,
+            "job_id": event.job_id,
+            "payload": event.payload,
+        }));
+    }
+    entries.sort_by(|left, right| {
+        left.get("created_at")
+            .and_then(Value::as_str)
+            .cmp(&right.get("created_at").and_then(Value::as_str))
+    });
+    entries
+}
+
+fn render_timeline_text(
+    config: &Config,
+    paper_id: &str,
+    rows: &[StatusView],
+    events: &[EventRecord],
+    show_token: bool,
+) {
+    if rows.is_empty() && events.is_empty() {
+        println!(
+            "No jobs found for paper {paper_id} in project {}.",
+            config.project_id
+        );
+        return;
+    }
+
+    println!(
+        "Paper timeline: {} (project_id={})",
+        paper_id, config.project_id
+    );
+    let mut grouped: std::collections::BTreeMap<(u32, u32), Vec<Value>> =
+        std::collections::BTreeMap::new();
+
+    for row in rows {
+        grouped
+            .entry((row.version_no, row.round_no))
+            .or_default()
+            .push(json!({
+                "kind": "job",
+                "created_at": row.created_at.to_rfc3339(),
+                "row": status_row_json(row, show_token),
+            }));
+    }
+
+    for event in events {
+        let version_no = event
+            .payload
+            .get("version_no")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+            .or_else(|| {
+                event.job_id.as_deref().and_then(|job_id| {
+                    rows.iter()
+                        .find(|row| row.id == job_id)
+                        .map(|row| row.version_no)
+                })
+            })
+            .unwrap_or(0);
+        let round_no = event
+            .payload
+            .get("round_no")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+            .or_else(|| {
+                event.job_id.as_deref().and_then(|job_id| {
+                    rows.iter()
+                        .find(|row| row.id == job_id)
+                        .map(|row| row.round_no)
+                })
+            })
+            .unwrap_or(0);
+        grouped
+            .entry((version_no, round_no))
+            .or_default()
+            .push(json!({
+                "kind": "event",
+                "created_at": event.created_at.to_rfc3339(),
+                "event_type": event.event_type,
+                "payload": event.payload,
+                "job_id": event.job_id,
+            }));
+    }
+
+    for ((version_no, round_no), entries) in grouped {
+        println!();
+        println!(
+            "Version {} Round {}",
+            if version_no == 0 {
+                "-".to_string()
+            } else {
+                version_no.to_string()
+            },
+            if round_no == 0 {
+                "-".to_string()
+            } else {
+                round_no.to_string()
+            }
+        );
+        let mut entries = entries;
+        entries.sort_by(|left, right| {
+            left.get("created_at")
+                .and_then(Value::as_str)
+                .cmp(&right.get("created_at").and_then(Value::as_str))
+        });
+
+        for entry in entries {
+            if entry.get("kind").and_then(Value::as_str) == Some("job") {
+                let row = entry.get("row").cloned().unwrap_or(Value::Null);
+                let token = row
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .or_else(|| row.get("token_masked").and_then(Value::as_str))
+                    .unwrap_or("-");
+                println!(
+                    "- [{}] {} status={} attempt={} score={} token={} created_at={}",
+                    row.get("backend").and_then(Value::as_str).unwrap_or("-"),
+                    row.get("id").and_then(Value::as_str).unwrap_or("-"),
+                    row.get("status").and_then(Value::as_str).unwrap_or("-"),
+                    row.get("attempt").and_then(Value::as_u64).unwrap_or(0),
+                    row.get("score").and_then(Value::as_str).unwrap_or("-"),
+                    token,
+                    row.get("created_at").and_then(Value::as_str).unwrap_or("-")
+                );
+                println!(
+                    "  started_at={} completed_at={}",
+                    row.get("started_at").and_then(Value::as_str).unwrap_or("-"),
+                    row.get("completed_at")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-")
+                );
+                println!(
+                    "  git_tag={} git_commit={} pdf_hash={}",
+                    row.get("git_tag").and_then(Value::as_str).unwrap_or("-"),
+                    row.get("git_commit").and_then(Value::as_str).unwrap_or("-"),
+                    row.get("pdf_hash").and_then(Value::as_str).unwrap_or("-")
+                );
+                if let Some(summary) = row.get("summary_md").and_then(Value::as_str)
+                    && !summary.trim().is_empty()
+                {
+                    println!("{}", indent_block(summary, "  "));
+                }
+                if let Some(err) = row.get("last_error").and_then(Value::as_str)
+                    && !err.trim().is_empty()
+                {
+                    println!("  error: {err}");
+                }
+            } else {
+                let payload = entry.get("payload").cloned().unwrap_or(Value::Null);
+                println!(
+                    "- [event] {} created_at={} {}",
+                    entry
+                        .get("event_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-"),
+                    entry
+                        .get("created_at")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-"),
+                    compact_event_payload(&payload)
+                );
+            }
+        }
+    }
+}
+
+fn render_token(token: Option<&str>, show_token: bool) -> String {
+    match token {
+        Some(token) if show_token => token.to_string(),
+        Some(token) if token.len() > 8 => {
+            format!("{}...{}", &token[..4], &token[token.len() - 4..])
+        }
+        Some(token) => token.to_string(),
+        None => "-".to_string(),
+    }
+}
+
+fn compact_event_payload(payload: &Value) -> String {
+    if let Some(existing_job_id) = payload.get("existing_job_id").and_then(Value::as_str) {
+        let status = payload
+            .get("existing_job_status")
+            .and_then(Value::as_str)
+            .unwrap_or("-");
+        return format!("existing_job_id={} status={}", existing_job_id, status);
+    }
+    if let Some(mode) = payload.get("mode").and_then(Value::as_str) {
+        return format!("mode={mode}");
+    }
+    if let Some(source) = payload.get("source").and_then(Value::as_str) {
+        return format!("source={source}");
+    }
+    payload.to_string()
+}
+
+fn indent_block(text: &str, prefix: &str) -> String {
+    text.lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn build_manual_review_payload(
+    summary_text: Option<&str>,
+    summary_url: Option<&str>,
+    empty_summary: bool,
+    score: Option<f64>,
+) -> Result<(String, Option<String>, Value)> {
+    let (mode, source_url, mut payload) = if let Some(text) = summary_text {
+        (
+            "text".to_string(),
+            None,
+            json!({
+                "sections": { "summary": text },
+                "content": text,
+            }),
+        )
+    } else if let Some(url) = summary_url {
+        let payload = fetch_summary_url(url).await?;
+        ("url".to_string(), Some(url.to_string()), payload)
+    } else if empty_summary {
+        (
+            "empty".to_string(),
+            None,
+            json!({
+                "sections": { "summary": "" },
+                "content": "",
+            }),
+        )
+    } else {
+        unreachable!("summary mode validated by caller");
+    };
+
+    if let Some(score) = score {
+        payload["numerical_score"] = json!(score);
+    }
+    let manual_meta = json!({
+        "mode": mode,
+        "source_url": source_url.clone(),
+        "completed_at": Utc::now().to_rfc3339(),
+        "score": score
+    });
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("manual_completion".to_string(), manual_meta);
+    }
+    Ok((mode, source_url, payload))
+}
+
+async fn fetch_summary_url(url: &str) -> Result<Value> {
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch summary URL: {url}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "summary URL request failed with status {}: {}",
+            status,
+            body
+        );
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let body = response
+        .text()
+        .await
+        .context("failed to read summary URL body")?;
+
+    if content_type.contains("application/json") {
+        let mut value: Value =
+            serde_json::from_str(&body).context("summary URL returned invalid JSON")?;
+        let is_review_like = value.as_object().is_some_and(|object| {
+            object.contains_key("sections")
+                || object.contains_key("content")
+                || object.contains_key("numerical_score")
+        });
+        if is_review_like {
+            return Ok(value);
+        }
+        value = json!({ "content": value.to_string() });
+        return Ok(value);
+    }
+
+    if content_type.contains("text/html") {
+        return Ok(json!({ "content": html_to_text(&body) }));
+    }
+
+    Ok(json!({ "content": body }))
+}
+
+fn html_to_text(html: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            }
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 async fn cmd_email_login(config: &Config, provider: &str) -> Result<()> {
