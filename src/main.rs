@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use reviewloop::artifact::write_review_artifacts;
 use reviewloop::config::{
     Config, LegacyConfig, PaperConfig, ProjectConfigFile, default_project_config_path,
@@ -32,6 +32,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Init(InitArgs),
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -110,6 +111,27 @@ enum Command {
     },
 }
 
+#[derive(Debug, Args, Clone)]
+struct InitArgs {
+    #[command(subcommand)]
+    command: Option<InitCommand>,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+enum InitCommand {
+    Project(InitProjectArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+struct InitProjectArgs {
+    #[arg(long)]
+    project_id: String,
+    #[arg(long, value_name = "PATH")]
+    project_root: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    force: bool,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum UpdateMethod {
     Auto,
@@ -119,6 +141,7 @@ enum UpdateMethod {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
+    Init(InitArgs),
     MigrateProject {
         #[arg(long)]
         project_id: String,
@@ -214,7 +237,9 @@ async fn run() -> Result<()> {
     Config::ensure_global_data_dir()?;
 
     match command {
+        Command::Init(args) => cmd_init(config_override.as_deref(), &args),
         Command::Config { command } => match command {
+            ConfigCommand::Init(args) => cmd_init(config_override.as_deref(), &args),
             ConfigCommand::MigrateProject {
                 project_id,
                 project_root,
@@ -271,7 +296,7 @@ async fn run() -> Result<()> {
                         "note: panel requested but stdout is not a TTY; running without panel."
                     );
                 }
-                let (config, db) = load_runtime(config_override.as_deref(), panel_enabled, true)?;
+                let (config, db) = load_runtime(config_override.as_deref(), panel_enabled, false)?;
                 reviewloop::worker::run_daemon(&config, &db, panel_enabled).await
             }
             DaemonCommand::Install { start } => {
@@ -281,11 +306,11 @@ async fn run() -> Result<()> {
             DaemonCommand::Status => cmd_daemon_status(),
         },
         Command::Submit { paper_id, force } => {
-            let (config, db) = load_runtime(config_override.as_deref(), false, true)?;
+            let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
             cmd_submit(&config, &db, &paper_id, force).await
         }
         Command::Approve { job_id } => {
-            let (config, db) = load_runtime(config_override.as_deref(), false, true)?;
+            let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
             cmd_approve(&config, &db, &job_id)
         }
         Command::ImportToken {
@@ -293,7 +318,7 @@ async fn run() -> Result<()> {
             token,
             source,
         } => {
-            let (config, db) = load_runtime(config_override.as_deref(), false, true)?;
+            let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
             cmd_import_token(&config, &db, &paper_id, &token, &source)
         }
         Command::Check {
@@ -301,7 +326,7 @@ async fn run() -> Result<()> {
             paper_id,
             all_processing,
         } => {
-            let (config, db) = load_runtime(config_override.as_deref(), false, true)?;
+            let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
             cmd_check(
                 &config,
                 &db,
@@ -316,14 +341,14 @@ async fn run() -> Result<()> {
             json,
             show_token,
         } => {
-            let (config, db) = load_runtime(config_override.as_deref(), false, true)?;
+            let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
             cmd_status(&config, &db, paper_id.as_deref(), json, show_token)
         }
         Command::Retry {
             job_id,
             override_rate_limit,
         } => {
-            let (config, db) = load_runtime(config_override.as_deref(), false, true)?;
+            let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
             cmd_retry(&config, &db, &job_id, override_rate_limit).await
         }
         Command::Complete {
@@ -333,7 +358,7 @@ async fn run() -> Result<()> {
             empty_summary,
             score,
         } => {
-            let (config, db) = load_runtime(config_override.as_deref(), false, true)?;
+            let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
             cmd_complete(
                 &config,
                 &db,
@@ -360,6 +385,73 @@ async fn run() -> Result<()> {
             dry_run,
         } => cmd_self_update(method, yes, dry_run),
     }
+}
+
+fn cmd_init(config_override: Option<&Path>, args: &InitArgs) -> Result<()> {
+    match &args.command {
+        Some(InitCommand::Project(project_args)) => cmd_init_project(config_override, project_args),
+        None => cmd_init_global(config_override),
+    }
+}
+
+fn cmd_init_global(config_override: Option<&Path>) -> Result<()> {
+    if let Some(path) = config_override {
+        anyhow::bail!(
+            "--config only applies to project config commands; use `reviewloop init project --project-id <id>` for {}",
+            path.display()
+        );
+    }
+
+    let global_path = Config::ensure_global_config_file()?
+        .ok_or_else(|| anyhow!("failed to determine global config path"))?;
+    let data_dir = Config::ensure_global_data_dir()?
+        .ok_or_else(|| anyhow!("failed to determine global data dir"))?;
+
+    println!(
+        "Initialized global reviewloop paths.\n- global config: {}\n- global data dir: {}",
+        global_path.display(),
+        data_dir.display()
+    );
+    Ok(())
+}
+
+fn cmd_init_project(config_override: Option<&Path>, args: &InitProjectArgs) -> Result<()> {
+    if config_override.is_some() && args.project_root.is_some() {
+        anyhow::bail!("--config and --project-root cannot be combined");
+    }
+
+    let project_path = if let Some(path) = config_override {
+        path.to_path_buf()
+    } else if let Some(root) = args.project_root.as_deref() {
+        root.join("reviewloop.toml")
+    } else {
+        default_project_config_path()?
+    };
+
+    let existed = project_path.exists();
+    if existed && !args.force {
+        anyhow::bail!(
+            "project config already exists: {} (use --force to update it)",
+            project_path.display()
+        );
+    }
+
+    let mut config = if existed {
+        ProjectConfigFile::load(&project_path)?
+    } else {
+        ProjectConfigFile::default()
+    };
+    config.project_id = args.project_id.clone();
+    config.validate(true)?;
+    config.save(&project_path)?;
+
+    println!(
+        "{} project config.\n- project config: {}\n- project_id: {}",
+        if existed { "Updated" } else { "Initialized" },
+        project_path.display(),
+        config.project_id
+    );
+    Ok(())
 }
 
 fn resolve_mutable_project_config_path(config_override: Option<&Path>) -> Result<PathBuf> {
@@ -399,7 +491,7 @@ fn load_or_create_project_config(
 
     let Some(project_id) = project_id.map(str::trim).filter(|value| !value.is_empty()) else {
         anyhow::bail!(
-            "project config {} does not exist. create it with `reviewloop config migrate-project --project-id <id>` or pass --project-id on `paper add`",
+            "project config {} does not exist. create it with `reviewloop init project --project-id <id>` or pass --project-id on `paper add`",
             path.display()
         );
     };
@@ -738,10 +830,23 @@ fn cmd_daemon_install(config_override: Option<&Path>, start: bool) -> Result<()>
     {
         const DAEMON_LABEL: &str = "ai.reviewloop.daemon";
 
-        let cfg_path = resolve_mutable_project_config_path(config_override)?;
-        let cfg_path = fs::canonicalize(&cfg_path).unwrap_or(cfg_path);
-        let (config, _db) = load_runtime(Some(&cfg_path), false, true)?;
+        let loaded = Config::load_runtime_with_metadata(config_override, false)?;
+        let reviewloop::config::LoadedConfig {
+            config,
+            global_path,
+            project_path,
+            legacy_global_path: _,
+            compat_notice,
+        } = loaded;
+        if let Some(notice) = compat_notice.as_deref() {
+            warn!("{notice}");
+        }
         ensure_runtime_dirs(&config)?;
+
+        let global_path = global_path
+            .map(|path| fs::canonicalize(&path).unwrap_or(path))
+            .ok_or_else(|| anyhow!("failed to determine global config path"))?;
+        let project_path = project_path.map(|path| fs::canonicalize(&path).unwrap_or(path));
 
         let home = env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
         let launch_agents_dir = PathBuf::from(home).join("Library").join("LaunchAgents");
@@ -757,20 +862,31 @@ fn cmd_daemon_install(config_override: Option<&Path>, start: bool) -> Result<()>
         let stdout_log = config.state_dir().join("daemon.stdout.log");
         let stderr_log = config.state_dir().join("daemon.stderr.log");
 
-        let args = vec![
-            exe.display().to_string(),
-            "--config".to_string(),
-            cfg_path.display().to_string(),
+        let mut args = vec![exe.display().to_string()];
+        if let Some(path) = project_path.as_ref() {
+            args.push("--config".to_string());
+            args.push(path.display().to_string());
+        }
+        args.extend([
             "daemon".to_string(),
             "run".to_string(),
             "--panel".to_string(),
             "false".to_string(),
-        ];
+        ]);
         let plist = render_launchd_plist(DAEMON_LABEL, &args, &stdout_log, &stderr_log);
         fs::write(&plist_path, plist)
             .with_context(|| format!("failed to write launchd plist: {}", plist_path.display()))?;
 
-        println!("Installed launchd plist at {}", plist_path.display());
+        println!(
+            "Installed launchd plist at {}\n- global config: {}",
+            plist_path.display(),
+            global_path.display()
+        );
+        if let Some(path) = project_path.as_ref() {
+            println!("- project config: {}", path.display());
+        } else {
+            println!("- mode: global-only daemon (no project config bound)");
+        }
 
         if start {
             let uid = current_uid_string()?;
@@ -1042,6 +1158,7 @@ fn print_guardrail_warnings(config: &Config) {
 }
 
 async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Result<()> {
+    ensure_project_context(config)?;
     let paper = config
         .find_paper(paper_id)
         .with_context(|| format!("paper_id not found in project config: {paper_id}"))?;
@@ -1120,6 +1237,7 @@ async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Re
 }
 
 fn cmd_approve(config: &Config, db: &Db, job_id: &str) -> Result<()> {
+    ensure_project_context(config)?;
     let job = ensure_project_job(config, db, job_id)?;
 
     if job.status != JobStatus::PendingApproval {
@@ -1144,6 +1262,7 @@ fn cmd_import_token(
     token: &str,
     source: &str,
 ) -> Result<()> {
+    ensure_project_context(config)?;
     db.record_email_token(token, source, None)?;
 
     let next_poll = compute_next_poll_at(
@@ -1216,6 +1335,7 @@ async fn cmd_check(
     paper_id: Option<&str>,
     all_processing: bool,
 ) -> Result<()> {
+    ensure_project_context(config)?;
     if job_id.is_some() && (paper_id.is_some() || all_processing) {
         anyhow::bail!("--job-id cannot be combined with --paper-id or --all-processing");
     }
@@ -1277,6 +1397,7 @@ fn cmd_status(
     as_json: bool,
     show_token: bool,
 ) -> Result<()> {
+    ensure_project_context(config)?;
     let rows = db.list_status_views(&config.project_id, paper_id)?;
 
     if let Some(paper_id) = paper_id {
@@ -1368,6 +1489,7 @@ async fn cmd_retry(
     job_id: &str,
     override_rate_limit: bool,
 ) -> Result<()> {
+    ensure_project_context(config)?;
     let job = ensure_project_job(config, db, job_id)?;
 
     if override_rate_limit {
@@ -1463,6 +1585,7 @@ async fn cmd_complete(
     empty_summary: bool,
     score: Option<f64>,
 ) -> Result<()> {
+    ensure_project_context(config)?;
     let job = ensure_project_job(config, db, job_id)?;
     if !matches!(
         job.status,
@@ -1522,6 +1645,15 @@ async fn cmd_complete(
 fn ensure_project_job(config: &Config, db: &Db, job_id: &str) -> Result<reviewloop::model::Job> {
     db.get_project_job(&config.project_id, job_id)?
         .ok_or_else(|| anyhow!("job not found in project {}: {}", config.project_id, job_id))
+}
+
+fn ensure_project_context(config: &Config) -> Result<()> {
+    if config.project_id.trim().is_empty() {
+        anyhow::bail!(
+            "this command requires a project config. run `reviewloop init project --project-id <id>` in your repo first"
+        );
+    }
+    Ok(())
 }
 
 fn version_identity(git_commit: Option<&str>, pdf_hash: &str) -> (String, String) {

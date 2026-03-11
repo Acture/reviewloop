@@ -331,7 +331,7 @@ impl Config {
         }
         if require_project && self.project_id.trim().is_empty() {
             return Err(anyhow!(
-                "project config is required here. create {} with project_id or run `reviewloop config migrate-project --project-id <id>`",
+                "project config is required here. create {} with project_id or run `reviewloop init project --project-id <id>`",
                 PROJECT_CONFIG_FILE
             ));
         }
