@@ -36,20 +36,24 @@ brew tap acture/ac && brew install reviewloop
 # OR
 cargo install reviewloop
 
-# 2) register paper (global config file is auto-created on first run)
+# 2) initialize global paths + current repo project config
+reviewloop init
+reviewloop init project --project-id main
+
+# 3) register paper
 reviewloop paper add \
   --paper-id main \
   --path paper/main.pdf \
   --backend stanford
 
-# 3) optional: add a custom git-tag trigger for this paper
+# 4) optional: add a custom git-tag trigger for this paper
 reviewloop paper add \
   --paper-id camera_ready \
   --path build/camera_ready.pdf \
   --backend stanford \
   --tag-trigger "custom-review/camera_ready/*"
 
-# 4) submit and run daemon
+# 5) submit and run daemon
 # `paper add` will prompt whether to submit immediately
 reviewloop daemon install --start true
 ```
@@ -107,6 +111,8 @@ reviewloop [--config /path/to/override.toml] <command>
 Core commands:
 
 ```bash
+reviewloop init
+reviewloop init project --project-id <id> [--project-root <path>] [--force]
 reviewloop paper add --paper-id <id> --path <pdf-or-build-artifact> --backend <backend> [--watch true|false] [--tag-trigger "<pattern>"] [--submit-now] [--no-submit-prompt]
 reviewloop paper watch --paper-id <id> --enabled <true|false>
 reviewloop paper remove --paper-id <id> [--purge-history]
@@ -122,6 +128,8 @@ reviewloop check [--job-id <job-id> | --paper-id <paper-id>] [--all-processing]
 reviewloop status [--paper-id main] [--json] [--show-token]
 reviewloop retry --job-id <job-id> [--override-rate-limit]
 reviewloop complete --job-id <job-id> [--summary-text <text> | --summary-url <url> | --empty-summary] [--score <value>]
+reviewloop config init
+reviewloop config init project --project-id <id> [--project-root <path>] [--force]
 reviewloop config migrate-project --project-id <id> [--project-root <path>]
 reviewloop email login --provider google
 reviewloop email status
@@ -253,6 +261,9 @@ There is no global-overrides-project merge chain. Instead:
 - global config owns machine/user concerns such as `core.*`, `logging.*`, `polling.*`, `retention.*`, `imap.*`, `gmail_oauth.*`, and Stanford provider connection defaults
 - project config owns repo concerns such as `project_id`, `papers`, `paper_watch`, `paper_tag_triggers`, `trigger.*`, and Stanford venue
 - `--config /path/to/reviewloop.toml` explicitly points to a project config file
+- `reviewloop init` initializes the global config/data paths
+- `reviewloop init project --project-id <id>` initializes the current repo's project config
+- `reviewloop daemon install` can run in global-only mode when no project config is present; if a project config is found, it binds the daemon to that project config
 
 Project commands require a non-empty `project_id` in the project config. Jobs, events, dedupe, and status views are isolated inside the shared global DB by `project_id`.
 
