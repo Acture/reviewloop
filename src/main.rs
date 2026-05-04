@@ -2809,9 +2809,10 @@ async fn cmd_email_login(config: &Config, provider: &str) -> Result<()> {
 
     let Some(oauth_provider) = GoogleOauthProvider::from_config_for_login(config)? else {
         anyhow::bail!(
-            "gmail oauth credentials missing. configure gmail_oauth.client_id/client_secret \
-or set REVIEWLOOP_GMAIL_CLIENT_ID and REVIEWLOOP_GMAIL_CLIENT_SECRET \
-or build with these values injected at compile time"
+            "gmail_oauth is not configured. set `gmail_oauth.enabled = true` and \
+             `gmail_oauth.client_id` in ~/.config/reviewloop/config.toml, or set \
+             REVIEWLOOP_GMAIL_CLIENT_ID / REVIEWLOOP_GMAIL_CLIENT_SECRET environment variables. \
+             see README \"Email Token Ingestion\" section."
         );
     };
 

@@ -24,21 +24,22 @@ use tokio::{
     net::TcpListener,
 };
 
-const BUILTIN_GOOGLE_CLIENT_ID: Option<&str> = option_env!("REVIEWLOOP_GMAIL_CLIENT_ID");
-const BUILTIN_GOOGLE_CLIENT_SECRET: Option<&str> = option_env!("REVIEWLOOP_GMAIL_CLIENT_SECRET");
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://www.googleapis.com/oauth2/v3/token";
 const DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
 const SCOPE_READONLY: &str = "https://www.googleapis.com/auth/gmail.readonly";
 const SCOPE_MODIFY: &str = "https://www.googleapis.com/auth/gmail.modify";
 
-fn resolve_credential(runtime_env_key: &str, compile_default: Option<&str>) -> String {
+/// Resolves a Gmail OAuth credential at runtime only (env var → config field).
+/// Compile-time bake-in via `option_env!` was removed (C3) to prevent secrets
+/// from being embedded in the binary.
+fn resolve_credential(runtime_env_key: &str, config_value: &str) -> String {
     if let Ok(value) = env::var(runtime_env_key)
         && !value.trim().is_empty()
     {
         return value;
     }
-    compile_default.unwrap_or_default().to_string()
+    config_value.to_string()
 }
 
 #[derive(Clone)]
@@ -66,17 +67,20 @@ impl GoogleOauthProvider {
         }
         let mut resolved = cfg.clone();
         if resolved.client_id.trim().is_empty() {
-            resolved.client_id =
-                resolve_credential("REVIEWLOOP_GMAIL_CLIENT_ID", BUILTIN_GOOGLE_CLIENT_ID);
+            resolved.client_id = resolve_credential("REVIEWLOOP_GMAIL_CLIENT_ID", &cfg.client_id);
         }
         if resolved.client_secret.trim().is_empty() {
-            resolved.client_secret = resolve_credential(
-                "REVIEWLOOP_GMAIL_CLIENT_SECRET",
-                BUILTIN_GOOGLE_CLIENT_SECRET,
-            );
+            let env_secret =
+                resolve_credential("REVIEWLOOP_GMAIL_CLIENT_SECRET", &cfg.client_secret);
+            resolved.client_secret = env_secret.into();
         }
         if resolved.client_id.trim().is_empty() {
-            return Ok(None);
+            return Err(anyhow!(
+                "gmail oauth client_id is not configured. set REVIEWLOOP_GMAIL_CLIENT_ID \
+                 environment variable or `gmail_oauth.client_id` in \
+                 ~/.config/reviewloop/config.toml. see README \"Email Token Ingestion\" \
+                 section for setup."
+            ));
         }
         let token_path = if let Some(path) = &resolved.token_store_path {
             PathBuf::from(path)
@@ -136,7 +140,7 @@ impl GoogleOauthProvider {
                 .url()
         } else {
             BasicClient::new(ClientId::new(self.cfg.client_id.clone()))
-                .set_client_secret(ClientSecret::new(self.cfg.client_secret.clone()))
+                .set_client_secret(ClientSecret::new(self.cfg.client_secret.0.clone()))
                 .set_auth_uri(
                     AuthUrl::new(AUTH_URL.to_string()).context("invalid google auth url")?,
                 )
@@ -183,7 +187,7 @@ impl GoogleOauthProvider {
                 .context("failed to exchange authorization code")?
         } else {
             BasicClient::new(ClientId::new(self.cfg.client_id.clone()))
-                .set_client_secret(ClientSecret::new(self.cfg.client_secret.clone()))
+                .set_client_secret(ClientSecret::new(self.cfg.client_secret.0.clone()))
                 .set_auth_uri(
                     AuthUrl::new(AUTH_URL.to_string()).context("invalid google auth url")?,
                 )
@@ -325,7 +329,7 @@ impl OauthProvider for GoogleOauthProvider {
                     .context("failed to request google device code")?
             } else {
                 BasicClient::new(ClientId::new(self.cfg.client_id.clone()))
-                    .set_client_secret(ClientSecret::new(self.cfg.client_secret.clone()))
+                    .set_client_secret(ClientSecret::new(self.cfg.client_secret.0.clone()))
                     .set_auth_uri(auth_url)
                     .set_token_uri(token_url)
                     .set_device_authorization_url(device_auth_url)
@@ -380,7 +384,7 @@ impl OauthProvider for GoogleOauthProvider {
                 .await
         } else {
             BasicClient::new(ClientId::new(self.cfg.client_id.clone()))
-                .set_client_secret(ClientSecret::new(self.cfg.client_secret.clone()))
+                .set_client_secret(ClientSecret::new(self.cfg.client_secret.0.clone()))
                 .set_auth_uri(auth_url)
                 .set_token_uri(token_url)
                 .set_device_authorization_url(device_auth_url)
@@ -464,7 +468,7 @@ impl OauthProvider for GoogleOauthProvider {
                 .context("failed to refresh google access token")?
         } else {
             BasicClient::new(ClientId::new(self.cfg.client_id.clone()))
-                .set_client_secret(ClientSecret::new(self.cfg.client_secret.clone()))
+                .set_client_secret(ClientSecret::new(self.cfg.client_secret.0.clone()))
                 .set_auth_uri(auth_url)
                 .set_token_uri(token_url)
                 .set_device_authorization_url(device_auth_url)

@@ -78,8 +78,27 @@ pub fn save_token_record(provider: &dyn OauthProvider, token: &OauthTokenRecord)
         })?;
     }
     let raw = serde_json::to_string_pretty(token)?;
-    std::fs::write(&path, raw)
-        .with_context(|| format!("failed to write oauth token file {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("failed to open oauth token file {}", path.display()))?;
+        f.write_all(raw.as_bytes())
+            .with_context(|| format!("failed to write oauth token file {}", path.display()))?;
+        f.sync_all()
+            .with_context(|| format!("failed to sync oauth token file {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, raw)
+            .with_context(|| format!("failed to write oauth token file {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -214,4 +233,61 @@ pub(crate) fn open_browser_url(url: &str) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_has_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let token_path = tmp.path().join("google_token.json");
+
+        struct MockProvider {
+            path: std::path::PathBuf,
+        }
+        #[async_trait::async_trait]
+        impl OauthProvider for MockProvider {
+            fn name(&self) -> &'static str {
+                "mock"
+            }
+            fn token_store_path(&self) -> std::path::PathBuf {
+                self.path.clone()
+            }
+            async fn start_device_flow(&self) -> anyhow::Result<DeviceCodeStart> {
+                unimplemented!()
+            }
+            async fn poll_device_flow(&self, _: &str) -> anyhow::Result<DeviceCodePoll> {
+                unimplemented!()
+            }
+            async fn refresh_access_token(&self, _: &str) -> anyhow::Result<OauthTokenResponse> {
+                unimplemented!()
+            }
+        }
+
+        let provider = MockProvider {
+            path: token_path.clone(),
+        };
+        let token = OauthTokenRecord {
+            refresh_token: "rt".to_string(),
+            access_token: "at".to_string(),
+            expires_at_unix: 9999999999,
+            scope: None,
+            token_type: None,
+            updated_at_unix: 0,
+        };
+        save_token_record(&provider, &token).expect("save_token_record");
+
+        let metadata = std::fs::metadata(&token_path).expect("metadata");
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "token file should have mode 0600, got {:o}",
+            mode
+        );
+    }
 }

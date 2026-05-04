@@ -201,7 +201,7 @@ mod imap_impl {
         })?;
 
         let mut session = client
-            .login(&imap_cfg.username, &imap_cfg.password)
+            .login(&imap_cfg.username, &*imap_cfg.password)
             .map_err(|e| e.0)
             .context("IMAP login failed")?;
 

@@ -6,6 +6,32 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Wrapper that redacts the inner value in `Debug` output. Used for
+/// passwords / OAuth client secrets so a future `tracing::warn!("{cfg:?}")`
+/// or panic dump cannot accidentally leak credentials.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Redacted<T>(pub T);
+
+impl<T> std::fmt::Debug for Redacted<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<redacted>")
+    }
+}
+
+impl<T> std::ops::Deref for Redacted<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> From<T> for Redacted<T> {
+    fn from(value: T) -> Self {
+        Self(value)
+    }
+}
+
 const GLOBAL_CONFIG_FILE: &str = "config.toml";
 const LEGACY_GLOBAL_CONFIG_FILE: &str = "reviewloop.toml";
 const PROJECT_CONFIG_FILE: &str = "reviewloop.toml";
@@ -450,6 +476,67 @@ impl Config {
             return Err(anyhow!(
                 "project config is required here. create {} with project_id or run `reviewloop init project --project-id <id>`",
                 PROJECT_CONFIG_FILE
+            ));
+        }
+        self.validate_base_url()?;
+        self.validate_fallback_script()?;
+        Ok(())
+    }
+
+    /// O9: `providers.stanford.base_url` must be `https://`, with
+    /// `http://localhost` and `http://127.0.0.1` whitelisted for local tests.
+    fn validate_base_url(&self) -> Result<()> {
+        let url = &self.providers.stanford.base_url;
+        let allowed = url.starts_with("https://")
+            || url.starts_with("http://localhost")
+            || url.starts_with("http://127.0.0.1");
+        if !allowed {
+            return Err(anyhow!(
+                "providers.stanford.base_url must be https:// (or http://localhost / \
+                 http://127.0.0.1 for local testing); got {}",
+                url
+            ));
+        }
+        Ok(())
+    }
+
+    /// O8: Validate that `providers.stanford.fallback_script` does not escape
+    /// the project root via `..` traversal when it is a relative path.
+    fn validate_fallback_script(&self) -> Result<()> {
+        let script_str = &self.providers.stanford.fallback_script;
+        let path = Path::new(script_str);
+        if path.is_absolute() {
+            // Absolute paths are an explicit user choice; trust them.
+            return Ok(());
+        }
+        let Some(root) = self.project_root.as_deref() else {
+            // Relative path with no project root — the script can never be
+            // cleanly resolved, but only surface an error if the path looks
+            // like it might escape (contains `..`).
+            if script_str.contains("..") {
+                return Err(anyhow!(
+                    "providers.stanford.fallback_script is relative ({}) but no project \
+                     root is set; either pin an absolute path in global config or run \
+                     from a directory with a reviewloop.toml",
+                    script_str
+                ));
+            }
+            return Ok(());
+        };
+        // If the script doesn't exist yet (fresh checkout), skip traversal
+        // check — the fallback won't be invoked anyway.
+        if !path.exists() {
+            return Ok(());
+        }
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let canonical_script = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if !canonical_script.starts_with(&canonical_root) {
+            return Err(anyhow!(
+                "providers.stanford.fallback_script ({}) resolves outside project \
+                 root ({}); refusing to execute. set an absolute path in global \
+                 config if this is intentional.",
+                canonical_script.display(),
+                canonical_root.display()
             ));
         }
         Ok(())
@@ -1183,7 +1270,7 @@ pub struct ImapConfig {
     pub server: String,
     pub port: u16,
     pub username: String,
-    pub password: String,
+    pub password: Redacted<String>,
     pub folder: String,
     pub poll_seconds: u64,
     pub mark_seen: bool,
@@ -1214,7 +1301,7 @@ impl Default for ImapConfig {
             server: "imap.gmail.com".to_string(),
             port: 993,
             username: String::new(),
-            password: String::new(),
+            password: Redacted::default(),
             folder: "INBOX".to_string(),
             poll_seconds: 300,
             mark_seen: true,
@@ -1232,7 +1319,7 @@ impl Default for ImapConfig {
 pub struct GmailOauthConfig {
     pub enabled: bool,
     pub client_id: String,
-    pub client_secret: String,
+    pub client_secret: Redacted<String>,
     pub token_store_path: Option<String>,
     pub poll_seconds: u64,
     pub mark_seen: bool,
@@ -1261,7 +1348,7 @@ impl Default for GmailOauthConfig {
         Self {
             enabled: false,
             client_id: String::new(),
-            client_secret: String::new(),
+            client_secret: Redacted::default(),
             token_store_path: None,
             poll_seconds: 300,
             mark_seen: true,
@@ -1312,7 +1399,7 @@ pub struct ProjectNotificationsConfig {
 mod tests {
     use super::{
         Config, GlobalConfigFile, LegacyConfig, PaperConfig, PaperConfigFile, ProjectConfigFile,
-        default_project_config_path, find_git_root,
+        Redacted, default_project_config_path, find_git_root,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -1812,5 +1899,84 @@ db_path = "db.sqlite"
         project.notifications.enabled = Some(true);
         let cfg = Config::merge_for_tests(global2, project);
         assert!(cfg.notifications.enabled);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // O9: base_url validation
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn base_url_https_passes() {
+        let mut cfg = Config::default();
+        cfg.providers.stanford.base_url = "https://paperreview.ai".to_string();
+        assert!(cfg.validate_base_url().is_ok());
+    }
+
+    #[test]
+    fn base_url_http_fails() {
+        let mut cfg = Config::default();
+        cfg.providers.stanford.base_url = "http://paperreview.ai".to_string();
+        assert!(cfg.validate_base_url().is_err());
+    }
+
+    #[test]
+    fn base_url_localhost_http_passes() {
+        let mut cfg = Config::default();
+        cfg.providers.stanford.base_url = "http://localhost:8080".to_string();
+        assert!(cfg.validate_base_url().is_ok());
+    }
+
+    #[test]
+    fn base_url_127_0_0_1_http_passes() {
+        let mut cfg = Config::default();
+        cfg.providers.stanford.base_url = "http://127.0.0.1:9000".to_string();
+        assert!(cfg.validate_base_url().is_ok());
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // O8: fallback_script path traversal validation
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fallback_script_absolute_always_passes() {
+        let mut cfg = Config::default();
+        cfg.providers.stanford.fallback_script = "/usr/local/bin/fallback.mjs".to_string();
+        cfg.project_root = None;
+        assert!(cfg.validate_fallback_script().is_ok());
+    }
+
+    #[test]
+    fn fallback_script_relative_with_dotdot_and_no_root_fails() {
+        let mut cfg = Config::default();
+        cfg.providers.stanford.fallback_script = "../../etc/passwd".to_string();
+        cfg.project_root = None;
+        assert!(cfg.validate_fallback_script().is_err());
+    }
+
+    #[test]
+    fn fallback_script_relative_no_dotdot_no_root_passes() {
+        let mut cfg = Config::default();
+        cfg.providers.stanford.fallback_script = "tools/fallback.mjs".to_string();
+        cfg.project_root = None;
+        // Relative without `..` and no project root is fine (script won't resolve
+        // but also won't be invoked).
+        assert!(cfg.validate_fallback_script().is_ok());
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // L1: Redacted<T> Debug impl
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn redacted_debug_hides_value() {
+        let secret: Redacted<String> = Redacted::from("hunter2".to_string());
+        assert_eq!(format!("{:?}", secret), "<redacted>");
+    }
+
+    #[test]
+    fn redacted_deref_gives_inner() {
+        let s: Redacted<String> = Redacted::from("hello".to_string());
+        assert_eq!(s.as_str(), "hello");
+        assert!(!s.trim().is_empty());
     }
 }

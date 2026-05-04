@@ -315,8 +315,10 @@ You can also provide credentials via environment variables:
 - `REVIEWLOOP_GMAIL_CLIENT_ID`
 - `REVIEWLOOP_GMAIL_CLIENT_SECRET`
 
-For official CI-built binaries, these same variable names can be injected at compile time
-via GitHub Actions `secrets.*`; runtime env/config can still override them.
+Credentials are resolved at **runtime only** (env var → `config.toml` field). They are
+**not** baked into the binary at compile time, so every deployment must supply them via
+one of the two mechanisms above. The old CI compile-time injection pattern
+(`option_env!`) has been removed to prevent secrets from being embedded in binaries.
 
 Then login:
 
@@ -414,7 +416,7 @@ Required secrets:
 - `CARGO_REGISTRY_TOKEN`
 - `HOMEBREW_TAP_GITHUB_TOKEN`
 
-Optional secrets (compile-time OAuth defaults for release/CI builds):
+Runtime secrets (must be provided via env or `config.toml` at runtime — not baked in at compile time):
 - `REVIEWLOOP_GMAIL_CLIENT_ID`
 - `REVIEWLOOP_GMAIL_CLIENT_SECRET`
 

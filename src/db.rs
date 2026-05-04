@@ -61,6 +61,22 @@ impl Db {
     }
 
     pub fn new_file(path: PathBuf) -> Self {
+        // C4: set 0o600 on the DB file at creation time (Unix only).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if !path.exists() {
+                // Touch the file so we can set permissions before SQLite opens it.
+                if let Ok(f) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    drop(f);
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                }
+            }
+        }
         Self {
             dsn: path.to_string_lossy().to_string(),
             path,
