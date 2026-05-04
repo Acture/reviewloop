@@ -10,18 +10,16 @@
 //!
 //! Implemented:
 //! - Per-active-job submenus (Retry now / Open artifacts / Open log)
+//! - "Recent failures (N)" submenu — each failed job surfaced with last_error (U2)
 //! - "Submit new…" — native file picker via `rfd`, spawns `reviewloop run <pdf>`
-//! - "Pause daemon" / "Resume daemon" — shells out to `reviewloop daemon pause/resume`
+//! - "Pause daemon" / "Resume daemon" — state-aware, polls launchctl each tick (U14)
 //! - Cross-platform `open_path` (macOS: `open`, Linux: `xdg-open`, Windows: `explorer`)
 //! - Menu rebuilt on every 5 s refresh tick so job list stays current
+//! - Last-action summary displayed as disabled top-of-menu item (U7)
+//! - No-project hint with disabled items when REVIEWLOOP_PROJECT_ID not set (U9)
 //!
 //! Deferred (noted here for future phases):
-//! - **Multi-project switching**: requires `Db::list_known_project_ids()` (future db.rs
-//!   addition). For now the bar is single-project, resolved from env
-//!   `REVIEWLOOP_PROJECT_ID` or `config.project_id`.
-//! - **Retry Failed enumeration**: requires `Db::list_failed_jobs_for_project()`.
-//!   A `reviewloop retry --paper-id <id>` is offered per active job instead.
-//! - **bar/state.toml persistence**: deferred until multi-project switching lands.
+//! - **Multi-project switching**: requires `Db::list_known_project_ids()`.
 
 use anyhow::{Context as _, Result};
 use chrono::Utc;
@@ -34,6 +32,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -116,9 +115,53 @@ fn open_log(path: &Path) {
 /// Returns `(active_job_count, has_failed_jobs)` for the given project.
 fn query_status(db: &Db, project_id: &str) -> Result<(usize, bool)> {
     let active = db.list_active_jobs_for_project(project_id)?.len();
-    let counts = db.status_counts(project_id)?;
-    let failed = counts.get("failed").copied().unwrap_or(0);
+    let failed = db.list_failed_jobs_for_project(project_id, 1)?.len();
     Ok((active, failed > 0))
+}
+
+// ── Daemon state (U14) ────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug)]
+struct DaemonState {
+    loaded: bool,
+    running: bool,
+}
+
+/// Poll launchctl to determine daemon loaded/running state.
+/// Returns `None` on non-macOS or when launchctl is unavailable.
+#[cfg(target_os = "macos")]
+fn poll_daemon_state() -> Option<DaemonState> {
+    const DAEMON_LABEL: &str = "ai.reviewloop.daemon";
+    let uid = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
+
+    let target = format!("gui/{uid}/{DAEMON_LABEL}");
+    let loaded = Command::new("launchctl")
+        .args(["print", &target])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let running = if loaded {
+        Command::new("launchctl")
+            .args(["list", DAEMON_LABEL])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    Some(DaemonState { loaded, running })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn poll_daemon_state() -> Option<DaemonState> {
+    None
 }
 
 // ── Job label formatting ──────────────────────────────────────────────────────
@@ -144,6 +187,24 @@ fn format_job_label(job: &Job) -> String {
     )
 }
 
+fn format_failed_job_label(job: &Job) -> String {
+    let err_snippet = job
+        .last_error
+        .as_deref()
+        .map(|e| {
+            let truncated = if e.len() > 60 { &e[..60] } else { e };
+            format!(" · {truncated}")
+        })
+        .unwrap_or_default();
+    format!(
+        "{} · {} · attempt={}{}",
+        job.paper_id,
+        job.status.as_str(),
+        job.attempt,
+        err_snippet
+    )
+}
+
 // ── Click action dispatch ─────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -154,7 +215,7 @@ enum ClickAction {
     OpenJobArtifacts(PathBuf),
     /// Open the shared log for a job (same file, different entry point).
     OpenJobLog(PathBuf),
-    /// Retry a specific job.
+    /// Retry a specific job (active or failed).
     RetryJob(String),
     /// Open a native file picker and submit the chosen PDF.
     SubmitNew,
@@ -174,20 +235,36 @@ fn rebuild_menu(
     project_id: Option<&str>,
     artifacts_dir: &Path,
     log_path: &Path,
+    daemon_state: Option<DaemonState>,
+    last_action: &Arc<Mutex<Option<String>>>,
     click_map: &mut HashMap<muda::MenuId, ClickAction>,
 ) {
     click_map.clear();
 
     let menu = Menu::new();
 
+    // ── Last-action summary (U7) ──────────────────────────────────────────────
+    if let Ok(guard) = last_action.lock() {
+        if let Some(summary) = guard.as_deref() {
+            let item = MenuItem::new(format!("↳ {summary}"), false, None);
+            let _ = menu.append(&item);
+            let _ = menu.append(&PredefinedMenuItem::separator());
+        }
+    }
+
     // ── Project header ────────────────────────────────────────────────────────
-    // Multi-project switching is deferred (needs Db::list_known_project_ids).
     let project_label = match project_id {
         Some(p) => format!("Project: {p}"),
-        None => "Project: not set — REVIEWLOOP_PROJECT_ID".to_string(),
+        None => "⚠ No project found in $REVIEWLOOP_PROJECT_ID or cwd".to_string(),
     };
     let project_item = MenuItem::new(&project_label, false, None);
     let _ = menu.append(&project_item);
+
+    if project_id.is_none() {
+        let hint = MenuItem::new("Set REVIEWLOOP_PROJECT_ID and restart", false, None);
+        let _ = menu.append(&hint);
+    }
+
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     // ── Status summary ────────────────────────────────────────────────────────
@@ -257,6 +334,25 @@ fn rebuild_menu(
                 }
             }
         }
+
+        // ── Recent failures submenu (U2) ──────────────────────────────────────
+        if let Ok(failed_jobs) = db.list_failed_jobs_for_project(pid, 20) {
+            if !failed_jobs.is_empty() {
+                let _ = menu.append(&PredefinedMenuItem::separator());
+                let failures_sub =
+                    Submenu::new(&format!("Recent failures ({})", failed_jobs.len()), true);
+                for job in &failed_jobs {
+                    let label = format_failed_job_label(job);
+                    let retry_item = MenuItem::new(&label, true, None);
+                    click_map.insert(
+                        retry_item.id().clone(),
+                        ClickAction::RetryJob(job.id.clone()),
+                    );
+                    let _ = failures_sub.append(&retry_item);
+                }
+                let _ = menu.append(&failures_sub);
+            }
+        }
     }
 
     // ── Top-level actions ─────────────────────────────────────────────────────
@@ -277,20 +373,56 @@ fn rebuild_menu(
 
     let _ = menu.append(&PredefinedMenuItem::separator());
 
-    // "Submit new…" — opens native file picker; deferred on unsupported rfd envs.
-    let submit_item = MenuItem::new("Submit new\u{2026}", true, None);
-    click_map.insert(submit_item.id().clone(), ClickAction::SubmitNew);
+    // "Submit new…" — disabled when no project is configured (U9).
+    let submit_enabled = project_id.is_some();
+    let submit_item = MenuItem::new("Submit new\u{2026}", submit_enabled, None);
+    if submit_enabled {
+        click_map.insert(submit_item.id().clone(), ClickAction::SubmitNew);
+    }
     let _ = menu.append(&submit_item);
 
-    // Pause / Resume daemon (macOS-only; shown disabled on other platforms).
+    // Pause / Resume daemon — state-aware (U14).
     #[cfg(target_os = "macos")]
     {
-        let pause_item = MenuItem::new("Pause daemon", true, None);
-        let resume_item = MenuItem::new("Resume daemon", true, None);
-        click_map.insert(pause_item.id().clone(), ClickAction::PauseDaemon);
-        click_map.insert(resume_item.id().clone(), ClickAction::ResumeDaemon);
-        let _ = menu.append(&pause_item);
-        let _ = menu.append(&resume_item);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        match daemon_state {
+            None => {
+                let _ = menu.append(&MenuItem::new(
+                    "Pause/Resume daemon (service not installed)",
+                    false,
+                    None,
+                ));
+            }
+            Some(DaemonState {
+                loaded: false,
+                running: _,
+            }) => {
+                let _ = menu.append(&MenuItem::new(
+                    "Pause/Resume daemon (service not installed)",
+                    false,
+                    None,
+                ));
+            }
+            Some(DaemonState {
+                loaded: true,
+                running,
+            }) => {
+                if running {
+                    let pause_item = MenuItem::new("Pause daemon", true, None);
+                    let resume_item =
+                        MenuItem::new("Resume daemon (currently running)", false, None);
+                    click_map.insert(pause_item.id().clone(), ClickAction::PauseDaemon);
+                    let _ = menu.append(&pause_item);
+                    let _ = menu.append(&resume_item);
+                } else {
+                    let pause_item = MenuItem::new("Pause daemon (currently stopped)", false, None);
+                    let resume_item = MenuItem::new("Resume daemon", true, None);
+                    click_map.insert(resume_item.id().clone(), ClickAction::ResumeDaemon);
+                    let _ = menu.append(&pause_item);
+                    let _ = menu.append(&resume_item);
+                }
+            }
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -310,9 +442,35 @@ fn rebuild_menu(
     tray.set_menu(Some(Box::new(menu)));
 }
 
-// ── Action executor ───────────────────────────────────────────────────────────
+// ── Action executor (U7) ──────────────────────────────────────────────────────
 
-fn execute_action(action: &ClickAction) -> bool {
+/// Run a short-lived reviewloop subcommand, capture its output, and update
+/// the last-action summary.  Called on the main thread for all actions except
+/// Submit (which shells out to a background thread to avoid blocking).
+fn run_action_cmd(args: &[&str], action_name: &str, last_action: &Arc<Mutex<Option<String>>>) {
+    match Command::new("reviewloop").args(args).output() {
+        Ok(out) if out.status.success() => {
+            set_last_action(last_action, format!("{action_name}: OK"));
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let first_line = stderr.lines().next().unwrap_or("unknown error");
+            set_last_action(last_action, format!("{action_name} failed: {first_line}"));
+        }
+        Err(e) => {
+            set_last_action(last_action, format!("{action_name} error: {e}"));
+        }
+    }
+}
+
+fn set_last_action(last_action: &Arc<Mutex<Option<String>>>, summary: String) {
+    tracing::info!("bar: {summary}");
+    if let Ok(mut g) = last_action.lock() {
+        *g = Some(summary);
+    }
+}
+
+fn execute_action(action: &ClickAction, last_action: &Arc<Mutex<Option<String>>>) -> bool {
     match action {
         ClickAction::OpenArtifacts(path) | ClickAction::OpenJobArtifacts(path) => {
             open_path(path);
@@ -322,32 +480,37 @@ fn execute_action(action: &ClickAction) -> bool {
         }
         ClickAction::RetryJob(job_id) => {
             tracing::info!("bar: retry job {job_id}");
-            let _ = Command::new("reviewloop")
-                .args(["retry", "--job-id", job_id, "--force"])
-                .spawn();
+            run_action_cmd(
+                &["retry", "--job-id", job_id, "--force"],
+                "Retry",
+                last_action,
+            );
         }
         ClickAction::SubmitNew => {
             // rfd::FileDialog::pick_file() is synchronous and must run on the
-            // main thread (NSOpenPanel on macOS). Since tao's event loop
-            // callback runs on the main thread, this is safe.
+            // main thread (NSOpenPanel on macOS).
             let file = rfd::FileDialog::new()
                 .add_filter("PDF", &["pdf"])
                 .pick_file();
             if let Some(path) = file {
                 let path_str = path.to_string_lossy().into_owned();
                 tracing::info!("bar: submitting {path_str}");
-                let _ = Command::new("reviewloop").args(["run", &path_str]).spawn();
+                // Submit can take a long time — run in background thread so
+                // the menu rebuild loop is not blocked.
+                let la = Arc::clone(last_action);
+                set_last_action(&la, format!("Submit started: {path_str}"));
+                std::thread::spawn(move || {
+                    run_action_cmd(&["run", &path_str], "Submit", &la);
+                });
             }
         }
         ClickAction::PauseDaemon => {
             tracing::info!("bar: pausing daemon");
-            let _ = Command::new("reviewloop").args(["daemon", "pause"]).spawn();
+            run_action_cmd(&["daemon", "pause"], "Pause", last_action);
         }
         ClickAction::ResumeDaemon => {
             tracing::info!("bar: resuming daemon");
-            let _ = Command::new("reviewloop")
-                .args(["daemon", "resume"])
-                .spawn();
+            run_action_cmd(&["daemon", "resume"], "Resume", last_action);
         }
         ClickAction::Quit => return true,
     }
@@ -377,6 +540,9 @@ fn run_tray(
     let click_map: Rc<RefCell<HashMap<muda::MenuId, ClickAction>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
+    // Last-action summary: written by background threads, read on main thread.
+    let last_action: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
     // Force an immediate refresh on the first timer tick.
     let mut last_refresh = Instant::now()
         .checked_sub(Duration::from_secs(10))
@@ -391,7 +557,7 @@ fn run_tray(
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             let action = click_map.borrow().get(&ev.id).cloned();
             if let Some(action) = action {
-                if execute_action(&action) {
+                if execute_action(&action, &last_action) {
                     *control_flow = ControlFlow::Exit;
                     return;
                 }
@@ -406,12 +572,15 @@ fn run_tray(
         );
         if is_tick && last_refresh.elapsed() >= Duration::from_secs(4) {
             last_refresh = Instant::now();
+            let daemon_state = poll_daemon_state();
             rebuild_menu(
                 &tray,
                 &db,
                 project_id.as_deref(),
                 &artifacts_dir,
                 &log_path,
+                daemon_state,
+                &last_action,
                 &mut click_map.borrow_mut(),
             );
         }

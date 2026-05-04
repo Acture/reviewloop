@@ -608,3 +608,95 @@ fn retention_prunes_old_terminal_jobs_when_enabled() -> Result<()> {
 
     Ok(())
 }
+
+// ── U2: list_failed_jobs_for_project ─────────────────────────────────────────
+
+#[test]
+fn list_failed_jobs_for_project_returns_terminal_statuses_only() -> Result<()> {
+    let ctx = DbTestContext::new()?;
+
+    // Create one job of each terminal-failure status and some non-failure ones.
+    let failed = ctx.create_job_with_hash(JobStatus::Failed, "hash-f1")?;
+    let needs_manual = ctx.create_job_with_hash(JobStatus::FailedNeedsManual, "hash-f2")?;
+    let timeout = ctx.create_job_with_hash(JobStatus::Timeout, "hash-f3")?;
+    let _completed = ctx.create_job_with_hash(JobStatus::Completed, "hash-c1")?;
+    let _queued = ctx.create_job_with_hash(JobStatus::Queued, "hash-q1")?;
+
+    let results = ctx
+        .db
+        .list_failed_jobs_for_project(&ctx.config.project_id, 20)?;
+
+    assert_eq!(results.len(), 3, "expected exactly 3 failed jobs");
+
+    let ids: std::collections::HashSet<_> = results.iter().map(|j| j.id.as_str()).collect();
+    assert!(ids.contains(failed.id.as_str()));
+    assert!(ids.contains(needs_manual.id.as_str()));
+    assert!(ids.contains(timeout.id.as_str()));
+
+    // Must not include Completed or Queued.
+    for job in &results {
+        assert!(
+            matches!(
+                job.status,
+                JobStatus::Failed | JobStatus::FailedNeedsManual | JobStatus::Timeout
+            ),
+            "unexpected status {:?} in failed list",
+            job.status
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn list_failed_jobs_for_project_orders_by_updated_at_desc() -> Result<()> {
+    let ctx = DbTestContext::new()?;
+
+    let j1 = ctx.create_job_with_hash(JobStatus::Failed, "hash-o1")?;
+    let j2 = ctx.create_job_with_hash(JobStatus::Failed, "hash-o2")?;
+    let j3 = ctx.create_job_with_hash(JobStatus::Failed, "hash-o3")?;
+
+    // Manually set updated_at so we have a predictable order.
+    let conn = rusqlite::Connection::open(&ctx.db.path)?;
+    let now = Utc::now();
+    conn.execute(
+        "UPDATE jobs SET updated_at = ?1 WHERE id = ?2",
+        params![(now - Duration::seconds(20)).to_rfc3339(), j1.id],
+    )?;
+    conn.execute(
+        "UPDATE jobs SET updated_at = ?1 WHERE id = ?2",
+        params![(now - Duration::seconds(10)).to_rfc3339(), j2.id],
+    )?;
+    conn.execute(
+        "UPDATE jobs SET updated_at = ?1 WHERE id = ?2",
+        params![now.to_rfc3339(), j3.id],
+    )?;
+
+    let results = ctx
+        .db
+        .list_failed_jobs_for_project(&ctx.config.project_id, 20)?;
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].id, j3.id, "most recent should be first");
+    assert_eq!(results[1].id, j2.id);
+    assert_eq!(results[2].id, j1.id);
+
+    Ok(())
+}
+
+#[test]
+fn list_failed_jobs_for_project_respects_limit() -> Result<()> {
+    let ctx = DbTestContext::new()?;
+
+    for i in 0..5 {
+        ctx.create_job_with_hash(JobStatus::Failed, &format!("hash-lim-{i}"))?;
+    }
+
+    let results = ctx
+        .db
+        .list_failed_jobs_for_project(&ctx.config.project_id, 3)?;
+
+    assert_eq!(results.len(), 3, "limit=3 should cap at 3 results");
+
+    Ok(())
+}

@@ -26,6 +26,7 @@
 //! future phase.
 
 use crate::config::Config;
+use crate::db::Db;
 use anyhow::{Context, Result};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use std::sync::{
@@ -53,6 +54,9 @@ struct RoundRobinProxyMiddleware {
     clients: Vec<reqwest::Client>,
     /// Monotonically increasing counter; modulo `clients.len()` gives index.
     counter: Arc<AtomicUsize>,
+    /// DB path + project_id for emitting `proxy_failover` events.
+    /// `None` when no project context is available (warn-only preserved).
+    event_target: Option<(std::path::PathBuf, String)>,
 }
 
 #[async_trait::async_trait]
@@ -98,6 +102,7 @@ impl reqwest_middleware::Middleware for RoundRobinProxyMiddleware {
                             attempts = attempt + 1,
                             "request succeeded after proxy failover"
                         );
+                        self.emit_failover_event(idx, attempt, None);
                     }
                     return Ok(resp);
                 }
@@ -126,9 +131,30 @@ impl reqwest_middleware::Middleware for RoundRobinProxyMiddleware {
             total_proxies = n,
             "all proxies failed for request; returning last transient error"
         );
-        Err(reqwest_middleware::Error::Reqwest(last_err.expect(
-            "loop ran at least once and last_err is set on every transient failure",
-        )))
+        let last = last_err
+            .expect("loop ran at least once and last_err is set on every transient failure");
+        self.emit_failover_event(n - 1, n, Some(&last.to_string()));
+        Err(reqwest_middleware::Error::Reqwest(last))
+    }
+}
+
+impl RoundRobinProxyMiddleware {
+    /// Write a `proxy_failover` event to the DB when a proxy failover occurs.
+    /// Opens a fresh `Db` connection from the stored path; dropped immediately.
+    /// Skipped silently when no event target is configured.
+    fn emit_failover_event(&self, failed_proxy_index: usize, attempt: usize, error: Option<&str>) {
+        let Some((ref db_path, ref pid)) = self.event_target else {
+            return;
+        };
+        let db = Db::new_file(db_path.clone());
+        let payload = serde_json::json!({
+            "failed_proxy_index": failed_proxy_index,
+            "attempt": attempt,
+            "error": error.unwrap_or("failover — subsequent proxy succeeded"),
+        });
+        if let Err(e) = db.add_event(Some(pid), None, "proxy_failover", payload) {
+            warn!(error = %e, "failed to write proxy_failover event to db");
+        }
     }
 }
 
@@ -152,7 +178,14 @@ fn is_transient_proxy_error(err: &reqwest::Error) -> bool {
 /// every request cycles through the proxy list.  Only the count is logged;
 /// individual proxy URLs are never emitted to avoid leaking embedded
 /// credentials.
-pub fn build_client(config: &Config) -> Result<ClientWithMiddleware> {
+///
+/// Pass `db` and `project_id` to enable `proxy_failover` event recording.
+/// When either is `None`, failovers are warn-logged only (legacy behaviour).
+pub fn build_client(
+    config: &Config,
+    db: Option<&Db>,
+    project_id: Option<&str>,
+) -> Result<ClientWithMiddleware> {
     if config.core.proxies.is_empty() {
         return Ok(ClientBuilder::new(reqwest::Client::new()).build());
     }
@@ -177,9 +210,15 @@ pub fn build_client(config: &Config) -> Result<ClientWithMiddleware> {
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // Store db_path + project_id for event recording; PathBuf + String are Send+Sync.
+    let event_target: Option<(std::path::PathBuf, String)> = db
+        .zip(project_id)
+        .map(|(d, pid)| (d.path.clone(), pid.to_owned()));
+
     let middleware = RoundRobinProxyMiddleware {
         clients: proxy_clients,
         counter: Arc::new(AtomicUsize::new(0)),
+        event_target,
     };
 
     Ok(ClientBuilder::new(reqwest::Client::new())
@@ -211,7 +250,7 @@ mod tests {
     fn build_client_no_proxies_succeeds() {
         let config = Config::default();
         assert!(config.core.proxies.is_empty());
-        let client = build_client(&config).expect("build_client with no proxies");
+        let client = build_client(&config, None, None).expect("build_client with no proxies");
         // Verify it is usable: just assert the type compiles and builds.
         drop(client);
     }
@@ -231,7 +270,7 @@ mod tests {
             "socks5://proxy2.example.com:1080".to_string(),
         ];
         // Build should succeed; actual connectivity is not tested in unit tests.
-        let client = build_client(&config).expect("build_client with valid proxy URLs");
+        let client = build_client(&config, None, None).expect("build_client with valid proxy URLs");
         drop(client);
     }
 
@@ -292,7 +331,7 @@ mod tests {
             "http://198.51.100.2:2".to_string(),
             format!("http://{live_addr}"),
         ];
-        let client = build_client(&config).expect("build client with mixed proxies");
+        let client = build_client(&config, None, None).expect("build client with mixed proxies");
 
         // Request at the live "proxy" itself so the first two genuinely fail
         // at the connect step rather than getting an HTTP error from a
@@ -306,6 +345,58 @@ mod tests {
         let body = resp.text().await.unwrap();
         assert!(status.is_success(), "got {status}: {body}");
         assert_eq!(body, "ok-from-live-proxy");
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn failover_writes_proxy_failover_event_to_db() {
+        use axum::{Router, response::IntoResponse, routing::get};
+        use std::net::SocketAddr;
+        use tempfile::tempdir;
+        use tokio::net::TcpListener;
+
+        async fn ok_handler() -> impl IntoResponse {
+            "ok"
+        }
+        let app = Router::new().route("/", get(ok_handler));
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let live_addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = tempdir().unwrap();
+        let db = crate::db::Db::new(tmp.path());
+        db.init_schema().unwrap();
+
+        let mut config = Config::default();
+        // One dead proxy, one live.
+        config.core.proxies = vec![
+            "http://198.51.100.1:1".to_string(),
+            format!("http://{live_addr}"),
+        ];
+        let project_id = "test-proj-failover";
+        let client =
+            build_client(&config, Some(&db), Some(project_id)).expect("build client for test");
+
+        let resp = client
+            .get(format!("http://{live_addr}/"))
+            .send()
+            .await
+            .expect("request must succeed via 2nd proxy");
+        assert!(resp.status().is_success());
+
+        // Give a moment for the event write (synchronous but confirm it happened).
+        let failover_event = db
+            .most_recent_event_of_type(project_id, "proxy_failover")
+            .unwrap();
+        assert!(
+            failover_event.is_some(),
+            "expected a proxy_failover event in db after failover"
+        );
 
         server_handle.abort();
     }

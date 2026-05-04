@@ -987,6 +987,34 @@ impl Db {
         collect_rows(rows)
     }
 
+    /// Returns recently-failed jobs for a project (status in `Failed`, `FailedNeedsManual`,
+    /// `Timeout`), ordered by `updated_at DESC` so the most recent failure appears first.
+    /// At most `limit` rows are returned to prevent menu blowup.
+    pub fn list_failed_jobs_for_project(&self, project_id: &str, limit: usize) -> Result<Vec<Job>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT *
+            FROM jobs
+            WHERE project_id = ?1
+              AND status IN (?2, ?3, ?4)
+            ORDER BY updated_at DESC
+            LIMIT ?5
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                JobStatus::Failed.as_str(),
+                JobStatus::FailedNeedsManual.as_str(),
+                JobStatus::Timeout.as_str(),
+                limit as i64,
+            ],
+            map_job_row,
+        )?;
+        collect_rows(rows)
+    }
+
     /// Returns the `created_at` timestamp of the most recent event for a project.
     /// Used as a proxy for "last daemon tick time" since no explicit tick events are stored.
     pub fn most_recent_event_created_at(&self, project_id: &str) -> Result<Option<DateTime<Utc>>> {

@@ -1,6 +1,7 @@
 pub mod stanford;
 
 use crate::config::Config;
+use crate::db::Db;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -56,10 +57,15 @@ pub trait ReviewBackend: Send + Sync {
     ) -> std::result::Result<ReviewFetchResult, BackendError>;
 }
 
-pub fn build_backend(config: &Config, backend: &str) -> Result<Box<dyn ReviewBackend>> {
+pub fn build_backend(
+    config: &Config,
+    backend: &str,
+    db: Option<&Db>,
+    project_id: Option<&str>,
+) -> Result<Box<dyn ReviewBackend>> {
     match backend {
         "stanford" => {
-            let client = crate::http::build_client(config)?;
+            let client = crate::http::build_client(config, db, project_id)?;
             Ok(Box::new(stanford::StanfordBackend::new(
                 config.providers.stanford.base_url.clone(),
                 client,

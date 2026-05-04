@@ -219,7 +219,7 @@ pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<()> {
         .find_paper(&job.paper_id)
         .with_context(|| format!("paper not found in config: {}", job.paper_id))?;
 
-    let backend = build_backend(config, &job.backend)?;
+    let backend = build_backend(config, &job.backend, Some(db), Some(&config.project_id))?;
 
     let email = resolve_submission_email(config, &job.backend, Some(&job.email))?;
     let venue = match job.backend.as_str() {
@@ -432,7 +432,7 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
         .as_deref()
         .with_context(|| format!("job {} has no token", job.id))?;
 
-    let backend = build_backend(config, &job.backend)?;
+    let backend = build_backend(config, &job.backend, Some(db), Some(&config.project_id))?;
 
     match backend.fetch_review(token).await {
         Ok(ReviewFetchResult::Processing) => {
