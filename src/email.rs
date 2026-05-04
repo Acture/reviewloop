@@ -8,6 +8,7 @@ use anyhow::Result;
 use chrono::Utc;
 use regex::Regex;
 use std::collections::{BTreeMap, HashSet};
+use tracing::Instrument;
 
 #[derive(Debug, Clone)]
 struct EmailMatch {
@@ -543,9 +544,14 @@ mod gmail_impl {
 }
 
 pub async fn poll_imap_if_enabled(config: &Config, db: &Db) -> Result<Vec<Job>> {
-    let mut affected = gmail_impl::poll_gmail_if_enabled(config, db).await?;
-    affected.extend(imap_impl::poll_imap_if_enabled(config, db).await?);
-    Ok(affected)
+    let span = tracing::info_span!("poll_imap_if_enabled", project_id = %config.project_id);
+    async move {
+        let mut affected = gmail_impl::poll_gmail_if_enabled(config, db).await?;
+        affected.extend(imap_impl::poll_imap_if_enabled(config, db).await?);
+        Ok(affected)
+    }
+    .instrument(span)
+    .await
 }
 
 #[cfg(test)]

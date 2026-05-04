@@ -1,7 +1,7 @@
 use crate::{
     artifact::write_review_artifacts,
     backend::{BackendError, ReviewFetchResult, SubmitRequest, build_backend},
-    config::Config,
+    config::{Config, NotificationsConfig},
     db::Db,
     email::poll_imap_if_enabled,
     email_account::resolve_submission_email,
@@ -17,6 +17,47 @@ use chrono::{Duration, Utc};
 use serde_json::json;
 use std::{path::Path, time::Duration as StdDuration};
 use tracing::{error, info, warn};
+
+/// Offload a notification call onto a blocking thread so a slow or absent
+/// OS notification daemon (NSUserNotificationCenter, D-Bus) cannot stall the
+/// tokio runtime.  The JoinHandle is intentionally detached — if the call
+/// fails, `notifier::notify` logs a `warn!` and returns; the daemon tick
+/// continues unaffected.
+///
+/// Falls back to a direct (synchronous) call when invoked outside a tokio
+/// runtime (e.g., in unit tests that call sync worker functions directly).
+fn fire_notification(
+    cfg: &NotificationsConfig,
+    kind: NotificationKind,
+    paper_id: Option<&str>,
+    job_id: Option<&str>,
+    body: Option<&str>,
+) {
+    let cfg = cfg.clone();
+    let paper_id = paper_id.map(str::to_string);
+    let job_id = job_id.map(str::to_string);
+    let body = body.map(str::to_string);
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::spawn_blocking(move || {
+            notifier::notify(
+                &cfg,
+                kind,
+                paper_id.as_deref(),
+                job_id.as_deref(),
+                body.as_deref(),
+            );
+        });
+    } else {
+        // Sync context (e.g., unit tests without a Tokio runtime).
+        notifier::notify(
+            &cfg,
+            kind,
+            paper_id.as_deref(),
+            job_id.as_deref(),
+            body.as_deref(),
+        );
+    }
+}
 
 const STANFORD_MAX_TIMEOUT_SCALE_PAGES: i64 = 20;
 const TERMINAL_REVIEW_FAILURE_HINTS: [&str; 3] = [
@@ -61,7 +102,7 @@ pub async fn run_daemon(config: &Config, db: &Db, panel: bool) -> Result<()> {
                     "failed to persist tick_failed event"
                 );
             }
-            notifier::notify(
+            fire_notification(
                 &config.notifications,
                 NotificationKind::TickError,
                 None,
@@ -93,6 +134,16 @@ pub async fn run_tick(config: &Config, db: &Db) -> Result<()> {
 }
 
 async fn run_tick_internal(config: &Config, db: &Db, tick: Option<u64>) -> Result<()> {
+    // NOTE: span is entered with `.entered()`. Span context is carried across
+    // the sync portions of this function but will not propagate through .await
+    // boundaries in called async fns — each of those enters its own span.
+    let _span = tracing::info_span!(
+        "run_tick",
+        tick = tick.unwrap_or(0),
+        project_id = %config.project_id
+    )
+    .entered();
+
     run_git_tag_trigger(config, db)?;
     run_pdf_trigger(config, db)?;
 
@@ -151,6 +202,18 @@ pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<()> {
             config.project_id
         );
     }
+
+    // NOTE: span is entered here; context is carried through sync code but
+    // not propagated across .await points (pragmatic trade-off over a full
+    // async body rewrite — still provides structured context on function entry).
+    let _span = tracing::info_span!(
+        "submit_job",
+        job_id = %job.id,
+        paper_id = %job.paper_id,
+        backend = %job.backend,
+        attempt = job.attempt
+    )
+    .entered();
 
     let paper = config
         .find_paper(&job.paper_id)
@@ -312,7 +375,7 @@ async fn handle_submit_error_with_fallback(
                     "submit_failed_needs_manual",
                     json!({ "reason": reason }),
                 )?;
-                notifier::notify(
+                fire_notification(
                     &config.notifications,
                     NotificationKind::FailedNeedsManual,
                     Some(&job.paper_id),
@@ -352,6 +415,18 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
             config.project_id
         );
     }
+
+    // NOTE: span is entered here; context is carried through sync code but
+    // not propagated across .await points (pragmatic trade-off over a full
+    // async body rewrite — still provides structured context on function entry).
+    let _span = tracing::info_span!(
+        "poll_job",
+        job_id = %job.id,
+        paper_id = %job.paper_id,
+        attempt = job.attempt
+    )
+    .entered();
+
     let token = job
         .token
         .as_deref()
@@ -398,7 +473,7 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
                 "review_completed",
                 json!({ "token": token }),
             )?;
-            notifier::notify(
+            fire_notification(
                 &config.notifications,
                 NotificationKind::Completed,
                 Some(&job.paper_id),
@@ -472,7 +547,7 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
                     "poll_terminal_error",
                     json!({ "status": status, "message": body }),
                 )?;
-                notifier::notify(
+                fire_notification(
                     &config.notifications,
                     NotificationKind::FailedNeedsManual,
                     Some(&job.paper_id),
@@ -549,7 +624,7 @@ pub fn mark_timeouts(config: &Config, db: &Db) -> Result<()> {
                 Some(Some("review timed out".to_string())),
             )?;
             db.add_event(None, Some(&job.id), "timeout", json!({}))?;
-            notifier::notify(
+            fire_notification(
                 &config.notifications,
                 NotificationKind::Timeout,
                 Some(&job.paper_id),
@@ -569,9 +644,13 @@ fn timeout_for_job(config: &Config, job: &Job) -> Duration {
         return Duration::hours(base_hours);
     }
 
-    let pages = estimate_pdf_page_count(Path::new(&job.pdf_path))
-        .ok()
-        .unwrap_or(0);
+    let pages = match estimate_pdf_page_count(Path::new(&job.pdf_path)) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %e, pdf_path = %job.pdf_path, "failed to estimate PDF page count; using base timeout");
+            0
+        }
+    };
     if pages == 0 {
         return Duration::hours(base_hours);
     }

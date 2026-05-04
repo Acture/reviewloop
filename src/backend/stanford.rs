@@ -5,22 +5,33 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 
+/// Maximum retry delay we will ever honor from a server-supplied `Retry-After`
+/// header. Caps malicious or buggy "5 years from now" dates so a single 429
+/// cannot freeze a job indefinitely.
+const MAX_RETRY_AFTER: chrono::Duration = chrono::Duration::seconds(24 * 60 * 60);
+
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<chrono::Duration> {
     let raw = headers
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
         .ok()?
         .trim();
-    if let Ok(secs) = raw.parse::<i64>() {
-        return chrono::Duration::try_seconds(secs.max(0));
-    }
-    if let Ok(when) = chrono::DateTime::parse_from_rfc2822(raw) {
+    let parsed = if let Ok(secs) = raw.parse::<i64>() {
+        // Clamp negative values to 0 so a server returning `-1` doesn't
+        // produce a negative duration that confuses scheduling math.
+        chrono::Duration::try_seconds(secs.max(0))?
+    } else if let Ok(when) = chrono::DateTime::parse_from_rfc2822(raw) {
         let delta = when.with_timezone(&chrono::Utc) - chrono::Utc::now();
-        if delta > chrono::Duration::zero() {
-            return Some(delta);
+        if delta <= chrono::Duration::zero() {
+            return Some(chrono::Duration::zero());
         }
-    }
-    None
+        delta
+    } else {
+        return None;
+    };
+    // Cap at MAX_RETRY_AFTER to prevent a far-future date or huge integer
+    // from freezing the job for an unbounded amount of time.
+    Some(parsed.min(MAX_RETRY_AFTER))
 }
 
 #[derive(Clone)]
@@ -270,5 +281,63 @@ impl ReviewBackend for StanfordBackend {
             .map_err(|e| BackendError::Schema(format!("invalid review payload: {e}")))?;
 
         Ok(ReviewFetchResult::Ready { raw_json: payload })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    fn map_with(value: &str) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        m.insert(RETRY_AFTER, HeaderValue::from_str(value).unwrap());
+        m
+    }
+
+    #[test]
+    fn retry_after_normal_seconds() {
+        let d = parse_retry_after(&map_with("30")).unwrap();
+        assert_eq!(d, chrono::Duration::seconds(30));
+    }
+
+    #[test]
+    fn retry_after_huge_integer_capped_to_24h() {
+        let d = parse_retry_after(&map_with("99999999")).unwrap();
+        assert_eq!(d, MAX_RETRY_AFTER);
+    }
+
+    #[test]
+    fn retry_after_negative_clamped_to_zero() {
+        let d = parse_retry_after(&map_with("-5")).unwrap();
+        assert_eq!(d, chrono::Duration::zero());
+    }
+
+    #[test]
+    fn retry_after_past_rfc2822_date_returns_zero() {
+        // 5 years ago — delta is negative, must clamp to zero
+        let past = chrono::Utc::now() - chrono::Duration::days(5 * 365);
+        let rfc = past.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let d = parse_retry_after(&map_with(&rfc)).unwrap();
+        assert_eq!(d, chrono::Duration::zero());
+    }
+
+    #[test]
+    fn retry_after_far_future_rfc2822_capped_to_24h() {
+        // 1 year in the future — must be capped to 24 h
+        let future = chrono::Utc::now() + chrono::Duration::days(365);
+        let rfc = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let d = parse_retry_after(&map_with(&rfc)).unwrap();
+        assert_eq!(d, MAX_RETRY_AFTER);
+    }
+
+    #[test]
+    fn retry_after_missing_header_returns_none() {
+        assert!(parse_retry_after(&HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn retry_after_garbage_returns_none() {
+        assert!(parse_retry_after(&map_with("not-a-date-or-number")).is_none());
     }
 }
