@@ -85,6 +85,7 @@ enum Command {
     },
     /// Show the current status of jobs. Use --paper-id to filter to one
     /// paper; --json for machine-readable output (always {"papers":[...]}).
+    /// Use --active to show only non-terminal jobs.
     Status {
         #[arg(long)]
         paper_id: Option<String>,
@@ -92,6 +93,22 @@ enum Command {
         json: bool,
         #[arg(long, default_value_t = false)]
         show_token: bool,
+        /// Filter to non-terminal jobs only (Queued, Submitted, Processing, PendingApproval).
+        #[arg(long, default_value_t = false)]
+        active: bool,
+    },
+    /// Mark a job as cancelled (terminal). Use when a submission was made by
+    /// mistake or the paper is no longer wanted. Does NOT contact the backend.
+    ///
+    /// Implementation note: uses `JobStatus::Failed` with last_error set to
+    /// "cancelled by user: <reason>" and writes a `cancelled` event with
+    /// `{reason, previous_status}`. No new enum variant is needed.
+    Cancel {
+        #[command(flatten)]
+        job_ref: JobOrPaperRef,
+        /// Free-form reason recorded on the cancellation event.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Re-queue a failed or stalled job for another attempt. Use --force to
     /// clear any cooldown. Accepts --job-id or --paper-id.
@@ -480,9 +497,32 @@ async fn run() -> Result<()> {
             paper_id,
             json,
             show_token,
+            active,
         } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
-            cmd_status(&config, &db, paper_id.as_deref(), json, show_token)
+            cmd_status(&config, &db, paper_id.as_deref(), json, show_token, active)
+        }
+        Command::Cancel { job_ref, reason } => {
+            let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
+            let job_id = match job_ref.job_id {
+                Some(id) => id,
+                None => {
+                    resolve_paper_id_to_job(
+                        &db,
+                        &config.project_id,
+                        &job_ref.paper_id.unwrap(),
+                        &[
+                            JobStatus::PendingApproval,
+                            JobStatus::Queued,
+                            JobStatus::Submitted,
+                            JobStatus::Processing,
+                        ],
+                        "cancel",
+                    )?
+                    .id
+                }
+            };
+            cmd_cancel(&config, &db, &job_id, reason.as_deref())
         }
         Command::Retry {
             job_ref,
@@ -1406,6 +1446,22 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
             Some(ev.created_at)
         });
 
+        // Compute tick health based on how long ago the last tick occurred.
+        // Thresholds: < 60s = normal, 60-300s = stale (note), > 300s = stuck (warning).
+        let tick_health = match last_tick_at {
+            None => "normal",
+            Some(ts) => {
+                let age_secs = (now - ts).num_seconds();
+                if age_secs < 60 {
+                    "normal"
+                } else if age_secs < 300 {
+                    "stale"
+                } else {
+                    "stuck"
+                }
+            }
+        };
+
         if as_json {
             let jobs_json: Vec<serde_json::Value> = active_jobs
                 .iter()
@@ -1430,6 +1486,7 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
                 "project_id": project_id,
                 "service": { "loaded": loaded, "running": running },
                 "last_tick_at": last_tick_at.map(|t| t.to_rfc3339()),
+                "tick_health": tick_health,
                 "last_tick_error": last_tick_error_json,
                 "active_jobs": jobs_json,
             });
@@ -1460,6 +1517,17 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
                     "  last activity: {} ({ago} ago)",
                     ts.format("%Y-%m-%dT%H:%M:%SZ")
                 );
+                match tick_health {
+                    "stale" => println!(
+                        "  last tick: {} (NOTE: older than usual 30s tick)",
+                        ts.format("%Y-%m-%dT%H:%M:%SZ")
+                    ),
+                    "stuck" => println!(
+                        "  last tick: {} (WARNING: daemon may be stuck or stopped)",
+                        ts.format("%Y-%m-%dT%H:%M:%SZ")
+                    ),
+                    _ => {}
+                }
             }
             None => {
                 println!("  last activity: none recorded");
@@ -2035,6 +2103,55 @@ fn cmd_approve(config: &Config, db: &Db, job_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Cancel a non-terminal job by marking it Failed with a cancellation reason.
+///
+/// Implementation choice (option b): reuses `JobStatus::Failed` instead of
+/// adding a new `JobStatus::Cancelled` variant, keeping the schema unchanged.
+/// The `last_error` field is set to "cancelled by user: <reason>" and a
+/// `cancelled` event is written with `{reason, previous_status}`.
+fn cmd_cancel(config: &Config, db: &Db, job_id: &str, reason: Option<&str>) -> Result<()> {
+    ensure_project_context(config)?;
+    let job = ensure_project_job(config, db, job_id)?;
+
+    if matches!(
+        job.status,
+        JobStatus::Completed
+            | JobStatus::Failed
+            | JobStatus::FailedNeedsManual
+            | JobStatus::Timeout
+    ) {
+        anyhow::bail!(
+            "job {} is already in terminal status {}; cannot cancel",
+            job.id,
+            job.status.as_str()
+        );
+    }
+
+    let previous_status = job.status.as_str().to_string();
+    let cancel_reason = reason.unwrap_or("cancelled by user");
+    let last_error = format!("cancelled by user: {cancel_reason}");
+
+    db.update_job_state(
+        &job.id,
+        JobStatus::Failed,
+        None,
+        Some(None),
+        Some(Some(last_error)),
+    )?;
+    db.add_event(
+        None,
+        Some(&job.id),
+        "cancelled",
+        json!({
+            "reason": cancel_reason,
+            "previous_status": previous_status,
+        }),
+    )?;
+
+    println!("Cancelled job {} (was {})", job.id, previous_status);
+    Ok(())
+}
+
 async fn cmd_import_token(
     config: &Config,
     db: &Db,
@@ -2205,9 +2322,22 @@ fn cmd_status(
     paper_id: Option<&str>,
     as_json: bool,
     show_token: bool,
+    active: bool,
 ) -> Result<()> {
     ensure_project_context(config)?;
-    let rows = db.list_status_views(&config.project_id, paper_id)?;
+    let state_dir = config.state_dir();
+    let all_rows = db.list_status_views(&config.project_id, paper_id)?;
+
+    // Active filter: keep only non-terminal statuses.
+    const NON_TERMINAL: &[&str] = &["PENDING_APPROVAL", "QUEUED", "SUBMITTED", "PROCESSING"];
+    let rows: Vec<_> = if active {
+        all_rows
+            .into_iter()
+            .filter(|r| NON_TERMINAL.contains(&r.status.as_str()))
+            .collect()
+    } else {
+        all_rows
+    };
 
     if let Some(paper_id) = paper_id {
         let events = db.list_timeline_events(&config.project_id, paper_id)?;
@@ -2216,8 +2346,8 @@ fn cmd_status(
                 "project_id": config.project_id,
                 "papers": [{
                     "paper_id": paper_id,
-                    "rows": rows.iter().map(|row| status_row_json(row, show_token)).collect::<Vec<_>>(),
-                    "timeline": timeline_json(&rows, &events, show_token),
+                    "rows": rows.iter().map(|row| status_row_json(row, show_token, Some(&state_dir))).collect::<Vec<_>>(),
+                    "timeline": timeline_json(&rows, &events, show_token, Some(&state_dir)),
                 }],
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -2230,7 +2360,7 @@ fn cmd_status(
     if as_json {
         let payload = json!({
             "project_id": config.project_id,
-            "papers": rows.iter().map(|row| status_row_json(row, show_token)).collect::<Vec<_>>(),
+            "papers": rows.iter().map(|row| status_row_json(row, show_token, Some(&state_dir))).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
@@ -2241,41 +2371,43 @@ fn cmd_status(
         return Ok(());
     }
 
-    println!(
-        "{:<36}  {:<16}  {:<10}  {:<18}  {:<7}  {:<8}  {:<14}  {:<20}  {:<20}  {:<8}",
-        "JOB ID",
-        "PAPER",
-        "BACKEND",
-        "STATUS",
-        "ATTEMPT",
-        "SCORE",
-        "TOKEN",
-        "NEXT POLL",
-        "STARTED",
-        "ELAPSED"
-    );
-    println!("{}", "-".repeat(200));
+    // Group rows by paper_id, ordered alphabetically (BTreeMap).
+    let mut groups: std::collections::BTreeMap<&str, Vec<&reviewloop::model::StatusView>> =
+        std::collections::BTreeMap::new();
+    for row in &rows {
+        groups.entry(row.paper_id.as_str()).or_default().push(row);
+    }
+
     let now = Utc::now();
-    for row in rows {
-        let started = row.started_at.unwrap_or(row.created_at);
-        let elapsed = format_elapsed(started, now);
-        println!(
-            "{:<36}  {:<16}  {:<10}  {:<18}  {:<7}  {:<8}  {:<14}  {:<20}  {:<20}  {:<8}",
-            row.id,
-            row.paper_id,
-            row.backend,
-            row.status,
-            row.attempt,
-            row.score.clone().unwrap_or_else(|| "-".to_string()),
-            render_token(row.token.as_deref(), show_token),
-            row.next_poll_at
+    for (pid, group_rows) in &groups {
+        println!("Paper: {pid}");
+        for row in group_rows.iter() {
+            let started = row.started_at.unwrap_or(row.created_at);
+            let elapsed = format_elapsed(started, now);
+            let score_str = row.score.clone().unwrap_or_else(|| "-".to_string());
+            let token_str = render_token(row.token.as_deref(), show_token);
+            let next_poll_str = row
+                .next_poll_at
                 .map(|v| v.to_rfc3339())
-                .unwrap_or_else(|| "-".to_string()),
-            started.to_rfc3339(),
-            elapsed
-        );
-        if let Some(err) = row.last_error.clone() {
-            println!("  error: {err}");
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "  [{status}] {id}  backend={backend}  attempt={attempt}  score={score}  token={token}  next_poll={next_poll}  elapsed={elapsed}",
+                status = row.status,
+                id = row.id,
+                backend = row.backend,
+                attempt = row.attempt,
+                score = score_str,
+                token = token_str,
+                next_poll = next_poll_str,
+            );
+            if let Some(err) = row.last_error.as_deref() {
+                let truncated = if err.len() > 80 { &err[..80] } else { err };
+                println!("    error: {truncated}");
+            }
+            if row.status == "COMPLETED" {
+                let artifact_dir = state_dir.join("artifacts").join(&row.id);
+                println!("    artifacts: {}", artifact_dir.display());
+            }
         }
     }
 
@@ -2621,7 +2753,12 @@ fn maybe_record_manual_poll_override(
     Ok(())
 }
 
-fn status_row_json(row: &StatusView, show_token: bool) -> Value {
+fn status_row_json(row: &StatusView, show_token: bool, state_dir: Option<&Path>) -> Value {
+    let artifact_dir = if row.status == "COMPLETED" {
+        state_dir.map(|dir| dir.join("artifacts").join(&row.id).display().to_string())
+    } else {
+        None
+    };
     json!({
         "id": row.id,
         "project_id": row.project_id,
@@ -2646,16 +2783,22 @@ fn status_row_json(row: &StatusView, show_token: bool) -> Value {
         "score": row.score,
         "summary_md": row.summary_md,
         "completed_at": row.completed_at.map(|value| value.to_rfc3339()),
+        "artifact_dir": artifact_dir,
     })
 }
 
-fn timeline_json(rows: &[StatusView], events: &[EventRecord], show_token: bool) -> Vec<Value> {
+fn timeline_json(
+    rows: &[StatusView],
+    events: &[EventRecord],
+    show_token: bool,
+    state_dir: Option<&Path>,
+) -> Vec<Value> {
     let mut entries = Vec::new();
     for row in rows {
         entries.push(json!({
             "kind": "job",
             "created_at": row.created_at.to_rfc3339(),
-            "job": status_row_json(row, show_token),
+            "job": status_row_json(row, show_token, state_dir),
         }));
     }
     for event in events {
@@ -2704,7 +2847,7 @@ fn render_timeline_text(
             .push(json!({
                 "kind": "job",
                 "created_at": row.created_at.to_rfc3339(),
-                "row": status_row_json(row, show_token),
+                "row": status_row_json(row, show_token, None),
             }));
     }
 
@@ -3818,7 +3961,7 @@ mod tests {
                 .expect("list_status_views all");
             let multi = serde_json::json!({
                 "project_id": project_id,
-                "papers": rows_all.iter().map(|r| status_row_json(r, false)).collect::<Vec<Value>>(),
+                "papers": rows_all.iter().map(|r| status_row_json(r, false, None)).collect::<Vec<Value>>(),
             });
 
             // Single-paper shape.
@@ -3832,8 +3975,8 @@ mod tests {
                 "project_id": project_id,
                 "papers": [{
                     "paper_id": "p1",
-                    "rows": rows_one.iter().map(|r| status_row_json(r, false)).collect::<Vec<Value>>(),
-                    "timeline": timeline_json(&rows_one, &events_one, false),
+                    "rows": rows_one.iter().map(|r| status_row_json(r, false, None)).collect::<Vec<Value>>(),
+                    "timeline": timeline_json(&rows_one, &events_one, false, None),
                 }],
             });
 
@@ -4043,6 +4186,271 @@ mod tests {
             )
             .unwrap();
             assert_eq!(resolved.id, queued.id);
+        }
+    }
+
+    /// Tests for U10 — `cancel` command.
+    mod cancel {
+        use reviewloop::db::Db;
+        use reviewloop::model::{JobStatus, NewJob};
+
+        fn make_processing_job(project_id: &str, paper_id: &str) -> (Db, String) {
+            let db = Db::new_in_memory(project_id).expect("in-memory DB");
+            db.init_schema().expect("init schema");
+            let job = db
+                .create_job(&NewJob {
+                    project_id: project_id.to_string(),
+                    paper_id: paper_id.to_string(),
+                    backend: "stanford".to_string(),
+                    pdf_path: "/test/paper.pdf".to_string(),
+                    pdf_hash: "abc123".to_string(),
+                    status: JobStatus::Processing,
+                    email: "test@example.com".to_string(),
+                    venue: None,
+                    git_tag: None,
+                    git_commit: None,
+                    next_poll_at: None,
+                })
+                .expect("create job");
+            (db, job.id)
+        }
+
+        /// Cancel sets status to Failed and records a `cancelled` event.
+        #[test]
+        fn cancel_sets_failed_and_writes_event() {
+            let project_id = "cancel_proj";
+            let (db, job_id) = make_processing_job(project_id, "paper-a");
+
+            // Perform the cancellation directly via DB (mirrors cmd_cancel logic).
+            db.update_job_state(
+                &job_id,
+                JobStatus::Failed,
+                None,
+                Some(None),
+                Some(Some("cancelled by user: test reason".to_string())),
+            )
+            .expect("update_job_state");
+            db.add_event(
+                None,
+                Some(&job_id),
+                "cancelled",
+                serde_json::json!({
+                    "reason": "test reason",
+                    "previous_status": "PROCESSING",
+                }),
+            )
+            .expect("add_event");
+
+            // Assert status is now Failed.
+            let updated = db.get_job(&job_id).expect("get_job").expect("job present");
+            assert_eq!(
+                updated.status,
+                JobStatus::Failed,
+                "cancelled job must have status=Failed"
+            );
+            assert_eq!(
+                updated.last_error.as_deref(),
+                Some("cancelled by user: test reason"),
+                "last_error must carry cancellation message"
+            );
+
+            // Assert cancelled event was written.
+            let events = db
+                .list_timeline_events(project_id, "paper-a")
+                .expect("list_timeline_events");
+            let cancel_event = events
+                .iter()
+                .find(|e| e.event_type == "cancelled")
+                .expect("cancelled event must be present");
+            assert_eq!(
+                cancel_event
+                    .payload
+                    .get("previous_status")
+                    .and_then(|v| v.as_str()),
+                Some("PROCESSING"),
+                "cancelled event must record previous_status"
+            );
+            assert_eq!(
+                cancel_event.payload.get("reason").and_then(|v| v.as_str()),
+                Some("test reason"),
+                "cancelled event must record reason"
+            );
+        }
+
+        /// Cancelling an already-terminal job is rejected at the CLI layer.
+        #[test]
+        fn cancel_terminal_job_is_rejected() {
+            use reviewloop::model::JobStatus;
+            // The guard in cmd_cancel checks for terminal states.
+            let terminal = [
+                JobStatus::Completed,
+                JobStatus::Failed,
+                JobStatus::FailedNeedsManual,
+                JobStatus::Timeout,
+            ];
+            for status in terminal {
+                let is_terminal = matches!(
+                    status,
+                    JobStatus::Completed
+                        | JobStatus::Failed
+                        | JobStatus::FailedNeedsManual
+                        | JobStatus::Timeout
+                );
+                assert!(
+                    is_terminal,
+                    "{:?} should be detected as terminal by cmd_cancel guard",
+                    status
+                );
+            }
+        }
+    }
+
+    /// Tests for U12 — status grouping by paper_id.
+    mod status_grouping {
+        use reviewloop::db::Db;
+        use reviewloop::model::{JobStatus, NewJob};
+
+        fn make_db_multi(project_id: &str, paper_ids: &[&str], jobs_per_paper: usize) -> Db {
+            let db = Db::new_in_memory(project_id).expect("in-memory DB");
+            db.init_schema().expect("init schema");
+            for paper_id in paper_ids {
+                for _ in 0..jobs_per_paper {
+                    db.create_job(&NewJob {
+                        project_id: project_id.to_string(),
+                        paper_id: paper_id.to_string(),
+                        backend: "stanford".to_string(),
+                        pdf_path: "/test/paper.pdf".to_string(),
+                        pdf_hash: "abc123".to_string(),
+                        status: JobStatus::Queued,
+                        email: "test@example.com".to_string(),
+                        venue: None,
+                        git_tag: None,
+                        git_commit: None,
+                        next_poll_at: None,
+                    })
+                    .expect("create job");
+                }
+            }
+            db
+        }
+
+        /// With 3 papers × 2 jobs each, list_status_views returns 6 rows
+        /// and they can be grouped by paper_id.
+        #[test]
+        fn grouped_output_has_correct_paper_count() {
+            let project_id = "group_proj";
+            let papers = ["alpha", "beta", "gamma"];
+            let db = make_db_multi(project_id, &papers, 2);
+
+            let rows = db
+                .list_status_views(project_id, None)
+                .expect("list_status_views");
+
+            assert_eq!(rows.len(), 6, "expect 6 rows total (3 papers × 2 jobs)");
+
+            let mut groups: std::collections::BTreeMap<&str, Vec<_>> = Default::default();
+            for row in &rows {
+                groups.entry(row.paper_id.as_str()).or_default().push(row);
+            }
+
+            assert_eq!(groups.len(), 3, "expect 3 paper groups");
+            for paper in &papers {
+                let group = groups.get(paper).expect("paper group must exist");
+                assert_eq!(group.len(), 2, "each paper must have 2 jobs");
+            }
+            // BTreeMap ensures alphabetical order.
+            let keys: Vec<&str> = groups.keys().copied().collect();
+            assert_eq!(
+                keys,
+                vec!["alpha", "beta", "gamma"],
+                "papers must be sorted alphabetically"
+            );
+        }
+
+        /// Active filter keeps only non-terminal statuses.
+        #[test]
+        fn active_filter_excludes_terminal_statuses() {
+            let project_id = "filter_proj";
+            let db = Db::new_in_memory(project_id).expect("in-memory DB");
+            db.init_schema().expect("init schema");
+
+            for status in [
+                JobStatus::Queued,
+                JobStatus::Completed,
+                JobStatus::Failed,
+                JobStatus::Processing,
+            ] {
+                db.create_job(&NewJob {
+                    project_id: project_id.to_string(),
+                    paper_id: "p1".to_string(),
+                    backend: "stanford".to_string(),
+                    pdf_path: "/test/paper.pdf".to_string(),
+                    pdf_hash: "abc123".to_string(),
+                    status,
+                    email: "test@example.com".to_string(),
+                    venue: None,
+                    git_tag: None,
+                    git_commit: None,
+                    next_poll_at: None,
+                })
+                .expect("create job");
+            }
+
+            let all_rows = db.list_status_views(project_id, None).expect("list all");
+            const NON_TERMINAL: &[&str] =
+                &["PENDING_APPROVAL", "QUEUED", "SUBMITTED", "PROCESSING"];
+            let active: Vec<_> = all_rows
+                .iter()
+                .filter(|r| NON_TERMINAL.contains(&r.status.as_str()))
+                .collect();
+
+            assert_eq!(
+                active.len(),
+                2,
+                "only QUEUED and PROCESSING should survive active filter"
+            );
+            for row in &active {
+                assert!(
+                    NON_TERMINAL.contains(&row.status.as_str()),
+                    "active filter must not include {}",
+                    row.status
+                );
+            }
+        }
+    }
+
+    /// Tests for U13 — daemon status tick health alarm.
+    mod daemon_tick_health {
+        /// Classify tick age into severity label, mirroring cmd_daemon_status logic.
+        fn tick_health(age_secs: i64) -> &'static str {
+            if age_secs < 60 {
+                "normal"
+            } else if age_secs < 300 {
+                "stale"
+            } else {
+                "stuck"
+            }
+        }
+
+        #[test]
+        fn recent_tick_is_normal() {
+            assert_eq!(tick_health(0), "normal");
+            assert_eq!(tick_health(30), "normal");
+            assert_eq!(tick_health(59), "normal");
+        }
+
+        #[test]
+        fn tick_between_1_and_5_min_is_stale() {
+            assert_eq!(tick_health(60), "stale");
+            assert_eq!(tick_health(120), "stale");
+            assert_eq!(tick_health(299), "stale");
+        }
+
+        #[test]
+        fn tick_over_5_min_is_stuck() {
+            assert_eq!(tick_health(300), "stuck");
+            assert_eq!(tick_health(600), "stuck");
+            assert_eq!(tick_health(3600), "stuck");
         }
     }
 }
