@@ -44,6 +44,23 @@ pub async fn run_daemon(config: &Config, db: &Db, panel: bool) -> Result<()> {
         if let Err(err) = run_tick_internal(config, db, Some(tick)).await {
             let msg = format!("{err:#}");
             error!(tick, error = %msg, "tick failed");
+            // Persist the failure so `daemon status` can surface it without
+            // tailing the daemon log. The next tick can read this back via
+            // db.most_recent_event_of_type(_, "tick_failed").
+            if let Err(persist_err) = db.add_event(
+                Some(&config.project_id),
+                None,
+                "tick_failed",
+                json!({ "tick": tick, "error": msg.clone() }),
+            ) {
+                // Don't let an event-write failure mask the underlying tick
+                // failure or kill the daemon; log and continue.
+                warn!(
+                    tick,
+                    error = %persist_err,
+                    "failed to persist tick_failed event"
+                );
+            }
             notifier::notify(
                 &config.notifications,
                 NotificationKind::TickError,
@@ -152,13 +169,17 @@ pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<()> {
         _ => job.venue.clone(),
     };
 
-    db.update_job_state(
-        &job.id,
-        JobStatus::Submitted,
-        Some(job.attempt),
-        Some(None),
-        Some(None),
-    )?;
+    // Intentionally do NOT pre-write JobStatus::Submitted here. The previous
+    // intermediate write existed to mark the job as "in flight", but if the
+    // process crashed (launchd restart, SIGKILL, panic) between this write
+    // and backend.submit() returning, the job was orphaned in SUBMITTED
+    // state with no token, and no worker path (list_ready_queued,
+    // list_due_processing, mark_timeouts) ever picked it back up. By keeping
+    // the job as QUEUED through the await, a crash leaves the job in a
+    // recoverable state: the next tick will re-attempt the submission.
+    // Successful submissions transition QUEUED -> PROCESSING in
+    // mark_submitted_with_token. The transient SUBMITTED status is now
+    // unused by the worker (still a valid value for future use).
 
     let submit_req = SubmitRequest {
         pdf_path: Path::new(&paper.pdf_path).to_path_buf(),

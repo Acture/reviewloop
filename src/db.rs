@@ -970,6 +970,52 @@ impl Db {
             .context("invalid created_at in events table")
     }
 
+    /// Returns the most recent event of a specific type for a project.
+    /// Used by `daemon status` to surface the last `tick_failed` event so
+    /// operators can see when (and why) the daemon last died.
+    pub fn most_recent_event_of_type(
+        &self,
+        project_id: &str,
+        event_type: &str,
+    ) -> Result<Option<EventRecord>> {
+        let conn = self.connect()?;
+        let row: Option<(i64, Option<String>, String, String)> = conn
+            .query_row(
+                r#"
+                SELECT id, job_id, payload_json, created_at
+                FROM events
+                WHERE project_id = ?1 AND event_type = ?2
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                "#,
+                params![project_id, event_type],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, job_id, payload_json, created_at)) = row else {
+            return Ok(None);
+        };
+        let payload: Value = serde_json::from_str(&payload_json)
+            .with_context(|| format!("invalid payload_json on event id={id}"))?;
+        let created_at = parse_rfc3339(&created_at)
+            .with_context(|| format!("invalid created_at on event id={id}"))?;
+        Ok(Some(EventRecord {
+            id,
+            project_id: project_id.to_string(),
+            job_id,
+            event_type: event_type.to_string(),
+            payload,
+            created_at,
+        }))
+    }
+
     pub fn status_counts(&self, project_id: &str) -> Result<BTreeMap<String, usize>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(

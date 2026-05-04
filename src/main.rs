@@ -1148,6 +1148,42 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
                 d.most_recent_event_created_at(project_id).ok().flatten()
             }
         });
+        // Surface the most recent tick failure if the worker logged one.
+        // Only show it when it's recent enough that it could plausibly be the
+        // current state of the daemon: we use 6x the daemon tick interval
+        // (30s) as the freshness window, so an error from >3 minutes ago is
+        // assumed to have been resolved by a subsequent successful tick.
+        let last_tick_error_msg: Option<(chrono::DateTime<Utc>, String)> = db.and_then(|d| {
+            if project_id.is_empty() {
+                return None;
+            }
+            let ev = d
+                .most_recent_event_of_type(project_id, "tick_failed")
+                .ok()
+                .flatten()?;
+            // Only include if the most recent tick_failed is also the most
+            // recent event overall (no successful work has happened since).
+            // If we've recorded a `submitted`, `polled`, etc. after it, the
+            // daemon has clearly recovered.
+            if last_tick_at
+                .map(|latest| latest > ev.created_at)
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            // And require it to be within ~3 minutes (6 ticks).
+            let age = now - ev.created_at;
+            if age > chrono::Duration::seconds(180) {
+                return None;
+            }
+            let msg = ev
+                .payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("(no error message)")
+                .to_string();
+            Some((ev.created_at, msg))
+        });
         let active_jobs: Vec<reviewloop::model::Job> = db
             .and_then(|d| {
                 if project_id.is_empty() {
@@ -1171,11 +1207,18 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
                     })
                 })
                 .collect();
+            let last_tick_error_json = match &last_tick_error_msg {
+                Some((ts, msg)) => json!({
+                    "at": ts.to_rfc3339(),
+                    "message": msg,
+                }),
+                None => serde_json::Value::Null,
+            };
             let payload = json!({
                 "project_id": project_id,
                 "service": { "loaded": loaded, "running": running },
                 "last_tick_at": last_tick_at.map(|t| t.to_rfc3339()),
-                "last_tick_error": serde_json::Value::Null,
+                "last_tick_error": last_tick_error_json,
                 "active_jobs": jobs_json,
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -1210,7 +1253,22 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
                 println!("  last activity: none recorded");
             }
         }
-        println!("  last tick error: none");
+        match &last_tick_error_msg {
+            Some((ts, msg)) => {
+                let ago = format_elapsed(*ts, now);
+                println!(
+                    "  last tick error: {} ({ago} ago)",
+                    ts.format("%Y-%m-%dT%H:%M:%SZ")
+                );
+                // Indent the message so it's clearly grouped under the label.
+                for line in msg.lines() {
+                    println!("    {line}");
+                }
+            }
+            None => {
+                println!("  last tick error: none");
+            }
+        }
 
         println!();
         if active_jobs.is_empty() {
@@ -3119,6 +3177,68 @@ mod tests {
                 .unwrap();
             let ts = db.most_recent_event_created_at("proj").unwrap();
             assert!(ts.is_some(), "expected a timestamp after inserting event");
+        }
+
+        #[test]
+        fn most_recent_event_of_type_filters_by_type_and_returns_payload() {
+            let db = Db::new_in_memory("daemon_status_event_typed").unwrap();
+            db.init_schema().unwrap();
+
+            // No matching events → None
+            assert!(
+                db.most_recent_event_of_type("proj", "tick_failed")
+                    .unwrap()
+                    .is_none()
+            );
+
+            // Mixed events of different types
+            db.add_event(
+                Some("proj"),
+                None,
+                "submitted",
+                serde_json::json!({"backend": "stanford"}),
+            )
+            .unwrap();
+            db.add_event(
+                Some("proj"),
+                None,
+                "tick_failed",
+                serde_json::json!({"tick": 7, "error": "first failure"}),
+            )
+            .unwrap();
+            db.add_event(
+                Some("proj"),
+                None,
+                "polled",
+                serde_json::json!({"status": "PROCESSING"}),
+            )
+            .unwrap();
+            db.add_event(
+                Some("proj"),
+                None,
+                "tick_failed",
+                serde_json::json!({"tick": 9, "error": "newer failure"}),
+            )
+            .unwrap();
+            // Different project's tick_failed must be ignored.
+            db.add_event(
+                Some("other"),
+                None,
+                "tick_failed",
+                serde_json::json!({"tick": 99, "error": "wrong project"}),
+            )
+            .unwrap();
+
+            let ev = db
+                .most_recent_event_of_type("proj", "tick_failed")
+                .unwrap()
+                .expect("expected most-recent tick_failed event");
+            assert_eq!(ev.event_type, "tick_failed");
+            assert_eq!(
+                ev.payload.get("error").and_then(Value::as_str),
+                Some("newer failure"),
+                "should return the most recently added tick_failed event"
+            );
         }
 
         #[test]
