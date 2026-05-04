@@ -53,8 +53,8 @@ enum Command {
         force: bool,
     },
     Approve {
-        #[arg(long)]
-        job_id: String,
+        #[command(flatten)]
+        job_ref: JobOrPaperRef,
     },
     ImportToken {
         #[arg(long)]
@@ -65,12 +65,8 @@ enum Command {
         source: String,
     },
     Check {
-        #[arg(long)]
-        job_id: Option<String>,
-        #[arg(long)]
-        paper_id: Option<String>,
-        #[arg(long, default_value_t = false)]
-        all_processing: bool,
+        #[command(flatten)]
+        target: CheckTarget,
     },
     Status {
         #[arg(long)]
@@ -81,14 +77,14 @@ enum Command {
         show_token: bool,
     },
     Retry {
-        #[arg(long)]
-        job_id: String,
+        #[command(flatten)]
+        job_ref: JobOrPaperRef,
         #[arg(long, default_value_t = false)]
         override_rate_limit: bool,
     },
     Complete {
-        #[arg(long)]
-        job_id: String,
+        #[command(flatten)]
+        job_ref: JobOrPaperRef,
         #[arg(long)]
         summary_text: Option<String>,
         #[arg(long)]
@@ -221,6 +217,30 @@ enum EmailCommand {
     Status,
 }
 
+/// Argument group for commands that accept either `--job-id` or `--paper-id`.
+/// Clap enforces that exactly one of the two flags is provided.
+#[derive(Debug, Args, Clone)]
+#[group(required = true, multiple = false)]
+struct JobOrPaperRef {
+    #[arg(long)]
+    job_id: Option<String>,
+    #[arg(long)]
+    paper_id: Option<String>,
+}
+
+/// Argument group for `check`: exactly one of `--job-id`, `--paper-id`, or
+/// `--all-processing` must be supplied.
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct CheckTarget {
+    #[arg(long)]
+    job_id: Option<String>,
+    #[arg(long)]
+    paper_id: Option<String>,
+    #[arg(long)]
+    all_processing: bool,
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
@@ -310,8 +330,21 @@ async fn run() -> Result<()> {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
             cmd_submit(&config, &db, &paper_id, force).await
         }
-        Command::Approve { job_id } => {
+        Command::Approve { job_ref } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
+            let job_id = match job_ref.job_id {
+                Some(id) => id,
+                None => {
+                    resolve_paper_id_to_job(
+                        &db,
+                        &config.project_id,
+                        &job_ref.paper_id.unwrap(),
+                        &[JobStatus::PendingApproval],
+                        "approve",
+                    )?
+                    .id
+                }
+            };
             cmd_approve(&config, &db, &job_id)
         }
         Command::ImportToken {
@@ -322,18 +355,14 @@ async fn run() -> Result<()> {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
             cmd_import_token(&config, &db, &paper_id, &token, &source)
         }
-        Command::Check {
-            job_id,
-            paper_id,
-            all_processing,
-        } => {
+        Command::Check { target } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
             cmd_check(
                 &config,
                 &db,
-                job_id.as_deref(),
-                paper_id.as_deref(),
-                all_processing,
+                target.job_id.as_deref(),
+                target.paper_id.as_deref(),
+                target.all_processing,
             )
             .await
         }
@@ -346,20 +375,53 @@ async fn run() -> Result<()> {
             cmd_status(&config, &db, paper_id.as_deref(), json, show_token)
         }
         Command::Retry {
-            job_id,
+            job_ref,
             override_rate_limit,
         } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
+            let job_id = match job_ref.job_id {
+                Some(id) => id,
+                None => {
+                    resolve_paper_id_to_job(
+                        &db,
+                        &config.project_id,
+                        &job_ref.paper_id.unwrap(),
+                        &[
+                            JobStatus::Failed,
+                            JobStatus::FailedNeedsManual,
+                            JobStatus::Timeout,
+                            JobStatus::Processing,
+                            JobStatus::Submitted,
+                            JobStatus::Queued,
+                        ],
+                        "retry",
+                    )?
+                    .id
+                }
+            };
             cmd_retry(&config, &db, &job_id, override_rate_limit).await
         }
         Command::Complete {
-            job_id,
+            job_ref,
             summary_text,
             summary_url,
             empty_summary,
             score,
         } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
+            let job_id = match job_ref.job_id {
+                Some(id) => id,
+                None => {
+                    resolve_paper_id_to_job(
+                        &db,
+                        &config.project_id,
+                        &job_ref.paper_id.unwrap(),
+                        &[JobStatus::Processing, JobStatus::Submitted],
+                        "complete",
+                    )?
+                    .id
+                }
+            };
             cmd_complete(
                 &config,
                 &db,
@@ -1338,9 +1400,6 @@ async fn cmd_check(
     all_processing: bool,
 ) -> Result<()> {
     ensure_project_context(config)?;
-    if job_id.is_some() && (paper_id.is_some() || all_processing) {
-        anyhow::bail!("--job-id cannot be combined with --paper-id or --all-processing");
-    }
 
     let mut targets = Vec::new();
     if let Some(job_id) = job_id {
@@ -1656,6 +1715,58 @@ fn ensure_project_context(config: &Config) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Resolve a `--paper-id` value to a single `Job` eligible for `command`.
+///
+/// Queries jobs for `(project_id, paper_id)` whose status is in
+/// `allowed_statuses` (ordered by `updated_at DESC`) and returns:
+/// - the job when exactly one match is found,
+/// - an error with a clear message when 0 or >1 jobs match.
+fn resolve_paper_id_to_job(
+    db: &Db,
+    project_id: &str,
+    paper_id: &str,
+    allowed_statuses: &[JobStatus],
+    command: &str,
+) -> Result<Job> {
+    let status_strs: Vec<&str> = allowed_statuses.iter().map(|s| s.as_str()).collect();
+    let all_views = db.list_status_views(project_id, Some(paper_id))?;
+    let mut matching: Vec<_> = all_views
+        .iter()
+        .filter(|v| status_strs.contains(&v.status.as_str()))
+        .collect();
+    // Sort by updated_at DESC for consistent ordering.
+    matching.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    match matching.len() {
+        0 => {
+            let statuses_str = allowed_statuses
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "no {command}-eligible job for paper_id={paper_id} \
+                 (looking for statuses: {statuses_str})"
+            )
+        }
+        1 => db
+            .get_project_job(project_id, &matching[0].id)?
+            .ok_or_else(|| anyhow!("job disappeared after lookup: {}", matching[0].id)),
+        _ => {
+            let candidates = matching
+                .iter()
+                .take(5)
+                .map(|v| format!("{} ({})", v.id, v.status))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "multiple jobs match paper_id={paper_id} for {command}; \
+                 pass --job-id explicitly. candidates: {candidates}"
+            )
+        }
+    }
 }
 
 fn version_identity(git_commit: Option<&str>, pdf_hash: &str) -> (String, String) {
@@ -2272,5 +2383,129 @@ mod tests {
         assert!(notice.contains("core.max_submissions_per_tick"));
         assert!(notice.contains("trigger.pdf.max_scan_papers"));
         assert!(notice.contains("starts at 10m"));
+    }
+
+    mod resolve_paper_id {
+        use super::super::resolve_paper_id_to_job;
+        use reviewloop::db::Db;
+        use reviewloop::model::{JobStatus, NewJob};
+
+        fn new_job(project_id: &str, paper_id: &str, pdf_hash: &str, status: JobStatus) -> NewJob {
+            NewJob {
+                project_id: project_id.to_string(),
+                paper_id: paper_id.to_string(),
+                backend: "stanford".to_string(),
+                pdf_path: "/test/paper.pdf".to_string(),
+                pdf_hash: pdf_hash.to_string(),
+                status,
+                email: "test@example.com".to_string(),
+                venue: None,
+                git_tag: None,
+                git_commit: None,
+                next_poll_at: None,
+            }
+        }
+
+        #[test]
+        fn zero_matches_returns_error() {
+            let db = Db::new_in_memory("resolve_zero").unwrap();
+            db.init_schema().unwrap();
+
+            let err = resolve_paper_id_to_job(
+                &db,
+                "proj1",
+                "paper1",
+                &[JobStatus::PendingApproval],
+                "approve",
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("no approve-eligible job"), "got: {msg}");
+            assert!(msg.contains("paper_id=paper1"), "got: {msg}");
+            assert!(msg.contains("PENDING_APPROVAL"), "got: {msg}");
+        }
+
+        #[test]
+        fn one_match_returns_job() {
+            let db = Db::new_in_memory("resolve_one").unwrap();
+            db.init_schema().unwrap();
+
+            let created = db
+                .create_job(&new_job(
+                    "proj1",
+                    "paper1",
+                    "hash_a",
+                    JobStatus::PendingApproval,
+                ))
+                .unwrap();
+
+            let resolved = resolve_paper_id_to_job(
+                &db,
+                "proj1",
+                "paper1",
+                &[JobStatus::PendingApproval],
+                "approve",
+            )
+            .unwrap();
+            assert_eq!(resolved.id, created.id);
+        }
+
+        #[test]
+        fn multiple_matches_returns_error_with_candidates() {
+            let db = Db::new_in_memory("resolve_multi").unwrap();
+            db.init_schema().unwrap();
+
+            db.create_job(&new_job(
+                "proj1",
+                "paper1",
+                "hash_a",
+                JobStatus::PendingApproval,
+            ))
+            .unwrap();
+            db.create_job(&new_job(
+                "proj1",
+                "paper1",
+                "hash_b",
+                JobStatus::PendingApproval,
+            ))
+            .unwrap();
+
+            let err = resolve_paper_id_to_job(
+                &db,
+                "proj1",
+                "paper1",
+                &[JobStatus::PendingApproval],
+                "approve",
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("multiple jobs match"), "got: {msg}");
+            assert!(msg.contains("paper_id=paper1"), "got: {msg}");
+            assert!(msg.contains("pass --job-id explicitly"), "got: {msg}");
+            assert!(msg.contains("candidates:"), "got: {msg}");
+        }
+
+        #[test]
+        fn filters_by_status_correctly() {
+            let db = Db::new_in_memory("resolve_status_filter").unwrap();
+            db.init_schema().unwrap();
+
+            // A completed job should NOT match when looking for PROCESSING
+            db.create_job(&new_job("proj1", "paper1", "hash_a", JobStatus::Completed))
+                .unwrap();
+            let processing_job = db
+                .create_job(&new_job("proj1", "paper1", "hash_b", JobStatus::Processing))
+                .unwrap();
+
+            let resolved = resolve_paper_id_to_job(
+                &db,
+                "proj1",
+                "paper1",
+                &[JobStatus::Processing, JobStatus::Submitted],
+                "complete",
+            )
+            .unwrap();
+            assert_eq!(resolved.id, processing_job.id);
+        }
     }
 }
