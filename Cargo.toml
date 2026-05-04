@@ -14,7 +14,7 @@ categories = ["command-line-utilities", "science"]
 
 [features]
 default = []
-bar = ["dep:tray-icon", "dep:tao", "dep:muda"]
+bar = ["dep:tray-icon", "dep:tao", "dep:muda", "dep:rfd"]
 
 [[bin]]
 name = "reviewloop"
@@ -52,6 +52,7 @@ notify-rust = { version = "4", default-features = false }
 tray-icon = { version = "0.23", optional = true, default-features = false, features = ["common-controls-v6"] }
 tao = { version = "0.35", optional = true }
 muda = { version = "0.19", optional = true }
+rfd = { version = "0.17", optional = true }
 
 [dev-dependencies]
 axum = "0.8"

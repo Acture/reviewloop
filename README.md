@@ -123,10 +123,10 @@ cargo build --release
 
 ### Menu bar companion (optional, macOS)
 
-`reviewloop-bar` is a small menu-bar app that surfaces the current
-state of your active jobs without keeping a terminal open. It is
-read-only against the same SQLite database the daemon writes to and
-triggers actions by spawning `reviewloop` subcommands.
+`reviewloop-bar` is a menu-bar app that surfaces the current state of
+your active jobs without keeping a terminal open. It is read-only
+against the same SQLite database the daemon writes to and triggers
+actions by spawning `reviewloop` subcommands.
 
 Build and install separately:
 
@@ -140,13 +140,30 @@ Run:
 reviewloop-bar &
 ```
 
+**v2 capabilities:**
+
+- **Per-job submenus** — each active job (QUEUED / SUBMITTED /
+  PROCESSING) gets its own submenu showing `paper_id · STATUS ·
+  attempt=N · in Xs` with three actions: *Retry now*, *Open
+  artifacts*, *Open log*.
+- **Submit new…** — opens a native PDF file picker and spawns
+  `reviewloop run <path>` in the background.
+- **Pause / Resume daemon** — shells out to `reviewloop daemon pause`
+  / `reviewloop daemon resume` (macOS only; menu item is disabled on
+  other platforms).
+- **Open Artifacts Folder** and **Open Daemon Log** — cross-platform
+  (`open` / `xdg-open` / `explorer`).
+- Menu is rebuilt every 5 s so the job list stays current without
+  restarting the bar.
+
 The bar is opt-in (gated behind the `bar` Cargo feature) so headless
 servers and CI continue to build the standard `reviewloop` binary
 without the GUI dependencies.
 
 > **Note:** The menu bar companion has no automated integration tests
 > (it is GUI-bound). Manual smoke-testing on macOS is the verification
-> path for v1.
+> path. Multi-project switching and "Retry Failed" enumeration are
+> deferred to a future phase (they require new `Db` helpers).
 
 ## Command Surface
 

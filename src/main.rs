@@ -168,6 +168,10 @@ enum DaemonCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Pause the daemon by unloading the launchd service (macOS only).
+    Pause,
+    /// Resume the daemon by re-loading the launchd service (macOS only).
+    Resume,
 }
 
 #[derive(Debug, Subcommand)]
@@ -355,6 +359,8 @@ async fn run() -> Result<()> {
                 cmd_daemon_install(config_override.as_deref(), start)
             }
             DaemonCommand::Uninstall => cmd_daemon_uninstall(),
+            DaemonCommand::Pause => cmd_daemon_pause(),
+            DaemonCommand::Resume => cmd_daemon_resume(),
             DaemonCommand::Status { json } => {
                 // Load config softly — daemon status is still useful without a project config.
                 let config_res =
@@ -1110,6 +1116,81 @@ fn cmd_daemon_uninstall() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
         anyhow::bail!("`daemon uninstall` is currently supported on macOS only");
+    }
+}
+
+/// Pause the daemon by unloading it from launchd (macOS only).
+/// The plist remains on disk; `daemon resume` re-loads it.
+fn cmd_daemon_pause() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        const DAEMON_LABEL: &str = "ai.reviewloop.daemon";
+        let uid = current_uid_string()?;
+        let target = format!("gui/{uid}/{DAEMON_LABEL}");
+        let status = ProcessCommand::new("launchctl")
+            .args(["bootout", &target])
+            .status()
+            .context("failed to run launchctl bootout")?;
+        if status.success() {
+            println!(
+                "Daemon paused (launchd service unloaded). Run `reviewloop daemon resume` to restart."
+            );
+        } else {
+            anyhow::bail!(
+                "launchctl bootout failed — the daemon may not be loaded. \
+                Check `reviewloop daemon status`."
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        anyhow::bail!(
+            "`daemon pause` is currently macOS-only. \
+            Use your system service manager to stop the daemon."
+        );
+    }
+}
+
+/// Resume the daemon by re-loading it into launchd (macOS only).
+fn cmd_daemon_resume() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        const DAEMON_LABEL: &str = "ai.reviewloop.daemon";
+        let home = env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
+        let plist_path = PathBuf::from(home)
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{DAEMON_LABEL}.plist"));
+        if !plist_path.exists() {
+            anyhow::bail!(
+                "No plist found at {}. Run `reviewloop daemon install` first.",
+                plist_path.display()
+            );
+        }
+        let uid = current_uid_string()?;
+        let domain = format!("gui/{uid}");
+        let out = ProcessCommand::new("launchctl")
+            .args(["bootstrap", &domain, plist_path.to_string_lossy().as_ref()])
+            .output()
+            .context("failed to run launchctl bootstrap")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "launchctl bootstrap failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        println!("Daemon resumed (launchd service loaded).");
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        anyhow::bail!(
+            "`daemon resume` is currently macOS-only. \
+            Use your system service manager to start the daemon."
+        );
     }
 }
 
@@ -3473,6 +3554,44 @@ mod tests {
             assert!(
                 effective_force,
                 "override_rate_limit should make effective force = true"
+            );
+        }
+    }
+
+    mod daemon_pause_resume {
+        /// `daemon pause` parses to the Pause variant.
+        #[test]
+        fn daemon_pause_parses() {
+            use crate::{Cli, Command, DaemonCommand};
+            use clap::Parser;
+            let args = Cli::try_parse_from(["reviewloop", "daemon", "pause"])
+                .expect("`daemon pause` should parse successfully");
+            assert!(
+                matches!(
+                    args.command,
+                    Command::Daemon {
+                        command: DaemonCommand::Pause
+                    }
+                ),
+                "expected DaemonCommand::Pause"
+            );
+        }
+
+        /// `daemon resume` parses to the Resume variant.
+        #[test]
+        fn daemon_resume_parses() {
+            use crate::{Cli, Command, DaemonCommand};
+            use clap::Parser;
+            let args = Cli::try_parse_from(["reviewloop", "daemon", "resume"])
+                .expect("`daemon resume` should parse successfully");
+            assert!(
+                matches!(
+                    args.command,
+                    Command::Daemon {
+                        command: DaemonCommand::Resume
+                    }
+                ),
+                "expected DaemonCommand::Resume"
             );
         }
     }
