@@ -41,6 +41,117 @@ impl JobStatus {
             _ => None,
         }
     }
+
+    /// Returns true if a job in `self` is permitted to move to `to`.
+    ///
+    /// The state machine is intentionally narrow:
+    /// - Terminal states (Completed, Failed, FailedNeedsManual, Timeout) are
+    ///   absorbing — no outgoing transitions for automated/daemon paths.
+    /// - PendingApproval → Queued (via `reviewloop approve`)
+    /// - Queued → {Submitted, Processing, Failed, FailedNeedsManual, Timeout}
+    /// - Submitted → {Processing, Failed, FailedNeedsManual, Timeout, Queued}
+    /// - Processing → {Completed, Failed, FailedNeedsManual, Timeout, Queued}
+    /// - Self-transitions (e.g. Processing → Processing on retry-bookkeeping)
+    ///   are always allowed; the worker uses them to bump attempt / next_poll_at
+    ///   without changing logical state.
+    ///
+    /// Note: user-initiated CLI overrides (`retry`, `complete`) deliberately
+    /// move jobs out of terminal states. Those call sites are intentional and
+    /// should NOT be routed through this guard.
+    pub fn can_transition(self, to: JobStatus) -> bool {
+        use JobStatus::*;
+        if self == to {
+            return true;
+        }
+        match (self, to) {
+            (Completed | Failed | FailedNeedsManual | Timeout, _) => false,
+            (PendingApproval, Queued) => true,
+            (PendingApproval, _) => false,
+            (Queued, Submitted | Processing | Failed | FailedNeedsManual | Timeout) => true,
+            (Submitted, Processing | Failed | FailedNeedsManual | Timeout | Queued) => true,
+            (Processing, Completed | Failed | FailedNeedsManual | Timeout | Queued) => true,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JobStatus;
+
+    #[test]
+    fn terminal_states_are_absorbing() {
+        use JobStatus::*;
+        let terminals = [Completed, Failed, FailedNeedsManual, Timeout];
+        let all = [
+            PendingApproval,
+            Queued,
+            Submitted,
+            Processing,
+            Completed,
+            Failed,
+            FailedNeedsManual,
+            Timeout,
+        ];
+        for t in terminals {
+            for to in all {
+                if t == to {
+                    assert!(
+                        t.can_transition(to),
+                        "{:?} -> {:?} self-transition must be allowed",
+                        t,
+                        to
+                    );
+                } else {
+                    assert!(
+                        !t.can_transition(to),
+                        "{:?} -> {:?} must be rejected (terminal absorbing)",
+                        t,
+                        to
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn worker_daemon_transitions_are_allowed() {
+        use JobStatus::*;
+        // approve command
+        assert!(PendingApproval.can_transition(Queued));
+        // submit path: Queued -> Processing (direct, skipping Submitted)
+        assert!(Queued.can_transition(Processing));
+        // submit path failure cases
+        assert!(Queued.can_transition(Failed));
+        assert!(Queued.can_transition(FailedNeedsManual));
+        assert!(Queued.can_transition(Timeout));
+        // rate-limit self-transition on submit
+        assert!(Queued.can_transition(Queued));
+        // poll path
+        assert!(Processing.can_transition(Completed));
+        assert!(Processing.can_transition(Failed));
+        assert!(Processing.can_transition(FailedNeedsManual));
+        assert!(Processing.can_transition(Timeout));
+        // rate-limit / retry-bookkeeping self-transitions
+        assert!(Processing.can_transition(Processing));
+        // Submitted fallback transitions
+        assert!(Submitted.can_transition(Processing));
+        assert!(Submitted.can_transition(Queued));
+    }
+
+    #[test]
+    fn obviously_invalid_transitions_are_rejected() {
+        use JobStatus::*;
+        assert!(!Completed.can_transition(Queued));
+        assert!(!Completed.can_transition(Processing));
+        assert!(!Completed.can_transition(Failed));
+        assert!(!Failed.can_transition(Queued));
+        assert!(!FailedNeedsManual.can_transition(Queued));
+        assert!(!Timeout.can_transition(Queued));
+        assert!(!PendingApproval.can_transition(Processing));
+        assert!(!PendingApproval.can_transition(Completed));
+        assert!(!PendingApproval.can_transition(Failed));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

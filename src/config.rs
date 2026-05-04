@@ -695,8 +695,36 @@ where
         })?;
     }
     let content = toml::to_string_pretty(value)?;
-    fs::write(path, content)
-        .with_context(|| format!("failed to write config file: {}", path.display()))
+
+    // Atomic write: write to a sibling temp file, fsync it, then rename over the
+    // target. Rename on POSIX (and reasonably-modern Windows NTFS) is atomic
+    // within a single filesystem, so a crash either leaves the original file
+    // intact or replaces it cleanly with the new contents.
+    let tmp_name = format!(
+        ".{}.tmp.{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("config"),
+        std::process::id()
+    );
+    let tmp_path = path.with_file_name(tmp_name);
+    {
+        let mut f = fs::File::create(&tmp_path)
+            .with_context(|| format!("failed to create temp config: {}", tmp_path.display()))?;
+        use std::io::Write;
+        f.write_all(content.as_bytes())
+            .with_context(|| format!("failed to write temp config: {}", tmp_path.display()))?;
+        f.sync_all()
+            .with_context(|| format!("failed to fsync temp config: {}", tmp_path.display()))?;
+    }
+    fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "failed to atomically rename {} -> {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn discover_project_config_path(explicit_path: Option<&Path>) -> Result<Option<PathBuf>> {
@@ -1288,6 +1316,38 @@ mod tests {
     };
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn save_toml_file_roundtrips_and_leaves_no_tmp_files() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("reviewloop.toml");
+        let original = ProjectConfigFile {
+            project_id: "my-project".to_string(),
+            papers: vec![],
+            ..ProjectConfigFile::default()
+        };
+        original.save(&path).expect("save");
+
+        // No .tmp.* sibling should remain after a successful save.
+        let leftover: Vec<_> = fs::read_dir(tmp.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "temp file must not linger: {leftover:?}"
+        );
+
+        // The written file must round-trip correctly.
+        let loaded = ProjectConfigFile::load(&path).expect("load");
+        assert_eq!(loaded.project_id, original.project_id);
+
+        // Save a second time to confirm idempotency.
+        original.save(&path).expect("second save");
+        let loaded2 = ProjectConfigFile::load(&path).expect("load2");
+        assert_eq!(loaded2.project_id, original.project_id);
+    }
 
     #[test]
     fn defaults_start_polling_within_one_minute() {

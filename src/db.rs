@@ -551,16 +551,23 @@ impl Db {
         next_poll_at: Option<Option<DateTime<Utc>>>,
         last_error: Option<Option<String>>,
     ) -> Result<()> {
-        let conn = self.connect()?;
-        let current = self
-            .get_job(job_id)?
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+
+        let current = tx
+            .query_row(
+                "SELECT * FROM jobs WHERE id = ?1",
+                params![job_id],
+                map_job_row,
+            )
+            .optional()?
             .ok_or_else(|| anyhow!("job not found: {job_id}"))?;
 
         let attempt_val = attempt.unwrap_or(current.attempt);
         let next_poll_val = next_poll_at.unwrap_or(current.next_poll_at).map(to_rfc3339);
         let last_error_val = last_error.unwrap_or(current.last_error);
 
-        conn.execute(
+        tx.execute(
             r#"
             UPDATE jobs
             SET status = ?2,
@@ -579,6 +586,7 @@ impl Db {
                 to_rfc3339(Utc::now()),
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -588,9 +596,29 @@ impl Db {
         token: &str,
         next_poll_at: DateTime<Utc>,
     ) -> Result<()> {
-        let conn = self.connect()?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+
+        let current = tx
+            .query_row(
+                "SELECT * FROM jobs WHERE id = ?1",
+                params![job_id],
+                map_job_row,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("job not found: {job_id}"))?;
+
+        if !current.status.can_transition(JobStatus::Processing) {
+            anyhow::bail!(
+                "invalid status transition for job {}: {} -> {}",
+                job_id,
+                current.status.as_str(),
+                JobStatus::Processing.as_str()
+            );
+        }
+
         let now = to_rfc3339(Utc::now());
-        conn.execute(
+        tx.execute(
             r#"
             UPDATE jobs
             SET status = ?2,
@@ -611,6 +639,7 @@ impl Db {
                 now,
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
