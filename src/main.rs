@@ -33,29 +33,42 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Initialize global config (~/.config/reviewloop/config.toml) and data
+    /// dir. Run once per machine before any other command.
     Init(InitArgs),
+    /// Manage configuration files. Subcommands: init, init project,
+    /// migrate-project.
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Manage papers tracked in the project config. Subcommands: add, watch,
+    /// remove.
     Paper {
         #[command(subcommand)]
         command: PaperCommand,
     },
+    /// Manage the background daemon that processes triggers, submissions, and
+    /// polls. Subcommands: run, install, uninstall, status, pause, resume.
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    /// Enqueue a paper for submission. Use --force to bypass dedupe and clear
+    /// any pending cooldown for prior siblings.
     Submit {
         #[arg(long)]
         paper_id: String,
         #[arg(long)]
         force: bool,
     },
+    /// Mark a job as approved so the daemon can proceed to submission.
     Approve {
         #[command(flatten)]
         job_ref: JobOrPaperRef,
     },
+    /// Manually inject a review token for a paper (source defaults to
+    /// "manual"). Useful when a token arrives out-of-band.
     ImportToken {
         #[arg(long)]
         paper_id: String,
@@ -64,10 +77,14 @@ enum Command {
         #[arg(long, default_value = "manual")]
         source: String,
     },
+    /// Poll the backend immediately for a job's current status. Use
+    /// --paper-id or --job-id to identify the target.
     Check {
         #[command(flatten)]
         target: CheckTarget,
     },
+    /// Show the current status of jobs. Use --paper-id to filter to one
+    /// paper; --json for machine-readable output (always {"papers":[...]}).
     Status {
         #[arg(long)]
         paper_id: Option<String>,
@@ -76,6 +93,8 @@ enum Command {
         #[arg(long, default_value_t = false)]
         show_token: bool,
     },
+    /// Re-queue a failed or stalled job for another attempt. Use --force to
+    /// clear any cooldown. Accepts --job-id or --paper-id.
     Retry {
         #[command(flatten)]
         job_ref: JobOrPaperRef,
@@ -86,6 +105,8 @@ enum Command {
         #[arg(long, default_value_t = false, hide = true)]
         override_rate_limit: bool,
     },
+    /// Mark a job as completed and optionally attach a summary or score.
+    /// Accepts --job-id or --paper-id.
     Complete {
         #[command(flatten)]
         job_ref: JobOrPaperRef,
@@ -98,10 +119,13 @@ enum Command {
         #[arg(long)]
         score: Option<f64>,
     },
+    /// Manage email / OAuth accounts used for token ingestion (optional).
+    /// Subcommands: login, logout, switch, status.
     Email {
         #[command(subcommand)]
         command: EmailCommand,
     },
+    /// Update the reviewloop binary to the latest release.
     SelfUpdate {
         #[arg(long, value_enum, default_value_t = UpdateMethod::Auto)]
         method: UpdateMethod,
@@ -110,7 +134,9 @@ enum Command {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
-    /// Submit a paper and watch it through to completion in one command.
+    /// One-shot: register a paper if absent, force-submit, and tail status
+    /// until terminal. Exit codes: 0=Completed, 2=terminal failure, 130=Ctrl+C.
+    /// Email/OAuth is NOT required for this command.
     Run(RunArgs),
 }
 
@@ -122,6 +148,8 @@ struct InitArgs {
 
 #[derive(Debug, Subcommand, Clone)]
 enum InitCommand {
+    /// Set up a per-repo project config (reviewloop.toml) with a given
+    /// project ID.
     Project(InitProjectArgs),
 }
 
@@ -144,7 +172,10 @@ enum UpdateMethod {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
+    /// Initialize a global or project config. Use `init project --project-id`
+    /// for per-repo setup.
     Init(InitArgs),
+    /// Migrate a legacy project config to the current format.
     MigrateProject {
         #[arg(long)]
         project_id: String,
@@ -155,15 +186,19 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
+    /// Start the daemon in the foreground (useful for debugging).
     Run {
         #[arg(long, default_value_t = true)]
         panel: bool,
     },
+    /// Install and optionally start the launchd service (macOS only).
     Install {
         #[arg(long, default_value_t = true)]
         start: bool,
     },
+    /// Uninstall the launchd service (macOS only).
     Uninstall,
+    /// Show daemon health, last tick time, and active jobs.
     Status {
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -176,6 +211,7 @@ enum DaemonCommand {
 
 #[derive(Debug, Subcommand)]
 enum PaperCommand {
+    /// Register a paper in the project config and optionally submit it now.
     Add {
         #[arg(long)]
         paper_id: String,
@@ -199,12 +235,15 @@ enum PaperCommand {
         #[arg(long, default_value_t = false)]
         no_submit_prompt: bool,
     },
+    /// Enable or disable PDF-change watching for an already-registered paper.
     Watch {
         #[arg(long)]
         paper_id: String,
         #[arg(long)]
         enabled: bool,
     },
+    /// Remove a paper from the project config. Use --purge-history to also
+    /// delete all associated jobs and events from the DB.
     Remove {
         #[arg(long)]
         paper_id: String,
@@ -215,18 +254,22 @@ enum PaperCommand {
 
 #[derive(Debug, Subcommand)]
 enum EmailCommand {
+    /// Authenticate an email account for token ingestion (optional feature).
     Login {
         #[arg(long, default_value = "google")]
         provider: String,
     },
+    /// Remove stored credentials for an email account.
     Logout {
         #[arg(long)]
         account: Option<String>,
     },
+    /// Switch the active email account used for token ingestion.
     Switch {
         #[arg(long)]
         account: String,
     },
+    /// Show which email accounts are configured and their auth status.
     Status,
 }
 
@@ -1224,9 +1267,14 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
         let project_id = config.map(|c| c.project_id.as_str()).unwrap_or("");
         let last_tick_at: Option<chrono::DateTime<Utc>> = db.and_then(|d| {
             if project_id.is_empty() {
-                None
-            } else {
-                d.most_recent_event_created_at(project_id).ok().flatten()
+                return None;
+            }
+            match d.most_recent_event_created_at(project_id) {
+                Ok(ts) => ts,
+                Err(e) => {
+                    tracing::warn!(error = %e, project_id, "failed to read last tick time for daemon status");
+                    None
+                }
             }
         });
         // Surface the most recent tick failure if the worker logged one.
@@ -1238,10 +1286,13 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
             if project_id.is_empty() {
                 return None;
             }
-            let ev = d
-                .most_recent_event_of_type(project_id, "tick_failed")
-                .ok()
-                .flatten()?;
+            let ev = match d.most_recent_event_of_type(project_id, "tick_failed") {
+                Ok(opt) => opt?,
+                Err(e) => {
+                    tracing::warn!(error = %e, project_id, "failed to read last tick_failed event for daemon status");
+                    return None;
+                }
+            };
             // Only include if the most recent tick_failed is also the most
             // recent event overall (no successful work has happened since).
             // If we've recorded a `submitted`, `polled`, etc. after it, the
@@ -1270,7 +1321,13 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
                 if project_id.is_empty() {
                     None
                 } else {
-                    d.list_active_jobs_for_project(project_id).ok()
+                    match d.list_active_jobs_for_project(project_id) {
+                        Ok(jobs) => Some(jobs),
+                        Err(e) => {
+                            tracing::warn!(error = %e, project_id, "failed to read active jobs for daemon status");
+                            None
+                        }
+                    }
                 }
             })
             .unwrap_or_default();
@@ -2037,8 +2094,12 @@ fn cmd_status(
         let events = db.list_timeline_events(&config.project_id, paper_id)?;
         if as_json {
             let payload = json!({
-                "rows": rows.iter().map(|row| status_row_json(row, show_token)).collect::<Vec<_>>(),
-                "timeline": timeline_json(&rows, &events, show_token),
+                "project_id": config.project_id,
+                "papers": [{
+                    "paper_id": paper_id,
+                    "rows": rows.iter().map(|row| status_row_json(row, show_token)).collect::<Vec<_>>(),
+                    "timeline": timeline_json(&rows, &events, show_token),
+                }],
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
             return Ok(());
@@ -2048,10 +2109,10 @@ fn cmd_status(
     }
 
     if as_json {
-        let payload = rows
-            .iter()
-            .map(|row| status_row_json(row, show_token))
-            .collect::<Vec<_>>();
+        let payload = json!({
+            "project_id": config.project_id,
+            "papers": rows.iter().map(|row| status_row_json(row, show_token)).collect::<Vec<_>>(),
+        });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
@@ -3593,6 +3654,84 @@ mod tests {
                     }
                 ),
                 "expected DaemonCommand::Resume"
+            );
+        }
+    }
+
+    mod status_json_shape {
+        use super::super::{status_row_json, timeline_json};
+        use reviewloop::db::Db;
+        use reviewloop::model::{JobStatus, NewJob};
+        use serde_json::Value;
+
+        fn make_db_with_jobs(project_id: &str, paper_ids: &[&str]) -> Db {
+            let db = Db::new_in_memory(project_id).expect("in-memory DB");
+            db.init_schema().expect("init schema");
+            for paper_id in paper_ids {
+                let job = NewJob {
+                    project_id: project_id.to_string(),
+                    paper_id: paper_id.to_string(),
+                    backend: "stanford".to_string(),
+                    pdf_path: "/test/paper.pdf".to_string(),
+                    pdf_hash: "abc123".to_string(),
+                    status: JobStatus::Queued,
+                    email: "test@example.com".to_string(),
+                    venue: None,
+                    git_tag: None,
+                    git_commit: None,
+                    next_poll_at: None,
+                };
+                db.create_job(&job).expect("create job");
+            }
+            db
+        }
+
+        /// Both single-paper and multi-paper `--json` output share the same
+        /// root shape: `{"project_id": ..., "papers": [...]}`.
+        #[test]
+        fn cmd_status_json_shape_is_consistent() {
+            let project_id = "shape_proj";
+            let db = make_db_with_jobs(project_id, &["p1", "p2"]);
+
+            // Multi-paper shape.
+            let rows_all = db
+                .list_status_views(project_id, None)
+                .expect("list_status_views all");
+            let multi = serde_json::json!({
+                "project_id": project_id,
+                "papers": rows_all.iter().map(|r| status_row_json(r, false)).collect::<Vec<Value>>(),
+            });
+
+            // Single-paper shape.
+            let rows_one = db
+                .list_status_views(project_id, Some("p1"))
+                .expect("list_status_views p1");
+            let events_one = db
+                .list_timeline_events(project_id, "p1")
+                .expect("list_timeline_events p1");
+            let single = serde_json::json!({
+                "project_id": project_id,
+                "papers": [{
+                    "paper_id": "p1",
+                    "rows": rows_one.iter().map(|r| status_row_json(r, false)).collect::<Vec<Value>>(),
+                    "timeline": timeline_json(&rows_one, &events_one, false),
+                }],
+            });
+
+            for (label, val) in [("multi", &multi), ("single", &single)] {
+                assert!(val.is_object(), "{label}: root must be an object");
+                let papers = val.get("papers").expect("must have 'papers' key");
+                assert!(papers.is_array(), "{label}: 'papers' must be an array");
+                assert!(
+                    val.get("project_id").is_some(),
+                    "{label}: root must have 'project_id'"
+                );
+            }
+            // Single-paper query → papers array of length 1.
+            assert_eq!(
+                single["papers"].as_array().unwrap().len(),
+                1,
+                "single-paper query must produce papers array of length 1"
             );
         }
     }

@@ -45,6 +45,12 @@ it immediately with force, then drives a live polling loop until the review land
 
 Exit codes: `0` = review complete, `2` = terminal failure, `130` = Ctrl+C.
 
+> **Email/OAuth is not required for the quickstart.** `reviewloop run` submits
+> via the API and polls for the result directly — the review token comes back in
+> the API response. Email/OAuth is only needed if you submitted via the
+> paperreview.ai website and want reviewloop to ingest tokens from your inbox.
+> See [Optional: email token ingestion](#email-token-ingestion-experimental-opt-in) below.
+
 Optional flags:
 
 ```bash
@@ -450,3 +456,20 @@ Please keep it that way:
 ## License
 
 [GPL-3.0](LICENSE)
+
+## IMAP support
+
+IMAP email ingestion is gated behind a Cargo feature and is **not compiled in by
+default**. Default builds work without it — `reviewloop run` submits and polls
+via the API directly.
+
+To enable IMAP support:
+
+```bash
+cargo build --features imap
+cargo install reviewloop --features imap
+```
+
+If `imap.enabled = true` appears in your config but the binary was built without
+`--features imap`, a warning is logged at startup and IMAP polling is silently
+skipped.
