@@ -7,6 +7,7 @@ use crate::{
     email_account::resolve_submission_email,
     fallback::submit_with_node_playwright,
     model::{Job, JobStatus},
+    notifier::{self, NotificationKind},
     panel::render_tick_panel,
     trigger::{run_git_tag_trigger, run_pdf_trigger},
     util::{compute_next_poll_at, estimate_pdf_page_count},
@@ -44,6 +45,13 @@ pub async fn run_daemon(config: &Config, db: &Db, panel: bool) -> Result<()> {
         if let Err(err) = run_tick_internal(config, db, Some(tick)).await {
             let msg = format!("{err:#}");
             error!(tick, error = %msg, "tick failed");
+            notifier::notify(
+                &config.notifications,
+                NotificationKind::TickError,
+                None,
+                None,
+                Some(&msg),
+            );
             last_tick_error = Some(msg);
         }
 
@@ -251,6 +259,13 @@ async fn handle_submit_error_with_fallback(
                     "submit_failed_needs_manual",
                     json!({ "reason": reason }),
                 )?;
+                notifier::notify(
+                    &config.notifications,
+                    NotificationKind::FailedNeedsManual,
+                    Some(&job.paper_id),
+                    Some(&job.id),
+                    Some(&reason),
+                );
                 error!(job_id = %job.id, "submit failed and fallback failed; manual intervention required");
                 return Ok(());
             }
@@ -330,6 +345,13 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
                 "review_completed",
                 json!({ "token": token }),
             )?;
+            notifier::notify(
+                &config.notifications,
+                NotificationKind::Completed,
+                Some(&job.paper_id),
+                Some(&job.id),
+                Some("ready"),
+            );
             info!(job_id = %job.id, "review completed and artifacts written");
         }
         Ok(ReviewFetchResult::InvalidToken) => {
@@ -381,6 +403,13 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
                     "poll_terminal_error",
                     json!({ "status": status, "message": body }),
                 )?;
+                notifier::notify(
+                    &config.notifications,
+                    NotificationKind::FailedNeedsManual,
+                    Some(&job.paper_id),
+                    Some(&job.id),
+                    Some(&reason),
+                );
                 warn!(
                     job_id = %job.id,
                     status,
@@ -446,6 +475,13 @@ pub fn mark_timeouts(config: &Config, db: &Db) -> Result<()> {
                 Some(Some("review timed out".to_string())),
             )?;
             db.add_event(None, Some(&job.id), "timeout", json!({}))?;
+            notifier::notify(
+                &config.notifications,
+                NotificationKind::Timeout,
+                Some(&job.paper_id),
+                Some(&job.id),
+                None,
+            );
             warn!(job_id = %job.id, "job timed out");
         }
     }

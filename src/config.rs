@@ -33,6 +33,7 @@ pub struct Config {
     pub paper_tag_triggers: BTreeMap<String, String>,
     pub imap: Option<ImapConfig>,
     pub gmail_oauth: Option<GmailOauthConfig>,
+    pub notifications: NotificationsConfig,
     pub project_root: Option<PathBuf>,
 }
 
@@ -381,6 +382,16 @@ impl Config {
             paper_tag_triggers: project.paper_tag_triggers,
             imap: global.imap,
             gmail_oauth: global.gmail_oauth,
+            notifications: NotificationsConfig {
+                enabled: project
+                    .notifications
+                    .enabled
+                    .unwrap_or(global.notifications.enabled),
+                summary_only: project
+                    .notifications
+                    .summary_only
+                    .unwrap_or(global.notifications.summary_only),
+            },
             project_root,
         }
     }
@@ -447,6 +458,7 @@ pub struct GlobalConfigFile {
     pub providers: GlobalProvidersConfig,
     pub imap: Option<ImapConfig>,
     pub gmail_oauth: Option<GmailOauthConfig>,
+    pub notifications: GlobalNotificationsConfig,
 }
 
 impl Default for GlobalConfigFile {
@@ -460,6 +472,7 @@ impl Default for GlobalConfigFile {
             providers: GlobalProvidersConfig::default(),
             imap: Some(ImapConfig::default()),
             gmail_oauth: Some(GmailOauthConfig::default()),
+            notifications: GlobalNotificationsConfig::default(),
         }
     }
 }
@@ -503,6 +516,7 @@ pub struct ProjectConfigFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_backend: Option<String>,
     pub core: ProjectCoreOverrides,
+    pub notifications: ProjectNotificationsConfig,
     pub trigger: ProjectTriggerConfig,
     pub providers: ProjectProvidersConfig,
     pub papers: Vec<PaperConfigFile>,
@@ -602,6 +616,7 @@ impl LegacyConfig {
             },
             imap: self.imap.clone(),
             gmail_oauth: self.gmail_oauth.clone(),
+            notifications: GlobalNotificationsConfig::default(),
         }
     }
 
@@ -615,6 +630,7 @@ impl LegacyConfig {
             project_id: String::new(),
             default_backend: None,
             core: ProjectCoreOverrides::default(),
+            notifications: ProjectNotificationsConfig::default(),
             trigger: ProjectTriggerConfig {
                 git: ProjectGitTriggerConfig {
                     enabled: legacy.git.enabled,
@@ -1216,6 +1232,40 @@ impl Default for GmailOauthConfig {
     }
 }
 
+/// Runtime notifications config (merged from global + project override).
+#[derive(Debug, Clone)]
+pub struct NotificationsConfig {
+    pub enabled: bool,
+    pub summary_only: bool,
+}
+
+/// Global on-disk notifications defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GlobalNotificationsConfig {
+    pub enabled: bool,
+    pub summary_only: bool,
+}
+
+impl Default for GlobalNotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            summary_only: false,
+        }
+    }
+}
+
+/// Per-project notification overrides. `None` means "inherit global default".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectNotificationsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_only: Option<bool>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1579,5 +1629,43 @@ db_path = "db.sqlite"
         assert_eq!(cfg.trigger.git.tag_pattern, "legacy-style/<paper-id>/*");
         assert!(cfg.trigger.pdf.auto_submit_on_change);
         assert_eq!(cfg.trigger.pdf.max_scan_papers, 99);
+    }
+
+    #[test]
+    fn notifications_default_enabled() {
+        let cfg = Config::default();
+        assert!(cfg.notifications.enabled);
+        assert!(!cfg.notifications.summary_only);
+    }
+
+    #[test]
+    fn notifications_use_project_override_then_global() {
+        // No project override -> inherits global
+        let mut global = GlobalConfigFile::default();
+        global.notifications.enabled = true;
+        global.notifications.summary_only = false;
+        let cfg = Config::merge_for_tests(global.clone(), project_with(vec![]));
+        assert!(cfg.notifications.enabled);
+        assert!(!cfg.notifications.summary_only);
+
+        // Project disables notifications
+        let mut project = project_with(vec![]);
+        project.notifications.enabled = Some(false);
+        let cfg = Config::merge_for_tests(global.clone(), project);
+        assert!(!cfg.notifications.enabled);
+
+        // Project enables summary_only
+        let mut project = project_with(vec![]);
+        project.notifications.summary_only = Some(true);
+        let cfg = Config::merge_for_tests(global.clone(), project);
+        assert!(cfg.notifications.summary_only);
+
+        // Global disabled, project re-enables
+        let mut global2 = GlobalConfigFile::default();
+        global2.notifications.enabled = false;
+        let mut project = project_with(vec![]);
+        project.notifications.enabled = Some(true);
+        let cfg = Config::merge_for_tests(global2, project);
+        assert!(cfg.notifications.enabled);
     }
 }

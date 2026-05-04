@@ -7,6 +7,7 @@ pub mod email_account;
 pub mod fallback;
 pub mod logging;
 pub mod model;
+pub mod notifier;
 pub mod oauth;
 pub mod panel;
 pub mod token;

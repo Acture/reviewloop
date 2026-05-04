@@ -35,6 +35,7 @@ oauth2 = { version = "5.0", default-features = false, features = ["reqwest", "ru
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+notify-rust = { version = "4", default-features = false }
 
 [dev-dependencies]
 axum = "0.8"
