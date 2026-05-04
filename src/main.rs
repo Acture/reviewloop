@@ -750,7 +750,7 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
     let watch_text = if options.watch { "enabled" } else { "disabled" };
     if let Some(trigger) = options.tag_trigger {
         println!(
-            "Added paper {paper_id}.\n- backend: {backend}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- tag trigger: {trigger}\n- config: {}",
+            "Added paper {paper_id}.\n- backend: {backend}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- tag trigger: {trigger}\n- config: {}\n  artifacts will appear in: <state-dir>/artifacts/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
             options.config_path.display(),
             paper_id = options.paper_id,
             backend = resolved_backend,
@@ -758,7 +758,7 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
         );
     } else {
         println!(
-            "Added paper {paper_id}.\n- backend: {backend}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- config: {}",
+            "Added paper {paper_id}.\n- backend: {backend}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- config: {}\n  artifacts will appear in: <state-dir>/artifacts/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
             options.config_path.display(),
             paper_id = options.paper_id,
             backend = resolved_backend,
@@ -1677,7 +1677,8 @@ async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Re
 
     let (email, venue) = match paper.backend.as_str() {
         "stanford" => (
-            email_account::resolve_submission_email(config, "stanford", None)?,
+            email_account::resolve_submission_email(config, "stanford", None)
+                .with_context(|| "reviewloop run requires a submitter email. set providers.stanford.email in ~/.config/reviewloop/config.toml or run 'reviewloop email login --provider google' to use OAuth (see README 'Email Token Ingestion' section).")?,
             config.venue_for(paper),
         ),
         _ => (String::new(), config.venue_for(paper)),
@@ -1785,7 +1786,8 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
     let pdf_hash = sha256_file(pdf_path)?;
     let (email, venue) = match paper.backend.as_str() {
         "stanford" => (
-            email_account::resolve_submission_email(&config, "stanford", None)?,
+            email_account::resolve_submission_email(&config, "stanford", None)
+                .with_context(|| "reviewloop run requires a submitter email. set providers.stanford.email in ~/.config/reviewloop/config.toml or run 'reviewloop email login --provider google' to use OAuth (see README 'Email Token Ingestion' section).")?,
             config.venue_for(paper),
         ),
         _ => (String::new(), config.venue_for(paper)),
@@ -1919,7 +1921,13 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
                 if !args.quiet && is_tty {
                     println!();
                 }
-                eprintln!("Interrupted (Ctrl+C).");
+                eprintln!(
+                    "^C  job {} left in {} state; resume tracking with 'reviewloop status --paper-id {}' or 'reviewloop check --paper-id {}'",
+                    job.id,
+                    updated.status.as_str(),
+                    paper_id,
+                    paper_id,
+                );
                 std::process::exit(130);
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
@@ -1969,6 +1977,21 @@ async fn cmd_import_token(
         if let Some(fresh) = db.get_job(&job.id)? {
             reviewloop::worker::poll_job(config, db, &fresh).await?;
         }
+        if let Some(after_poll) = db.get_job(&job.id)? {
+            let is_failed = matches!(
+                after_poll.status,
+                JobStatus::Failed | JobStatus::FailedNeedsManual | JobStatus::Timeout
+            );
+            if is_failed {
+                let detail = after_poll.last_error.as_deref().unwrap_or("(no details)");
+                eprintln!(
+                    "warning: token attached but immediate poll returned {}: {}",
+                    after_poll.status.as_str(),
+                    detail
+                );
+                std::process::exit(2);
+            }
+        }
         return Ok(());
     }
 
@@ -2017,6 +2040,21 @@ async fn cmd_import_token(
     // Immediately poll rather than waiting for the next 30-second daemon tick.
     if let Some(fresh) = db.get_job(&job.id)? {
         reviewloop::worker::poll_job(config, db, &fresh).await?;
+    }
+    if let Some(after_poll) = db.get_job(&job.id)? {
+        let is_failed = matches!(
+            after_poll.status,
+            JobStatus::Failed | JobStatus::FailedNeedsManual | JobStatus::Timeout
+        );
+        if is_failed {
+            let detail = after_poll.last_error.as_deref().unwrap_or("(no details)");
+            eprintln!(
+                "warning: token attached but immediate poll returned {}: {}",
+                after_poll.status.as_str(),
+                detail
+            );
+            std::process::exit(2);
+        }
     }
     Ok(())
 }

@@ -36,6 +36,10 @@ reviewloop init
 # 2) for any repo, one-time project setup
 reviewloop init project --project-id main
 
+# 2.5) one-time: configure submitter email
+reviewloop config init  # or edit ~/.config/reviewloop/config.toml
+# set providers.stanford.email = "you@example.edu"
+
 # 3) submit + watch a paper come back, all at once
 reviewloop run paper/main.pdf
 ```
@@ -45,10 +49,11 @@ it immediately with force, then drives a live polling loop until the review land
 
 Exit codes: `0` = review complete, `2` = terminal failure, `130` = Ctrl+C.
 
-> **Email/OAuth is not required for the quickstart.** `reviewloop run` submits
-> via the API and polls for the result directly — the review token comes back in
-> the API response. Email/OAuth is only needed if you submitted via the
-> paperreview.ai website and want reviewloop to ingest tokens from your inbox.
+> **A submitter email is required.** Set `providers.stanford.email` in
+> `~/.config/reviewloop/config.toml` (step 2.5 above) or run
+> `reviewloop email login --provider google` to use OAuth.
+> Email/OAuth is also needed if you submitted via the paperreview.ai website
+> and want reviewloop to ingest tokens from your inbox.
 > See [Optional: email token ingestion](#email-token-ingestion-experimental-opt-in) below.
 
 Optional flags:
@@ -198,7 +203,7 @@ reviewloop approve --job-id <job-id>
 reviewloop import-token --paper-id main --token <token> [--source email]
 reviewloop check [--job-id <job-id> | --paper-id <paper-id>] [--all-processing]
 reviewloop status [--paper-id main] [--json] [--show-token]
-reviewloop retry --job-id <job-id> [--override-rate-limit]
+reviewloop retry --job-id <job-id> [--force]  # (was --override-rate-limit, deprecated since vNext)
 reviewloop complete --job-id <job-id> [--summary-text <text> | --summary-url <url> | --empty-summary] [--score <value>]
 reviewloop config init
 reviewloop config init project --project-id <id> [--project-root <path>] [--force]
