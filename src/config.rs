@@ -172,10 +172,6 @@ impl Config {
         Ok(Some(path))
     }
 
-    pub fn save_project(&self, path: &Path) -> Result<()> {
-        self.project_file().save(path)
-    }
-
     pub fn load_project(path: &Path) -> Result<ProjectConfigFile> {
         ProjectConfigFile::load(path)
     }
@@ -241,21 +237,6 @@ impl Config {
             .filter(|v| !v.is_empty())
             .unwrap_or("ICLR")
             .to_string()
-    }
-
-    pub fn project_file(&self) -> ProjectConfigFile {
-        ProjectConfigFile {
-            project_id: self.project_id.clone(),
-            trigger: self.trigger.clone(),
-            providers: ProjectProvidersConfig {
-                stanford: ProjectStanfordProviderConfig {
-                    venue: self.providers.stanford.venue.clone(),
-                },
-            },
-            papers: self.papers.clone(),
-            paper_watch: self.paper_watch.clone(),
-            paper_tag_triggers: self.paper_tag_triggers.clone(),
-        }
     }
 
     fn from_parts(
