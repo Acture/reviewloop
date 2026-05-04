@@ -40,17 +40,15 @@ cargo install reviewloop
 reviewloop init
 reviewloop init project --project-id main
 
-# 3) register paper
+# 3) register paper (--backend defaults to project.default_backend, then "stanford")
 reviewloop paper add \
   --paper-id main \
-  --path paper/main.pdf \
-  --backend stanford
+  --path paper/main.pdf
 
 # 4) optional: add a custom git-tag trigger for this paper
 reviewloop paper add \
   --paper-id camera_ready \
   --path build/camera_ready.pdf \
-  --backend stanford \
   --tag-trigger "custom-review/camera_ready/*"
 
 # 5) submit and run daemon
@@ -113,7 +111,7 @@ Core commands:
 ```bash
 reviewloop init
 reviewloop init project --project-id <id> [--project-root <path>] [--force]
-reviewloop paper add --paper-id <id> --path <pdf-or-build-artifact> --backend <backend> [--watch true|false] [--tag-trigger "<pattern>"] [--submit-now] [--no-submit-prompt]
+reviewloop paper add --paper-id <id> --path <pdf-or-build-artifact> [--backend <backend>] [--watch true|false] [--tag-trigger "<pattern>"] [--submit-now] [--no-submit-prompt]
 reviewloop paper watch --paper-id <id> --enabled <true|false>
 reviewloop paper remove --paper-id <id> [--purge-history]
 reviewloop daemon run
@@ -193,15 +191,26 @@ review-stanford/main/v1
 - New hash enqueues job
 - Default status is `PENDING_APPROVAL` (manual `approve` required)
 
-## Email Token Ingestion
+## Email Token Ingestion (Experimental, opt-in)
 
-ReviewLoop can attach review tokens from email to open jobs.
+ReviewLoop can attach review tokens from email to open jobs. Both
+ingestion paths default to **disabled** because the regex / header
+matching is heuristic and noisy when the inbox does not contain the
+expected `paperreview.ai` mail. The Stanford backend already returns
+the token directly from `confirm-upload`, so this path is mostly
+useful as a backup for the Playwright fallback flow or for jobs
+created out-of-band.
+
+To turn either path on, set `enabled = true` explicitly in your config.
 
 ### IMAP mode (built in)
 
 Default token pattern includes Stanford:
 
 ```toml
+[imap]
+enabled = true  # opt-in; default is false
+
 [imap.backend_patterns]
 stanford = "https?://paperreview\\.ai/review\\?token=([A-Za-z0-9_-]+)"
 ```
@@ -217,7 +226,7 @@ Configure:
 
 ```toml
 [gmail_oauth]
-enabled = true
+enabled = true  # opt-in; default is false
 client_id = "your-google-oauth-client-id"
 client_secret = "your-google-oauth-client-secret"
 token_store_path = "~/.review_loop/oauth/google_token.json" # optional
@@ -281,7 +290,7 @@ Safe defaults:
 - `core.db_path = "~/.review_loop/reviewloop.db"` (or `<REVIEWLOOP_STATE_DIR>/reviewloop.db`)
 - `core.review_timeout_hours = 48`
   - for `stanford`, timeout is linearly scaled by PDF page count up to 20 pages
-- `polling.schedule_minutes = [10, 20, 40, 60]`
+- `polling.schedule_minutes = [1, 2, 5, 10, 20, 40]` (first poll within ~1 minute, then back off)
 - `polling.jitter_percent = 10`
 - `retention.enabled = true`
 - `retention.prune_every_ticks = 20` (10 minutes with 30s tick)

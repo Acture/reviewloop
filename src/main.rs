@@ -176,7 +176,7 @@ enum PaperCommand {
         )]
         pdf_path: String,
         #[arg(long)]
-        backend: String,
+        backend: Option<String>,
         #[arg(long, default_value_t = true)]
         watch: bool,
         #[arg(long)]
@@ -288,7 +288,7 @@ async fn run() -> Result<()> {
                         paper_id: &paper_id,
                         project_id: project_id.as_deref(),
                         pdf_path: &pdf_path,
-                        backend: &backend,
+                        backend: backend.as_deref(),
                         watch,
                         tag_trigger: tag_trigger.as_deref(),
                         submit_now,
@@ -579,7 +579,9 @@ struct PaperAddOptions<'a> {
     paper_id: &'a str,
     project_id: Option<&'a str>,
     pdf_path: &'a str,
-    backend: &'a str,
+    /// User-provided backend on the CLI. When `None`, falls back to the
+    /// project's `default_backend`, then to `Config::DEFAULT_BACKEND`.
+    backend: Option<&'a str>,
     watch: bool,
     tag_trigger: Option<&'a str>,
     submit_now: bool,
@@ -596,10 +598,37 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
         anyhow::bail!("paper_id already exists: {}", options.paper_id);
     }
 
+    // Resolve effective backend now so we can echo it back to the user even
+    // when they relied on the project default. Empty/whitespace CLI values are
+    // treated as "not provided".
+    let resolved_backend = options
+        .backend
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            config
+                .default_backend
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| Config::DEFAULT_BACKEND.to_string());
+
+    // Only persist the backend on the paper if the user actually overrode the
+    // project default, so future changes to default_backend continue to flow
+    // through to papers that didn't pin one.
+    let persisted_backend = options
+        .backend
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
     config.papers.push(PaperConfigFile {
         id: options.paper_id.to_string(),
         pdf_path: options.pdf_path.to_string(),
-        backend: Some(options.backend.to_string()),
+        backend: persisted_backend,
         venue: None,
     });
     config
@@ -628,7 +657,7 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
             "Added paper {paper_id}.\n- backend: {backend}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- tag trigger: {trigger}\n- config: {}",
             options.config_path.display(),
             paper_id = options.paper_id,
-            backend = options.backend,
+            backend = resolved_backend,
             pdf_path = options.pdf_path,
         );
     } else {
@@ -636,7 +665,7 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
             "Added paper {paper_id}.\n- backend: {backend}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- config: {}",
             options.config_path.display(),
             paper_id = options.paper_id,
-            backend = options.backend,
+            backend = resolved_backend,
             pdf_path = options.pdf_path,
         );
     }

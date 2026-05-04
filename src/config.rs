@@ -841,7 +841,7 @@ pub struct PollingConfig {
 impl Default for PollingConfig {
     fn default() -> Self {
         Self {
-            schedule_minutes: vec![10, 20, 40, 60],
+            schedule_minutes: vec![1, 2, 5, 10, 20, 40],
             jitter_percent: 10,
         }
     }
@@ -1168,7 +1168,7 @@ impl Default for ImapConfig {
         );
 
         Self {
-            enabled: true,
+            enabled: false,
             server: "imap.gmail.com".to_string(),
             port: 993,
             username: String::new(),
@@ -1217,7 +1217,7 @@ impl Default for GmailOauthConfig {
         );
 
         Self {
-            enabled: true,
+            enabled: false,
             client_id: String::new(),
             client_secret: String::new(),
             token_store_path: None,
@@ -1276,13 +1276,35 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn defaults_start_polling_at_ten_minutes() {
+    fn defaults_start_polling_within_one_minute() {
         let cfg = Config::default();
-        assert_eq!(cfg.polling.schedule_minutes, vec![10, 20, 40, 60]);
+        // First poll happens within ~1 minute so users see fast feedback after
+        // submit; later attempts fall back over minutes (Phase 1 default change).
+        assert_eq!(cfg.polling.schedule_minutes, vec![1, 2, 5, 10, 20, 40]);
         assert_eq!(cfg.trigger.git.repo_dir, ".");
         assert_eq!(cfg.core.max_submissions_per_tick, 1);
         assert!(cfg.project_id.is_empty());
         assert!(cfg.papers.is_empty());
+    }
+
+    #[test]
+    fn email_ingestion_is_disabled_by_default() {
+        // Email ingestion is opt-in: empty / unconfigured installations should
+        // not silently try to log into IMAP or Gmail OAuth.
+        let cfg = Config::default();
+        let imap = cfg.imap.as_ref().expect("imap default config exists");
+        assert!(
+            !imap.enabled,
+            "imap should be opt-in (Experimental), default disabled"
+        );
+        let gmail = cfg
+            .gmail_oauth
+            .as_ref()
+            .expect("gmail oauth default config exists");
+        assert!(
+            !gmail.enabled,
+            "gmail_oauth should be opt-in (Experimental), default disabled"
+        );
     }
 
     #[test]
