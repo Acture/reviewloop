@@ -1,6 +1,7 @@
 use super::{BackendError, ReviewBackend, ReviewFetchResult, SubmitReceipt, SubmitRequest};
 use async_trait::async_trait;
-use reqwest::{Client, StatusCode, multipart};
+use reqwest::{StatusCode, multipart};
+use reqwest_middleware::ClientWithMiddleware;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
@@ -36,14 +37,14 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<chrono::Dur
 
 #[derive(Clone)]
 pub struct StanfordBackend {
-    client: Client,
+    client: ClientWithMiddleware,
     base_url: String,
 }
 
 impl StanfordBackend {
-    pub fn new(base_url: String) -> Self {
+    pub fn new(base_url: String, client: ClientWithMiddleware) -> Self {
         Self {
-            client: Client::new(),
+            client,
             base_url: base_url.trim_end_matches('/').to_string(),
         }
     }

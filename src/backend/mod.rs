@@ -58,9 +58,13 @@ pub trait ReviewBackend: Send + Sync {
 
 pub fn build_backend(config: &Config, backend: &str) -> Result<Box<dyn ReviewBackend>> {
     match backend {
-        "stanford" => Ok(Box::new(stanford::StanfordBackend::new(
-            config.providers.stanford.base_url.clone(),
-        ))),
+        "stanford" => {
+            let client = crate::http::build_client(config)?;
+            Ok(Box::new(stanford::StanfordBackend::new(
+                config.providers.stanford.base_url.clone(),
+                client,
+            )))
+        }
         other => anyhow::bail!("unsupported backend: {other}"),
     }
 }

@@ -2539,6 +2539,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "reqwest-middleware"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57f17d28a6e6acfe1733fe24bcd30774d13bffa4b8a22535b4c8c98423088d4e"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "http",
+ "reqwest",
+ "serde",
+ "thiserror 1.0.69",
+ "tower-service",
+]
+
+[[package]]
 name = "reviewloop"
 version = "0.1.4"
 dependencies = [
@@ -2548,6 +2563,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "http",
  "imap",
  "muda",
  "native-tls",
@@ -2556,6 +2572,7 @@ dependencies = [
  "rand 0.8.5",
  "regex",
  "reqwest",
+ "reqwest-middleware",
  "rfd",
  "rusqlite",
  "serde",

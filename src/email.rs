@@ -299,13 +299,6 @@ mod gmail_impl {
         engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
     };
     use serde::Deserialize;
-    use std::sync::OnceLock;
-
-    static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-
-    fn http_client() -> &'static reqwest::Client {
-        HTTP_CLIENT.get_or_init(reqwest::Client::new)
-    }
 
     #[derive(Debug, Deserialize)]
     struct GmailListResponse {
@@ -360,12 +353,16 @@ mod gmail_impl {
             }
         };
 
-        let matches = fetch_matches(gmail_cfg, &access_token).await?;
+        let client = crate::http::build_reqwest_client(config)?;
+        let matches = fetch_matches(gmail_cfg, &access_token, &client).await?;
         bind_matches(db, &config.project_id, "gmail", matches)
     }
 
-    async fn fetch_matches(cfg: &GmailOauthConfig, access_token: &str) -> Result<Vec<EmailMatch>> {
-        let client = http_client();
+    async fn fetch_matches(
+        cfg: &GmailOauthConfig,
+        access_token: &str,
+        client: &reqwest::Client,
+    ) -> Result<Vec<EmailMatch>> {
         let query = build_unread_query(cfg);
         let max_results = cfg.max_messages_per_poll.to_string();
 

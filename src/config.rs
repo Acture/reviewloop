@@ -347,6 +347,12 @@ impl Config {
         if let Some(hours) = project.core.review_timeout_hours {
             core.review_timeout_hours = hours;
         }
+        // Project proxy list replaces global when non-empty.
+        if let Some(proxies) = project.core.proxies {
+            if !proxies.is_empty() {
+                core.proxies = proxies;
+            }
+        }
 
         let trigger = TriggerConfig {
             git: GitTriggerConfig {
@@ -630,6 +636,11 @@ pub struct ProjectCoreOverrides {
     /// otherwise to the global value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_timeout_hours: Option<u64>,
+    /// Per-project proxy list. When non-empty, replaces (not merges with)
+    /// the global `core.proxies` list. An empty project list means "inherit
+    /// global"; use `[""]` tricks are not needed — just omit the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxies: Option<Vec<String>>,
 }
 
 impl ProjectConfigFile {
@@ -926,6 +937,12 @@ pub struct CoreConfig {
     pub max_concurrency: usize,
     pub max_submissions_per_tick: usize,
     pub review_timeout_hours: u64,
+    /// HTTP / SOCKS proxy URLs that all outbound requests rotate through.
+    /// Empty list = direct connection (no proxy). Each entry is a full URL
+    /// like `"http://user:pass@proxy.example.com:8080"` or `"socks5://..."`.
+    /// Credentials in the URL are not logged — only the count is reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxies: Vec<String>,
 }
 
 impl Default for CoreConfig {
@@ -936,6 +953,7 @@ impl Default for CoreConfig {
             max_concurrency: 2,
             max_submissions_per_tick: 1,
             review_timeout_hours: 48,
+            proxies: Vec::new(),
         }
     }
 }

@@ -47,6 +47,9 @@ pub struct GoogleOauthProvider {
     cfg: GmailOauthConfig,
     token_path: PathBuf,
     pending: Arc<Mutex<HashMap<String, StandardDeviceAuthorizationResponse>>>,
+    /// First proxy from `core.proxies`, used for OAuth token exchange
+    /// requests.  `None` means direct connection.
+    proxy_url: Option<String>,
 }
 
 impl GoogleOauthProvider {
@@ -92,6 +95,7 @@ impl GoogleOauthProvider {
             cfg: resolved,
             token_path,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            proxy_url: config.core.proxies.first().cloned(),
         }))
     }
 
@@ -103,11 +107,14 @@ impl GoogleOauthProvider {
         }
     }
 
-    fn http_client() -> Result<reqwest::Client> {
-        reqwest::ClientBuilder::new()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("failed to build oauth http client")
+    fn http_client(&self) -> Result<reqwest::Client> {
+        let mut builder = reqwest::ClientBuilder::new().redirect(reqwest::redirect::Policy::none());
+        if let Some(proxy_url) = &self.proxy_url {
+            let proxy =
+                reqwest::Proxy::all(proxy_url).context("invalid proxy URL for oauth client")?;
+            builder = builder.proxy(proxy);
+        }
+        builder.build().context("failed to build oauth http client")
     }
 
     pub async fn run_browser_pkce_login(&self) -> Result<PathBuf> {
@@ -119,7 +126,7 @@ impl GoogleOauthProvider {
             .context("failed to resolve local oauth callback listener address")?;
         let redirect_uri = format!("http://{}/oauth2/callback", callback_addr);
         let redirect = RedirectUrl::new(redirect_uri.clone()).context("invalid redirect url")?;
-        let http_client = Self::http_client()?;
+        let http_client = self.http_client()?;
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
         let (auth_url, csrf_token) = if self.cfg.client_secret.trim().is_empty() {
@@ -310,7 +317,7 @@ impl OauthProvider for GoogleOauthProvider {
     }
 
     async fn start_device_flow(&self) -> Result<DeviceCodeStart> {
-        let http_client = Self::http_client()?;
+        let http_client = self.http_client()?;
         let auth_url = AuthUrl::new(AUTH_URL.to_string()).context("invalid google auth url")?;
         let token_url = TokenUrl::new(TOKEN_URL.to_string()).context("invalid google token url")?;
         let device_auth_url = DeviceAuthorizationUrl::new(DEVICE_CODE_URL.to_string())
@@ -368,7 +375,7 @@ impl OauthProvider for GoogleOauthProvider {
             .cloned()
             .ok_or_else(|| anyhow!("missing pending device session for code"))?;
 
-        let http_client = Self::http_client()?;
+        let http_client = self.http_client()?;
         let auth_url = AuthUrl::new(AUTH_URL.to_string()).context("invalid google auth url")?;
         let token_url = TokenUrl::new(TOKEN_URL.to_string()).context("invalid google token url")?;
         let device_auth_url = DeviceAuthorizationUrl::new(DEVICE_CODE_URL.to_string())
@@ -451,7 +458,7 @@ impl OauthProvider for GoogleOauthProvider {
     }
 
     async fn refresh_access_token(&self, refresh_token: &str) -> Result<OauthTokenResponse> {
-        let http_client = Self::http_client()?;
+        let http_client = self.http_client()?;
         let auth_url = AuthUrl::new(AUTH_URL.to_string()).context("invalid google auth url")?;
         let token_url = TokenUrl::new(TOKEN_URL.to_string()).context("invalid google token url")?;
         let device_auth_url = DeviceAuthorizationUrl::new(DEVICE_CODE_URL.to_string())

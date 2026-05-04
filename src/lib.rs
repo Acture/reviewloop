@@ -5,6 +5,7 @@ pub mod db;
 pub mod email;
 pub mod email_account;
 pub mod fallback;
+pub mod http;
 pub mod logging;
 pub mod model;
 pub mod notifier;

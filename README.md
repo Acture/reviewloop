@@ -338,6 +338,39 @@ ReviewLoop runs Gmail API polling first when available, then IMAP fallback.
 
 ## Configuration Highlights
 
+### Proxy pool
+
+Outbound HTTP requests (PDF upload, review fetch, Gmail API) can be routed
+through a list of user-configured HTTP / SOCKS proxies. ReviewLoop uses
+[`reqwest-middleware`](https://crates.io/crates/reqwest-middleware) for
+round-robin rotation across pre-built proxy clients — no proxy management code
+lives in reviewloop itself.
+
+> **Note on library choice**: [`reqwest-proxy-pool`](https://crates.io/crates/reqwest-proxy-pool)
+> 0.4 only supports proxy lists fetched from remote URLs (`.sources()`), not
+> static user-supplied lists. ReviewLoop therefore uses a lightweight custom
+> middleware (∼50 lines) on top of `reqwest-middleware` for the same effect.
+> Migration to upstream when it gains static-list support is tracked separately.
+
+Configure in global config:
+```toml
+[core]
+proxies = [
+    "http://user:pass@proxy1.example.com:8080",
+    "socks5://user:pass@proxy2.example.com:1080",
+]
+```
+
+Or per-project (overrides global, does not merge):
+```toml
+[core]
+proxies = ["http://special-proxy.example.com:8080"]
+```
+
+Empty list (default) disables proxy routing — direct connections used.
+Credentials embedded in proxy URLs are never written to logs; only the count
+is reported.
+
 ReviewLoop uses two config files with separate responsibilities:
 - global config: `$XDG_CONFIG_HOME/reviewloop/config.toml` or `~/.config/reviewloop/config.toml`
 - project config: `<repo-root>/reviewloop.toml`
