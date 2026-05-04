@@ -318,6 +318,32 @@ impl Config {
             core.review_timeout_hours = hours;
         }
 
+        let trigger = TriggerConfig {
+            git: GitTriggerConfig {
+                enabled: project.trigger.git.enabled,
+                tag_pattern: merge_optional_string(
+                    project.trigger.git.tag_pattern,
+                    global.trigger.git.tag_pattern,
+                ),
+                repo_dir: project.trigger.git.repo_dir,
+                auto_create_tags_on_pdf_change: project.trigger.git.auto_create_tags_on_pdf_change,
+                auto_delete_processed_tags: project.trigger.git.auto_delete_processed_tags,
+            },
+            pdf: PdfTriggerConfig {
+                enabled: project.trigger.pdf.enabled,
+                auto_submit_on_change: project
+                    .trigger
+                    .pdf
+                    .auto_submit_on_change
+                    .unwrap_or(global.trigger.pdf.auto_submit_on_change),
+                max_scan_papers: project
+                    .trigger
+                    .pdf
+                    .max_scan_papers
+                    .unwrap_or(global.trigger.pdf.max_scan_papers),
+            },
+        };
+
         let provider_email = merge_optional_string(
             project.providers.stanford.email,
             global.providers.stanford.email,
@@ -340,7 +366,7 @@ impl Config {
             logging: global.logging,
             polling: global.polling,
             retention: global.retention,
-            trigger: project.trigger,
+            trigger,
             providers: ProvidersConfig {
                 stanford: StanfordProviderConfig {
                     base_url: global.providers.stanford.base_url,
@@ -417,6 +443,7 @@ pub struct GlobalConfigFile {
     pub logging: LoggingConfig,
     pub polling: PollingConfig,
     pub retention: RetentionConfig,
+    pub trigger: GlobalTriggerConfig,
     pub providers: GlobalProvidersConfig,
     pub imap: Option<ImapConfig>,
     pub gmail_oauth: Option<GmailOauthConfig>,
@@ -429,6 +456,7 @@ impl Default for GlobalConfigFile {
             logging: LoggingConfig::default(),
             polling: PollingConfig::default(),
             retention: RetentionConfig::default(),
+            trigger: GlobalTriggerConfig::default(),
             providers: GlobalProvidersConfig::default(),
             imap: Some(ImapConfig::default()),
             gmail_oauth: Some(GmailOauthConfig::default()),
@@ -475,7 +503,7 @@ pub struct ProjectConfigFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_backend: Option<String>,
     pub core: ProjectCoreOverrides,
-    pub trigger: TriggerConfig,
+    pub trigger: ProjectTriggerConfig,
     pub providers: ProjectProvidersConfig,
     pub papers: Vec<PaperConfigFile>,
     pub paper_watch: BTreeMap<String, bool>,
@@ -507,7 +535,7 @@ impl ProjectConfigFile {
         if require_project && self.project_id.trim().is_empty() {
             return Err(anyhow!("project_id must not be empty"));
         }
-        if self.trigger.pdf.max_scan_papers == 0 {
+        if self.trigger.pdf.max_scan_papers == Some(0) {
             return Err(anyhow!("trigger.pdf.max_scan_papers must be >= 1"));
         }
         Ok(())
@@ -559,6 +587,11 @@ impl LegacyConfig {
             logging: self.logging.clone(),
             polling: self.polling.clone(),
             retention: self.retention.clone(),
+            // Legacy values went through a single trigger struct that conflated
+            // global defaults and project overrides. Migration parks the legacy
+            // trigger values fully on the project side (see project_config()),
+            // so the migrated global trigger gets stock defaults.
+            trigger: GlobalTriggerConfig::default(),
             providers: GlobalProvidersConfig {
                 stanford: GlobalStanfordProviderConfig {
                     base_url: self.providers.stanford.base_url.clone(),
@@ -573,11 +606,29 @@ impl LegacyConfig {
     }
 
     pub fn project_config(&self) -> ProjectConfigFile {
+        // Migration: legacy single-file configs put the trigger fields inline.
+        // We materialize the whole legacy trigger as project-side overrides so
+        // the migrated project matches the legacy runtime behavior exactly,
+        // even when the legacy values diverged from current global defaults.
+        let legacy = self.trigger.clone();
         ProjectConfigFile {
             project_id: String::new(),
             default_backend: None,
             core: ProjectCoreOverrides::default(),
-            trigger: self.trigger.clone(),
+            trigger: ProjectTriggerConfig {
+                git: ProjectGitTriggerConfig {
+                    enabled: legacy.git.enabled,
+                    tag_pattern: Some(legacy.git.tag_pattern),
+                    repo_dir: legacy.git.repo_dir,
+                    auto_create_tags_on_pdf_change: legacy.git.auto_create_tags_on_pdf_change,
+                    auto_delete_processed_tags: legacy.git.auto_delete_processed_tags,
+                },
+                pdf: ProjectPdfTriggerConfig {
+                    enabled: legacy.pdf.enabled,
+                    auto_submit_on_change: Some(legacy.pdf.auto_submit_on_change),
+                    max_scan_papers: Some(legacy.pdf.max_scan_papers),
+                },
+            },
             providers: ProjectProvidersConfig {
                 stanford: ProjectStanfordProviderConfig {
                     email: None,
@@ -847,6 +898,108 @@ impl Default for PdfTriggerConfig {
             enabled: true,
             auto_submit_on_change: false,
             max_scan_papers: 10,
+        }
+    }
+}
+
+// ===== On-disk: GLOBAL trigger defaults =====
+//
+// Only contains fields that have a sensible machine-wide default and may be
+// overridden per project. Other trigger fields (like git.repo_dir or the
+// auto-tag toggles) live exclusively on the project side because they are
+// inherently per-repo decisions.
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GlobalTriggerConfig {
+    pub git: GlobalGitTriggerConfig,
+    pub pdf: GlobalPdfTriggerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GlobalGitTriggerConfig {
+    pub tag_pattern: String,
+}
+
+impl Default for GlobalGitTriggerConfig {
+    fn default() -> Self {
+        Self {
+            tag_pattern: GitTriggerConfig::default().tag_pattern,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GlobalPdfTriggerConfig {
+    pub auto_submit_on_change: bool,
+    pub max_scan_papers: usize,
+}
+
+impl Default for GlobalPdfTriggerConfig {
+    fn default() -> Self {
+        let pdf = PdfTriggerConfig::default();
+        Self {
+            auto_submit_on_change: pdf.auto_submit_on_change,
+            max_scan_papers: pdf.max_scan_papers,
+        }
+    }
+}
+
+// ===== On-disk: PROJECT trigger overrides =====
+//
+// Concrete fields stay (project-only knobs); the three overridable defaults
+// from GlobalTriggerConfig become Option<T>: `None` means "inherit global".
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectTriggerConfig {
+    pub git: ProjectGitTriggerConfig,
+    pub pdf: ProjectPdfTriggerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectGitTriggerConfig {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_pattern: Option<String>,
+    pub repo_dir: String,
+    pub auto_create_tags_on_pdf_change: bool,
+    pub auto_delete_processed_tags: bool,
+}
+
+impl Default for ProjectGitTriggerConfig {
+    fn default() -> Self {
+        let git = GitTriggerConfig::default();
+        Self {
+            enabled: git.enabled,
+            tag_pattern: None,
+            repo_dir: git.repo_dir,
+            auto_create_tags_on_pdf_change: git.auto_create_tags_on_pdf_change,
+            auto_delete_processed_tags: git.auto_delete_processed_tags,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectPdfTriggerConfig {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_submit_on_change: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_scan_papers: Option<usize>,
+}
+
+impl Default for ProjectPdfTriggerConfig {
+    fn default() -> Self {
+        let pdf = PdfTriggerConfig::default();
+        Self {
+            enabled: pdf.enabled,
+            auto_submit_on_change: None,
+            max_scan_papers: None,
         }
     }
 }
@@ -1335,5 +1488,96 @@ db_path = "db.sqlite"
         project.core.review_timeout_hours = Some(12);
         let cfg = Config::merge_for_tests(global, project);
         assert_eq!(cfg.core.review_timeout_hours, 12);
+    }
+
+    #[test]
+    fn trigger_tag_pattern_uses_project_override_then_global() {
+        let mut global = GlobalConfigFile::default();
+        global.trigger.git.tag_pattern = "global-pattern/*".to_string();
+        // No project override -> global default flows through
+        let cfg = Config::merge_for_tests(global.clone(), project_with(vec![]));
+        assert_eq!(cfg.trigger.git.tag_pattern, "global-pattern/*");
+
+        // Project override wins
+        let mut project = project_with(vec![]);
+        project.trigger.git.tag_pattern = Some("project-pattern/*".to_string());
+        let cfg = Config::merge_for_tests(global.clone(), project);
+        assert_eq!(cfg.trigger.git.tag_pattern, "project-pattern/*");
+
+        // Empty/whitespace project override falls back to global
+        let mut project = project_with(vec![]);
+        project.trigger.git.tag_pattern = Some("   ".to_string());
+        let cfg = Config::merge_for_tests(global, project);
+        assert_eq!(cfg.trigger.git.tag_pattern, "global-pattern/*");
+    }
+
+    #[test]
+    fn trigger_pdf_prefs_use_project_overrides_then_global() {
+        let mut global = GlobalConfigFile::default();
+        global.trigger.pdf.auto_submit_on_change = true;
+        global.trigger.pdf.max_scan_papers = 25;
+
+        // No project overrides -> global defaults flow through
+        let cfg = Config::merge_for_tests(global.clone(), project_with(vec![]));
+        assert!(cfg.trigger.pdf.auto_submit_on_change);
+        assert_eq!(cfg.trigger.pdf.max_scan_papers, 25);
+
+        // Project overrides win
+        let mut project = project_with(vec![]);
+        project.trigger.pdf.auto_submit_on_change = Some(false);
+        project.trigger.pdf.max_scan_papers = Some(7);
+        let cfg = Config::merge_for_tests(global, project);
+        assert!(!cfg.trigger.pdf.auto_submit_on_change);
+        assert_eq!(cfg.trigger.pdf.max_scan_papers, 7);
+    }
+
+    #[test]
+    fn trigger_project_only_fields_pass_through_unchanged() {
+        // git.enabled, repo_dir, auto_create_tags, auto_delete_processed_tags,
+        // pdf.enabled live exclusively on the project side -- no global default.
+        let mut project = project_with(vec![]);
+        project.trigger.git.enabled = false;
+        project.trigger.git.repo_dir = "/tmp/repo".to_string();
+        project.trigger.git.auto_create_tags_on_pdf_change = true;
+        project.trigger.git.auto_delete_processed_tags = true;
+        project.trigger.pdf.enabled = false;
+        let cfg = Config::merge_for_tests(GlobalConfigFile::default(), project);
+        assert!(!cfg.trigger.git.enabled);
+        assert_eq!(cfg.trigger.git.repo_dir, "/tmp/repo");
+        assert!(cfg.trigger.git.auto_create_tags_on_pdf_change);
+        assert!(cfg.trigger.git.auto_delete_processed_tags);
+        assert!(!cfg.trigger.pdf.enabled);
+    }
+
+    #[test]
+    fn legacy_config_migrates_trigger_fully_to_project_side() {
+        // Legacy single-file configs put trigger settings in one shared struct.
+        // Migration must preserve those exact values, even when they differ
+        // from the new global defaults, so the upgraded user sees no behavior
+        // change. Achieved by parking the legacy trigger as project overrides.
+        let mut legacy = LegacyConfig::default();
+        legacy.trigger.git.tag_pattern = "legacy-style/<paper-id>/*".to_string();
+        legacy.trigger.pdf.auto_submit_on_change = true;
+        legacy.trigger.pdf.max_scan_papers = 99;
+
+        let migrated_project = legacy.project_config();
+        assert_eq!(
+            migrated_project.trigger.git.tag_pattern.as_deref(),
+            Some("legacy-style/<paper-id>/*")
+        );
+        assert_eq!(
+            migrated_project.trigger.pdf.auto_submit_on_change,
+            Some(true)
+        );
+        assert_eq!(migrated_project.trigger.pdf.max_scan_papers, Some(99));
+
+        // And the migrated global trigger is plain defaults -- the project
+        // overrides carry the actual values so the merged Config matches
+        // the legacy runtime exactly.
+        let migrated_global = legacy.global_config();
+        let cfg = Config::merge_for_tests(migrated_global, migrated_project);
+        assert_eq!(cfg.trigger.git.tag_pattern, "legacy-style/<paper-id>/*");
+        assert!(cfg.trigger.pdf.auto_submit_on_change);
+        assert_eq!(cfg.trigger.pdf.max_scan_papers, 99);
     }
 }
