@@ -95,6 +95,12 @@ enum Command {
     },
     /// Re-queue a failed or stalled job for another attempt. Use --force to
     /// clear any cooldown. Accepts --job-id or --paper-id.
+    ///
+    /// When using --paper-id, only active jobs (QUEUED, SUBMITTED, PROCESSING)
+    /// are matched by default to avoid ambiguity from historical failures. Pass
+    /// --include-failed to also consider FAILED, FAILED_NEEDS_MANUAL, and
+    /// TIMEOUT jobs (useful when no active job exists and you want to retry a
+    /// previously-failed run).
     Retry {
         #[command(flatten)]
         job_ref: JobOrPaperRef,
@@ -104,6 +110,10 @@ enum Command {
         /// Deprecated alias for --force. Will be removed in a future release.
         #[arg(long, default_value_t = false, hide = true)]
         override_rate_limit: bool,
+        /// Also consider FAILED, FAILED_NEEDS_MANUAL, and TIMEOUT jobs when
+        /// resolving --paper-id. By default only active jobs are matched.
+        #[arg(long, default_value_t = false)]
+        include_failed: bool,
     },
     /// Mark a job as completed and optionally attach a summary or score.
     /// Accepts --job-id or --paper-id.
@@ -234,6 +244,10 @@ enum PaperCommand {
         submit_now: bool,
         #[arg(long, default_value_t = false)]
         no_submit_prompt: bool,
+        /// Override the venue for this paper. When omitted, the project-level
+        /// `venue` from `reviewloop.toml` is used.
+        #[arg(long)]
+        venue: Option<String>,
     },
     /// Enable or disable PDF-change watching for an already-registered paper.
     Watch {
@@ -360,6 +374,7 @@ async fn run() -> Result<()> {
                     tag_trigger,
                     submit_now,
                     no_submit_prompt,
+                    venue,
                 } => {
                     let should_submit = cmd_paper_add(PaperAddOptions {
                         config_path: &write_path,
@@ -371,6 +386,7 @@ async fn run() -> Result<()> {
                         tag_trigger: tag_trigger.as_deref(),
                         submit_now,
                         no_submit_prompt,
+                        venue: venue.as_deref(),
                     })?;
                     if should_submit {
                         let (config, db) = load_runtime(Some(write_path.as_path()), false, true)?;
@@ -472,26 +488,45 @@ async fn run() -> Result<()> {
             job_ref,
             force,
             override_rate_limit,
+            include_failed,
         } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
             let job_id = match job_ref.job_id {
                 Some(id) => id,
                 None => {
-                    resolve_paper_id_to_job(
-                        &db,
-                        &config.project_id,
-                        &job_ref.paper_id.unwrap(),
-                        &[
-                            JobStatus::Failed,
-                            JobStatus::FailedNeedsManual,
-                            JobStatus::Timeout,
-                            JobStatus::Processing,
-                            JobStatus::Submitted,
-                            JobStatus::Queued,
-                        ],
-                        "retry",
-                    )?
-                    .id
+                    let paper_id = job_ref.paper_id.unwrap();
+                    let active_statuses = &[
+                        JobStatus::Queued,
+                        JobStatus::Submitted,
+                        JobStatus::Processing,
+                    ];
+                    let extended_statuses = &[
+                        JobStatus::Queued,
+                        JobStatus::Submitted,
+                        JobStatus::Processing,
+                        JobStatus::Failed,
+                        JobStatus::FailedNeedsManual,
+                        JobStatus::Timeout,
+                    ];
+                    let statuses: &[JobStatus] = if include_failed {
+                        extended_statuses
+                    } else {
+                        active_statuses
+                    };
+                    resolve_paper_id_to_job(&db, &config.project_id, &paper_id, statuses, "retry")
+                        .map_err(|e| {
+                            let msg = e.to_string();
+                            if !include_failed && msg.contains("no retry-eligible job") {
+                                anyhow!(
+                                    "{msg}\n\
+                                     hint: no active job for paper_id={paper_id}; \
+                                     pass --include-failed to retry a previously-failed job"
+                                )
+                            } else {
+                                e
+                            }
+                        })?
+                        .id
                 }
             };
             cmd_retry(&config, &db, &job_id, force, override_rate_limit).await
@@ -682,6 +717,9 @@ struct PaperAddOptions<'a> {
     tag_trigger: Option<&'a str>,
     submit_now: bool,
     no_submit_prompt: bool,
+    /// Per-paper venue override. When `None`, the project-level venue applies.
+    /// Whitespace-only values are treated as `None`.
+    venue: Option<&'a str>,
 }
 
 fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
@@ -725,7 +763,11 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
         id: options.paper_id.to_string(),
         pdf_path: options.pdf_path.to_string(),
         backend: persisted_backend,
-        venue: None,
+        venue: options
+            .venue
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
     });
     config
         .paper_watch
@@ -748,9 +790,15 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
     config.save(options.config_path)?;
 
     let watch_text = if options.watch { "enabled" } else { "disabled" };
+    let venue_text = options
+        .venue
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "project default".to_string());
     if let Some(trigger) = options.tag_trigger {
         println!(
-            "Added paper {paper_id}.\n- backend: {backend}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- tag trigger: {trigger}\n- config: {}\n  artifacts will appear in: <state-dir>/artifacts/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
+            "Added paper {paper_id}.\n- backend: {backend}\n- venue: {venue_text}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- tag trigger: {trigger}\n- config: {}\n  artifacts will appear in: <state-dir>/artifacts/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
             options.config_path.display(),
             paper_id = options.paper_id,
             backend = resolved_backend,
@@ -758,7 +806,7 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
         );
     } else {
         println!(
-            "Added paper {paper_id}.\n- backend: {backend}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- config: {}\n  artifacts will appear in: <state-dir>/artifacts/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
+            "Added paper {paper_id}.\n- backend: {backend}\n- venue: {venue_text}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- config: {}\n  artifacts will appear in: <state-dir>/artifacts/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
             options.config_path.display(),
             paper_id = options.paper_id,
             backend = resolved_backend,
@@ -1799,6 +1847,7 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
                 tag_trigger: args.tag_trigger.as_deref(),
                 submit_now: false,
                 no_submit_prompt: true,
+                venue: None,
             })?;
         }
     }
@@ -3803,6 +3852,197 @@ mod tests {
                 1,
                 "single-paper query must produce papers array of length 1"
             );
+        }
+    }
+
+    mod paper_add_venue {
+        use crate::{Cli, Command, PaperCommand};
+        use clap::Parser;
+
+        #[test]
+        fn paper_add_venue_flag_parses() {
+            let args = Cli::try_parse_from([
+                "reviewloop",
+                "paper",
+                "add",
+                "--paper-id",
+                "main",
+                "--pdf-path",
+                "paper/main.pdf",
+                "--venue",
+                "ICLR",
+            ])
+            .expect("paper add --venue should parse");
+            match args.command {
+                Command::Paper {
+                    command:
+                        PaperCommand::Add {
+                            venue, paper_id, ..
+                        },
+                } => {
+                    assert_eq!(venue.as_deref(), Some("ICLR"), "venue should be ICLR");
+                    assert_eq!(paper_id, "main");
+                }
+                _ => panic!("expected Paper Add command"),
+            }
+        }
+
+        #[test]
+        fn paper_add_without_venue_is_none() {
+            let args = Cli::try_parse_from([
+                "reviewloop",
+                "paper",
+                "add",
+                "--paper-id",
+                "main",
+                "--pdf-path",
+                "paper/main.pdf",
+            ])
+            .expect("paper add without --venue should parse");
+            match args.command {
+                Command::Paper {
+                    command: PaperCommand::Add { venue, .. },
+                } => {
+                    assert!(venue.is_none(), "venue should be None when not specified");
+                }
+                _ => panic!("expected Paper Add command"),
+            }
+        }
+    }
+
+    mod retry_include_failed {
+        use crate::{Cli, Command};
+        use clap::Parser;
+        use reviewloop::db::Db;
+        use reviewloop::model::{JobStatus, NewJob};
+
+        use super::super::resolve_paper_id_to_job;
+
+        fn new_job(paper_id: &str, pdf_hash: &str, status: JobStatus) -> NewJob {
+            NewJob {
+                project_id: "proj".to_string(),
+                paper_id: paper_id.to_string(),
+                backend: "stanford".to_string(),
+                pdf_path: "/test/paper.pdf".to_string(),
+                pdf_hash: pdf_hash.to_string(),
+                status,
+                email: "test@example.com".to_string(),
+                venue: None,
+                git_tag: None,
+                git_commit: None,
+                next_poll_at: None,
+            }
+        }
+
+        #[test]
+        fn retry_without_include_failed_parses_default_false() {
+            let args = Cli::try_parse_from(["reviewloop", "retry", "--paper-id", "main"]).unwrap();
+            match args.command {
+                Command::Retry { include_failed, .. } => {
+                    assert!(!include_failed, "include_failed should default to false");
+                }
+                _ => panic!("expected Retry command"),
+            }
+        }
+
+        #[test]
+        fn retry_with_include_failed_parses_true() {
+            let args = Cli::try_parse_from([
+                "reviewloop",
+                "retry",
+                "--paper-id",
+                "main",
+                "--include-failed",
+            ])
+            .unwrap();
+            match args.command {
+                Command::Retry { include_failed, .. } => {
+                    assert!(
+                        include_failed,
+                        "include_failed should be true when flag is set"
+                    );
+                }
+                _ => panic!("expected Retry command"),
+            }
+        }
+
+        #[test]
+        fn narrow_scope_excludes_failed_jobs() {
+            let db = Db::new_in_memory("retry_narrow").unwrap();
+            db.init_schema().unwrap();
+
+            // Only a Failed job exists — narrow scope should not match it.
+            db.create_job(&new_job("paper1", "hash_a", JobStatus::Failed))
+                .unwrap();
+
+            let err = resolve_paper_id_to_job(
+                &db,
+                "proj",
+                "paper1",
+                &[
+                    JobStatus::Queued,
+                    JobStatus::Submitted,
+                    JobStatus::Processing,
+                ],
+                "retry",
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("no retry-eligible job"),
+                "got: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn wide_scope_includes_failed_jobs() {
+            let db = Db::new_in_memory("retry_wide").unwrap();
+            db.init_schema().unwrap();
+
+            let failed = db
+                .create_job(&new_job("paper1", "hash_a", JobStatus::Failed))
+                .unwrap();
+
+            let resolved = resolve_paper_id_to_job(
+                &db,
+                "proj",
+                "paper1",
+                &[
+                    JobStatus::Queued,
+                    JobStatus::Submitted,
+                    JobStatus::Processing,
+                    JobStatus::Failed,
+                    JobStatus::FailedNeedsManual,
+                    JobStatus::Timeout,
+                ],
+                "retry",
+            )
+            .unwrap();
+            assert_eq!(resolved.id, failed.id);
+        }
+
+        #[test]
+        fn narrow_scope_matches_active_queued_job() {
+            let db = Db::new_in_memory("retry_active_queued").unwrap();
+            db.init_schema().unwrap();
+
+            let queued = db
+                .create_job(&new_job("paper1", "hash_a", JobStatus::Queued))
+                .unwrap();
+
+            let resolved = resolve_paper_id_to_job(
+                &db,
+                "proj",
+                "paper1",
+                &[
+                    JobStatus::Queued,
+                    JobStatus::Submitted,
+                    JobStatus::Processing,
+                ],
+                "retry",
+            )
+            .unwrap();
+            assert_eq!(resolved.id, queued.id);
         }
     }
 }

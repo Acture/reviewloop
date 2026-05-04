@@ -72,15 +72,16 @@ reviewloop run paper/main.pdf \
 For daemon-based automation with multiple papers and Git-tag triggers:
 
 ```bash
-# register a paper manually
+# register a paper (uses the project-level venue from reviewloop.toml)
 reviewloop paper add \
   --paper-id main \
   --path paper/main.pdf
 
-# optional: add a custom git-tag trigger for a second paper
+# register a second paper targeting a different venue (per-paper override)
 reviewloop paper add \
   --paper-id camera_ready \
   --path build/camera_ready.pdf \
+  --venue NeurIPS \
   --tag-trigger "custom-review/camera_ready/*"
 
 # install and start the background daemon (macOS)
@@ -190,7 +191,7 @@ Core commands:
 reviewloop init
 reviewloop init project --project-id <id> [--project-root <path>] [--force]
 reviewloop run <pdf-path> [--paper-id <id>] [--backend <backend>] [--watch true|false] [--tag-trigger "<pattern>"] [--quiet]
-reviewloop paper add --paper-id <id> --path <pdf-or-build-artifact> [--backend <backend>] [--watch true|false] [--tag-trigger "<pattern>"] [--submit-now] [--no-submit-prompt]
+reviewloop paper add --paper-id <id> --path <pdf-or-build-artifact> [--backend <backend>] [--venue <venue>] [--watch true|false] [--tag-trigger "<pattern>"] [--submit-now] [--no-submit-prompt]
 reviewloop paper watch --paper-id <id> --enabled <true|false>
 reviewloop paper remove --paper-id <id> [--purge-history]
 reviewloop daemon run
