@@ -32,6 +32,7 @@ struct MockReply {
     status: StatusCode,
     body: String,
     content_type: &'static str,
+    extra_headers: Vec<(&'static str, String)>,
 }
 
 impl MockReply {
@@ -40,6 +41,7 @@ impl MockReply {
             status,
             body: value.to_string(),
             content_type: "application/json",
+            extra_headers: vec![],
         }
     }
 
@@ -48,7 +50,13 @@ impl MockReply {
             status,
             body: body.into(),
             content_type: "text/plain",
+            extra_headers: vec![],
         }
+    }
+
+    fn with_retry_after_secs(mut self, secs: u64) -> Self {
+        self.extra_headers.push(("retry-after", secs.to_string()));
+        self
     }
 
     fn default_get_upload_error() -> Self {
@@ -87,6 +95,14 @@ impl IntoResponse for MockReply {
             header::CONTENT_TYPE,
             header::HeaderValue::from_static(self.content_type),
         );
+        for (name, value) in &self.extra_headers {
+            if let (Ok(header_name), Ok(header_value)) = (
+                header::HeaderName::from_bytes(name.as_bytes()),
+                header::HeaderValue::from_str(value),
+            ) {
+                response.headers_mut().insert(header_name, header_value);
+            }
+        }
         response
     }
 }
@@ -449,11 +465,76 @@ async fn integration_poll_404_marks_job_failed_invalid_token() -> Result<()> {
     Ok(())
 }
 
+// Previously asserted a 30-minute hard cooldown; now the behavior is:
+//  - 429 with Retry-After header  → next_poll_at = now + header duration
+//  - 429 without Retry-After      → next_poll_at = compute_next_poll_at (normal schedule)
+//  - 5xx non-terminal             → next_poll_at = compute_next_poll_at (normal schedule)
 #[tokio::test]
-async fn integration_rate_limit_and_server_error_apply_cooldown() -> Result<()> {
+async fn integration_rate_limit_honors_retry_after_header() -> Result<()> {
     let state = Arc::new(MockState::default());
     let server = MockServer::start(state.clone()).await?;
 
+    // 429 on submit with Retry-After: 5 seconds
+    state.enqueue_get_upload(
+        MockReply::json(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({ "detail": "rate limit exceeded" }),
+        )
+        .with_retry_after_secs(5),
+    );
+
+    let ctx = TestContext::new(server.base_url.clone())?;
+    let submit_job = ctx.create_job(JobStatus::Queued)?;
+    let before = Utc::now();
+
+    worker::submit_job(&ctx.config, &ctx.db, &submit_job.id).await?;
+
+    let queued = ctx
+        .db
+        .get_job(&submit_job.id)?
+        .context("submit job missing")?;
+    assert_eq!(queued.status, JobStatus::Queued);
+    assert_eq!(queued.attempt, 1);
+    let next = queued.next_poll_at.context("missing next_poll_at")?;
+    let delta = (next - before).num_seconds();
+    assert!(
+        (3..=10).contains(&delta),
+        "expected ~5s Retry-After scheduling, got {delta}s"
+    );
+
+    // 429 on poll with Retry-After: 5 seconds
+    state.enqueue_review(
+        "tok-rl-header",
+        MockReply::json(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({ "detail": "rate limited" }),
+        )
+        .with_retry_after_secs(5),
+    );
+
+    let poll_job = ctx.create_processing_job("tok-rl-header")?;
+    let before2 = Utc::now();
+
+    worker::poll_job(&ctx.config, &ctx.db, &poll_job).await?;
+
+    let retrying = ctx.db.get_job(&poll_job.id)?.context("poll job missing")?;
+    assert_eq!(retrying.status, JobStatus::Processing);
+    let next2 = retrying.next_poll_at.context("missing next_poll_at")?;
+    let delta2 = (next2 - before2).num_seconds();
+    assert!(
+        (3..=10).contains(&delta2),
+        "expected ~5s Retry-After scheduling, got {delta2}s"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn integration_rate_limit_without_retry_after_falls_back_to_schedule() -> Result<()> {
+    let state = Arc::new(MockState::default());
+    let server = MockServer::start(state.clone()).await?;
+
+    // 429 without Retry-After header — should use polling schedule (10-60 min range)
     state.enqueue_get_upload(MockReply::json(
         StatusCode::TOO_MANY_REQUESTS,
         json!({ "detail": "rate limit exceeded" }),
@@ -470,20 +551,37 @@ async fn integration_rate_limit_and_server_error_apply_cooldown() -> Result<()> 
         .context("submit job missing")?;
     assert_eq!(queued.status, JobStatus::Queued);
     assert_eq!(queued.attempt, 1);
-    assert_cooldown_minutes(queued.next_poll_at.context("missing cooldown")?, 29, 31);
+    // schedule = [10,20,40,60], attempt+1=1 → index 1 → 20 minutes (jitter=0)
+    assert_cooldown_minutes(queued.next_poll_at.context("missing next_poll_at")?, 19, 21);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn integration_server_error_uses_polling_schedule() -> Result<()> {
+    let state = Arc::new(MockState::default());
+    let server = MockServer::start(state.clone()).await?;
 
     state.enqueue_review(
-        "tok-500",
+        "tok-500-sched",
         MockReply::text(StatusCode::INTERNAL_SERVER_ERROR, "backend overloaded"),
     );
 
-    let poll_job = ctx.create_processing_job("tok-500")?;
+    let ctx = TestContext::new(server.base_url.clone())?;
+    let poll_job = ctx.create_processing_job("tok-500-sched")?;
+
     worker::poll_job(&ctx.config, &ctx.db, &poll_job).await?;
 
     let retrying = ctx.db.get_job(&poll_job.id)?.context("poll job missing")?;
     assert_eq!(retrying.status, JobStatus::Processing);
     assert_eq!(retrying.attempt, 1);
-    assert_cooldown_minutes(retrying.next_poll_at.context("missing cooldown")?, 29, 31);
+    // schedule = [10,20,40,60], attempt+1=1 → index 1 → 20 minutes (jitter=0)
+    // NOT 30 minutes (the old hard cooldown)
+    assert_cooldown_minutes(
+        retrying.next_poll_at.context("missing next_poll_at")?,
+        19,
+        21,
+    );
     assert!(
         retrying
             .last_error

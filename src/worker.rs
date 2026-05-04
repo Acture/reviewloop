@@ -18,7 +18,6 @@ use serde_json::json;
 use std::{path::Path, time::Duration as StdDuration};
 use tracing::{error, info, warn};
 
-const RATE_LIMIT_COOLDOWN_MINUTES: i64 = 30;
 const STANFORD_MAX_TIMEOUT_SCALE_PAGES: i64 = 20;
 const TERMINAL_REVIEW_FAILURE_HINTS: [&str; 3] = [
     "review generation failed",
@@ -80,11 +79,22 @@ async fn run_tick_internal(config: &Config, db: &Db, tick: Option<u64>) -> Resul
     run_git_tag_trigger(config, db)?;
     run_pdf_trigger(config, db)?;
 
-    poll_imap_if_enabled(config, db).await?;
+    let email_polled_jobs = poll_imap_if_enabled(config, db).await?;
 
     mark_timeouts(config, db)?;
     process_submissions(config, db).await?;
     process_polls(config, db).await?;
+
+    // Immediately poll any jobs that just received a token via email ingestion,
+    // rather than waiting for the next 30-second tick.
+    for job in email_polled_jobs {
+        if let Some(fresh) = db.get_job(&job.id)? {
+            if fresh.status == crate::model::JobStatus::Processing && fresh.token.is_some() {
+                poll_job(config, db, &fresh).await?;
+            }
+        }
+    }
+
     prune_retention(config, db, tick)?;
 
     Ok(())
@@ -175,8 +185,24 @@ pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<()> {
             info!(job_id = %job.id, backend = %backend.name(), "job submitted");
             Ok(())
         }
-        Err(BackendError::RateLimited(message)) => {
-            let next = Utc::now() + Duration::minutes(RATE_LIMIT_COOLDOWN_MINUTES);
+        Err(BackendError::RateLimited {
+            message,
+            retry_after,
+        }) => {
+            let next = match retry_after {
+                Some(d) => Utc::now() + d,
+                None => compute_next_poll_at(
+                    Utc::now(),
+                    &config.polling.schedule_minutes,
+                    job.attempt + 1,
+                    config.polling.jitter_percent,
+                ),
+            };
+            let retry_after_source = if retry_after.is_some() {
+                "server"
+            } else {
+                "schedule"
+            };
             db.update_job_state(
                 &job.id,
                 JobStatus::Queued,
@@ -188,9 +214,9 @@ pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<()> {
                 None,
                 Some(&job.id),
                 "submit_rate_limited",
-                json!({ "message": message, "cooldown_minutes": RATE_LIMIT_COOLDOWN_MINUTES }),
+                json!({ "message": message, "next_poll_at": next.to_rfc3339(), "retry_after_source": retry_after_source }),
             )?;
-            warn!(job_id = %job.id, "submit rate limited; cooldown applied");
+            warn!(job_id = %job.id, retry_after_source, "submit rate limited; next attempt scheduled");
             Ok(())
         }
         Err(err) => handle_submit_error_with_fallback(config, db, &job, err).await,
@@ -370,8 +396,24 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
             )?;
             warn!(job_id = %job.id, "invalid token reported by backend");
         }
-        Err(BackendError::RateLimited(message)) => {
-            let next = Utc::now() + Duration::minutes(RATE_LIMIT_COOLDOWN_MINUTES);
+        Err(BackendError::RateLimited {
+            message,
+            retry_after,
+        }) => {
+            let next = match retry_after {
+                Some(d) => Utc::now() + d,
+                None => compute_next_poll_at(
+                    Utc::now(),
+                    &config.polling.schedule_minutes,
+                    job.attempt + 1,
+                    config.polling.jitter_percent,
+                ),
+            };
+            let retry_after_source = if retry_after.is_some() {
+                "server"
+            } else {
+                "schedule"
+            };
             db.update_job_state(
                 &job.id,
                 JobStatus::Processing,
@@ -383,9 +425,9 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
                 None,
                 Some(&job.id),
                 "poll_rate_limited",
-                json!({ "message": message, "next_poll_at": next.to_rfc3339() }),
+                json!({ "message": message, "next_poll_at": next.to_rfc3339(), "retry_after_source": retry_after_source }),
             )?;
-            warn!(job_id = %job.id, "poll rate limited; cooldown applied");
+            warn!(job_id = %job.id, retry_after_source, "poll rate limited; next attempt scheduled");
         }
         Err(BackendError::Server { status, body }) => {
             if is_terminal_review_generation_failure(&body) {
@@ -416,7 +458,12 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
                     "poll returned terminal review-generation failure; marked failed-needs-manual"
                 );
             } else {
-                let next = Utc::now() + Duration::minutes(RATE_LIMIT_COOLDOWN_MINUTES);
+                let next = compute_next_poll_at(
+                    Utc::now(),
+                    &config.polling.schedule_minutes,
+                    job.attempt + 1,
+                    config.polling.jitter_percent,
+                );
                 db.update_job_state(
                     &job.id,
                     JobStatus::Processing,
@@ -428,9 +475,9 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
                     None,
                     Some(&job.id),
                     "poll_server_error",
-                    json!({ "status": status, "message": body, "next_poll_at": next.to_rfc3339() }),
+                    json!({ "status": status, "message": body, "next_poll_at": next.to_rfc3339(), "retry_after_source": "schedule" }),
                 )?;
-                warn!(job_id = %job.id, "poll server error; cooldown applied");
+                warn!(job_id = %job.id, "poll server error; scheduled retry via polling cadence");
             }
         }
         Err(err) => {

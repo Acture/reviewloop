@@ -353,7 +353,7 @@ async fn run() -> Result<()> {
             source,
         } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
-            cmd_import_token(&config, &db, &paper_id, &token, &source)
+            cmd_import_token(&config, &db, &paper_id, &token, &source).await
         }
         Command::Check { target } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
@@ -1325,6 +1325,27 @@ async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Re
     )?;
 
     reviewloop::worker::submit_job(config, db, &job.id).await?;
+
+    // Force the first poll to fire within ~60s regardless of the polling schedule,
+    // so the user gets fast feedback after submit.
+    if let Some(updated_job) = db.get_job(&job.id)?
+        && updated_job.token.is_some()
+    {
+        let fast_first = Utc::now() + chrono::Duration::seconds(60);
+        let current = updated_job
+            .next_poll_at
+            .unwrap_or(fast_first + chrono::Duration::seconds(1));
+        if fast_first < current {
+            db.update_job_state(
+                &updated_job.id,
+                updated_job.status,
+                None,
+                Some(Some(fast_first)),
+                None,
+            )?;
+        }
+    }
+
     println!("Submitted job {} for paper_id={paper_id}", job.id);
     Ok(())
 }
@@ -1348,7 +1369,7 @@ fn cmd_approve(config: &Config, db: &Db, job_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_import_token(
+async fn cmd_import_token(
     config: &Config,
     db: &Db,
     paper_id: &str,
@@ -1358,15 +1379,8 @@ fn cmd_import_token(
     ensure_project_context(config)?;
     db.record_email_token(token, source, None)?;
 
-    let next_poll = compute_next_poll_at(
-        Utc::now(),
-        &config.polling.schedule_minutes,
-        0,
-        config.polling.jitter_percent,
-    );
-
     if let Some(job) = db.find_latest_open_job_for_paper(&config.project_id, paper_id)? {
-        db.attach_token_to_job(&job.id, token, next_poll)?;
+        db.attach_token_to_job(&job.id, token, Utc::now())?;
         db.add_event(
             None,
             Some(&job.id),
@@ -1374,6 +1388,10 @@ fn cmd_import_token(
             json!({ "source": source, "token": token }),
         )?;
         println!("Attached token to existing job {}", job.id);
+        // Immediately poll rather than waiting for the next 30-second daemon tick.
+        if let Some(fresh) = db.get_job(&job.id)? {
+            reviewloop::worker::poll_job(config, db, &fresh).await?;
+        }
         return Ok(());
     }
 
@@ -1406,9 +1424,9 @@ fn cmd_import_token(
         venue,
         git_tag: None,
         git_commit: None,
-        next_poll_at: Some(next_poll),
+        next_poll_at: Some(Utc::now()),
     })?;
-    db.attach_token_to_job(&job.id, token, next_poll)?;
+    db.attach_token_to_job(&job.id, token, Utc::now())?;
 
     db.add_event(
         None,
@@ -1418,6 +1436,11 @@ fn cmd_import_token(
     )?;
 
     println!("Created job {} and attached imported token", job.id);
+
+    // Immediately poll rather than waiting for the next 30-second daemon tick.
+    if let Some(fresh) = db.get_job(&job.id)? {
+        reviewloop::worker::poll_job(config, db, &fresh).await?;
+    }
     Ok(())
 }
 

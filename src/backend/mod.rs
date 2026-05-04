@@ -29,8 +29,13 @@ pub enum ReviewFetchResult {
 
 #[derive(Debug, Error)]
 pub enum BackendError {
-    #[error("rate limited: {0}")]
-    RateLimited(String),
+    #[error("rate limited: {message}")]
+    RateLimited {
+        message: String,
+        /// `Some(_)` when the server sent a parseable `Retry-After` header.
+        /// `None` means honor the local polling cadence instead.
+        retry_after: Option<chrono::Duration>,
+    },
     #[error("server error ({status}): {body}")]
     Server { status: u16, body: String },
     #[error("schema error: {0}")]

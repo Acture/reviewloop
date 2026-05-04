@@ -5,6 +5,24 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<chrono::Duration> {
+    let raw = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(secs) = raw.parse::<i64>() {
+        return chrono::Duration::try_seconds(secs.max(0));
+    }
+    if let Ok(when) = chrono::DateTime::parse_from_rfc2822(raw) {
+        let delta = when.with_timezone(&chrono::Utc) - chrono::Utc::now();
+        if delta > chrono::Duration::zero() {
+            return Some(delta);
+        }
+    }
+    None
+}
+
 #[derive(Clone)]
 pub struct StanfordBackend {
     client: Client,
@@ -67,13 +85,17 @@ impl ReviewBackend for StanfordBackend {
             .map_err(|e| BackendError::Network(e.to_string()))?;
 
         let status = upload_url_resp.status();
+        let retry_after = parse_retry_after(upload_url_resp.headers());
         let body_text = upload_url_resp
             .text()
             .await
             .unwrap_or_else(|_| "".to_string());
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(BackendError::RateLimited(body_text));
+            return Err(BackendError::RateLimited {
+                message: body_text,
+                retry_after,
+            });
         }
         if status.is_server_error() {
             return Err(BackendError::Server {
@@ -153,10 +175,14 @@ impl ReviewBackend for StanfordBackend {
             .map_err(|e| BackendError::Network(e.to_string()))?;
 
         let status = confirm_resp.status();
+        let retry_after = parse_retry_after(confirm_resp.headers());
         let body_text = confirm_resp.text().await.unwrap_or_else(|_| "".to_string());
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(BackendError::RateLimited(body_text));
+            return Err(BackendError::RateLimited {
+                message: body_text,
+                retry_after,
+            });
         }
         if status.is_server_error() {
             return Err(BackendError::Server {
@@ -201,13 +227,16 @@ impl ReviewBackend for StanfordBackend {
             .map_err(|e| BackendError::Network(e.to_string()))?;
 
         let status = resp.status();
+        let retry_after = parse_retry_after(resp.headers());
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(BackendError::RateLimited(
-                resp.text()
+            return Err(BackendError::RateLimited {
+                message: resp
+                    .text()
                     .await
                     .unwrap_or_else(|_| "rate limited".to_string()),
-            ));
+                retry_after,
+            });
         }
 
         if status == StatusCode::ACCEPTED {

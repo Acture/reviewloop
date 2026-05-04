@@ -1,7 +1,7 @@
 use crate::{
     config::Config,
     db::Db,
-    model::JobStatus,
+    model::{Job, JobStatus},
     token::{extract_review_token, extract_token_with_pattern},
 };
 use anyhow::Result;
@@ -66,8 +66,14 @@ fn extract_match(
     })
 }
 
-fn bind_matches(db: &Db, project_id: &str, source: &str, matches: Vec<EmailMatch>) -> Result<()> {
+fn bind_matches(
+    db: &Db,
+    project_id: &str,
+    source: &str,
+    matches: Vec<EmailMatch>,
+) -> Result<Vec<Job>> {
     let mut seen_tokens = HashSet::new();
+    let mut affected: Vec<Job> = Vec::new();
 
     for matched in matches {
         if !seen_tokens.insert(matched.token.clone()) {
@@ -99,6 +105,10 @@ fn bind_matches(db: &Db, project_id: &str, source: &str, matches: Vec<EmailMatch
                         "source": source
                     }),
                 )?;
+                // Return the fresh job state so the caller can immediately poll it.
+                if let Some(fresh) = db.get_job(&existing_job.id)? {
+                    affected.push(fresh);
+                }
                 continue;
             }
             db.add_event(
@@ -127,10 +137,14 @@ fn bind_matches(db: &Db, project_id: &str, source: &str, matches: Vec<EmailMatch
                     "source": source
                 }),
             )?;
+            // Return the fresh job state (now with token set) so the caller can immediately poll.
+            if let Some(fresh) = db.get_job(&job.id)? {
+                affected.push(fresh);
+            }
         }
     }
 
-    Ok(())
+    Ok(affected)
 }
 
 fn should_nudge_poll_now(status: JobStatus) -> bool {
@@ -153,15 +167,15 @@ mod imap_impl {
     use chrono::{Duration, Utc};
     use native_tls::TlsConnector;
 
-    pub async fn poll_imap_if_enabled(config: &Config, db: &Db) -> Result<()> {
+    pub async fn poll_imap_if_enabled(config: &Config, db: &Db) -> Result<Vec<crate::model::Job>> {
         let Some(imap_cfg) = &config.imap else {
-            return Ok(());
+            return Ok(vec![]);
         };
         if !imap_cfg.enabled {
-            return Ok(());
+            return Ok(vec![]);
         }
         if imap_cfg.username.trim().is_empty() || imap_cfg.password.trim().is_empty() {
-            return Ok(());
+            return Ok(vec![]);
         }
 
         let imap_cfg = imap_cfg.clone();
@@ -318,22 +332,22 @@ mod gmail_impl {
         data: Option<String>,
     }
 
-    pub async fn poll_gmail_if_enabled(config: &Config, db: &Db) -> Result<()> {
+    pub async fn poll_gmail_if_enabled(config: &Config, db: &Db) -> Result<Vec<crate::model::Job>> {
         let Some(gmail_cfg) = &config.gmail_oauth else {
-            return Ok(());
+            return Ok(vec![]);
         };
         if !gmail_cfg.enabled {
-            return Ok(());
+            return Ok(vec![]);
         }
 
         let Some(provider) = GoogleOauthProvider::from_config(config)? else {
-            return Ok(());
+            return Ok(vec![]);
         };
         let access_token = match oauth::ensure_valid_access_token(&provider).await {
             Ok(token) => token,
             Err(err) => {
                 tracing::warn!(error = %err, "gmail oauth not ready; skipping gmail poll");
-                return Ok(());
+                return Ok(vec![]);
             }
         };
 
@@ -528,9 +542,10 @@ mod gmail_impl {
     }
 }
 
-pub async fn poll_imap_if_enabled(config: &Config, db: &Db) -> Result<()> {
-    gmail_impl::poll_gmail_if_enabled(config, db).await?;
-    imap_impl::poll_imap_if_enabled(config, db).await
+pub async fn poll_imap_if_enabled(config: &Config, db: &Db) -> Result<Vec<Job>> {
+    let mut affected = gmail_impl::poll_gmail_if_enabled(config, db).await?;
+    affected.extend(imap_impl::poll_imap_if_enabled(config, db).await?);
+    Ok(affected)
 }
 
 #[cfg(test)]
