@@ -5,10 +5,10 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -371,44 +371,20 @@ impl Db {
         paper_id: &str,
     ) -> Result<Vec<EventRecord>> {
         let conn = self.connect()?;
-        let mut job_ids = BTreeSet::new();
-        {
-            let mut stmt = conn.prepare(
-                "SELECT id FROM jobs WHERE project_id = ?1 AND paper_id = ?2 ORDER BY created_at ASC",
-            )?;
-            let rows =
-                stmt.query_map(params![project_id, paper_id], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                job_ids.insert(row?);
-            }
-        }
-
-        let mut events = Vec::new();
         let mut stmt = conn.prepare(
             r#"
             SELECT id, project_id, job_id, event_type, payload_json, created_at
             FROM events
             WHERE project_id = ?1
+              AND (
+                job_id IN (SELECT id FROM jobs WHERE project_id = ?1 AND paper_id = ?2)
+                OR JSON_EXTRACT(payload_json, '$.paper_id') = ?2
+              )
             ORDER BY created_at ASC, id ASC
             "#,
         )?;
-        let rows = stmt.query_map(params![project_id], map_event_row)?;
-        for row in rows {
-            let event = row?;
-            let matches_job = event
-                .job_id
-                .as_deref()
-                .is_some_and(|job_id| job_ids.contains(job_id));
-            let matches_payload = event
-                .payload
-                .get("paper_id")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value == paper_id);
-            if matches_job || matches_payload {
-                events.push(event);
-            }
-        }
-        Ok(events)
+        let rows = stmt.query_map(params![project_id, paper_id], map_event_row)?;
+        collect_rows(rows)
     }
 
     pub fn find_duplicate_covering_job(
@@ -961,12 +937,25 @@ impl Db {
             }
             drop(stmt);
 
-            for id in job_ids {
-                report.reviews +=
-                    tx.execute("DELETE FROM reviews WHERE job_id = ?1", params![&id])?;
-                report.events +=
-                    tx.execute("DELETE FROM events WHERE job_id = ?1", params![&id])?;
-                report.jobs += tx.execute("DELETE FROM jobs WHERE id = ?1", params![&id])?;
+            for chunk in job_ids.chunks(500) {
+                let placeholders = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("?{}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                report.reviews += tx.execute(
+                    &format!("DELETE FROM reviews WHERE job_id IN ({placeholders})"),
+                    params_from_iter(chunk.iter()),
+                )?;
+                report.events += tx.execute(
+                    &format!("DELETE FROM events WHERE job_id IN ({placeholders})"),
+                    params_from_iter(chunk.iter()),
+                )?;
+                report.jobs += tx.execute(
+                    &format!("DELETE FROM jobs WHERE id IN ({placeholders})"),
+                    params_from_iter(chunk.iter()),
+                )?;
             }
         }
 

@@ -15,6 +15,7 @@ categories = ["command-line-utilities", "science"]
 [features]
 default = []
 bar = ["dep:tray-icon", "dep:tao", "dep:muda", "dep:rfd"]
+imap = ["dep:imap", "dep:native-tls"]
 
 [[bin]]
 name = "reviewloop"
@@ -38,12 +39,12 @@ rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-tokio = { version = "1.46", features = ["full"] }
+tokio = { version = "1.46", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs", "io-util", "net", "process"] }
 toml = "0.8"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 thiserror = "2.0"
-imap = "2.4"
-native-tls = "0.2"
+imap = { version = "2.4", optional = true }
+native-tls = { version = "0.2", optional = true }
 oauth2 = { version = "5.0", default-features = false, features = ["reqwest", "rustls-tls"] }
 tracing = "0.1"
 tracing-appender = "0.2"

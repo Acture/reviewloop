@@ -158,6 +158,7 @@ fn should_nudge_poll_now(status: JobStatus) -> bool {
     )
 }
 
+#[cfg(feature = "imap")]
 mod imap_impl {
     use crate::{
         config::{Config, ImapConfig},
@@ -298,6 +299,13 @@ mod gmail_impl {
         engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
     };
     use serde::Deserialize;
+    use std::sync::OnceLock;
+
+    static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+    fn http_client() -> &'static reqwest::Client {
+        HTTP_CLIENT.get_or_init(reqwest::Client::new)
+    }
 
     #[derive(Debug, Deserialize)]
     struct GmailListResponse {
@@ -357,7 +365,7 @@ mod gmail_impl {
     }
 
     async fn fetch_matches(cfg: &GmailOauthConfig, access_token: &str) -> Result<Vec<EmailMatch>> {
-        let client = reqwest::Client::new();
+        let client = http_client();
         let query = build_unread_query(cfg);
         let max_results = cfg.max_messages_per_poll.to_string();
 
@@ -382,7 +390,7 @@ mod gmail_impl {
         let mut matches = Vec::new();
 
         for msg in list_payload.messages.unwrap_or_default() {
-            let metadata = fetch_message_metadata(&client, access_token, &msg.id).await?;
+            let metadata = fetch_message_metadata(client, access_token, &msg.id).await?;
             let header_text = metadata
                 .payload
                 .as_ref()
@@ -400,7 +408,7 @@ mod gmail_impl {
                 continue;
             }
 
-            let full = fetch_message_full(&client, access_token, &msg.id).await?;
+            let full = fetch_message_full(client, access_token, &msg.id).await?;
             let mut text = String::new();
             if let Some(snippet) = full.snippet {
                 text.push_str(&snippet);
@@ -415,7 +423,7 @@ mod gmail_impl {
             {
                 matches.push(matched);
                 if cfg.mark_seen {
-                    mark_message_seen(&client, access_token, &msg.id).await?;
+                    mark_message_seen(client, access_token, &msg.id).await?;
                 }
             }
         }
@@ -546,7 +554,9 @@ mod gmail_impl {
 pub async fn poll_imap_if_enabled(config: &Config, db: &Db) -> Result<Vec<Job>> {
     let span = tracing::info_span!("poll_imap_if_enabled", project_id = %config.project_id);
     async move {
+        #[allow(unused_mut)]
         let mut affected = gmail_impl::poll_gmail_if_enabled(config, db).await?;
+        #[cfg(feature = "imap")]
         affected.extend(imap_impl::poll_imap_if_enabled(config, db).await?);
         Ok(affected)
     }
@@ -562,7 +572,9 @@ mod tests {
         email::detect_backend_from_header,
         model::{JobStatus, NewJob},
     };
-    use chrono::{Duration, TimeZone, Utc};
+    #[cfg(feature = "imap")]
+    use chrono::TimeZone;
+    use chrono::{Duration, Utc};
 
     #[test]
     fn header_match_detects_stanford_sender() {
@@ -581,6 +593,7 @@ mod tests {
         assert!(backend.is_none());
     }
 
+    #[cfg(feature = "imap")]
     #[test]
     fn imap_search_query_applies_lookback_window() {
         let cfg = ImapConfig {
@@ -592,6 +605,7 @@ mod tests {
         assert_eq!(query, "UNSEEN SINCE 02-Mar-2026");
     }
 
+    #[cfg(feature = "imap")]
     #[test]
     fn imap_search_query_can_disable_lookback() {
         let cfg = ImapConfig {
