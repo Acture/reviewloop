@@ -3,7 +3,8 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use reviewloop::artifact::write_review_artifacts;
 use reviewloop::config::{
-    Config, LegacyConfig, PaperConfig, ProjectConfigFile, default_project_config_path,
+    Config, LegacyConfig, PaperConfig, PaperConfigFile, ProjectConfigFile,
+    default_project_config_path,
 };
 use reviewloop::db::Db;
 use reviewloop::email_account;
@@ -533,10 +534,11 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
         anyhow::bail!("paper_id already exists: {}", options.paper_id);
     }
 
-    config.papers.push(PaperConfig {
+    config.papers.push(PaperConfigFile {
         id: options.paper_id.to_string(),
         pdf_path: options.pdf_path.to_string(),
-        backend: options.backend.to_string(),
+        backend: Some(options.backend.to_string()),
+        venue: None,
     });
     config
         .paper_watch
@@ -1297,9 +1299,9 @@ fn cmd_import_token(
     let (email, venue) = match paper.backend.as_str() {
         "stanford" => (
             email_account::resolve_submission_email(config, "stanford", None)?,
-            Some(config.effective_stanford_venue()),
+            config.venue_for(paper),
         ),
-        _ => (String::new(), None),
+        _ => (String::new(), config.venue_for(paper)),
     };
 
     let job = db.create_job(&NewJob {

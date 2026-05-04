@@ -328,7 +328,7 @@ fn enqueue_for_paper(
         pdf_hash,
         status,
         email: provider_email(config, &paper.backend)?,
-        venue: provider_venue(config, &paper.backend),
+        venue: provider_venue(config, paper),
         git_tag,
         git_commit,
         next_poll_at: None,
@@ -407,11 +407,8 @@ fn provider_email(config: &Config, backend: &str) -> Result<String> {
     resolve_submission_email(config, backend, None)
 }
 
-fn provider_venue(config: &Config, backend: &str) -> Option<String> {
-    match backend {
-        "stanford" => Some(config.effective_stanford_venue()),
-        _ => None,
-    }
+fn provider_venue(config: &Config, paper: &PaperConfig) -> Option<String> {
+    config.venue_for(paper)
 }
 
 #[cfg(test)]
@@ -445,6 +442,7 @@ mod tests {
             id: "main".to_string(),
             pdf_path: pdf_path.to_string_lossy().to_string(),
             backend: "stanford".to_string(),
+            venue: None,
         }];
 
         let db = Db::new(Path::new(&config.core.state_dir));

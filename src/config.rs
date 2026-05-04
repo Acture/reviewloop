@@ -239,6 +239,50 @@ impl Config {
             .to_string()
     }
 
+    /// Resolve the venue used when submitting / referencing this specific paper.
+    /// For `stanford`, falls back to the project default and finally to "ICLR";
+    /// for other backends, just returns the per-paper override (or `None`).
+    pub fn venue_for(&self, paper: &PaperConfig) -> Option<String> {
+        let per_paper = paper
+            .venue
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        if per_paper.is_some() {
+            return per_paper;
+        }
+        match paper.backend.as_str() {
+            "stanford" => Some(self.effective_stanford_venue()),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn merge_for_tests(global: GlobalConfigFile, project: ProjectConfigFile) -> Self {
+        Self::from_parts(global, project, None)
+    }
+
+    /// The default backend for papers that omit `backend` in the project file
+    /// AND when `project.default_backend` is also unset.
+    pub const DEFAULT_BACKEND: &'static str = "stanford";
+
+    /// Resolve a [`PaperConfigFile`] (TOML form) into a runtime [`PaperConfig`].
+    /// Backend falls back to `default_backend`, then to [`Self::DEFAULT_BACKEND`].
+    fn resolve_paper(file: PaperConfigFile, default_backend: &str) -> PaperConfig {
+        let backend = file
+            .backend
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| default_backend.to_string());
+        PaperConfig {
+            id: file.id,
+            pdf_path: file.pdf_path,
+            backend,
+            venue: file.venue,
+        }
+    }
+
     fn from_parts(
         global: GlobalConfigFile,
         mut project: ProjectConfigFile,
@@ -256,6 +300,18 @@ impl Config {
                     .to_string();
         }
 
+        let default_backend = project
+            .default_backend
+            .clone()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| Self::DEFAULT_BACKEND.to_string());
+        let papers: Vec<PaperConfig> = project
+            .papers
+            .into_iter()
+            .map(|file| Self::resolve_paper(file, &default_backend))
+            .collect();
+
         Self {
             project_id: project.project_id,
             core: global.core,
@@ -272,7 +328,7 @@ impl Config {
                     venue: project.providers.stanford.venue,
                 },
             },
-            papers: project.papers,
+            papers,
             paper_watch: project.paper_watch,
             paper_tag_triggers: project.paper_tag_triggers,
             imap: global.imap,
@@ -382,9 +438,11 @@ impl GlobalConfigFile {
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectConfigFile {
     pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_backend: Option<String>,
     pub trigger: TriggerConfig,
     pub providers: ProjectProvidersConfig,
-    pub papers: Vec<PaperConfig>,
+    pub papers: Vec<PaperConfigFile>,
     pub paper_watch: BTreeMap<String, bool>,
     pub paper_tag_triggers: BTreeMap<String, String>,
 }
@@ -418,7 +476,7 @@ pub struct LegacyConfig {
     pub retention: RetentionConfig,
     pub trigger: TriggerConfig,
     pub providers: ProvidersConfig,
-    pub papers: Vec<PaperConfig>,
+    pub papers: Vec<PaperConfigFile>,
     pub paper_watch: BTreeMap<String, bool>,
     pub paper_tag_triggers: BTreeMap<String, String>,
     pub imap: Option<ImapConfig>,
@@ -470,6 +528,7 @@ impl LegacyConfig {
     pub fn project_config(&self) -> ProjectConfigFile {
         ProjectConfigFile {
             project_id: String::new(),
+            default_backend: None,
             trigger: self.trigger.clone(),
             providers: ProjectProvidersConfig {
                 stanford: ProjectStanfordProviderConfig {
@@ -823,6 +882,25 @@ pub struct PaperConfig {
     pub id: String,
     pub pdf_path: String,
     pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub venue: Option<String>,
+}
+
+/// On-disk representation of a paper inside `ProjectConfigFile.papers`.
+///
+/// `backend` is optional because it can fall back to `project.default_backend`,
+/// which itself ultimately falls back to `"stanford"`. The runtime
+/// [`PaperConfig`] always has a concrete `backend`; resolution happens in
+/// [`Config::from_parts`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PaperConfigFile {
+    pub id: String,
+    pub pdf_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub venue: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -926,8 +1004,8 @@ impl Default for GmailOauthConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, GlobalConfigFile, LegacyConfig, ProjectConfigFile, default_project_config_path,
-        find_git_root,
+        Config, GlobalConfigFile, LegacyConfig, PaperConfig, PaperConfigFile, ProjectConfigFile,
+        default_project_config_path, find_git_root,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -1015,5 +1093,133 @@ db_path = "db.sqlite"
                 .expect("canonical project parent"),
             tmp.path().canonicalize().expect("canonical tempdir")
         );
+    }
+
+    fn paper_file(id: &str, backend: Option<&str>, venue: Option<&str>) -> PaperConfigFile {
+        PaperConfigFile {
+            id: id.to_string(),
+            pdf_path: format!("{id}.pdf"),
+            backend: backend.map(str::to_string),
+            venue: venue.map(str::to_string),
+        }
+    }
+
+    fn project_with(papers: Vec<PaperConfigFile>) -> ProjectConfigFile {
+        ProjectConfigFile {
+            project_id: "p".to_string(),
+            papers,
+            ..ProjectConfigFile::default()
+        }
+    }
+
+    #[test]
+    fn paper_backend_falls_back_to_default_backend_then_stanford() {
+        // No explicit backend, no default_backend -> Config::DEFAULT_BACKEND
+        let cfg = Config::merge_for_tests(
+            GlobalConfigFile::default(),
+            project_with(vec![paper_file("a", None, None)]),
+        );
+        assert_eq!(cfg.papers[0].backend, Config::DEFAULT_BACKEND);
+
+        // No explicit backend, project sets default_backend -> uses it
+        let mut project = project_with(vec![paper_file("b", None, None)]);
+        project.default_backend = Some("custom".to_string());
+        let cfg = Config::merge_for_tests(GlobalConfigFile::default(), project);
+        assert_eq!(cfg.papers[0].backend, "custom");
+
+        // Explicit backend wins over default_backend
+        let mut project = project_with(vec![paper_file("c", Some("explicit"), None)]);
+        project.default_backend = Some("ignored".to_string());
+        let cfg = Config::merge_for_tests(GlobalConfigFile::default(), project);
+        assert_eq!(cfg.papers[0].backend, "explicit");
+
+        // Empty/whitespace explicit backend treated as missing
+        let mut project = project_with(vec![paper_file("d", Some("   "), None)]);
+        project.default_backend = Some("filled".to_string());
+        let cfg = Config::merge_for_tests(GlobalConfigFile::default(), project);
+        assert_eq!(cfg.papers[0].backend, "filled");
+    }
+
+    #[test]
+    fn venue_for_resolves_per_paper_then_project_then_iclr() {
+        // Per-paper venue wins
+        let cfg = Config::merge_for_tests(
+            GlobalConfigFile::default(),
+            project_with(vec![paper_file(
+                "a",
+                Some("stanford"),
+                Some("NeurIPS workshop"),
+            )]),
+        );
+        assert_eq!(
+            cfg.venue_for(&cfg.papers[0]),
+            Some("NeurIPS workshop".to_string())
+        );
+
+        // No per-paper venue, project default applies for stanford
+        let mut project = project_with(vec![paper_file("b", Some("stanford"), None)]);
+        project.providers.stanford.venue = Some("CVPR".to_string());
+        let cfg = Config::merge_for_tests(GlobalConfigFile::default(), project);
+        assert_eq!(cfg.venue_for(&cfg.papers[0]), Some("CVPR".to_string()));
+
+        // No per-paper, no project venue, stanford -> falls back to "ICLR"
+        let mut project = project_with(vec![paper_file("c", Some("stanford"), None)]);
+        project.providers.stanford.venue = None;
+        let cfg = Config::merge_for_tests(GlobalConfigFile::default(), project);
+        assert_eq!(cfg.venue_for(&cfg.papers[0]), Some("ICLR".to_string()));
+
+        // Empty per-paper venue is ignored, project default takes over
+        let mut project = project_with(vec![paper_file("d", Some("stanford"), Some("   "))]);
+        project.providers.stanford.venue = Some("ACL".to_string());
+        let cfg = Config::merge_for_tests(GlobalConfigFile::default(), project);
+        assert_eq!(cfg.venue_for(&cfg.papers[0]), Some("ACL".to_string()));
+
+        // Non-stanford backend, no per-paper -> None
+        let cfg = Config::merge_for_tests(
+            GlobalConfigFile::default(),
+            project_with(vec![paper_file("e", Some("custom"), None)]),
+        );
+        assert_eq!(cfg.venue_for(&cfg.papers[0]), None);
+
+        // Non-stanford backend, with per-paper -> per-paper
+        let cfg = Config::merge_for_tests(
+            GlobalConfigFile::default(),
+            project_with(vec![paper_file("f", Some("custom"), Some("Foo"))]),
+        );
+        assert_eq!(cfg.venue_for(&cfg.papers[0]), Some("Foo".to_string()));
+    }
+
+    #[test]
+    fn paper_runtime_struct_keeps_pdf_path() {
+        let project = project_with(vec![PaperConfigFile {
+            id: "main".to_string(),
+            pdf_path: "build/main.pdf".to_string(),
+            backend: Some("stanford".to_string()),
+            venue: Some("ICLR".to_string()),
+        }]);
+        let cfg = Config::merge_for_tests(GlobalConfigFile::default(), project);
+        let resolved: &PaperConfig = &cfg.papers[0];
+        assert_eq!(resolved.id, "main");
+        assert_eq!(resolved.pdf_path, "build/main.pdf");
+        assert_eq!(resolved.backend, "stanford");
+        assert_eq!(resolved.venue.as_deref(), Some("ICLR"));
+    }
+
+    #[test]
+    fn legacy_papers_round_trip_through_project_config() {
+        // Existing legacy single-file configs continue to deserialize / migrate:
+        // backend stays explicit, venue is migrated to project-default (per-paper venue
+        // is a new field and not present in legacy files).
+        let mut legacy = LegacyConfig::default();
+        legacy.papers.push(PaperConfigFile {
+            id: "main".to_string(),
+            pdf_path: "main.pdf".to_string(),
+            backend: Some("stanford".to_string()),
+            venue: None,
+        });
+        let project = legacy.project_config();
+        assert_eq!(project.papers.len(), 1);
+        assert_eq!(project.papers[0].backend.as_deref(), Some("stanford"));
+        assert_eq!(project.providers.stanford.venue.as_deref(), Some("ICLR"));
     }
 }

@@ -54,6 +54,7 @@ impl GitTriggerTestContext {
             id: "main".to_string(),
             pdf_path: pdf_main.to_string_lossy().to_string(),
             backend: "stanford".to_string(),
+            venue: None,
         }];
 
         let db = Db::new(Path::new(&config.core.state_dir));
@@ -76,6 +77,7 @@ impl GitTriggerTestContext {
             id: paper_id.to_string(),
             pdf_path: path.to_string_lossy().to_string(),
             backend: "stanford".to_string(),
+            venue: None,
         });
         Ok(())
     }

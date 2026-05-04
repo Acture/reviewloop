@@ -268,6 +268,7 @@ impl TestContext {
             id: "main".to_string(),
             pdf_path: pdf_path.to_string_lossy().to_string(),
             backend: "stanford".to_string(),
+            venue: None,
         }];
 
         let db = Db::new(Path::new(&config.core.state_dir));
