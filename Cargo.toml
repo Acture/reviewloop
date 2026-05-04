@@ -12,6 +12,19 @@ documentation = "https://docs.rs/reviewloop"
 keywords = ["academic", "review", "research", "cli", "automation"]
 categories = ["command-line-utilities", "science"]
 
+[features]
+default = []
+bar = ["dep:tray-icon", "dep:tao", "dep:muda"]
+
+[[bin]]
+name = "reviewloop"
+path = "src/main.rs"
+
+[[bin]]
+name = "reviewloop-bar"
+path = "src/bin/reviewloop_bar.rs"
+required-features = ["bar"]
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
@@ -36,6 +49,9 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 notify-rust = { version = "4", default-features = false }
+tray-icon = { version = "0.23", optional = true, default-features = false, features = ["common-controls-v6"] }
+tao = { version = "0.35", optional = true }
+muda = { version = "0.19", optional = true }
 
 [dev-dependencies]
 axum = "0.8"

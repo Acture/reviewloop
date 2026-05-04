@@ -110,6 +110,8 @@ enum Command {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+    /// Submit a paper and watch it through to completion in one command.
+    Run(RunArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -233,6 +235,28 @@ struct JobOrPaperRef {
     job_id: Option<String>,
     #[arg(long)]
     paper_id: Option<String>,
+}
+
+/// Arguments for `reviewloop run <pdf-path>`.
+#[derive(Debug, Args)]
+struct RunArgs {
+    /// Path to the PDF file to submit.
+    pdf_path: String,
+    /// Paper ID (defaults to the PDF filename stem, e.g. "paper/main.pdf" → "main").
+    #[arg(long)]
+    paper_id: Option<String>,
+    /// Backend (defaults to project.default_backend, then "stanford").
+    #[arg(long)]
+    backend: Option<String>,
+    /// Enable PDF watching for the registered paper (default: true).
+    #[arg(long, default_value_t = true)]
+    watch: bool,
+    /// Tag trigger pattern for the paper.
+    #[arg(long)]
+    tag_trigger: Option<String>,
+    /// Suppress live status rendering; only print the final result line.
+    #[arg(long, default_value_t = false)]
+    quiet: bool,
 }
 
 /// Argument group for `check`: exactly one of `--job-id`, `--paper-id`, or
@@ -469,6 +493,7 @@ async fn run() -> Result<()> {
             yes,
             dry_run,
         } => cmd_self_update(method, yes, dry_run),
+        Command::Run(args) => cmd_run(config_override.as_deref(), &args).await,
     }
 }
 
@@ -1511,6 +1536,199 @@ async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Re
 
     println!("Submitted job {} for paper_id={paper_id}", job.id);
     Ok(())
+}
+
+async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
+    let write_path = resolve_mutable_project_config_path(config_override)?;
+    if !write_path.exists() {
+        anyhow::bail!(
+            "no project config found. run `reviewloop init project --project-id <id>` in this repo first"
+        );
+    }
+
+    let pdf_path_str = &args.pdf_path;
+    let paper_id = match &args.paper_id {
+        Some(id) => id.clone(),
+        None => Path::new(pdf_path_str)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("cannot derive paper_id from pdf path: {pdf_path_str}"))?,
+    };
+
+    // Register paper in project config if not already present.
+    {
+        let project_cfg = ProjectConfigFile::load(&write_path)?;
+        if project_cfg.papers.iter().all(|p| p.id != paper_id) {
+            cmd_paper_add(PaperAddOptions {
+                config_path: &write_path,
+                paper_id: &paper_id,
+                project_id: None,
+                pdf_path: pdf_path_str,
+                backend: args.backend.as_deref(),
+                watch: args.watch,
+                tag_trigger: args.tag_trigger.as_deref(),
+                submit_now: false,
+                no_submit_prompt: true,
+            })?;
+        }
+    }
+
+    let (config, db) = load_runtime(Some(&write_path), false, true)?;
+    ensure_project_context(&config)?;
+
+    let paper = config
+        .find_paper(&paper_id)
+        .ok_or_else(|| paper_not_found_error(&paper_id, &config))?;
+
+    let pdf_path = Path::new(&paper.pdf_path);
+    if !pdf_path.exists() {
+        anyhow::bail!("pdf file not found: {}", pdf_path.display());
+    }
+
+    let pdf_hash = sha256_file(pdf_path)?;
+    let (email, venue) = match paper.backend.as_str() {
+        "stanford" => (
+            email_account::resolve_submission_email(&config, "stanford", None)?,
+            Some(config.effective_stanford_venue()),
+        ),
+        _ => (String::new(), None),
+    };
+
+    // Force: clear cooldowns on any sibling jobs.
+    clear_sibling_job_cooldowns(&config, &db, &paper_id)?;
+
+    let job = db.create_job(&NewJob {
+        project_id: config.project_id.clone(),
+        paper_id: paper.id.clone(),
+        backend: paper.backend.clone(),
+        pdf_path: paper.pdf_path.clone(),
+        pdf_hash,
+        status: JobStatus::Queued,
+        email,
+        venue,
+        git_tag: None,
+        git_commit: None,
+        next_poll_at: None,
+    })?;
+
+    db.add_event(
+        None,
+        Some(&job.id),
+        "run_submit_requested",
+        json!({ "paper_id": paper_id, "force": true }),
+    )?;
+
+    // Submit immediately (equivalent to cmd_submit with force=true).
+    reviewloop::worker::submit_job(&config, &db, &job.id).await?;
+
+    // Fast-forward the first poll window for snappy feedback.
+    if let Some(submitted) = db.get_job(&job.id)?
+        && submitted.token.is_some()
+    {
+        let fast_first = Utc::now() + chrono::Duration::seconds(60);
+        let current = submitted
+            .next_poll_at
+            .unwrap_or(fast_first + chrono::Duration::seconds(1));
+        if fast_first < current {
+            db.update_job_state(
+                &submitted.id,
+                submitted.status,
+                None,
+                Some(Some(fast_first)),
+                None,
+            )?;
+        }
+    }
+
+    if !args.quiet {
+        println!("Submitted job {} for paper_id={paper_id}", job.id);
+    }
+
+    // Foreground polling loop.
+    let start = std::time::Instant::now();
+    let is_tty = std::io::stdout().is_terminal();
+    loop {
+        if let Err(e) = reviewloop::worker::run_tick(&config, &db).await {
+            warn!("run: tick error: {e:#}");
+        }
+
+        let updated = db
+            .get_job(&job.id)?
+            .ok_or_else(|| anyhow!("job {} disappeared from database", job.id))?;
+
+        if !args.quiet {
+            let elapsed_secs = start.elapsed().as_secs();
+            let next_poll = match updated.next_poll_at {
+                None => "now".to_string(),
+                Some(t) => {
+                    let secs = (t - Utc::now()).num_seconds().max(0);
+                    format!("in {secs}s")
+                }
+            };
+            let line = format!(
+                "[t+{}s] {} attempt={} next_poll={}",
+                elapsed_secs,
+                updated.status.as_str(),
+                updated.attempt,
+                next_poll,
+            );
+            if is_tty {
+                print!("\r{line:<80}");
+                std::io::stdout().flush().ok();
+            } else {
+                println!("{line}");
+            }
+        }
+
+        let is_terminal = matches!(
+            updated.status,
+            JobStatus::Completed
+                | JobStatus::Failed
+                | JobStatus::FailedNeedsManual
+                | JobStatus::Timeout
+        );
+
+        if is_terminal {
+            if !args.quiet && is_tty {
+                println!();
+            }
+            match updated.status {
+                JobStatus::Completed => {
+                    let artifact_root = config.state_dir().join("artifacts").join(&job.id);
+                    println!("✓ Review complete for job {}", job.id);
+                    for name in &["review.md", "review.json", "meta.json"] {
+                        let p = artifact_root.join(name);
+                        if p.exists() {
+                            println!("  {name}: {}", p.display());
+                        }
+                    }
+                    return Ok(());
+                }
+                _ => {
+                    let reason = updated.last_error.as_deref().unwrap_or("(no details)");
+                    eprintln!(
+                        "✗ Job {} reached {}: {}",
+                        job.id,
+                        updated.status.as_str(),
+                        reason
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                if !args.quiet && is_tty {
+                    println!();
+                }
+                eprintln!("Interrupted (Ctrl+C).");
+                std::process::exit(130);
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+        }
+    }
 }
 
 fn cmd_approve(config: &Config, db: &Db, job_id: &str) -> Result<()> {
@@ -2944,6 +3162,29 @@ mod tests {
             // On non-macOS this returns an error; that's fine — we just check no panic.
             let _ = cmd_daemon_status(None, None, false);
             let _ = cmd_daemon_status(None, None, true);
+        }
+    }
+
+    mod run_command {
+        #[test]
+        fn paper_id_default_from_filename_stem() {
+            use std::path::Path;
+
+            let cases = [
+                ("paper/main.pdf", "main"),
+                ("build/camera_ready.pdf", "camera_ready"),
+                ("/abs/path/to/paper.pdf", "paper"),
+                ("just_a_stem.pdf", "just_a_stem"),
+                ("no_extension", "no_extension"),
+            ];
+
+            for (pdf_path, expected_id) in cases {
+                let stem = Path::new(pdf_path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default();
+                assert_eq!(stem, expected_id, "failed for {pdf_path}");
+            }
         }
     }
 

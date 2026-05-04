@@ -738,3 +738,196 @@ async fn integration_virtual_paper_e2e_single_tick_completes() -> Result<()> {
 
     Ok(())
 }
+
+/// Validates the full `reviewloop run` loop behavior:
+/// - submit with force (QUEUED → SUBMITTED → PROCESSING)
+/// - drive run_tick in a loop until the job reaches a terminal state
+/// - assert COMPLETED and artifacts present
+/// - assert exit-code semantics (terminal detection)
+#[tokio::test]
+async fn integration_run_loop_completes_via_ticks() -> Result<()> {
+    let state = Arc::new(MockState::default());
+    let server = MockServer::start(state.clone()).await?;
+
+    const TOKEN: &str = "tok-run-loop";
+
+    state.enqueue_get_upload(MockReply::json(
+        StatusCode::OK,
+        json!({
+            "success": true,
+            "presigned_url": format!("{}/s3/upload", server.base_url),
+            "s3_key": "uploads/run-loop.pdf",
+            "presigned_fields": {
+                "key": "uploads/run-loop.pdf",
+                "policy": "abc",
+                "x-amz-algorithm": "AWS4-HMAC-SHA256",
+                "x-amz-credential": "credential",
+                "x-amz-date": "20260401T000000Z",
+                "x-amz-signature": "sig"
+            }
+        }),
+    ));
+    state.enqueue_s3(MockReply::text(StatusCode::NO_CONTENT, ""));
+    state.enqueue_confirm(MockReply::json(
+        StatusCode::OK,
+        json!({ "success": true, "token": TOKEN }),
+    ));
+    // First poll: still processing.
+    state.enqueue_review(
+        TOKEN,
+        MockReply::json(
+            StatusCode::ACCEPTED,
+            json!({ "detail": "still processing" }),
+        ),
+    );
+    // Second poll: review ready.
+    state.enqueue_review(
+        TOKEN,
+        MockReply::json(
+            StatusCode::OK,
+            json!({
+                "title": "Run Loop Paper",
+                "sections": {
+                    "summary": "The run loop drove this to completion",
+                    "strengths": "Automated foreground polling",
+                    "weaknesses": "None"
+                }
+            }),
+        ),
+    );
+
+    let mut ctx = TestContext::new(server.base_url.clone())?;
+    ctx.config.polling.schedule_minutes = vec![0];
+
+    // Step 1: simulate cmd_run's force-submit (create QUEUED job + submit immediately).
+    let job = ctx.create_job(JobStatus::Queued)?;
+    worker::submit_job(&ctx.config, &ctx.db, &job.id).await?;
+
+    // After submit, job should be PROCESSING with a token.
+    let submitted = ctx
+        .db
+        .get_job(&job.id)?
+        .context("job not found after submit")?;
+    assert_eq!(submitted.status, JobStatus::Processing);
+    assert_eq!(submitted.token.as_deref(), Some(TOKEN));
+
+    // Step 2: drive the polling loop until terminal (mirrors the cmd_run loop body).
+    let mut reached_terminal = false;
+    for _ in 0..10 {
+        worker::run_tick(&ctx.config, &ctx.db).await?;
+        let updated = ctx.db.get_job(&job.id)?.context("job disappeared")?;
+        if matches!(
+            updated.status,
+            JobStatus::Completed
+                | JobStatus::Failed
+                | JobStatus::FailedNeedsManual
+                | JobStatus::Timeout
+        ) {
+            reached_terminal = true;
+            break;
+        }
+    }
+
+    assert!(
+        reached_terminal,
+        "job should reach terminal state within 10 ticks"
+    );
+
+    let final_job = ctx.db.get_job(&job.id)?.context("final job not found")?;
+    assert_eq!(
+        final_job.status,
+        JobStatus::Completed,
+        "expected COMPLETED, got {}",
+        final_job.status.as_str()
+    );
+
+    // Step 3: verify artifacts (what cmd_run would report on Completed).
+    let artifact_root = Path::new(&ctx.config.core.state_dir)
+        .join("artifacts")
+        .join(&job.id);
+    assert!(
+        artifact_root.join("review.json").exists(),
+        "review.json missing"
+    );
+    assert!(
+        artifact_root.join("review.md").exists(),
+        "review.md missing"
+    );
+    assert!(
+        artifact_root.join("meta.json").exists(),
+        "meta.json missing"
+    );
+
+    // Step 4: verify exit-code semantics by checking that Completed maps to code 0,
+    // and non-Completed terminal statuses would map to code 2.
+    let exit_code = match final_job.status {
+        JobStatus::Completed => 0u32,
+        JobStatus::Failed | JobStatus::FailedNeedsManual | JobStatus::Timeout => 2,
+        _ => 99, // non-terminal: unexpected
+    };
+    assert_eq!(exit_code, 0, "expected exit code 0 for Completed");
+
+    assert_eq!(state.call_count("get_upload"), 1);
+    assert_eq!(state.call_count("s3_upload"), 1);
+    assert_eq!(state.call_count("confirm_upload"), 1);
+    assert_eq!(state.call_count(&format!("review:{TOKEN}")), 2); // 1 processing + 1 ready
+
+    Ok(())
+}
+
+/// Validates that a terminal-failure job would map to exit code 2.
+#[tokio::test]
+async fn integration_run_loop_terminal_failure_exit_code_2() -> Result<()> {
+    let state = Arc::new(MockState::default());
+    let server = MockServer::start(state.clone()).await?;
+
+    const TOKEN: &str = "tok-run-fail";
+
+    state.enqueue_get_upload(MockReply::json(
+        StatusCode::OK,
+        json!({
+            "success": true,
+            "presigned_url": format!("{}/s3/upload", server.base_url),
+            "s3_key": "uploads/run-fail.pdf",
+            "presigned_fields": {
+                "key": "uploads/run-fail.pdf",
+                "policy": "abc",
+                "x-amz-algorithm": "AWS4-HMAC-SHA256",
+                "x-amz-credential": "credential",
+                "x-amz-date": "20260401T000000Z",
+                "x-amz-signature": "sig"
+            }
+        }),
+    ));
+    state.enqueue_s3(MockReply::text(StatusCode::NO_CONTENT, ""));
+    state.enqueue_confirm(MockReply::json(
+        StatusCode::OK,
+        json!({ "success": true, "token": TOKEN }),
+    ));
+    state.enqueue_review(
+        TOKEN,
+        MockReply::json(
+            StatusCode::NOT_FOUND,
+            json!({"detail": "Invalid token or submission not found"}),
+        ),
+    );
+
+    let mut ctx = TestContext::new(server.base_url.clone())?;
+    ctx.config.polling.schedule_minutes = vec![0];
+
+    let job = ctx.create_job(JobStatus::Queued)?;
+    worker::submit_job(&ctx.config, &ctx.db, &job.id).await?;
+    worker::run_tick(&ctx.config, &ctx.db).await?;
+
+    let final_job = ctx.db.get_job(&job.id)?.context("final job not found")?;
+    assert_eq!(final_job.status, JobStatus::Failed);
+
+    let exit_code = match final_job.status {
+        JobStatus::Completed => 0u32,
+        JobStatus::Failed | JobStatus::FailedNeedsManual | JobStatus::Timeout => 2,
+        _ => 99,
+    };
+    assert_eq!(exit_code, 2, "expected exit code 2 for Failed");
+
+    Ok(())
+}

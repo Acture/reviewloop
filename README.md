@@ -30,31 +30,54 @@ If you want reliable, low-drama automation for `paperreview.ai`, this is the too
 ## 1-Minute Quick Start
 
 ```bash
-# 1) install (choose one)
-# after public release
-brew tap acture/ac && brew install reviewloop
-# OR
-cargo install reviewloop
-
-# 2) initialize global paths + current repo project config
+# 1) one-time machine setup
 reviewloop init
+
+# 2) for any repo, one-time project setup
 reviewloop init project --project-id main
 
-# 3) register paper (--backend defaults to project.default_backend, then "stanford")
+# 3) submit + watch a paper come back, all at once
+reviewloop run paper/main.pdf
+```
+
+`reviewloop run` registers the paper if it isn't already in the project config, submits
+it immediately with force, then drives a live polling loop until the review lands.
+
+Exit codes: `0` = review complete, `2` = terminal failure, `130` = Ctrl+C.
+
+Optional flags:
+
+```bash
+reviewloop run paper/main.pdf \
+  --paper-id main \        # override the default (filename stem)
+  --backend stanford \     # override the default backend
+  --watch false \          # disable PDF-change watching for this paper
+  --tag-trigger "review-stanford/main/*" \  # custom tag trigger
+  --quiet                  # suppress live status; print only the final line
+```
+
+## Long-running Setup (Multiple Papers, Automation)
+
+For daemon-based automation with multiple papers and Git-tag triggers:
+
+```bash
+# register a paper manually
 reviewloop paper add \
   --paper-id main \
   --path paper/main.pdf
 
-# 4) optional: add a custom git-tag trigger for this paper
+# optional: add a custom git-tag trigger for a second paper
 reviewloop paper add \
   --paper-id camera_ready \
   --path build/camera_ready.pdf \
   --tag-trigger "custom-review/camera_ready/*"
 
-# 5) submit and run daemon
-# `paper add` will prompt whether to submit immediately
+# install and start the background daemon (macOS)
 reviewloop daemon install --start true
 ```
+
+The daemon runs every 30 seconds, handles retries, token ingestion, and retention pruning
+automatically. Use `reviewloop status` and `reviewloop check` to monitor it.
 
 ## Installation
 
@@ -98,6 +121,33 @@ cargo build --release
 ./target/release/reviewloop --help
 ```
 
+### Menu bar companion (optional, macOS)
+
+`reviewloop-bar` is a small menu-bar app that surfaces the current
+state of your active jobs without keeping a terminal open. It is
+read-only against the same SQLite database the daemon writes to and
+triggers actions by spawning `reviewloop` subcommands.
+
+Build and install separately:
+
+```bash
+cargo install --path . --bin reviewloop-bar --features bar
+```
+
+Run:
+
+```bash
+reviewloop-bar &
+```
+
+The bar is opt-in (gated behind the `bar` Cargo feature) so headless
+servers and CI continue to build the standard `reviewloop` binary
+without the GUI dependencies.
+
+> **Note:** The menu bar companion has no automated integration tests
+> (it is GUI-bound). Manual smoke-testing on macOS is the verification
+> path for v1.
+
 ## Command Surface
 
 Global usage:
@@ -111,6 +161,7 @@ Core commands:
 ```bash
 reviewloop init
 reviewloop init project --project-id <id> [--project-root <path>] [--force]
+reviewloop run <pdf-path> [--paper-id <id>] [--backend <backend>] [--watch true|false] [--tag-trigger "<pattern>"] [--quiet]
 reviewloop paper add --paper-id <id> --path <pdf-or-build-artifact> [--backend <backend>] [--watch true|false] [--tag-trigger "<pattern>"] [--submit-now] [--no-submit-prompt]
 reviewloop paper watch --paper-id <id> --enabled <true|false>
 reviewloop paper remove --paper-id <id> [--purge-history]
