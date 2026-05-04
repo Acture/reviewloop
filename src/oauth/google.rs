@@ -472,7 +472,7 @@ impl OauthProvider for GoogleOauthProvider {
                 .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
                 .request_async(&http_client)
                 .await
-                .context("failed to refresh google access token")?
+                .context("google oauth: token exchange HTTP request failed (no client secret)")?
         } else {
             BasicClient::new(ClientId::new(self.cfg.client_id.clone()))
                 .set_client_secret(ClientSecret::new(self.cfg.client_secret.0.clone()))
@@ -483,7 +483,7 @@ impl OauthProvider for GoogleOauthProvider {
                 .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
                 .request_async(&http_client)
                 .await
-                .context("failed to refresh google access token")?
+                .context("google oauth: token exchange HTTP request failed (client secret)")?
         };
 
         let scope = token.scopes().map(|scopes| {

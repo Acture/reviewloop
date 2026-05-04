@@ -1332,6 +1332,32 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
             })
             .unwrap_or_default();
 
+        // Surface a recent Gmail OAuth refresh failure (U6).  Use a 1-hour
+        // freshness window: OAuth tokens typically stay broken until the user
+        // re-authorises, unlike transient tick errors which resolve on the
+        // next tick.  Skipped in --json output (small UX touch only).
+        let gmail_oauth_stale: Option<chrono::DateTime<Utc>> = db.and_then(|d| {
+            if project_id.is_empty() {
+                return None;
+            }
+            let ev = match d.most_recent_event_of_type(project_id, "gmail_oauth_refresh_failed") {
+                Ok(opt) => opt?,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        project_id,
+                        "failed to read last gmail_oauth_refresh_failed event for daemon status"
+                    );
+                    return None;
+                }
+            };
+            let age = now - ev.created_at;
+            if age > chrono::Duration::hours(1) {
+                return None;
+            }
+            Some(ev.created_at)
+        });
+
         if as_json {
             let jobs_json: Vec<serde_json::Value> = active_jobs
                 .iter()
@@ -1406,6 +1432,12 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
             None => {
                 println!("  last tick error: none");
             }
+        }
+        if let Some(ts) = gmail_oauth_stale {
+            println!(
+                "  gmail oauth: stale (refresh failed at {}); run 'reviewloop email login --provider google' to re-authorize",
+                ts.format("%Y-%m-%dT%H:%M:%SZ")
+            );
         }
 
         println!();

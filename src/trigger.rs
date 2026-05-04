@@ -9,7 +9,12 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use regex::Regex;
 use serde_json::json;
-use std::{path::Path, process::Command};
+use std::{
+    collections::HashSet,
+    path::Path,
+    process::Command,
+    sync::{Mutex, OnceLock},
+};
 use tracing::warn;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +84,17 @@ pub fn run_git_tag_trigger(config: &Config, db: &Db) -> Result<()> {
     Ok(())
 }
 
+// Per-process set of paper IDs for which a missing-PDF warning has already
+// been emitted.  We log the warning and write the `pdf_missing` event only
+// once per paper per process lifetime (option b from the design notes) to
+// avoid spamming the event table every 30-second tick.
+//
+// Trade-off: if the file reappears and then goes missing again without a
+// daemon restart, the second disappearance will be silent.  Acceptable given
+// the use-case (reorganised repo); a `daemon stop && daemon start` resets the
+// set.
+static PDF_MISSING_WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
 pub fn run_pdf_trigger(config: &Config, db: &Db) -> Result<()> {
     if !config.trigger.pdf.enabled {
         return Ok(());
@@ -92,6 +108,21 @@ pub fn run_pdf_trigger(config: &Config, db: &Db) -> Result<()> {
     {
         let path = Path::new(&paper.pdf_path);
         if !path.exists() {
+            let guard = PDF_MISSING_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+            let mut seen = guard.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.insert(paper.id.clone()) {
+                tracing::warn!(
+                    paper_id = %paper.id,
+                    path = %paper.pdf_path,
+                    "configured PDF not found; skipping until file appears"
+                );
+                db.add_event(
+                    Some(&config.project_id),
+                    None,
+                    "pdf_missing",
+                    json!({"paper_id": paper.id, "path": paper.pdf_path}),
+                )?;
+            }
             continue;
         }
 
@@ -538,6 +569,67 @@ mod tests {
             db.list_status_views(&config.project_id, Some("main"))?
                 .is_empty()
         );
+        Ok(())
+    }
+
+    /// U4 regression: a missing PDF must emit a `pdf_missing` event exactly
+    /// once per paper per process lifetime, no matter how many ticks fire.
+    #[test]
+    fn pdf_trigger_emits_pdf_missing_event_once_for_missing_file() -> anyhow::Result<()> {
+        // Use a project/paper ID that is unique to this test to avoid
+        // colliding with the process-global PDF_MISSING_WARNED HashSet that
+        // other tests might have already populated.
+        let tmp = tempfile::tempdir()?;
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir)?;
+
+        let mut config = Config {
+            project_id: "proj-u4-pdf-missing".to_string(),
+            ..Config::default()
+        };
+        config.core.state_dir = state_dir.to_string_lossy().to_string();
+        config.trigger.pdf.enabled = true;
+        config.providers.stanford.email = "test@example.edu".to_string();
+
+        // Point to a path that will never exist.
+        let missing = tmp.path().join("does-not-exist-u4.pdf");
+        config.papers = vec![PaperConfig {
+            id: "u4-missing-paper".to_string(),
+            pdf_path: missing.to_string_lossy().to_string(),
+            backend: "stanford".to_string(),
+            venue: None,
+        }];
+
+        let db = Db::new(Path::new(&config.core.state_dir));
+        db.init_schema()?;
+
+        // Simulate three daemon ticks.
+        run_pdf_trigger(&config, &db)?;
+        run_pdf_trigger(&config, &db)?;
+        run_pdf_trigger(&config, &db)?;
+
+        // The `pdf_missing` event must have been recorded.
+        let ev = db
+            .most_recent_event_of_type(&config.project_id, "pdf_missing")?
+            .expect("expected a pdf_missing event after ticks with missing file");
+        assert_eq!(
+            ev.payload.get("paper_id").and_then(|v| v.as_str()),
+            Some("u4-missing-paper"),
+        );
+
+        // Only one event must have been written (HashSet dedup).
+        let timeline = db.list_timeline_events(&config.project_id, "u4-missing-paper")?;
+        let missing_events: Vec<_> = timeline
+            .iter()
+            .filter(|e| e.event_type == "pdf_missing")
+            .collect();
+        assert_eq!(
+            missing_events.len(),
+            1,
+            "pdf_missing must be written exactly once per process lifetime per paper; got {}",
+            missing_events.len()
+        );
+
         Ok(())
     }
 }

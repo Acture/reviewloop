@@ -299,6 +299,7 @@ mod gmail_impl {
         engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
     };
     use serde::Deserialize;
+    use serde_json::json;
 
     #[derive(Debug, Deserialize)]
     struct GmailListResponse {
@@ -348,7 +349,18 @@ mod gmail_impl {
         let access_token = match oauth::ensure_valid_access_token(&provider).await {
             Ok(token) => token,
             Err(err) => {
-                tracing::warn!(error = %err, "gmail oauth not ready; skipping gmail poll");
+                tracing::warn!(
+                    error = %err,
+                    "gmail oauth refresh failed; email ingestion paused this tick"
+                );
+                // Surface the failure as a db event so `daemon status` can
+                // highlight it without requiring the user to check logs.
+                let _ = db.add_event(
+                    Some(&config.project_id),
+                    None,
+                    "gmail_oauth_refresh_failed",
+                    json!({"error": err.to_string()}),
+                );
                 return Ok(vec![]);
             }
         };
@@ -720,5 +732,54 @@ mod tests {
         assert_eq!(updated.status, JobStatus::Completed);
         assert_eq!(updated.attempt, 3);
         assert_eq!(updated.next_poll_at, Some(far_future));
+    }
+
+    /// U6 regression: when the Gmail OAuth token is absent (simulates a
+    /// revoked / missing refresh token), `poll_gmail_if_enabled` must write a
+    /// `gmail_oauth_refresh_failed` event so `daemon status` can surface it.
+    #[tokio::test]
+    async fn gmail_poll_writes_oauth_refresh_failed_event_on_error() {
+        use crate::config::{Config, GmailOauthConfig};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).expect("create state_dir");
+
+        // Point to a token file that does not exist — ensure_valid_access_token
+        // returns Err("no oauth token found …") which is the same error path
+        // as a revoked refresh token.
+        let token_path = tmp.path().join("no_token.json");
+
+        let mut config = Config {
+            project_id: "proj-u6-gmail".to_string(),
+            ..Config::default()
+        };
+        config.core.state_dir = state_dir.to_string_lossy().to_string();
+        config.gmail_oauth = Some(GmailOauthConfig {
+            enabled: true,
+            client_id: "dummy-client-id-u6".to_string(),
+            token_store_path: Some(token_path.to_string_lossy().to_string()),
+            ..GmailOauthConfig::default()
+        });
+
+        let db = Db::new_in_memory("email_u6_oauth_refresh").expect("in-memory db");
+        db.init_schema().expect("init schema");
+
+        // Should succeed (returns Ok with empty vec) and write the event.
+        let result = super::gmail_impl::poll_gmail_if_enabled(&config, &db).await;
+        assert!(
+            result.is_ok(),
+            "poll must not propagate the error: {result:?}"
+        );
+        assert!(result.unwrap().is_empty());
+
+        let ev = db
+            .most_recent_event_of_type(&config.project_id, "gmail_oauth_refresh_failed")
+            .expect("db query")
+            .expect("expected gmail_oauth_refresh_failed event");
+        assert!(
+            ev.payload.get("error").is_some(),
+            "event payload must contain an 'error' field"
+        );
     }
 }
