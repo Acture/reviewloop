@@ -435,6 +435,31 @@ impl Db {
         .map_err(Into::into)
     }
 
+    pub fn list_active_jobs_for_paper(&self, project_id: &str, paper_id: &str) -> Result<Vec<Job>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT *
+            FROM jobs
+            WHERE project_id = ?1
+              AND paper_id = ?2
+              AND status IN (?3, ?4, ?5)
+            ORDER BY created_at DESC
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                paper_id,
+                JobStatus::Queued.as_str(),
+                JobStatus::Submitted.as_str(),
+                JobStatus::Processing.as_str(),
+            ],
+            map_job_row,
+        )?;
+        collect_rows(rows)
+    }
+
     pub fn latest_hash_for_paper(
         &self,
         project_id: &str,
@@ -902,6 +927,47 @@ impl Db {
 
         tx.commit()?;
         Ok(report)
+    }
+
+    /// Returns active (QUEUED, SUBMITTED, PROCESSING) jobs for a project, oldest first.
+    pub fn list_active_jobs_for_project(&self, project_id: &str) -> Result<Vec<Job>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT *
+            FROM jobs
+            WHERE project_id = ?1
+              AND status IN (?2, ?3, ?4)
+            ORDER BY created_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                JobStatus::Queued.as_str(),
+                JobStatus::Submitted.as_str(),
+                JobStatus::Processing.as_str(),
+            ],
+            map_job_row,
+        )?;
+        collect_rows(rows)
+    }
+
+    /// Returns the `created_at` timestamp of the most recent event for a project.
+    /// Used as a proxy for "last daemon tick time" since no explicit tick events are stored.
+    pub fn most_recent_event_created_at(&self, project_id: &str) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.connect()?;
+        let ts: Option<String> = conn
+            .query_row(
+                "SELECT created_at FROM events WHERE project_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        ts.as_deref()
+            .map(parse_rfc3339)
+            .transpose()
+            .context("invalid created_at in events table")
     }
 
     pub fn status_counts(&self, project_id: &str) -> Result<BTreeMap<String, usize>> {

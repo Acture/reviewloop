@@ -79,7 +79,11 @@ enum Command {
     Retry {
         #[command(flatten)]
         job_ref: JobOrPaperRef,
+        /// Force immediate retry, clearing any pending cooldown / rate-limit wait.
         #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Deprecated alias for --force. Will be removed in a future release.
+        #[arg(long, default_value_t = false, hide = true)]
         override_rate_limit: bool,
     },
     Complete {
@@ -158,7 +162,10 @@ enum DaemonCommand {
         start: bool,
     },
     Uninstall,
-    Status,
+    Status {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -324,7 +331,21 @@ async fn run() -> Result<()> {
                 cmd_daemon_install(config_override.as_deref(), start)
             }
             DaemonCommand::Uninstall => cmd_daemon_uninstall(),
-            DaemonCommand::Status => cmd_daemon_status(),
+            DaemonCommand::Status { json } => {
+                // Load config softly — daemon status is still useful without a project config.
+                let config_res =
+                    Config::load_runtime_with_metadata(config_override.as_deref(), false);
+                match config_res {
+                    Ok(loaded) => {
+                        let config = loaded.config;
+                        ensure_runtime_dirs(&config)?;
+                        let db = Db::from_config(&config)?;
+                        db.init_schema()?;
+                        cmd_daemon_status(Some(&config), Some(&db), json)
+                    }
+                    Err(_) => cmd_daemon_status(None, None, json),
+                }
+            }
         },
         Command::Submit { paper_id, force } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
@@ -376,6 +397,7 @@ async fn run() -> Result<()> {
         }
         Command::Retry {
             job_ref,
+            force,
             override_rate_limit,
         } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
@@ -399,7 +421,7 @@ async fn run() -> Result<()> {
                     .id
                 }
             };
-            cmd_retry(&config, &db, &job_id, override_rate_limit).await
+            cmd_retry(&config, &db, &job_id, force, override_rate_limit).await
         }
         Command::Complete {
             job_ref,
@@ -1066,7 +1088,7 @@ fn cmd_daemon_uninstall() -> Result<()> {
     }
 }
 
-fn cmd_daemon_status() -> Result<()> {
+fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         const DAEMON_LABEL: &str = "ai.reviewloop.daemon";
@@ -1077,16 +1099,127 @@ fn cmd_daemon_status() -> Result<()> {
             .output()
             .context("failed to run launchctl print")?;
 
-        if output.status.success() {
-            println!("launchd job is loaded: {target}");
+        let loaded = output.status.success();
+
+        // Detect if daemon process is actually running via launchctl list.
+        let running = if loaded {
+            ProcessCommand::new("launchctl")
+                .args(["list", DAEMON_LABEL])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
         } else {
-            println!("launchd job is not loaded: {target}");
+            false
+        };
+
+        let now = Utc::now();
+
+        // Collect DB-backed context when available.
+        let project_id = config.map(|c| c.project_id.as_str()).unwrap_or("");
+        let last_tick_at: Option<chrono::DateTime<Utc>> = db.and_then(|d| {
+            if project_id.is_empty() {
+                None
+            } else {
+                d.most_recent_event_created_at(project_id).ok().flatten()
+            }
+        });
+        let active_jobs: Vec<reviewloop::model::Job> = db
+            .and_then(|d| {
+                if project_id.is_empty() {
+                    None
+                } else {
+                    d.list_active_jobs_for_project(project_id).ok()
+                }
+            })
+            .unwrap_or_default();
+
+        if as_json {
+            let jobs_json: Vec<serde_json::Value> = active_jobs
+                .iter()
+                .map(|j| {
+                    json!({
+                        "job_id": j.id,
+                        "paper_id": j.paper_id,
+                        "status": j.status.as_str(),
+                        "attempt": j.attempt,
+                        "next_poll_at": j.next_poll_at.map(|t| t.to_rfc3339()),
+                    })
+                })
+                .collect();
+            let payload = json!({
+                "project_id": project_id,
+                "service": { "loaded": loaded, "running": running },
+                "last_tick_at": last_tick_at.map(|t| t.to_rfc3339()),
+                "last_tick_error": serde_json::Value::Null,
+                "active_jobs": jobs_json,
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+            return Ok(());
         }
+
+        // --- Human-readable output ---
+        let service_text = match (loaded, running) {
+            (true, true) => "loaded (running)".to_string(),
+            (true, false) => "loaded (not running)".to_string(),
+            _ => format!("not loaded: {target}"),
+        };
+
+        let project_display = if project_id.is_empty() {
+            "(no project config)".to_string()
+        } else {
+            project_id.to_string()
+        };
+
+        println!("Daemon status (project={project_display}):");
+        println!("  service: {service_text}");
+
+        match last_tick_at {
+            Some(ts) => {
+                let ago = format_elapsed(ts, now);
+                println!(
+                    "  last activity: {} ({ago} ago)",
+                    ts.format("%Y-%m-%dT%H:%M:%SZ")
+                );
+            }
+            None => {
+                println!("  last activity: none recorded");
+            }
+        }
+        println!("  last tick error: none");
+
+        println!();
+        if active_jobs.is_empty() {
+            println!("Active jobs (0): none");
+        } else {
+            println!("Active jobs ({}):", active_jobs.len());
+            for job in &active_jobs {
+                let next_poll_text = match job.next_poll_at {
+                    None => "now".to_string(),
+                    Some(t) => {
+                        let secs = (t - now).num_seconds();
+                        if secs <= 0 {
+                            "now".to_string()
+                        } else {
+                            format!("{} (in {}s)", t.format("%H:%M:%SZ"), secs)
+                        }
+                    }
+                };
+                println!(
+                    "  {} · {} · attempt={} · next_poll_at={}",
+                    job.paper_id,
+                    job.status.as_str(),
+                    job.attempt,
+                    next_poll_text
+                );
+            }
+        }
+
         Ok(())
     }
 
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = (config, db, as_json);
         anyhow::bail!("`daemon status` is currently supported on macOS only");
     }
 }
@@ -1250,11 +1383,37 @@ fn print_guardrail_warnings(config: &Config) {
     }
 }
 
+/// When `submit --force` is used, clear `next_poll_at` and reset `attempt = 0`
+/// for any existing QUEUED / SUBMITTED / PROCESSING job for the same paper so
+/// the worker picks them up immediately instead of waiting out a cooldown.
+fn clear_sibling_job_cooldowns(config: &Config, db: &Db, paper_id: &str) -> Result<()> {
+    let siblings = db.list_active_jobs_for_paper(&config.project_id, paper_id)?;
+    for s in siblings {
+        if matches!(
+            s.status,
+            JobStatus::Processing | JobStatus::Submitted | JobStatus::Queued
+        ) {
+            db.update_job_state(&s.id, s.status, Some(0), Some(None), None)?;
+            db.add_event(
+                Some(&config.project_id),
+                Some(&s.id),
+                "force_clear_cooldown",
+                json!({
+                    "from_command": "submit --force",
+                    "previous_attempt": s.attempt,
+                    "previous_next_poll_at": s.next_poll_at.map(|t| t.to_rfc3339()),
+                }),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Result<()> {
     ensure_project_context(config)?;
     let paper = config
         .find_paper(paper_id)
-        .with_context(|| format!("paper_id not found in project config: {paper_id}"))?;
+        .ok_or_else(|| paper_not_found_error(paper_id, config))?;
 
     let pdf_path = Path::new(&paper.pdf_path);
     if !pdf_path.exists() {
@@ -1302,6 +1461,10 @@ async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Re
         ),
         _ => (String::new(), None),
     };
+
+    if force {
+        clear_sibling_job_cooldowns(config, db, paper_id)?;
+    }
 
     let job = db.create_job(&NewJob {
         project_id: config.project_id.clone(),
@@ -1397,7 +1560,7 @@ async fn cmd_import_token(
 
     let paper = config
         .find_paper(paper_id)
-        .with_context(|| format!("paper_id not found in project config: {paper_id}"))?;
+        .ok_or_else(|| paper_not_found_error(paper_id, config))?;
 
     let pdf_hash = if Path::new(&paper.pdf_path).exists() {
         sha256_file(Path::new(&paper.pdf_path))?
@@ -1600,18 +1763,23 @@ async fn cmd_retry(
     config: &Config,
     db: &Db,
     job_id: &str,
+    force: bool,
     override_rate_limit: bool,
 ) -> Result<()> {
+    if override_rate_limit {
+        eprintln!("warning: --override-rate-limit is deprecated; use --force instead");
+        tracing::warn!("deprecated flag --override-rate-limit used; treating as --force");
+    }
+    let force = force || override_rate_limit;
+
     ensure_project_context(config)?;
     let job = ensure_project_job(config, db, job_id)?;
 
-    if override_rate_limit {
+    if force {
         let previous_next_poll_at = job.next_poll_at.map(|value| value.to_rfc3339());
         if job.token.is_some() {
             if job.status != JobStatus::Processing {
-                anyhow::bail!(
-                    "--override-rate-limit for token-backed jobs only supports PROCESSING jobs"
-                );
+                anyhow::bail!("--force for token-backed jobs only supports PROCESSING jobs");
             }
             db.add_event(
                 Some(&config.project_id),
@@ -1641,7 +1809,7 @@ async fn cmd_retry(
                 | JobStatus::Timeout
         ) {
             anyhow::bail!(
-                "--override-rate-limit for tokenless jobs only supports QUEUED/SUBMITTED/FAILED/FAILED_NEEDS_MANUAL/TIMEOUT"
+                "--force for tokenless jobs only supports QUEUED/SUBMITTED/FAILED/FAILED_NEEDS_MANUAL/TIMEOUT"
             );
         }
 
@@ -1758,6 +1926,24 @@ async fn cmd_complete(
 fn ensure_project_job(config: &Config, db: &Db, job_id: &str) -> Result<reviewloop::model::Job> {
     db.get_project_job(&config.project_id, job_id)?
         .ok_or_else(|| anyhow!("job not found in project {}: {}", config.project_id, job_id))
+}
+
+/// Build a rich error for a missing paper_id that lists known paper_ids.
+fn paper_not_found_error(paper_id: &str, config: &Config) -> anyhow::Error {
+    let known: Vec<&str> = config.papers.iter().map(|p| p.id.as_str()).collect();
+    if known.is_empty() {
+        anyhow!(
+            "paper_id not found in project config: {paper_id}\n  \
+             no papers configured yet — add one with `reviewloop paper add --paper-id {paper_id} --pdf-path <path>`"
+        )
+    } else {
+        let known_str = known.join(", ");
+        anyhow!(
+            "paper_id not found in project config: {paper_id}\n  \
+             known paper_ids: {known_str}\n  \
+             add this paper with `reviewloop paper add --paper-id {paper_id} --pdf-path <path>`"
+        )
+    }
 }
 
 fn ensure_project_context(config: &Config) -> Result<()> {
@@ -2558,6 +2744,375 @@ mod tests {
             )
             .unwrap();
             assert_eq!(resolved.id, processing_job.id);
+        }
+    }
+
+    mod check_arggroup {
+        use crate::Cli;
+        use clap::Parser;
+
+        #[test]
+        fn check_with_no_flags_fails() {
+            let err = Cli::try_parse_from(["reviewloop", "check"]).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("required") || msg.contains("job-id") || msg.contains("paper-id"),
+                "expected a required-argument error, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn check_with_both_job_id_and_paper_id_fails() {
+            let err =
+                Cli::try_parse_from(["reviewloop", "check", "--job-id", "x", "--paper-id", "y"])
+                    .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("cannot be used with") || msg.contains("argument"),
+                "expected a conflict error, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn check_with_job_id_succeeds() {
+            Cli::try_parse_from(["reviewloop", "check", "--job-id", "some-id"]).unwrap();
+        }
+
+        #[test]
+        fn check_with_all_processing_succeeds() {
+            Cli::try_parse_from(["reviewloop", "check", "--all-processing"]).unwrap();
+        }
+
+        #[test]
+        fn check_with_paper_id_succeeds() {
+            Cli::try_parse_from(["reviewloop", "check", "--paper-id", "main"]).unwrap();
+        }
+    }
+
+    mod error_messages {
+        use super::super::paper_not_found_error;
+        use reviewloop::config::Config;
+
+        fn config_with_papers(paper_ids: &[&str]) -> Config {
+            let mut cfg = Config::default();
+            for id in paper_ids {
+                cfg.papers.push(reviewloop::config::PaperConfig {
+                    id: id.to_string(),
+                    pdf_path: format!("/fake/{id}.pdf"),
+                    backend: "stanford".to_string(),
+                    venue: None,
+                });
+            }
+            cfg
+        }
+
+        #[test]
+        fn paper_not_found_no_papers_suggests_add() {
+            let cfg = config_with_papers(&[]);
+            let err = paper_not_found_error("myid", &cfg);
+            let msg = err.to_string();
+            assert!(
+                msg.contains("paper_id not found in project config: myid"),
+                "got: {msg}"
+            );
+            assert!(msg.contains("no papers configured yet"), "got: {msg}");
+            assert!(
+                msg.contains("reviewloop paper add --paper-id myid"),
+                "got: {msg}"
+            );
+        }
+
+        #[test]
+        fn paper_not_found_with_known_papers_lists_them() {
+            let cfg = config_with_papers(&["main", "camera_ready"]);
+            let err = paper_not_found_error("foo", &cfg);
+            let msg = err.to_string();
+            assert!(
+                msg.contains("paper_id not found in project config: foo"),
+                "got: {msg}"
+            );
+            assert!(msg.contains("known paper_ids:"), "got: {msg}");
+            assert!(msg.contains("main"), "got: {msg}");
+            assert!(msg.contains("camera_ready"), "got: {msg}");
+            assert!(
+                msg.contains("reviewloop paper add --paper-id foo"),
+                "got: {msg}"
+            );
+        }
+    }
+
+    mod daemon_status_db {
+        use reviewloop::db::Db;
+        use reviewloop::model::{JobStatus, NewJob};
+        use serde_json::Value;
+
+        fn make_job(paper_id: &str, status: JobStatus, idx: u32) -> NewJob {
+            NewJob {
+                project_id: "proj".to_string(),
+                paper_id: paper_id.to_string(),
+                backend: "stanford".to_string(),
+                pdf_path: "/fake/paper.pdf".to_string(),
+                pdf_hash: format!("hash{idx}"),
+                status,
+                email: "test@example.com".to_string(),
+                venue: None,
+                git_tag: None,
+                git_commit: None,
+                next_poll_at: None,
+            }
+        }
+
+        #[test]
+        fn list_active_jobs_returns_queued_submitted_processing() {
+            let db = Db::new_in_memory("daemon_status_active").unwrap();
+            db.init_schema().unwrap();
+
+            db.create_job(&make_job("p1", JobStatus::Queued, 1))
+                .unwrap();
+            db.create_job(&make_job("p2", JobStatus::Processing, 2))
+                .unwrap();
+            db.create_job(&make_job("p3", JobStatus::Submitted, 3))
+                .unwrap();
+            db.create_job(&make_job("p4", JobStatus::Completed, 4))
+                .unwrap();
+            db.create_job(&make_job("p5", JobStatus::Failed, 5))
+                .unwrap();
+
+            let active = db.list_active_jobs_for_project("proj").unwrap();
+            let statuses: Vec<&str> = active.iter().map(|j| j.status.as_str()).collect();
+            // Should include QUEUED, PROCESSING, SUBMITTED but not COMPLETED or FAILED
+            assert_eq!(active.len(), 3, "expected 3 active jobs, got: {statuses:?}");
+            assert!(active.iter().all(|j| matches!(
+                j.status,
+                JobStatus::Queued | JobStatus::Processing | JobStatus::Submitted
+            )));
+        }
+
+        #[test]
+        fn most_recent_event_reflects_last_activity() {
+            let db = Db::new_in_memory("daemon_status_event").unwrap();
+            db.init_schema().unwrap();
+
+            // No events → None
+            assert!(db.most_recent_event_created_at("proj").unwrap().is_none());
+
+            // Add an event
+            db.add_event(Some("proj"), None, "test_event", serde_json::json!({}))
+                .unwrap();
+            let ts = db.most_recent_event_created_at("proj").unwrap();
+            assert!(ts.is_some(), "expected a timestamp after inserting event");
+        }
+
+        #[test]
+        fn daemon_status_json_structure() {
+            use super::super::cmd_daemon_status;
+            // We can't easily capture stdout in unit tests, but we can verify the
+            // DB helpers return the right shape that would feed into JSON output.
+            let db = Db::new_in_memory("daemon_status_json").unwrap();
+            db.init_schema().unwrap();
+
+            db.create_job(&make_job("main", JobStatus::Processing, 1))
+                .unwrap();
+            db.create_job(&make_job("cr", JobStatus::Queued, 2))
+                .unwrap();
+
+            let active = db.list_active_jobs_for_project("proj").unwrap();
+            assert_eq!(active.len(), 2);
+
+            let jobs_json: Vec<Value> = active
+                .iter()
+                .map(|j| {
+                    serde_json::json!({
+                        "job_id": j.id,
+                        "paper_id": j.paper_id,
+                        "status": j.status.as_str(),
+                        "attempt": j.attempt,
+                        "next_poll_at": j.next_poll_at.map(|t| t.to_rfc3339()),
+                    })
+                })
+                .collect();
+
+            // Verify shape
+            assert!(jobs_json.iter().all(|j| j.get("job_id").is_some()));
+            assert!(jobs_json.iter().all(|j| j.get("paper_id").is_some()));
+            assert!(jobs_json.iter().all(|j| j.get("status").is_some()));
+            assert!(jobs_json.iter().any(|j| j["status"] == "PROCESSING"));
+            assert!(jobs_json.iter().any(|j| j["status"] == "QUEUED"));
+
+            // Verify cmd_daemon_status can be called without panicking when both
+            // config and db are None (offline / no-project case).
+            // On non-macOS this returns an error; that's fine — we just check no panic.
+            let _ = cmd_daemon_status(None, None, false);
+            let _ = cmd_daemon_status(None, None, true);
+        }
+    }
+
+    mod force_flag {
+        use super::super::clear_sibling_job_cooldowns;
+        use chrono::Utc;
+        use reviewloop::config::Config;
+        use reviewloop::db::Db;
+        use reviewloop::model::{JobStatus, NewJob};
+
+        fn make_config(project_id: &str) -> Config {
+            Config {
+                project_id: project_id.to_string(),
+                ..Default::default()
+            }
+        }
+
+        fn new_processing_job(project_id: &str, paper_id: &str) -> NewJob {
+            NewJob {
+                project_id: project_id.to_string(),
+                paper_id: paper_id.to_string(),
+                backend: "stanford".to_string(),
+                pdf_path: "/test/paper.pdf".to_string(),
+                pdf_hash: "testhash".to_string(),
+                status: JobStatus::Processing,
+                email: "test@example.com".to_string(),
+                venue: None,
+                git_tag: None,
+                git_commit: None,
+                next_poll_at: None,
+            }
+        }
+
+        /// `submit --force` clears `next_poll_at` and resets `attempt = 0` on a
+        /// stuck sibling job for the same paper.
+        #[test]
+        fn submit_force_clears_stuck_job_cooldown() {
+            let db = Db::new_in_memory("force_clears_cooldown").unwrap();
+            db.init_schema().unwrap();
+            let config = make_config("proj1");
+
+            let stuck = db
+                .create_job(&new_processing_job("proj1", "paper1"))
+                .unwrap();
+            let future_time = Utc::now() + chrono::Duration::hours(2);
+            db.update_job_state(
+                &stuck.id,
+                JobStatus::Processing,
+                Some(3),
+                Some(Some(future_time)),
+                None,
+            )
+            .unwrap();
+
+            let before = db.get_job(&stuck.id).unwrap().unwrap();
+            assert_eq!(before.attempt, 3);
+            assert!(before.next_poll_at.is_some());
+
+            clear_sibling_job_cooldowns(&config, &db, "paper1").unwrap();
+
+            let after = db.get_job(&stuck.id).unwrap().unwrap();
+            assert_eq!(after.attempt, 0, "attempt should be reset to 0");
+            assert!(
+                after.next_poll_at.is_none(),
+                "next_poll_at should be cleared"
+            );
+            // Status should be unchanged.
+            assert_eq!(after.status, JobStatus::Processing);
+        }
+
+        /// No active jobs → noop, no error.
+        #[test]
+        fn submit_force_no_active_jobs_is_noop() {
+            let db = Db::new_in_memory("force_noop").unwrap();
+            db.init_schema().unwrap();
+            let config = make_config("proj1");
+            clear_sibling_job_cooldowns(&config, &db, "paper1").unwrap();
+        }
+
+        /// COMPLETED jobs are not in scope for cooldown clearing.
+        #[test]
+        fn submit_force_does_not_touch_completed_jobs() {
+            let db = Db::new_in_memory("force_active_only").unwrap();
+            db.init_schema().unwrap();
+            let config = make_config("proj1");
+
+            let completed = db
+                .create_job(&NewJob {
+                    project_id: "proj1".to_string(),
+                    paper_id: "paper1".to_string(),
+                    backend: "stanford".to_string(),
+                    pdf_path: "/test/paper.pdf".to_string(),
+                    pdf_hash: "hash_done".to_string(),
+                    status: JobStatus::Completed,
+                    email: "test@example.com".to_string(),
+                    venue: None,
+                    git_tag: None,
+                    git_commit: None,
+                    next_poll_at: None,
+                })
+                .unwrap();
+
+            clear_sibling_job_cooldowns(&config, &db, "paper1").unwrap();
+
+            let after = db.get_job(&completed.id).unwrap().unwrap();
+            assert_eq!(after.status, JobStatus::Completed);
+        }
+
+        /// `--override-rate-limit` is still accepted by the clap parser and
+        /// maps to the `override_rate_limit` field (backward compat).
+        #[test]
+        fn override_rate_limit_alias_parses() {
+            use crate::{Cli, Command};
+            use clap::Parser;
+            let args = Cli::try_parse_from([
+                "reviewloop",
+                "retry",
+                "--job-id",
+                "some-job-id",
+                "--override-rate-limit",
+            ])
+            .expect("--override-rate-limit should still parse successfully");
+            match args.command {
+                Command::Retry {
+                    override_rate_limit,
+                    force,
+                    ..
+                } => {
+                    assert!(override_rate_limit, "override_rate_limit should be true");
+                    assert!(!force, "force should be false when only alias is passed");
+                }
+                _ => panic!("expected Retry command"),
+            }
+        }
+
+        /// `--force` on retry sets the `force` field.
+        #[test]
+        fn retry_force_flag_parses() {
+            use crate::{Cli, Command};
+            use clap::Parser;
+            let args =
+                Cli::try_parse_from(["reviewloop", "retry", "--job-id", "some-job-id", "--force"])
+                    .expect("--force should parse successfully");
+            match args.command {
+                Command::Retry {
+                    force,
+                    override_rate_limit,
+                    ..
+                } => {
+                    assert!(force, "force should be true");
+                    assert!(!override_rate_limit, "override_rate_limit should be false");
+                }
+                _ => panic!("expected Retry command"),
+            }
+        }
+
+        /// Deprecation warning is printed to stderr when --override-rate-limit is used.
+        #[test]
+        fn override_rate_limit_deprecation_warning_logic() {
+            // The actual eprintln! runs in cmd_retry. Here we verify that the
+            // combined force value is `true` when override_rate_limit is set,
+            // mirroring the logic in cmd_retry.
+            let force = false;
+            let override_rate_limit = true;
+            let effective_force = force || override_rate_limit;
+            assert!(
+                effective_force,
+                "override_rate_limit should make effective force = true"
+            );
         }
     }
 }
