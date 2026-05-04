@@ -1482,9 +1482,9 @@ async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Re
     let (email, venue) = match paper.backend.as_str() {
         "stanford" => (
             email_account::resolve_submission_email(config, "stanford", None)?,
-            Some(config.effective_stanford_venue()),
+            config.venue_for(paper),
         ),
-        _ => (String::new(), None),
+        _ => (String::new(), config.venue_for(paper)),
     };
 
     if force {
@@ -1590,9 +1590,9 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
     let (email, venue) = match paper.backend.as_str() {
         "stanford" => (
             email_account::resolve_submission_email(&config, "stanford", None)?,
-            Some(config.effective_stanford_venue()),
+            config.venue_for(paper),
         ),
-        _ => (String::new(), None),
+        _ => (String::new(), config.venue_for(paper)),
     };
 
     // Force: clear cooldowns on any sibling jobs.

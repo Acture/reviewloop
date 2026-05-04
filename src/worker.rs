@@ -148,7 +148,7 @@ pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<()> {
             .clone()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
-            .or_else(|| Some(config.effective_stanford_venue())),
+            .or_else(|| config.venue_for(paper)),
         _ => job.venue.clone(),
     };
 
@@ -241,7 +241,13 @@ async fn handle_submit_error_with_fallback(
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(str::to_string)
-            .or_else(|| Some(config.effective_stanford_venue()));
+            .or_else(|| {
+                // Re-derive from the current paper config in case the user
+                // updated the venue between submit attempts.
+                config
+                    .find_paper(&job.paper_id)
+                    .and_then(|p| config.venue_for(p))
+            });
 
         match submit_with_node_playwright(
             Path::new(&config.providers.stanford.fallback_script),

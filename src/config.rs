@@ -229,20 +229,16 @@ impl Config {
         }
     }
 
-    pub fn effective_stanford_venue(&self) -> String {
-        self.providers
-            .stanford
-            .venue
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .unwrap_or("ICLR")
-            .to_string()
-    }
-
     /// Resolve the venue used when submitting / referencing this specific paper.
-    /// For `stanford`, falls back to the project default and finally to "ICLR";
-    /// for other backends, just returns the per-paper override (or `None`).
+    ///
+    /// The resolution chain is fully config-driven, with no hardcoded fallback:
+    /// `paper.venue → project.providers.stanford.venue → global.providers.stanford.venue`.
+    /// `Config::from_parts` materializes the second-and-third merge into
+    /// `self.providers.stanford.venue`, so this only needs to combine the
+    /// per-paper override with the merged project/global default.
+    ///
+    /// For non-stanford backends, only the per-paper override is consulted;
+    /// returns `None` if not set.
     pub fn venue_for(&self, paper: &PaperConfig) -> Option<String> {
         let per_paper = paper
             .venue
@@ -254,7 +250,14 @@ impl Config {
             return per_paper;
         }
         match paper.backend.as_str() {
-            "stanford" => Some(self.effective_stanford_venue()),
+            "stanford" => self
+                .providers
+                .stanford
+                .venue
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
             _ => None,
         }
     }
@@ -374,7 +377,13 @@ impl Config {
                     fallback_mode: global.providers.stanford.fallback_mode,
                     fallback_script: provider_fallback_script,
                     email: provider_email,
-                    venue: project.providers.stanford.venue,
+                    // Project venue overrides global venue. Per-paper overrides
+                    // are applied later in `Config::venue_for`.
+                    venue: project
+                        .providers
+                        .stanford
+                        .venue
+                        .or(global.providers.stanford.venue),
                 },
             },
             papers,
@@ -612,6 +621,9 @@ impl LegacyConfig {
                     fallback_mode: self.providers.stanford.fallback_mode.clone(),
                     fallback_script: self.providers.stanford.fallback_script.clone(),
                     email: self.providers.stanford.email.clone(),
+                    // Legacy global venue stayed empty; the per-project venue
+                    // (now migrated to project_config below) carries the value.
+                    venue: None,
                 },
             },
             imap: self.imap.clone(),
@@ -1061,6 +1073,12 @@ pub struct GlobalStanfordProviderConfig {
     pub fallback_mode: String,
     pub fallback_script: String,
     pub email: String,
+    /// The default venue used when neither the paper nor the project specifies
+    /// one. Lives in the global config so users can change "ICLR" once and
+    /// have every project pick it up. The runtime `Config` flattens the chain
+    /// `paper.venue → project.providers.stanford.venue → this` into
+    /// `Config.providers.stanford.venue`.
+    pub venue: Option<String>,
 }
 
 impl Default for GlobalStanfordProviderConfig {
@@ -1071,6 +1089,7 @@ impl Default for GlobalStanfordProviderConfig {
             fallback_mode: base.fallback_mode,
             fallback_script: base.fallback_script,
             email: base.email,
+            venue: Some("ICLR".to_string()),
         }
     }
 }
@@ -1081,7 +1100,7 @@ pub struct ProjectProvidersConfig {
     pub stanford: ProjectStanfordProviderConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectStanfordProviderConfig {
     /// Per-project submitter email. When set, overrides
@@ -1094,17 +1113,12 @@ pub struct ProjectStanfordProviderConfig {
     /// path is resolved relative to the project root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_script: Option<String>,
+    /// Per-project default venue. When set, overrides
+    /// `global.providers.stanford.venue`. When `None`, the global value is
+    /// used (which itself defaults to "ICLR" but is user-overridable in
+    /// `~/.config/reviewloop/config.toml`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub venue: Option<String>,
-}
-
-impl Default for ProjectStanfordProviderConfig {
-    fn default() -> Self {
-        Self {
-            email: None,
-            fallback_script: None,
-            venue: Some("ICLR".to_string()),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1428,7 +1442,7 @@ db_path = "db.sqlite"
     }
 
     #[test]
-    fn venue_for_resolves_per_paper_then_project_then_iclr() {
+    fn venue_for_resolves_per_paper_then_project_then_global() {
         // Per-paper venue wins
         let cfg = Config::merge_for_tests(
             GlobalConfigFile::default(),
@@ -1449,7 +1463,9 @@ db_path = "db.sqlite"
         let cfg = Config::merge_for_tests(GlobalConfigFile::default(), project);
         assert_eq!(cfg.venue_for(&cfg.papers[0]), Some("CVPR".to_string()));
 
-        // No per-paper, no project venue, stanford -> falls back to "ICLR"
+        // No per-paper, no project venue, stanford -> falls back to global
+        // default which ships as "ICLR" (but is user-overridable in the
+        // global config file -- see test below).
         let mut project = project_with(vec![paper_file("c", Some("stanford"), None)]);
         project.providers.stanford.venue = None;
         let cfg = Config::merge_for_tests(GlobalConfigFile::default(), project);
@@ -1474,6 +1490,53 @@ db_path = "db.sqlite"
             project_with(vec![paper_file("f", Some("custom"), Some("Foo"))]),
         );
         assert_eq!(cfg.venue_for(&cfg.papers[0]), Some("Foo".to_string()));
+    }
+
+    #[test]
+    fn venue_global_default_is_user_overridable() {
+        // Regression guard for the original "ICLR is hardcoded in code" smell:
+        // the global default venue MUST be a config value, not a string literal
+        // baked into Config::venue_for. A user (or a future Stanford default
+        // change) can flip it via ~/.config/reviewloop/config.toml without a
+        // recompile, and project-level / per-paper overrides still win.
+        let mut global = GlobalConfigFile::default();
+        global.providers.stanford.venue = Some("NeurIPS".to_string());
+
+        // Bare project: inherits the new global default.
+        let cfg = Config::merge_for_tests(
+            global.clone(),
+            project_with(vec![paper_file("a", Some("stanford"), None)]),
+        );
+        assert_eq!(cfg.venue_for(&cfg.papers[0]), Some("NeurIPS".to_string()));
+
+        // Project override still wins over global.
+        let mut project = project_with(vec![paper_file("b", Some("stanford"), None)]);
+        project.providers.stanford.venue = Some("CVPR".to_string());
+        let cfg = Config::merge_for_tests(global.clone(), project);
+        assert_eq!(cfg.venue_for(&cfg.papers[0]), Some("CVPR".to_string()));
+
+        // Per-paper override still wins over project + global.
+        let cfg = Config::merge_for_tests(
+            global,
+            project_with(vec![paper_file("c", Some("stanford"), Some("ACL"))]),
+        );
+        assert_eq!(cfg.venue_for(&cfg.papers[0]), Some("ACL".to_string()));
+    }
+
+    #[test]
+    fn venue_returns_none_when_no_default_anywhere() {
+        // When the global default is explicitly cleared and nothing project-
+        // or paper-level fills in, venue_for is None. The submit path treats
+        // this as "no venue", which Stanford backend serializes as empty
+        // string -- not great UX, but the behavior is observable + testable
+        // rather than masked by an invisible "ICLR" default.
+        let mut global = GlobalConfigFile::default();
+        global.providers.stanford.venue = None;
+        let cfg = Config::merge_for_tests(
+            global,
+            project_with(vec![paper_file("a", Some("stanford"), None)]),
+        );
+        assert_eq!(cfg.venue_for(&cfg.papers[0]), None);
     }
 
     #[test]
