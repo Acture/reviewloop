@@ -342,15 +342,25 @@ ReviewLoop runs Gmail API polling first when available, then IMAP fallback.
 
 Outbound HTTP requests (PDF upload, review fetch, Gmail API) can be routed
 through a list of user-configured HTTP / SOCKS proxies. ReviewLoop uses
-[`reqwest-middleware`](https://crates.io/crates/reqwest-middleware) for
-round-robin rotation across pre-built proxy clients — no proxy management code
-lives in reviewloop itself.
+[`reqwest-middleware`](https://crates.io/crates/reqwest-middleware) for the
+middleware framework; the rotation logic itself is a small in-house
+middleware (∼90 lines) that does:
+
+- **Round-robin** across the configured proxy URLs using an atomic counter,
+  so concurrent requests spread across the pool.
+- **Sequential failover** on transient connection errors: when a proxy
+  refuses the connection, times out, or fails the TLS handshake, the
+  request is retried against the next proxy in the rotation. HTTP
+  responses (any 4xx / 5xx that completes a round-trip) are returned as
+  the upstream service answered — the proxy is healthy, the upstream said
+  no.
 
 > **Note on library choice**: [`reqwest-proxy-pool`](https://crates.io/crates/reqwest-proxy-pool)
-> 0.4 only supports proxy lists fetched from remote URLs (`.sources()`), not
-> static user-supplied lists. ReviewLoop therefore uses a lightweight custom
-> middleware (∼50 lines) on top of `reqwest-middleware` for the same effect.
-> Migration to upstream when it gains static-list support is tracked separately.
+> 0.4 was evaluated and found unsuitable: it supports only SOCKS5/SOCKS5H
+> (no HTTP proxy) and only fetches its proxy list from remote URLs (no API
+> for a user-supplied static list). The custom middleware avoids both
+> limitations. Migration to upstream when it gains HTTP + static-list
+> support is tracked separately.
 
 Configure in global config:
 ```toml
@@ -370,6 +380,34 @@ proxies = ["http://special-proxy.example.com:8080"]
 Empty list (default) disables proxy routing — direct connections used.
 Credentials embedded in proxy URLs are never written to logs; only the count
 is reported.
+
+**Tip — using Clash / Mihomo:** if you already run Clash locally, just point
+ReviewLoop at its HTTP listener:
+
+```toml
+[core]
+proxies = ["http://127.0.0.1:7890"]
+```
+
+Clash itself handles subscription URLs, real proxy rotation, health-check,
+and protocol translation (VMess / Trojan / SS / etc.). ReviewLoop treats it
+as a single stable upstream HTTP proxy.
+
+**Limitations:**
+- Bodies that cannot be cloned (streamed uploads from a file handle) fall
+  back to a single-attempt path with no failover. The current PDF upload
+  reads the file into memory before constructing the request body, so
+  failover applies. Future streaming-upload paths would not.
+- The OAuth2 token-exchange flow (`reviewloop email login --provider
+  google`) uses only the **first** proxy in the list, because the `oauth2`
+  crate requires a bare `reqwest::Client`. This affects only the initial
+  one-time login; subsequent token refreshes go through the full pool.
+- No active health-check probe / cooldown for known-bad proxies.
+  Failover is per-request (next request again starts at round-robin
+  position N+1 — a dead proxy is skipped at the moment of use, not
+  blacklisted). Acceptable for small static lists; for large pools
+  consider a managed service or Clash upstream.
+
 
 ReviewLoop uses two config files with separate responsibilities:
 - global config: `$XDG_CONFIG_HOME/reviewloop/config.toml` or `~/.config/reviewloop/config.toml`

@@ -7,17 +7,23 @@
 //! # Proxy pool strategy
 //!
 //! [`reqwest-proxy-pool`](https://crates.io/crates/reqwest-proxy-pool) 0.4 only
-//! supports proxy lists fetched from remote URLs (`.sources(vec![url, ...])`);
-//! it has no API for a static user-supplied list.  Therefore this module
-//! implements **option (b)**: a lightweight custom
-//! [`reqwest_middleware::Middleware`] that round-robins across pre-built
-//! `reqwest::Client` instances (one per proxy URL).  This keeps the rotation
-//! logic inside the library layer (`reqwest-middleware`) and out of
-//! application code, while still giving the user full control over the proxy
-//! list via `core.proxies`.
+//! supports proxy lists fetched from remote URLs (`.sources(vec![url, ...])`)
+//! and only SOCKS5/SOCKS5H — neither matches our use case (static
+//! user-supplied list of HTTP / SOCKS proxies).  Therefore this module
+//! implements a lightweight custom [`reqwest_middleware::Middleware`] that:
 //!
-//! Cooldown / health-check is deferred to a future phase when upstream adds a
-//! static-list API.
+//! - **Round-robins** across pre-built `reqwest::Client` instances (one per
+//!   proxy URL) using an atomic counter so concurrent requests spread across
+//!   the pool.
+//! - **Sequentially fails over** on transient connection errors — when a
+//!   proxy times out, refuses the connection, or fails the TLS handshake,
+//!   the same request is re-attempted against the next proxy in the
+//!   rotation.  HTTP-level errors (any 4xx / 5xx that completes the
+//!   round-trip and produces a Response) are NOT retried — the upstream
+//!   service answered, so the proxy is healthy.
+//!
+//! Health-check probing / cooldown for known-bad proxies is deferred to a
+//! future phase.
 
 use crate::config::Config;
 use anyhow::{Context, Result};
@@ -26,13 +32,22 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use tracing::warn;
 
-/// Round-robin proxy selection middleware.
+/// Round-robin + per-request failover proxy middleware.
 ///
 /// Pre-builds one `reqwest::Client` per configured proxy URL and cycles
 /// through them with an atomic counter.  When [`handle`] is called it picks
-/// the next client and executes the already-built `reqwest::Request` through
-/// it, bypassing the inner `ClientWithMiddleware` client entirely.
+/// a starting index, then iterates the proxy list in order, returning on the
+/// first success.  Transient connection errors (see
+/// [`is_transient_proxy_error`]) trigger failover to the next proxy; HTTP
+/// errors that complete a round-trip do not.
+///
+/// Bodies that cannot be cloned (streamed bodies) fall back to a
+/// single-attempt path against the first selected proxy — documented
+/// limitation that does not affect the current PDF-upload path (which
+/// reads the whole file into memory before constructing the multipart
+/// request body).
 struct RoundRobinProxyMiddleware {
     /// One client per proxy URL, built at construction time.
     clients: Vec<reqwest::Client>,
@@ -48,13 +63,82 @@ impl reqwest_middleware::Middleware for RoundRobinProxyMiddleware {
         _extensions: &mut http::Extensions,
         _next: reqwest_middleware::Next<'_>,
     ) -> reqwest_middleware::Result<reqwest::Response> {
+        let n = self.clients.len();
         // `clients` is never empty when this middleware is installed.
-        let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.clients.len();
-        self.clients[idx]
-            .execute(req)
-            .await
-            .map_err(reqwest_middleware::Error::Reqwest)
+        debug_assert!(n > 0, "proxy middleware installed with no clients");
+
+        let start = self.counter.fetch_add(1, Ordering::Relaxed) % n;
+
+        // Streamed bodies (e.g. tokio File) can't be re-tried because
+        // try_clone returns None. Fall back to single-attempt, no failover.
+        // The current PDF upload path constructs the body from a Vec<u8>
+        // (whole file pre-loaded), so try_clone returns Some -- failover
+        // works for that flow.
+        if req.try_clone().is_none() {
+            return self.clients[start]
+                .execute(req)
+                .await
+                .map_err(reqwest_middleware::Error::Reqwest);
+        }
+
+        let mut last_err: Option<reqwest::Error> = None;
+        for attempt in 0..n {
+            let idx = (start + attempt) % n;
+            // Safe: we already verified try_clone returns Some above, and
+            // try_clone is idempotent for cloneable bodies.
+            let req_clone = req
+                .try_clone()
+                .expect("request body became non-cloneable mid-loop (impossible)");
+
+            match self.clients[idx].execute(req_clone).await {
+                Ok(resp) => {
+                    if attempt > 0 {
+                        warn!(
+                            proxy_index = idx,
+                            attempts = attempt + 1,
+                            "request succeeded after proxy failover"
+                        );
+                    }
+                    return Ok(resp);
+                }
+                Err(e) if is_transient_proxy_error(&e) => {
+                    warn!(
+                        proxy_index = idx,
+                        error = %e,
+                        attempt = attempt + 1,
+                        total_proxies = n,
+                        "proxy attempt failed; trying next proxy"
+                    );
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => {
+                    // Non-transient: don't waste time on more proxies.
+                    // Examples: body-serialization failures, redirect-loop
+                    // errors -- these would fail identically against any
+                    // proxy.
+                    return Err(reqwest_middleware::Error::Reqwest(e));
+                }
+            }
+        }
+
+        warn!(
+            total_proxies = n,
+            "all proxies failed for request; returning last transient error"
+        );
+        Err(reqwest_middleware::Error::Reqwest(last_err.expect(
+            "loop ran at least once and last_err is set on every transient failure",
+        )))
     }
+}
+
+/// Heuristic for "this looks like the proxy itself misbehaved, retry on a
+/// different one" vs "this is a real error that won't change with a
+/// different proxy". Conservative: only retry on errors that have no HTTP
+/// status (i.e. the request never completed) — connect refused, timeout,
+/// TLS handshake, DNS, etc.
+fn is_transient_proxy_error(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout() || err.status().is_none()
 }
 
 /// Build an outbound HTTP client with proxy pool middleware when proxies are
@@ -149,5 +233,80 @@ mod tests {
         // Build should succeed; actual connectivity is not tested in unit tests.
         let client = build_client(&config).expect("build_client with valid proxy URLs");
         drop(client);
+    }
+
+    #[test]
+    fn is_transient_proxy_error_classifies_correctly() {
+        // Build a request to an unroutable address to force a connect error.
+        // 198.51.100.0/24 is the TEST-NET-2 reserved block; nothing routes there.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(500))
+            .build()
+            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt.block_on(async {
+            client
+                .get("http://198.51.100.1:1")
+                .send()
+                .await
+                .expect_err("connection to TEST-NET-2 must fail")
+        });
+        assert!(
+            is_transient_proxy_error(&err),
+            "connect error to unroutable host must be classified as transient: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn round_robin_failover_skips_dead_proxies() {
+        use axum::{Router, response::IntoResponse, routing::get};
+        use std::net::SocketAddr;
+        use tokio::net::TcpListener;
+
+        // Spin up a working "proxy" -- actually a plain HTTP server. The
+        // failover logic we want to exercise lives in the middleware, not
+        // in the proxy protocol itself; treating these endpoints as direct
+        // upstreams via reqwest::Proxy::all is enough to verify that a dead
+        // proxy URL gets skipped and a live one returns the response.
+        async fn ok_handler() -> impl IntoResponse {
+            "ok-from-live-proxy"
+        }
+        let app = Router::new().route("/", get(ok_handler));
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let live_addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Two dead proxies (TEST-NET-2, unroutable) plus one live one at the end.
+        // start counter is 0 on first request, so we'll attempt index 0 (dead),
+        // then 1 (dead), then 2 (live) -- exercising the full failover loop.
+        let mut config = Config::default();
+        config.core.proxies = vec![
+            "http://198.51.100.1:1".to_string(),
+            "http://198.51.100.2:2".to_string(),
+            format!("http://{live_addr}"),
+        ];
+        let client = build_client(&config).expect("build client with mixed proxies");
+
+        // Request at the live "proxy" itself so the first two genuinely fail
+        // at the connect step rather than getting an HTTP error from a
+        // working proxy.
+        let resp = client
+            .get(format!("http://{live_addr}/"))
+            .send()
+            .await
+            .expect("request must succeed via 3rd proxy after 2 failover steps");
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert!(status.is_success(), "got {status}: {body}");
+        assert_eq!(body, "ok-from-live-proxy");
+
+        server_handle.abort();
     }
 }
