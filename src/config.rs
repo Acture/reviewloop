@@ -312,9 +312,31 @@ impl Config {
             .map(|file| Self::resolve_paper(file, &default_backend))
             .collect();
 
+        // Merge: project Option<T> overrides global concrete value.
+        let mut core = global.core;
+        if let Some(hours) = project.core.review_timeout_hours {
+            core.review_timeout_hours = hours;
+        }
+
+        let provider_email = merge_optional_string(
+            project.providers.stanford.email,
+            global.providers.stanford.email,
+        );
+        let provider_fallback_script = merge_optional_string(
+            project.providers.stanford.fallback_script,
+            global.providers.stanford.fallback_script,
+        );
+        let provider_fallback_script = if let Some(root) = project_root.as_deref() {
+            resolve_project_relative_path(root, &provider_fallback_script)
+                .to_string_lossy()
+                .to_string()
+        } else {
+            provider_fallback_script
+        };
+
         Self {
             project_id: project.project_id,
-            core: global.core,
+            core,
             logging: global.logging,
             polling: global.polling,
             retention: global.retention,
@@ -323,8 +345,8 @@ impl Config {
                 stanford: StanfordProviderConfig {
                     base_url: global.providers.stanford.base_url,
                     fallback_mode: global.providers.stanford.fallback_mode,
-                    fallback_script: global.providers.stanford.fallback_script,
-                    email: global.providers.stanford.email,
+                    fallback_script: provider_fallback_script,
+                    email: provider_email,
                     venue: project.providers.stanford.venue,
                 },
             },
@@ -336,7 +358,19 @@ impl Config {
             project_root,
         }
     }
+}
 
+/// Returns `project` when it carries a non-empty value, otherwise `global`.
+/// Used for fields that live in the global config but accept per-project
+/// overrides.
+fn merge_optional_string(project: Option<String>, global: String) -> String {
+    project
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(global)
+}
+
+impl Config {
     fn validate_runtime(&self, require_project: bool) -> Result<()> {
         if self.core.db_path.trim().is_empty() {
             return Err(anyhow!("core.db_path must not be empty"));
@@ -440,11 +474,24 @@ pub struct ProjectConfigFile {
     pub project_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_backend: Option<String>,
+    pub core: ProjectCoreOverrides,
     pub trigger: TriggerConfig,
     pub providers: ProjectProvidersConfig,
     pub papers: Vec<PaperConfigFile>,
     pub paper_watch: BTreeMap<String, bool>,
     pub paper_tag_triggers: BTreeMap<String, String>,
+}
+
+/// Project-side override slots for fields whose defaults live in the global
+/// config. Every field is `Option<T>`; `None` means "inherit global".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectCoreOverrides {
+    /// Override for `global.core.review_timeout_hours`. The runtime
+    /// [`CoreConfig::review_timeout_hours`] resolves to this value when set,
+    /// otherwise to the global value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_timeout_hours: Option<u64>,
 }
 
 impl ProjectConfigFile {
@@ -529,9 +576,12 @@ impl LegacyConfig {
         ProjectConfigFile {
             project_id: String::new(),
             default_backend: None,
+            core: ProjectCoreOverrides::default(),
             trigger: self.trigger.clone(),
             providers: ProjectProvidersConfig {
                 stanford: ProjectStanfordProviderConfig {
+                    email: None,
+                    fallback_script: None,
                     venue: self.providers.stanford.venue.clone(),
                 },
             },
@@ -865,12 +915,24 @@ pub struct ProjectProvidersConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectStanfordProviderConfig {
+    /// Per-project submitter email. When set, overrides
+    /// `global.providers.stanford.email`. When `None` (or empty), the global
+    /// value is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Per-project Playwright fallback script path. Overrides
+    /// `global.providers.stanford.fallback_script` when set; the project
+    /// path is resolved relative to the project root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_script: Option<String>,
     pub venue: Option<String>,
 }
 
 impl Default for ProjectStanfordProviderConfig {
     fn default() -> Self {
         Self {
+            email: None,
+            fallback_script: None,
             venue: Some("ICLR".to_string()),
         }
     }
@@ -1221,5 +1283,57 @@ db_path = "db.sqlite"
         assert_eq!(project.papers.len(), 1);
         assert_eq!(project.papers[0].backend.as_deref(), Some("stanford"));
         assert_eq!(project.providers.stanford.venue.as_deref(), Some("ICLR"));
+        // None of the new override slots should fire on migration: the legacy
+        // values stay where they were (in global), not duplicated into project.
+        assert_eq!(project.providers.stanford.email, None);
+        assert_eq!(project.providers.stanford.fallback_script, None);
+        assert_eq!(project.core.review_timeout_hours, None);
+    }
+
+    #[test]
+    fn provider_email_uses_project_override_then_global() {
+        // No project override -> global value flows through.
+        let mut global = GlobalConfigFile::default();
+        global.providers.stanford.email = "global@example.edu".to_string();
+        let cfg = Config::merge_for_tests(global.clone(), project_with(vec![]));
+        assert_eq!(cfg.providers.stanford.email, "global@example.edu");
+
+        // Project override wins.
+        let mut project = project_with(vec![]);
+        project.providers.stanford.email = Some("project@example.edu".to_string());
+        let cfg = Config::merge_for_tests(global.clone(), project);
+        assert_eq!(cfg.providers.stanford.email, "project@example.edu");
+
+        // Empty/whitespace project override falls back to global.
+        let mut project = project_with(vec![]);
+        project.providers.stanford.email = Some("   ".to_string());
+        let cfg = Config::merge_for_tests(global, project);
+        assert_eq!(cfg.providers.stanford.email, "global@example.edu");
+    }
+
+    #[test]
+    fn provider_fallback_script_uses_project_override_then_global() {
+        let mut global = GlobalConfigFile::default();
+        global.providers.stanford.fallback_script = "tools/global.mjs".to_string();
+        let cfg = Config::merge_for_tests(global.clone(), project_with(vec![]));
+        assert_eq!(cfg.providers.stanford.fallback_script, "tools/global.mjs");
+
+        let mut project = project_with(vec![]);
+        project.providers.stanford.fallback_script = Some("tools/project.mjs".to_string());
+        let cfg = Config::merge_for_tests(global, project);
+        assert_eq!(cfg.providers.stanford.fallback_script, "tools/project.mjs");
+    }
+
+    #[test]
+    fn core_review_timeout_uses_project_override_then_global() {
+        let mut global = GlobalConfigFile::default();
+        global.core.review_timeout_hours = 48;
+        let cfg = Config::merge_for_tests(global.clone(), project_with(vec![]));
+        assert_eq!(cfg.core.review_timeout_hours, 48);
+
+        let mut project = project_with(vec![]);
+        project.core.review_timeout_hours = Some(12);
+        let cfg = Config::merge_for_tests(global, project);
+        assert_eq!(cfg.core.review_timeout_hours, 12);
     }
 }
