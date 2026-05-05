@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased] — 2026-05-05
+
+### Added
+
+- **macOS Widget Extension (preview).** Daemon now writes `widget-state.json`
+  snapshots every tick; a SwiftUI WidgetKit extension under
+  `apple/ReviewLoopWidget/` renders glance UI (active job count, recent
+  failures) in macOS desktop / Notification Center widgets. Build instructions
+  in README.
+- **`core.widget_state_enabled`** (default `true`) and
+  **`core.widget_state_dir`** (default `None` → `state_dir`) config fields for
+  controlling widget snapshot output.
+
+---
+
 ## [Unreleased] — 2025-05-05
 
 ### Breaking Changes

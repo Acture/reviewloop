@@ -535,6 +535,51 @@ Please keep it that way:
 - Database: SQLite (global state path by default, supports `:memory:`)
 - Interface: CLI + daemon
 
+## macOS Widget (preview)
+
+The daemon writes a small JSON status snapshot (`widget-state.json`) every tick.
+A separate macOS WidgetKit extension reads that snapshot and renders a glance UI
+(active job count, recent failures) in macOS desktop / Notification Center widgets.
+
+**Platform**: macOS only. **Distribution**: opt-in via build — no signed binary is
+distributed. You build the `.app` yourself with your Personal Team.
+
+### Build & install
+
+1. Install xcodegen: `brew install xcodegen`
+2. `cd apple/ReviewLoopWidget && xcodegen generate`
+3. Open `ReviewLoopWidget.xcodeproj` in Xcode 16+
+4. Select your Personal Team for both `HostApp` and `Widget` targets in
+   Signing & Capabilities
+5. In both `.entitlements` files (`HostApp/HostApp.entitlements`,
+   `Widget/Widget.entitlements`), change `group.ai.reviewloop.local` to
+   `group.<your-bundle-prefix>.shared` (must match across both files)
+6. Configure the daemon to write into the App Group container so the sandboxed
+   widget can read it. Edit `~/.config/reviewloop/config.toml`:
+   ```toml
+   [core]
+   widget_state_dir = "/Users/<you>/Library/Group Containers/group.<your-bundle-prefix>.shared"
+   ```
+7. In Xcode: ⌘R to build & launch the host app once. The host app is just a
+   placeholder window; quit it.
+8. Add the widget from the macOS desktop / Notification Center widget gallery
+   (search for "ReviewLoop").
+
+### Limitations
+
+- Refresh ~5 minutes minimum (Apple WidgetKit budget); not a real-time dashboard.
+- macOS 15+, Xcode 16+ required.
+- You build the `.app` yourself with your Personal Team. No signed binary is
+  distributed (~$99/yr Apple Developer fee not paid).
+- Sandbox: the widget can only read the App Group container; you **must** configure
+  `core.widget_state_dir` to match the App Group ID, or the widget will show
+  "no data" indefinitely.
+- Currently V1: small + medium widget sizes only; no Lock Screen /
+  accessoryRectangular variants.
+
+See [`apple/ReviewLoopWidget/README.md`](apple/ReviewLoopWidget/README.md) for
+build details that may evolve.
+
 ## License
 
 [GPL-3.0](LICENSE)
