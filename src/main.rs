@@ -829,6 +829,12 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
     }
     config.save(options.config_path)?;
 
+    // Resolve the runtime state dir for the artifacts path hint.
+    // Falls back to the documented default if the global config is not yet loadable.
+    let artifacts_root = reviewloop::config::Config::load_runtime(Some(options.config_path), false)
+        .map(|cfg| cfg.state_dir().join("artifacts"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("~/.review_loop/artifacts"));
+
     let watch_text = if options.watch { "enabled" } else { "disabled" };
     let venue_text = options
         .venue
@@ -838,16 +844,18 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
         .unwrap_or_else(|| "project default".to_string());
     if let Some(trigger) = options.tag_trigger {
         println!(
-            "Added paper {paper_id}.\n- backend: {backend}\n- venue: {venue_text}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- tag trigger: {trigger}\n- config: {}\n  artifacts will appear in: <state-dir>/artifacts/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
+            "Added paper {paper_id}.\n- backend: {backend}\n- venue: {venue_text}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- tag trigger: {trigger}\n- config: {}\n  artifacts will appear in: {}/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
             options.config_path.display(),
+            artifacts_root.display(),
             paper_id = options.paper_id,
             backend = resolved_backend,
             pdf_path = options.pdf_path,
         );
     } else {
         println!(
-            "Added paper {paper_id}.\n- backend: {backend}\n- venue: {venue_text}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- config: {}\n  artifacts will appear in: <state-dir>/artifacts/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
+            "Added paper {paper_id}.\n- backend: {backend}\n- venue: {venue_text}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- config: {}\n  artifacts will appear in: {}/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
             options.config_path.display(),
+            artifacts_root.display(),
             paper_id = options.paper_id,
             backend = resolved_backend,
             pdf_path = options.pdf_path,
@@ -1448,8 +1456,9 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
 
         // Compute tick health based on how long ago the last tick occurred.
         // Thresholds: < 60s = normal, 60-300s = stale (note), > 300s = stuck (warning).
+        // None means no tick events have ever been recorded, so health is unknown.
         let tick_health = match last_tick_at {
-            None => "normal",
+            None => "unknown",
             Some(ts) => {
                 let age_secs = (now - ts).num_seconds();
                 if age_secs < 60 {
@@ -1531,6 +1540,7 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
             }
             None => {
                 println!("  last activity: none recorded");
+                println!("  tick health: unknown (no events recorded yet)");
             }
         }
         match &last_tick_error_msg {
@@ -1826,7 +1836,7 @@ async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Re
     let (email, venue) = match paper.backend.as_str() {
         "stanford" => (
             email_account::resolve_submission_email(config, "stanford", None)
-                .with_context(|| "reviewloop run requires a submitter email. set providers.stanford.email in ~/.config/reviewloop/config.toml or run 'reviewloop email login --provider google' to use OAuth (see README 'Email Token Ingestion' section).")?,
+                .with_context(|| "reviewloop submit requires a submitter email. set providers.stanford.email in ~/.config/reviewloop/config.toml or run 'reviewloop email login --provider google' to use OAuth (see README 'Email Token Ingestion' section).")?,
             config.venue_for(paper),
         ),
         _ => (String::new(), config.venue_for(paper)),

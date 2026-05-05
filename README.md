@@ -37,8 +37,13 @@ reviewloop init
 reviewloop init project --project-id main
 
 # 2.5) one-time: configure submitter email
-reviewloop config init  # or edit ~/.config/reviewloop/config.toml
-# set providers.stanford.email = "you@example.edu"
+# Edit ~/.config/reviewloop/config.toml and add:
+#
+#   [providers.stanford]
+#   email = "you@example.edu"
+#
+# (reviewloop config init creates the file if it doesn't exist yet; re-running it
+#  is a no-op when the file already exists, so edit the file directly.)
 
 # 3) submit + watch a paper come back, all at once
 reviewloop run paper/main.pdf

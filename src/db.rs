@@ -998,6 +998,7 @@ impl Db {
             FROM jobs
             WHERE project_id = ?1
               AND status IN (?2, ?3, ?4)
+              AND (last_error IS NULL OR last_error NOT LIKE 'cancelled by user:%')
             ORDER BY updated_at DESC
             LIMIT ?5
             "#,
