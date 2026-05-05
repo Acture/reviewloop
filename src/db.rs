@@ -115,8 +115,21 @@ impl Db {
     }
 
     fn connect(&self) -> Result<Connection> {
-        let conn = Connection::open_with_flags(&self.dsn, self.open_flags)
-            .with_context(|| format!("failed to open sqlite database: {}", self.dsn))?;
+        let conn = Connection::open_with_flags(&self.dsn, self.open_flags).map_err(|e| {
+            let is_permission = e.to_string().to_lowercase().contains("permission denied")
+                || e.to_string().to_lowercase().contains("unable to open");
+            let ctx = if is_permission {
+                format!(
+                    "failed to open sqlite database: {}; ensure the file is owned by your \
+                         user — if you previously ran reviewloop with sudo, run \
+                         `sudo chown $(whoami) {}` or remove the file and re-init",
+                    self.dsn, self.dsn
+                )
+            } else {
+                format!("failed to open sqlite database: {}", self.dsn)
+            };
+            anyhow::Error::from(e).context(ctx)
+        })?;
         conn.busy_timeout(Duration::from_secs(5))?;
         Ok(conn)
     }

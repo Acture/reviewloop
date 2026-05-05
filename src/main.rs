@@ -507,10 +507,11 @@ async fn run() -> Result<()> {
             let job_id = match job_ref.job_id {
                 Some(id) => id,
                 None => {
+                    let paper_id = job_ref.paper_id.unwrap();
                     resolve_paper_id_to_job(
                         &db,
                         &config.project_id,
-                        &job_ref.paper_id.unwrap(),
+                        &paper_id,
                         &[
                             JobStatus::PendingApproval,
                             JobStatus::Queued,
@@ -518,7 +519,20 @@ async fn run() -> Result<()> {
                             JobStatus::Processing,
                         ],
                         "cancel",
-                    )?
+                    )
+                    .map_err(|e| {
+                        let msg = e.to_string();
+                        if msg.contains("no") && msg.contains("job") {
+                            anyhow::anyhow!(
+                                "{msg}\n\
+                                 hint: cancel only applies to active jobs; for already-completed/failed \
+                                 jobs no action is needed; for rerunning, use \
+                                 'reviewloop retry --paper-id {paper_id} --include-failed'"
+                            )
+                        } else {
+                            e
+                        }
+                    })?
                     .id
                 }
             };

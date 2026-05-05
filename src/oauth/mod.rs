@@ -60,8 +60,20 @@ pub fn load_token_record(provider: &dyn OauthProvider) -> Result<Option<OauthTok
     if !path.exists() {
         return Ok(None);
     }
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        let ctx = if e.kind() == std::io::ErrorKind::PermissionDenied {
+            format!(
+                "failed to read {}; ensure the file is owned by your user — if you previously \
+                 ran reviewloop with sudo, run `sudo chown $(whoami) {}` or remove the file and \
+                 re-init",
+                path.display(),
+                path.display()
+            )
+        } else {
+            format!("failed to read {}", path.display())
+        };
+        anyhow::Error::from(e).context(ctx)
+    })?;
     let parsed: OauthTokenRecord = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse oauth token file {}", path.display()))?;
     Ok(Some(parsed))

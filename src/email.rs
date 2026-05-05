@@ -567,6 +567,19 @@ pub async fn poll_imap_if_enabled(config: &Config, db: &Db) -> Result<Vec<Job>> 
         let mut affected = gmail_impl::poll_gmail_if_enabled(config, db).await?;
         #[cfg(feature = "imap")]
         affected.extend(imap_impl::poll_imap_if_enabled(config, db).await?);
+        #[cfg(not(feature = "imap"))]
+        {
+            use std::sync::OnceLock;
+            static WARNED: OnceLock<()> = OnceLock::new();
+            if config.imap.as_ref().map(|c| c.enabled).unwrap_or(false) {
+                WARNED.get_or_init(|| {
+                    tracing::warn!(
+                        "imap.enabled = true but this binary was built without --features imap; \
+                         install with 'cargo install reviewloop --features imap' to enable IMAP token ingestion"
+                    );
+                });
+            }
+        }
         Ok(affected)
     }
     .instrument(span)
