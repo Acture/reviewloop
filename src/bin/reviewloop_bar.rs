@@ -74,9 +74,32 @@ fn try_main() -> Result<()> {
 // ── Icon helpers ─────────────────────────────────────────────────────────────
 
 fn make_icon(r: u8, g: u8, b: u8) -> tray_icon::Icon {
-    // 16×16 solid-colour RGBA square — good enough for v2.
-    let pixels: Vec<u8> = (0..16u32 * 16).flat_map(|_| [r, g, b, 255u8]).collect();
-    tray_icon::Icon::from_rgba(pixels, 16, 16).expect("icon dimensions are valid")
+    // 16×16 RGBA: a coloured disc with a white outline so it is legible on
+    // both light and dark menu bars. Outside the outer radius is transparent.
+    const SIZE: i32 = 16;
+    const CENTER: f32 = 7.5;
+    const OUTER: f32 = 7.5;
+    const INNER: f32 = 6.0;
+
+    let mut pixels = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let dx = x as f32 - CENTER;
+            let dy = y as f32 - CENTER;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let (pr, pg, pb, pa) = if dist <= INNER {
+                (r, g, b, 255u8)
+            } else if dist <= OUTER {
+                // White ring with anti-aliasing on the outer edge.
+                let alpha = ((OUTER - dist).clamp(0.0, 1.0) * 255.0) as u8;
+                (255u8, 255u8, 255u8, alpha)
+            } else {
+                (0, 0, 0, 0)
+            };
+            pixels.extend_from_slice(&[pr, pg, pb, pa]);
+        }
+    }
+    tray_icon::Icon::from_rgba(pixels, SIZE as u32, SIZE as u32).expect("icon dimensions are valid")
 }
 
 // ── Platform helpers ─────────────────────────────────────────────────────────
