@@ -110,15 +110,6 @@ fn open_log(path: &Path) {
     open_path(path);
 }
 
-// ── DB helpers ────────────────────────────────────────────────────────────────
-
-/// Returns `(active_job_count, has_failed_jobs)` for the given project.
-fn query_status(db: &Db, project_id: &str) -> Result<(usize, bool)> {
-    let active = db.list_active_jobs_for_project(project_id)?.len();
-    let failed = db.list_failed_jobs_for_project(project_id, 1)?.len();
-    Ok((active, failed > 0))
-}
-
 // ── Daemon state (U14) ────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug)]
@@ -164,6 +155,83 @@ fn poll_daemon_state() -> Option<DaemonState> {
     None
 }
 
+// ── Background state snapshot (N4 / A3) ──────────────────────────────────────
+
+/// State polled by the background thread, read cheaply by the main event loop.
+struct BarSnapshot {
+    active_jobs: Vec<Job>,
+    failed_jobs: Vec<Job>,
+    daemon_state: Option<DaemonState>,
+    db_error: Option<String>,
+}
+
+impl Default for BarSnapshot {
+    fn default() -> Self {
+        Self {
+            active_jobs: Vec::new(),
+            failed_jobs: Vec::new(),
+            daemon_state: None,
+            db_error: None,
+        }
+    }
+}
+
+/// Run `poll_daemon_state()` in a child thread with a 3-second watchdog.
+/// Returns `None` if launchctl hangs or is unavailable.
+fn poll_daemon_state_with_timeout() -> Option<DaemonState> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(poll_daemon_state());
+    });
+    rx.recv_timeout(Duration::from_secs(3)).unwrap_or(None)
+}
+
+/// Spawn a background thread that refreshes `snapshot` every `interval`.
+/// The thread opens its own `Db` connection so the main thread stays free.
+fn start_background_poller(
+    db_path: PathBuf,
+    project_id: Option<String>,
+    snapshot: Arc<Mutex<BarSnapshot>>,
+    interval: Duration,
+) {
+    std::thread::spawn(move || {
+        loop {
+            let db = Db::new_file(db_path.clone());
+            let (active_jobs, failed_jobs, db_error) = if let Err(e) = db.init_schema() {
+                (Vec::new(), Vec::new(), Some(e.to_string()))
+            } else if let Some(ref pid) = project_id {
+                let active = db.list_active_jobs_for_project(pid).unwrap_or_default();
+                let failed = db.list_failed_jobs_for_project(pid, 20).unwrap_or_default();
+                (active, failed, None)
+            } else {
+                (Vec::new(), Vec::new(), None)
+            };
+            let daemon_state = poll_daemon_state_with_timeout();
+
+            if let Ok(mut snap) = snapshot.lock() {
+                snap.active_jobs = active_jobs;
+                snap.failed_jobs = failed_jobs;
+                snap.daemon_state = daemon_state;
+                snap.db_error = db_error;
+            }
+
+            std::thread::sleep(interval);
+        }
+    });
+}
+
+// ── String helpers ────────────────────────────────────────────────────────────
+
+/// Truncate `s` to at most `n` Unicode scalar values, appending `…` if cut.
+fn truncate_chars(s: &str, n: usize) -> String {
+    let truncated: String = s.chars().take(n).collect();
+    if truncated.chars().count() < s.chars().count() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
 // ── Job label formatting ──────────────────────────────────────────────────────
 
 fn format_job_label(job: &Job) -> String {
@@ -191,10 +259,7 @@ fn format_failed_job_label(job: &Job) -> String {
     let err_snippet = job
         .last_error
         .as_deref()
-        .map(|e| {
-            let truncated = if e.len() > 60 { &e[..60] } else { e };
-            format!(" · {truncated}")
-        })
+        .map(|e| format!(" · {}", truncate_chars(e, 60)))
         .unwrap_or_default();
     format!(
         "{} · {} · attempt={}{}",
@@ -228,27 +293,35 @@ enum ClickAction {
 
 /// Rebuild the tray menu from scratch and update the click map.
 ///
-/// Called on first tick and every 5 s thereafter.
+/// Called on first tick and every 5 s thereafter (reads from cached snapshot).
 fn rebuild_menu(
     tray: &tray_icon::TrayIcon,
-    db: &Db,
     project_id: Option<&str>,
     artifacts_dir: &Path,
     log_path: &Path,
-    daemon_state: Option<DaemonState>,
-    last_action: &Arc<Mutex<Option<String>>>,
+    snapshot: &BarSnapshot,
+    last_action: &Arc<Mutex<Option<(String, Instant)>>>,
     click_map: &mut HashMap<muda::MenuId, ClickAction>,
 ) {
     click_map.clear();
 
     let menu = Menu::new();
 
-    // ── Last-action summary (U7) ──────────────────────────────────────────────
+    // ── Last-action summary (U7) — with TTL (N3) ─────────────────────────────
     if let Ok(guard) = last_action.lock() {
-        if let Some(summary) = guard.as_deref() {
-            let item = MenuItem::new(format!("↳ {summary}"), false, None);
-            let _ = menu.append(&item);
-            let _ = menu.append(&PredefinedMenuItem::separator());
+        if let Some((summary, ts)) = guard.as_ref() {
+            let elapsed = ts.elapsed();
+            if elapsed < Duration::from_secs(300) {
+                let display = if elapsed >= Duration::from_secs(60) {
+                    let mins = elapsed.as_secs() / 60;
+                    format!("{summary} ({mins}m ago)")
+                } else {
+                    summary.clone()
+                };
+                let item = MenuItem::new(format!("↳ {display}"), false, None);
+                let _ = menu.append(&item);
+                let _ = menu.append(&PredefinedMenuItem::separator());
+            }
         }
     }
 
@@ -268,90 +341,86 @@ fn rebuild_menu(
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     // ── Status summary ────────────────────────────────────────────────────────
-    let (status_label, icon_r, icon_g, icon_b) = match project_id {
-        None => (
+    let (status_label, icon_r, icon_g, icon_b) = if project_id.is_none() {
+        (
             "No project — set REVIEWLOOP_PROJECT_ID".to_string(),
             128u8,
             128u8,
             128u8,
-        ),
-        Some(pid) => match query_status(db, pid) {
-            Err(e) => {
-                tracing::warn!("bar: db query error: {e}");
-                (format!("DB error: {e}"), 200u8, 100u8, 30u8)
-            }
-            Ok((active, has_errors)) => {
-                if has_errors {
-                    (
-                        format!("{active} active · recent error(s)"),
-                        200u8,
-                        30u8,
-                        30u8,
-                    )
-                } else if active > 0 {
-                    (format!("{active} active job(s)"), 30u8, 100u8, 200u8)
-                } else {
-                    ("No active jobs".to_string(), 128u8, 128u8, 128u8)
-                }
-            }
-        },
+        )
+    } else if let Some(ref e) = snapshot.db_error {
+        tracing::warn!("bar: db query error: {e}");
+        (format!("DB error: {e}"), 200u8, 100u8, 30u8)
+    } else {
+        let active = snapshot.active_jobs.len();
+        let has_errors = !snapshot.failed_jobs.is_empty();
+        if has_errors {
+            (
+                format!("{active} active · recent error(s)"),
+                200u8,
+                30u8,
+                30u8,
+            )
+        } else if active > 0 {
+            (format!("{active} active job(s)"), 30u8, 100u8, 200u8)
+        } else {
+            ("No active jobs".to_string(), 128u8, 128u8, 128u8)
+        }
     };
     let _ = tray.set_icon(Some(make_icon(icon_r, icon_g, icon_b)));
     let status_item = MenuItem::new(format!("Status: {status_label}"), false, None);
     let _ = menu.append(&status_item);
 
     // ── Per-active-job submenus ───────────────────────────────────────────────
-    if let Some(pid) = project_id {
-        if let Ok(jobs) = db.list_active_jobs_for_project(pid) {
-            if !jobs.is_empty() {
-                let _ = menu.append(&PredefinedMenuItem::separator());
-                for job in &jobs {
-                    let label = format_job_label(job);
-                    let job_sub = Submenu::new(&label, true);
+    if project_id.is_some() {
+        let jobs = &snapshot.active_jobs;
+        if !jobs.is_empty() {
+            let _ = menu.append(&PredefinedMenuItem::separator());
+            for job in jobs {
+                let label = format_job_label(job);
+                let job_sub = Submenu::new(&label, true);
 
-                    let retry_item = MenuItem::new("Retry now", true, None);
-                    let open_art_item = MenuItem::new("Open artifacts", true, None);
-                    let open_log_item = MenuItem::new("Open log", true, None);
+                let retry_item = MenuItem::new("Retry now", true, None);
+                let open_art_item = MenuItem::new("Open artifacts", true, None);
+                let open_log_item = MenuItem::new("Open log", true, None);
 
-                    let _ = job_sub.append(&retry_item);
-                    let _ = job_sub.append(&open_art_item);
-                    let _ = job_sub.append(&open_log_item);
-                    let _ = menu.append(&job_sub);
+                let _ = job_sub.append(&retry_item);
+                let _ = job_sub.append(&open_art_item);
+                let _ = job_sub.append(&open_log_item);
+                let _ = menu.append(&job_sub);
 
-                    let job_artifacts = artifacts_dir.join(&job.id);
-                    click_map.insert(
-                        retry_item.id().clone(),
-                        ClickAction::RetryJob(job.id.clone()),
-                    );
-                    click_map.insert(
-                        open_art_item.id().clone(),
-                        ClickAction::OpenJobArtifacts(job_artifacts),
-                    );
-                    click_map.insert(
-                        open_log_item.id().clone(),
-                        ClickAction::OpenJobLog(log_path.to_path_buf()),
-                    );
-                }
+                let job_artifacts = artifacts_dir.join(&job.id);
+                click_map.insert(
+                    retry_item.id().clone(),
+                    ClickAction::RetryJob(job.id.clone()),
+                );
+                click_map.insert(
+                    open_art_item.id().clone(),
+                    ClickAction::OpenJobArtifacts(job_artifacts),
+                );
+                click_map.insert(
+                    open_log_item.id().clone(),
+                    ClickAction::OpenJobLog(log_path.to_path_buf()),
+                );
             }
         }
 
         // ── Recent failures submenu (U2) ──────────────────────────────────────
-        if let Ok(failed_jobs) = db.list_failed_jobs_for_project(pid, 20) {
-            if !failed_jobs.is_empty() {
-                let _ = menu.append(&PredefinedMenuItem::separator());
-                let failures_sub =
-                    Submenu::new(&format!("Recent failures ({})", failed_jobs.len()), true);
-                for job in &failed_jobs {
-                    let label = format_failed_job_label(job);
-                    let retry_item = MenuItem::new(&label, true, None);
-                    click_map.insert(
-                        retry_item.id().clone(),
-                        ClickAction::RetryJob(job.id.clone()),
-                    );
-                    let _ = failures_sub.append(&retry_item);
-                }
-                let _ = menu.append(&failures_sub);
+        let failed_jobs = &snapshot.failed_jobs;
+        if !failed_jobs.is_empty() {
+            let _ = menu.append(&PredefinedMenuItem::separator());
+            let failures_sub =
+                Submenu::new(&format!("Recent failures ({})", failed_jobs.len()), true);
+            for job in failed_jobs {
+                let label = format_failed_job_label(job);
+                let retry_item = MenuItem::new(&label, true, None);
+                click_map.insert(
+                    retry_item.id().clone(),
+                    ClickAction::RetryJob(job.id.clone()),
+                );
+                let _ = failures_sub.append(&retry_item);
             }
+            let _ = menu.append(&failures_sub);
         }
     }
 
@@ -385,7 +454,7 @@ fn rebuild_menu(
     #[cfg(target_os = "macos")]
     {
         let _ = menu.append(&PredefinedMenuItem::separator());
-        match daemon_state {
+        match snapshot.daemon_state {
             None => {
                 let _ = menu.append(&MenuItem::new(
                     "Pause/Resume daemon (service not installed)",
@@ -447,7 +516,11 @@ fn rebuild_menu(
 /// Run a short-lived reviewloop subcommand, capture its output, and update
 /// the last-action summary.  Called on the main thread for all actions except
 /// Submit (which shells out to a background thread to avoid blocking).
-fn run_action_cmd(args: &[&str], action_name: &str, last_action: &Arc<Mutex<Option<String>>>) {
+fn run_action_cmd(
+    args: &[&str],
+    action_name: &str,
+    last_action: &Arc<Mutex<Option<(String, Instant)>>>,
+) {
     match Command::new("reviewloop").args(args).output() {
         Ok(out) if out.status.success() => {
             set_last_action(last_action, format!("{action_name}: OK"));
@@ -463,14 +536,17 @@ fn run_action_cmd(args: &[&str], action_name: &str, last_action: &Arc<Mutex<Opti
     }
 }
 
-fn set_last_action(last_action: &Arc<Mutex<Option<String>>>, summary: String) {
+fn set_last_action(last_action: &Arc<Mutex<Option<(String, Instant)>>>, summary: String) {
     tracing::info!("bar: {summary}");
     if let Ok(mut g) = last_action.lock() {
-        *g = Some(summary);
+        *g = Some((summary, Instant::now()));
     }
 }
 
-fn execute_action(action: &ClickAction, last_action: &Arc<Mutex<Option<String>>>) -> bool {
+fn execute_action(
+    action: &ClickAction,
+    last_action: &Arc<Mutex<Option<(String, Instant)>>>,
+) -> bool {
     match action {
         ClickAction::OpenArtifacts(path) | ClickAction::OpenJobArtifacts(path) => {
             open_path(path);
@@ -480,11 +556,11 @@ fn execute_action(action: &ClickAction, last_action: &Arc<Mutex<Option<String>>>
         }
         ClickAction::RetryJob(job_id) => {
             tracing::info!("bar: retry job {job_id}");
-            run_action_cmd(
-                &["retry", "--job-id", job_id, "--force"],
-                "Retry",
-                last_action,
-            );
+            let job_id = job_id.clone();
+            let la = Arc::clone(last_action);
+            std::thread::spawn(move || {
+                run_action_cmd(&["retry", "--job-id", &job_id, "--force"], "Retry", &la);
+            });
         }
         ClickAction::SubmitNew => {
             // rfd::FileDialog::pick_file() is synchronous and must run on the
@@ -494,11 +570,14 @@ fn execute_action(action: &ClickAction, last_action: &Arc<Mutex<Option<String>>>
                 .pick_file();
             if let Some(path) = file {
                 let path_str = path.to_string_lossy().into_owned();
+                // Redact: show only the filename, not the full path (N3).
+                let filename = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path_str.clone());
                 tracing::info!("bar: submitting {path_str}");
-                // Submit can take a long time — run in background thread so
-                // the menu rebuild loop is not blocked.
                 let la = Arc::clone(last_action);
-                set_last_action(&la, format!("Submit started: {path_str}"));
+                set_last_action(&la, format!("Submit started: {filename}"));
                 std::thread::spawn(move || {
                     run_action_cmd(&["run", &path_str], "Submit", &la);
                 });
@@ -506,11 +585,17 @@ fn execute_action(action: &ClickAction, last_action: &Arc<Mutex<Option<String>>>
         }
         ClickAction::PauseDaemon => {
             tracing::info!("bar: pausing daemon");
-            run_action_cmd(&["daemon", "pause"], "Pause", last_action);
+            let la = Arc::clone(last_action);
+            std::thread::spawn(move || {
+                run_action_cmd(&["daemon", "pause"], "Pause", &la);
+            });
         }
         ClickAction::ResumeDaemon => {
             tracing::info!("bar: resuming daemon");
-            run_action_cmd(&["daemon", "resume"], "Resume", last_action);
+            let la = Arc::clone(last_action);
+            std::thread::spawn(move || {
+                run_action_cmd(&["daemon", "resume"], "Resume", &la);
+            });
         }
         ClickAction::Quit => return true,
     }
@@ -541,7 +626,18 @@ fn run_tray(
         Rc::new(RefCell::new(HashMap::new()));
 
     // Last-action summary: written by background threads, read on main thread.
-    let last_action: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let last_action: Arc<Mutex<Option<(String, Instant)>>> = Arc::new(Mutex::new(None));
+
+    // Shared snapshot: updated by the background poller, read cheaply on tick.
+    let snapshot: Arc<Mutex<BarSnapshot>> = Arc::new(Mutex::new(BarSnapshot::default()));
+
+    // Kick off the background poller thread (N4 / A3).
+    start_background_poller(
+        db.path.clone(),
+        project_id.clone(),
+        Arc::clone(&snapshot),
+        Duration::from_secs(5),
+    );
 
     // Force an immediate refresh on the first timer tick.
     let mut last_refresh = Instant::now()
@@ -565,6 +661,7 @@ fn run_tray(
         }
 
         // Refresh on the very first tick and every ~5 s thereafter.
+        // Reads only the cached snapshot — no I/O on the main thread.
         let is_tick = matches!(
             event,
             Event::NewEvents(StartCause::Init)
@@ -572,14 +669,21 @@ fn run_tray(
         );
         if is_tick && last_refresh.elapsed() >= Duration::from_secs(4) {
             last_refresh = Instant::now();
-            let daemon_state = poll_daemon_state();
+            let snap = snapshot
+                .lock()
+                .map(|g| BarSnapshot {
+                    active_jobs: g.active_jobs.clone(),
+                    failed_jobs: g.failed_jobs.clone(),
+                    daemon_state: g.daemon_state,
+                    db_error: g.db_error.clone(),
+                })
+                .unwrap_or_default();
             rebuild_menu(
                 &tray,
-                &db,
                 project_id.as_deref(),
                 &artifacts_dir,
                 &log_path,
-                daemon_state,
+                &snap,
                 &last_action,
                 &mut click_map.borrow_mut(),
             );
@@ -590,4 +694,42 @@ fn run_tray(
     // may return; either way this line is never reached in practice.
     #[allow(unreachable_code)]
     Ok(())
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_chars_ascii() {
+        assert_eq!(truncate_chars("hello", 10), "hello");
+        assert_eq!(truncate_chars("hello world", 5), "hello…");
+    }
+
+    #[test]
+    fn truncate_chars_non_ascii_no_panic() {
+        // Chinese characters (3 bytes each) — byte-slice would panic mid-codepoint.
+        let chinese = "服务器错误：连接超时，请稍后重试并检查网络设置";
+        let result = truncate_chars(chinese, 10);
+        // Must not panic; result must be valid UTF-8.
+        assert!(result.chars().count() <= 11); // 10 chars + ellipsis
+        // Verify it's valid UTF-8.
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn truncate_chars_emoji_no_panic() {
+        let emojis = "🔥💥🚀⭐🎉🌟💫✨🎊🎁extra";
+        let result = truncate_chars(emojis, 10);
+        assert_eq!(result, "🔥💥🚀⭐🎉🌟💫✨🎊🎁…");
+    }
+
+    #[test]
+    fn truncate_chars_exact_boundary() {
+        let s = "abcde";
+        assert_eq!(truncate_chars(s, 5), "abcde");
+        assert_eq!(truncate_chars(s, 4), "abcd…");
+    }
 }
