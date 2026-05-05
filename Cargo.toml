@@ -51,7 +51,11 @@ oauth2 = { version = "5.0", default-features = false, features = ["reqwest", "ru
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-notify-rust = { version = "4", default-features = false }
+# notify-rust: default features pick the platform-appropriate backend
+# (mac-notification-sys on macOS, dbus on Linux, winrt on Windows). Pinning
+# default-features = false strips ALL Linux backends and breaks the Linux
+# build with "you have to build with either zbus or dbus turned on".
+notify-rust = "4"
 tray-icon = { version = "0.23", optional = true, default-features = false, features = ["common-controls-v6"] }
 tao = { version = "0.35", optional = true }
 muda = { version = "0.19", optional = true }

@@ -2756,7 +2756,7 @@ fn resolve_paper_id_to_job(
         .filter(|v| status_strs.contains(&v.status.as_str()))
         .collect();
     // Sort by updated_at DESC for consistent ordering.
-    matching.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    matching.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
 
     match matching.len() {
         0 => {

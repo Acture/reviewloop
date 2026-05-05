@@ -149,6 +149,11 @@ impl Db {
         // "memory"), which is fine since in-memory DBs are single-process
         // and don't have the concurrent-connection issue.
         let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
+
+        // Step 1: create tables. CREATE TABLE IF NOT EXISTS leaves an
+        // existing table's schema untouched, so on upgrade these no-op
+        // and we rely on ensure_column_exists below to backfill any
+        // columns that didn't exist in the older schema.
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS jobs (
@@ -207,14 +212,14 @@ impl Db {
                 matched_at TEXT NOT NULL,
                 raw_ref TEXT
             );
-
-            CREATE INDEX IF NOT EXISTS idx_jobs_project_status_next_poll ON jobs(project_id, status, next_poll_at);
-            CREATE INDEX IF NOT EXISTS idx_jobs_project_backend_hash ON jobs(project_id, backend, pdf_hash);
-            CREATE INDEX IF NOT EXISTS idx_jobs_project_paper_backend ON jobs(project_id, paper_id, backend);
-            CREATE INDEX IF NOT EXISTS idx_jobs_project_dedupe ON jobs(project_id, paper_id, backend, pdf_hash, version_key, status);
-            CREATE INDEX IF NOT EXISTS idx_events_project_created_at ON events(project_id, created_at);
             "#,
         )?;
+
+        // Step 2: backfill columns that were added in later versions. MUST
+        // run before CREATE INDEX below, since some indexes reference
+        // columns (project_id, version_key) that an older schema lacks --
+        // creating those indexes against a pre-migration table would fail
+        // with "no such column".
         ensure_column_exists(&conn, "jobs", "project_id", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column_exists(&conn, "jobs", "started_at", "TEXT")?;
         ensure_column_exists(&conn, "jobs", "version_no", "INTEGER NOT NULL DEFAULT 1")?;
@@ -227,6 +232,17 @@ impl Db {
         )?;
         ensure_column_exists(&conn, "jobs", "version_key", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column_exists(&conn, "events", "project_id", "TEXT NOT NULL DEFAULT ''")?;
+
+        // Step 3: indexes (now that all referenced columns exist).
+        conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_jobs_project_status_next_poll ON jobs(project_id, status, next_poll_at);
+            CREATE INDEX IF NOT EXISTS idx_jobs_project_backend_hash ON jobs(project_id, backend, pdf_hash);
+            CREATE INDEX IF NOT EXISTS idx_jobs_project_paper_backend ON jobs(project_id, paper_id, backend);
+            CREATE INDEX IF NOT EXISTS idx_jobs_project_dedupe ON jobs(project_id, paper_id, backend, pdf_hash, version_key, status);
+            CREATE INDEX IF NOT EXISTS idx_events_project_created_at ON events(project_id, created_at);
+            "#,
+        )?;
 
         conn.execute(
             "UPDATE jobs SET version_no = 1 WHERE version_no IS NULL OR version_no = 0",
@@ -1483,6 +1499,102 @@ mod tests {
             mode, "wal",
             "expected WAL journal mode after init_schema; got: {mode}"
         );
+    }
+
+    /// Regression: upgrading from a pre-Phase-0 schema (jobs table without
+    /// the project_id column) used to fail in init_schema because CREATE
+    /// INDEX on (project_id, ...) ran BEFORE ensure_column_exists added the
+    /// missing column. Reproduces the production breakage by hand-crafting
+    /// an old-shape jobs table, then runs init_schema and asserts indexes
+    /// got created and old rows are still readable.
+    #[test]
+    fn init_schema_migrates_pre_project_id_table() {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("legacy.db");
+
+        // Hand-craft the pre-Phase-0 schema (no project_id, no version_*,
+        // no started_at). This mirrors what a v0.1.x install left on disk.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE jobs (
+                    id TEXT PRIMARY KEY,
+                    paper_id TEXT NOT NULL,
+                    backend TEXT NOT NULL,
+                    pdf_path TEXT NOT NULL,
+                    pdf_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    token TEXT,
+                    email TEXT NOT NULL,
+                    venue TEXT,
+                    git_tag TEXT,
+                    git_commit TEXT,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    next_poll_at TEXT,
+                    last_error TEXT,
+                    fallback_used INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE seen_tags (
+                    tag_name TEXT PRIMARY KEY,
+                    target_commit TEXT NOT NULL,
+                    seen_at TEXT NOT NULL
+                );
+                CREATE TABLE email_tokens (
+                    token TEXT PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    matched_at TEXT NOT NULL,
+                    raw_ref TEXT
+                );
+                CREATE TABLE reviews (
+                    job_id TEXT PRIMARY KEY,
+                    token TEXT NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    summary_md TEXT NOT NULL,
+                    completed_at TEXT NOT NULL
+                );
+                INSERT INTO jobs (id, paper_id, backend, pdf_path, pdf_hash, status, email, attempt, fallback_used, created_at, updated_at)
+                VALUES ('legacy-job-1', 'main', 'stanford', '/tmp/p.pdf', 'h1', 'COMPLETED', 'test@example.com', 0, 0, '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z');
+                "#,
+            ).unwrap();
+        }
+
+        // Now run init_schema -- this used to fail with "no such column:
+        // project_id" because CREATE INDEX ran before ensure_column_exists.
+        let db = Db::new_file(db_path.clone());
+        db.init_schema()
+            .expect("init_schema must succeed on legacy db");
+
+        // Old row is still there and the new column got a default.
+        let conn = db.connect().unwrap();
+        let (proj, paper_id): (String, String) = conn
+            .query_row(
+                "SELECT project_id, paper_id FROM jobs WHERE id = ?1",
+                ["legacy-job-1"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("legacy row preserved");
+        assert_eq!(proj, "");
+        assert_eq!(paper_id, "main");
+
+        // Indexes referencing project_id were actually created.
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_jobs_project_status_next_poll'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 1, "project_id-prefixed index must exist");
     }
 
     #[test]
