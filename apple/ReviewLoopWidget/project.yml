@@ -1,0 +1,53 @@
+name: ReviewLoopWidget
+options:
+  bundleIdPrefix: ai.reviewloop
+  deploymentTarget:
+    macOS: "15.0"
+  xcodeVersion: "16.0"
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    MACOSX_DEPLOYMENT_TARGET: "15.0"
+    ENABLE_HARDENED_RUNTIME: YES
+
+targets:
+  HostApp:
+    type: application
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - HostApp
+    info:
+      path: HostApp/Info.plist
+    entitlements:
+      path: HostApp/HostApp.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.reviewloop.ReviewLoopWidget
+        PRODUCT_NAME: ReviewLoopWidget
+        INFOPLIST_FILE: HostApp/Info.plist
+        CODE_SIGN_ENTITLEMENTS: HostApp/HostApp.entitlements
+        ENABLE_PREVIEWS: YES
+    dependencies:
+      - target: Widget
+        embed: true
+
+  Widget:
+    type: app-extension
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - Widget
+    info:
+      path: Widget/Info.plist
+    entitlements:
+      path: Widget/Widget.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.reviewloop.ReviewLoopWidget.Widget
+        PRODUCT_NAME: ReviewLoopWidget-Widget
+        INFOPLIST_FILE: Widget/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Widget/Widget.entitlements
+        ENABLE_PREVIEWS: YES
