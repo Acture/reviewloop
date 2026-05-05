@@ -358,6 +358,8 @@ enum ClickAction {
     OpenJobLog(PathBuf),
     /// Retry a specific job (active or failed).
     RetryJob(String),
+    /// Cancel an active job (QUEUED / SUBMITTED / PROCESSING).
+    CancelJob(String),
     /// Open a native file picker and submit the chosen PDF.
     SubmitNew,
     PauseDaemon,
@@ -511,10 +513,13 @@ fn rebuild_menu(
                 let job_sub = Submenu::new(&label, true);
 
                 let retry_item = MenuItem::new("Retry now", true, None);
+                let cancel_item = MenuItem::new("Cancel job", true, None);
                 let open_art_item = MenuItem::new("Open artifacts", true, None);
                 let open_log_item = MenuItem::new("Open log", true, None);
 
                 let _ = job_sub.append(&retry_item);
+                let _ = job_sub.append(&cancel_item);
+                let _ = job_sub.append(&PredefinedMenuItem::separator());
                 let _ = job_sub.append(&open_art_item);
                 let _ = job_sub.append(&open_log_item);
                 let _ = project_sub.append(&job_sub);
@@ -523,6 +528,10 @@ fn rebuild_menu(
                 click_map.insert(
                     retry_item.id().clone(),
                     ClickAction::RetryJob(job.id.clone()),
+                );
+                click_map.insert(
+                    cancel_item.id().clone(),
+                    ClickAction::CancelJob(job.id.clone()),
                 );
                 click_map.insert(
                     open_art_item.id().clone(),
@@ -692,6 +701,25 @@ fn execute_action(
                     &["retry", "--job-id", &job_id, "--force"],
                     None,
                     "Retry",
+                    &la,
+                );
+            });
+        }
+        ClickAction::CancelJob(job_id) => {
+            tracing::info!("bar: cancel job {job_id}");
+            let job_id = job_id.clone();
+            let la = Arc::clone(last_action);
+            std::thread::spawn(move || {
+                run_action_cmd(
+                    &[
+                        "cancel",
+                        "--job-id",
+                        &job_id,
+                        "--reason",
+                        "cancelled from menu bar",
+                    ],
+                    None,
+                    "Cancel",
                     &la,
                 );
             });
