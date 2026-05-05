@@ -1165,6 +1165,29 @@ impl Db {
         collect_rows(rows)
     }
 
+    /// Count COMPLETED jobs whose `updated_at` starts with `date_prefix` (e.g. `"2026-05-05"`).
+    /// Used by the widget state builder for `summary.completed_today`.
+    /// The date is compared against the UTC date stored in `updated_at`.
+    pub fn count_completed_today(&self, project_id: &str, date_prefix: &str) -> Result<usize> {
+        let conn = self.connect()?;
+        let count: i64 = conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM jobs
+            WHERE project_id = ?1
+              AND status = ?2
+              AND updated_at LIKE ?3
+            "#,
+            params![
+                project_id,
+                JobStatus::Completed.as_str(),
+                format!("{date_prefix}%"),
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     pub fn status_counts(&self, project_id: &str) -> Result<BTreeMap<String, usize>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(

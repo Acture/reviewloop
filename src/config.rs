@@ -211,6 +211,24 @@ impl Config {
         PathBuf::from(&self.core.state_dir)
     }
 
+    /// Returns the path where the widget state JSON file should be written,
+    /// or `None` if `core.widget_state_enabled` is `false`.
+    ///
+    /// The directory defaults to `core.state_dir`; override with
+    /// `core.widget_state_dir` (global config only; no per-project V1 support).
+    pub fn widget_state_path(&self) -> Option<PathBuf> {
+        if !self.core.widget_state_enabled {
+            return None;
+        }
+        let dir = self
+            .core
+            .widget_state_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.state_dir());
+        Some(dir.join("widget-state.json"))
+    }
+
     pub fn db_in_memory(&self) -> bool {
         self.core.db_path.trim().eq_ignore_ascii_case(":memory:")
     }
@@ -929,6 +947,10 @@ fn default_log_path() -> String {
         .to_string()
 }
 
+fn default_widget_state_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CoreConfig {
@@ -943,6 +965,15 @@ pub struct CoreConfig {
     /// Credentials in the URL are not logged — only the count is reported.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxies: Vec<String>,
+    /// Whether to write a widget state JSON file on every tick.
+    /// Defaults to `true`. Set to `false` to disable (e.g. on non-macOS hosts).
+    #[serde(default = "default_widget_state_enabled")]
+    pub widget_state_enabled: bool,
+    /// Directory in which to write `widget-state.json`.
+    /// `None` (the default) resolves to `state_dir`.
+    /// Per-project override is not supported in V1; this is a global-only field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widget_state_dir: Option<String>,
 }
 
 impl Default for CoreConfig {
@@ -954,6 +985,8 @@ impl Default for CoreConfig {
             max_submissions_per_tick: 1,
             review_timeout_hours: 48,
             proxies: Vec::new(),
+            widget_state_enabled: default_widget_state_enabled(),
+            widget_state_dir: None,
         }
     }
 }

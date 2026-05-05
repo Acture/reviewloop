@@ -14,4 +14,5 @@ pub mod panel;
 pub mod token;
 pub mod trigger;
 pub mod util;
+pub mod widget_state;
 pub mod worker;

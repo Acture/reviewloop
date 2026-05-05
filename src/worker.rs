@@ -11,6 +11,7 @@ use crate::{
     panel::render_tick_panel,
     trigger::{run_git_tag_trigger, run_pdf_trigger},
     util::{compute_next_poll_at, estimate_pdf_page_count},
+    widget_state,
 };
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
@@ -164,6 +165,12 @@ async fn run_tick_internal(config: &Config, db: &Db, tick: Option<u64>) -> Resul
     }
 
     prune_retention(config, db, tick)?;
+
+    if let Some(path) = config.widget_state_path() {
+        if let Err(e) = widget_state::build_and_write(config, db, &path) {
+            tracing::warn!(error = %e, "failed to write widget state file");
+        }
+    }
 
     Ok(())
 }
