@@ -142,6 +142,12 @@ impl RoundRobinProxyMiddleware {
     /// Write a `proxy_failover` event to the DB when a proxy failover occurs.
     /// Opens a fresh `Db` connection from the stored path; dropped immediately.
     /// Skipped silently when no event target is configured.
+    ///
+    /// `job_id` and `paper_id` are not included in the payload because the
+    /// middleware executes below the per-job call sites (in `backend.submit` /
+    /// `backend.poll`).  Plumbing them through `reqwest_middleware::Extensions`
+    /// would require each backend to stamp every `reqwest::Request` before
+    /// dispatch — worthwhile but deferred to a future iteration (R4 option a).
     fn emit_failover_event(&self, failed_proxy_index: usize, attempt: usize, error: Option<&str>) {
         let Some((ref db_path, ref pid)) = self.event_target else {
             return;

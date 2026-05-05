@@ -1442,11 +1442,11 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
             })
             .unwrap_or_default();
 
-        // Surface a recent Gmail OAuth refresh failure (U6).  Use a 1-hour
-        // freshness window: OAuth tokens typically stay broken until the user
-        // re-authorises, unlike transient tick errors which resolve on the
-        // next tick.  Skipped in --json output (small UX touch only).
-        let gmail_oauth_stale: Option<chrono::DateTime<Utc>> = db.and_then(|d| {
+        // Surface a recent Gmail OAuth refresh failure (U6).  Use a 24-hour
+        // freshness window: OAuth tokens stay broken until the user re-authorises
+        // (not a transient error like a tick failure), so the 1-hour window
+        // was hiding ongoing failures that required user action.
+        let gmail_oauth_stale: Option<(chrono::DateTime<Utc>, String)> = db.and_then(|d| {
             if project_id.is_empty() {
                 return None;
             }
@@ -1462,10 +1462,16 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
                 }
             };
             let age = now - ev.created_at;
-            if age > chrono::Duration::hours(1) {
+            if age > chrono::Duration::hours(24) {
                 return None;
             }
-            Some(ev.created_at)
+            let msg = ev
+                .payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("OAuth token refresh failed")
+                .to_string();
+            Some((ev.created_at, msg))
         });
 
         // Compute tick health based on how long ago the last tick occurred.
@@ -1484,6 +1490,32 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
                 }
             }
         };
+
+        // Query recent proxy_failover events for R3 (proxy health section).
+        let recent_proxy_failovers: Vec<EventRecord> = db
+            .and_then(|d| {
+                if project_id.is_empty() {
+                    return None;
+                }
+                match d.list_recent_events_of_type(project_id, "proxy_failover", 10) {
+                    Ok(evs) => Some(evs),
+                    Err(e) => {
+                        tracing::warn!(error = %e, project_id, "failed to read proxy_failover events for daemon status");
+                        None
+                    }
+                }
+            })
+            .unwrap_or_default();
+        let cutoff_5m = now - chrono::Duration::minutes(5);
+        let cutoff_1h = now - chrono::Duration::hours(1);
+        let failovers_5m = recent_proxy_failovers
+            .iter()
+            .filter(|ev| ev.created_at >= cutoff_5m)
+            .count();
+        let failovers_1h = recent_proxy_failovers
+            .iter()
+            .filter(|ev| ev.created_at >= cutoff_1h)
+            .count();
 
         if as_json {
             let jobs_json: Vec<serde_json::Value> = active_jobs
@@ -1505,6 +1537,24 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
                 }),
                 None => serde_json::Value::Null,
             };
+            let gmail_oauth_json = match &gmail_oauth_stale {
+                Some((ts, msg)) => json!({
+                    "stale": true,
+                    "since": ts.to_rfc3339(),
+                    "message": msg,
+                }),
+                None => serde_json::Value::Null,
+            };
+            let proxy_health_recent: Vec<serde_json::Value> = recent_proxy_failovers
+                .iter()
+                .map(|ev| {
+                    json!({
+                        "id": ev.id,
+                        "created_at": ev.created_at.to_rfc3339(),
+                        "payload": ev.payload,
+                    })
+                })
+                .collect();
             let payload = json!({
                 "project_id": project_id,
                 "service": { "loaded": loaded, "running": running },
@@ -1512,6 +1562,12 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
                 "tick_health": tick_health,
                 "last_tick_error": last_tick_error_json,
                 "active_jobs": jobs_json,
+                "gmail_oauth_status": gmail_oauth_json,
+                "proxy_health": {
+                    "failovers_5m": failovers_5m,
+                    "failovers_1h": failovers_1h,
+                    "recent": proxy_health_recent,
+                },
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
             return Ok(());
@@ -1573,10 +1629,15 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
                 println!("  last tick error: none");
             }
         }
-        if let Some(ts) = gmail_oauth_stale {
+        if let Some((ts, _msg)) = &gmail_oauth_stale {
             println!(
                 "  gmail oauth: stale (refresh failed at {}); run 'reviewloop email login --provider google' to re-authorize",
                 ts.format("%Y-%m-%dT%H:%M:%SZ")
+            );
+        }
+        if failovers_1h > 0 {
+            println!(
+                "  proxy: {failovers_5m} failover(s) in last 5min, {failovers_1h} in last hour"
             );
         }
 

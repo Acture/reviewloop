@@ -130,12 +130,25 @@ impl Db {
             };
             anyhow::Error::from(e).context(ctx)
         })?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        // 30-second busy timeout so concurrent writes from emit_failover_event
+        // (opening a fresh connection while update_job_state holds a write
+        // transaction) retry rather than fail immediately. WAL mode (set in
+        // init_schema) further reduces contention, but having a generous
+        // timeout is a belt-and-suspenders safeguard.
+        conn.busy_timeout(Duration::from_secs(30))?;
         Ok(conn)
     }
 
     pub fn init_schema(&self) -> Result<()> {
         let conn = self.connect()?;
+        // Enable WAL journal mode for file-based databases.  WAL allows
+        // concurrent readers + one writer without blocking each other, so a
+        // write transaction in one connection (e.g. update_job_state) does
+        // not starve another connection's write (e.g. emit_failover_event).
+        // For in-memory databases this pragma is silently ignored (mode stays
+        // "memory"), which is fine since in-memory DBs are single-process
+        // and don't have the concurrent-connection issue.
+        let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS jobs (
@@ -1092,6 +1105,29 @@ impl Db {
         }))
     }
 
+    /// Returns up to `limit` most-recent events of `event_type` for a project,
+    /// ordered newest first.  Used by `daemon status` to surface proxy failover
+    /// health without a full table scan.
+    pub fn list_recent_events_of_type(
+        &self,
+        project_id: &str,
+        event_type: &str,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, project_id, job_id, event_type, payload_json, created_at
+            FROM events
+            WHERE project_id = ?1 AND event_type = ?2
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?3
+            "#,
+        )?;
+        let rows = stmt.query_map(params![project_id, event_type, limit as i64], map_event_row)?;
+        collect_rows(rows)
+    }
+
     pub fn status_counts(&self, project_id: &str) -> Result<BTreeMap<String, usize>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -1344,4 +1380,32 @@ fn conversion_error(message: String) -> rusqlite::Error {
             message,
         )),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Verify that WAL journal mode is enabled after init_schema.
+    ///
+    /// With WAL enabled, concurrent writes from separate connections (e.g.
+    /// update_job_state holding a transaction while emit_failover_event opens
+    /// a fresh connection) are retried rather than failing immediately, fixing
+    /// the "failover events silently dropped under load" bug (N2).
+    #[test]
+    fn wal_mode_enabled_after_init_schema() {
+        let tmp = tempdir().unwrap();
+        let db = Db::new(tmp.path());
+        db.init_schema().expect("init_schema must succeed");
+
+        let conn = db.connect().expect("connect after init_schema");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("PRAGMA journal_mode must return a row");
+        assert_eq!(
+            mode, "wal",
+            "expected WAL journal mode after init_schema; got: {mode}"
+        );
+    }
 }
