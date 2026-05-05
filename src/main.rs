@@ -2195,8 +2195,12 @@ fn cmd_approve(config: &Config, db: &Db, job_id: &str) -> Result<()> {
 /// The `last_error` field is set to "cancelled by user: <reason>" and a
 /// `cancelled` event is written with `{reason, previous_status}`.
 fn cmd_cancel(config: &Config, db: &Db, job_id: &str, reason: Option<&str>) -> Result<()> {
-    ensure_project_context(config)?;
-    let job = ensure_project_job(config, db, job_id)?;
+    // Cancel only updates DB rows for the named job — no worker, no provider
+    // config required. Allow it to run without project context so the menu
+    // bar companion can cancel any job from any cwd. When project context IS
+    // set, we still scope-check so a paper-repo cwd cannot accidentally act
+    // on a different project's jobs.
+    let job = resolve_job_by_id_any_project(config, db, job_id)?;
 
     if matches!(
         job.status,
@@ -2707,6 +2711,26 @@ async fn cmd_complete(
 fn ensure_project_job(config: &Config, db: &Db, job_id: &str) -> Result<reviewloop::model::Job> {
     db.get_project_job(&config.project_id, job_id)?
         .ok_or_else(|| anyhow!("job not found in project {}: {}", config.project_id, job_id))
+}
+
+/// Look up a job by ID with optional project scoping.
+///
+/// When `config.project_id` is non-empty, the lookup is project-scoped (so
+/// callers in a paper repo cannot accidentally act on another project's
+/// jobs). When `config.project_id` is empty, falls back to a global lookup
+/// — useful for the menu bar companion which runs from any directory and
+/// needs to act on jobs across every project.
+fn resolve_job_by_id_any_project(
+    config: &Config,
+    db: &Db,
+    job_id: &str,
+) -> Result<reviewloop::model::Job> {
+    if config.project_id.trim().is_empty() {
+        db.get_job(job_id)?
+            .ok_or_else(|| anyhow!("job not found: {}", job_id))
+    } else {
+        ensure_project_job(config, db, job_id)
+    }
 }
 
 /// Build a rich error for a missing paper_id that lists known paper_ids.
