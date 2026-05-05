@@ -74,6 +74,28 @@ impl DbTestContext {
         let hash = sha256_file(Path::new(&paper.pdf_path))?;
         self.create_job_with_hash(status, &hash)
     }
+
+    fn create_job_with_project_and_hash(
+        &self,
+        project_id: &str,
+        status: JobStatus,
+        hash: &str,
+    ) -> Result<Job> {
+        let paper = &self.config.papers[0];
+        self.db.create_job(&NewJob {
+            project_id: project_id.to_string(),
+            paper_id: paper.id.clone(),
+            backend: paper.backend.clone(),
+            pdf_path: paper.pdf_path.clone(),
+            pdf_hash: hash.to_string(),
+            status,
+            email: self.config.providers.stanford.email.clone(),
+            venue: self.config.providers.stanford.venue.clone(),
+            git_tag: None,
+            git_commit: None,
+            next_poll_at: None,
+        })
+    }
 }
 
 #[test]
@@ -699,6 +721,88 @@ fn list_failed_jobs_for_project_respects_limit() -> Result<()> {
         .list_failed_jobs_for_project(&ctx.config.project_id, 3)?;
 
     assert_eq!(results.len(), 3, "limit=3 should cap at 3 results");
+
+    Ok(())
+}
+
+#[test]
+fn list_active_jobs_all_returns_jobs_from_every_project() -> Result<()> {
+    let ctx = DbTestContext::new()?;
+
+    let a = ctx.create_job_with_project_and_hash("proj-a", JobStatus::Queued, "ha-1")?;
+    let b = ctx.create_job_with_project_and_hash("proj-b", JobStatus::Submitted, "hb-1")?;
+    let c = ctx.create_job_with_project_and_hash("proj-c", JobStatus::Processing, "hc-1")?;
+    // A completed job from another project should NOT appear (not active).
+    let _completed =
+        ctx.create_job_with_project_and_hash("proj-d", JobStatus::Completed, "hd-1")?;
+
+    let results = ctx.db.list_active_jobs_all()?;
+    let ids: std::collections::HashSet<_> = results.iter().map(|j| j.id.as_str()).collect();
+    assert_eq!(results.len(), 3, "expected 3 active jobs across 3 projects");
+    assert!(ids.contains(a.id.as_str()));
+    assert!(ids.contains(b.id.as_str()));
+    assert!(ids.contains(c.id.as_str()));
+
+    // project_id field is preserved so the bar can group by it.
+    let projects: std::collections::HashSet<_> =
+        results.iter().map(|j| j.project_id.as_str()).collect();
+    assert!(projects.contains("proj-a"));
+    assert!(projects.contains("proj-b"));
+    assert!(projects.contains("proj-c"));
+
+    Ok(())
+}
+
+#[test]
+fn list_failed_jobs_all_per_project_caps_per_project_not_globally() -> Result<()> {
+    let ctx = DbTestContext::new()?;
+
+    // Project A: 8 failures (noisy).
+    for i in 0..8 {
+        ctx.create_job_with_project_and_hash("noisy", JobStatus::Failed, &format!("noisy-{i}"))?;
+    }
+    // Project B: 1 failure.
+    ctx.create_job_with_project_and_hash("quiet", JobStatus::Failed, "quiet-1")?;
+
+    // Per-project limit = 3 should yield 3 from "noisy" + 1 from "quiet" = 4.
+    // A naive global LIMIT 3 would have hidden "quiet" entirely.
+    let results = ctx.db.list_failed_jobs_all_per_project(3)?;
+    let by_project: std::collections::HashMap<&str, usize> =
+        results
+            .iter()
+            .fold(std::collections::HashMap::new(), |mut acc, j| {
+                *acc.entry(j.project_id.as_str()).or_insert(0) += 1;
+                acc
+            });
+
+    assert_eq!(by_project.get("noisy").copied().unwrap_or(0), 3);
+    assert_eq!(by_project.get("quiet").copied().unwrap_or(0), 1);
+    assert_eq!(results.len(), 4);
+
+    Ok(())
+}
+
+#[test]
+fn list_failed_jobs_all_per_project_excludes_user_cancellations() -> Result<()> {
+    let ctx = DbTestContext::new()?;
+
+    let cancelled = ctx.create_job_with_project_and_hash("p", JobStatus::Failed, "cancel-1")?;
+    let real_failure = ctx.create_job_with_project_and_hash("p", JobStatus::Failed, "real-1")?;
+
+    // Mark one as user-cancelled.
+    let conn = rusqlite::Connection::open(&ctx.db.path)?;
+    conn.execute(
+        "UPDATE jobs SET last_error = ?1 WHERE id = ?2",
+        params![
+            "cancelled by user: requested via reviewloop cancel",
+            cancelled.id
+        ],
+    )?;
+
+    let results = ctx.db.list_failed_jobs_all_per_project(10)?;
+    let ids: std::collections::HashSet<_> = results.iter().map(|j| j.id.as_str()).collect();
+    assert!(!ids.contains(cancelled.id.as_str()));
+    assert!(ids.contains(real_failure.id.as_str()));
 
     Ok(())
 }

@@ -6,29 +6,31 @@
 //! Build:   cargo build   --bin reviewloop-bar --features bar
 //! Install: cargo install --path . --bin reviewloop-bar --features bar
 //!
-//! ## v2 feature summary
+//! ## Design — fleet view (v3)
 //!
-//! Implemented:
-//! - Per-active-job submenus (Retry now / Open artifacts / Open log)
-//! - "Recent failures (N)" submenu — each failed job surfaced with last_error (U2)
-//! - "Submit new…" — native file picker via `rfd`, spawns `reviewloop run <pdf>`
-//! - "Pause daemon" / "Resume daemon" — state-aware, polls launchctl each tick (U14)
-//! - Cross-platform `open_path` (macOS: `open`, Linux: `xdg-open`, Windows: `explorer`)
-//! - Menu rebuilt on every 5 s refresh tick so job list stays current
-//! - Last-action summary displayed as disabled top-of-menu item (U7)
-//! - No-project hint with disabled items when REVIEWLOOP_PROJECT_ID not set (U9)
+//! The bar is a **fleet dashboard**, not a per-project tool. It opens the
+//! shared SQLite database and shows status across every project that has
+//! activity, grouped by `project_id`. There is no `REVIEWLOOP_PROJECT_ID`
+//! requirement; running the bar from any directory works.
 //!
-//! Deferred (noted here for future phases):
-//! - **Multi-project switching**: requires `Db::list_known_project_ids()`.
+//! - Top-level: aggregate counts (active / recent failures / project count)
+//! - Per project: a submenu with that project's active jobs and recent
+//!   failures, each with retry / open-artifacts / open-log actions
+//! - Legacy bucket: jobs with empty `project_id` (pre-Phase-0 data) are
+//!   surfaced under a synthetic "(legacy)" group so they remain visible
+//!   without contaminating real project counts in the menu header
+//! - Submit new… spawns `reviewloop run <pdf>` with cwd set to the PDF's
+//!   parent directory so the CLI's own config discovery picks the project
+//! - Pause/Resume daemon — state-aware via launchctl
 
 use anyhow::{Context as _, Result};
 use chrono::Utc;
 use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use reviewloop::config::Config;
 use reviewloop::db::Db;
-use reviewloop::model::Job;
+use reviewloop::model::{Job, JobStatus};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
@@ -37,6 +39,13 @@ use std::time::{Duration, Instant};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::TrayIconBuilder;
+
+/// Synthetic project_id label used when `Job::project_id` is empty/whitespace.
+const LEGACY_PROJECT_LABEL: &str = "(legacy)";
+
+/// Cap on how many recent failures we surface per project, both at the
+/// SQL window-function layer and the menu layer.
+const FAILURES_PER_PROJECT_LIMIT: usize = 5;
 
 fn main() {
     tracing_subscriber::fmt::init();
@@ -51,15 +60,6 @@ fn try_main() -> Result<()> {
     let db = Db::from_config(&config).context("opening database")?;
     db.init_schema().context("initialising schema")?;
 
-    // Project ID: env var first, then config, else None (shows hint in menu).
-    let project_id: Option<String> = std::env::var("REVIEWLOOP_PROJECT_ID").ok().or_else(|| {
-        if config.project_id.trim().is_empty() {
-            None
-        } else {
-            Some(config.project_id.clone())
-        }
-    });
-
     let artifacts_dir = config.state_dir().join("artifacts");
     let log_path: PathBuf = config
         .logging
@@ -68,18 +68,21 @@ fn try_main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| config.state_dir().join("reviewloop.log"));
 
-    run_tray(db, project_id, artifacts_dir, log_path)
+    run_tray(db, artifacts_dir, log_path)
 }
 
 // ── Icon helpers ─────────────────────────────────────────────────────────────
 
 fn make_icon(r: u8, g: u8, b: u8) -> tray_icon::Icon {
-    // 16×16 RGBA: a coloured disc with a white outline so it is legible on
-    // both light and dark menu bars. Outside the outer radius is transparent.
-    const SIZE: i32 = 16;
-    const CENTER: f32 = 7.5;
-    const OUTER: f32 = 7.5;
-    const INNER: f32 = 6.0;
+    // 18×18 RGBA: a coloured disc that fills most of the canvas with a thin
+    // darker rim for definition on light menu bars. Outside the disc is fully
+    // transparent so the icon sits cleanly next to other tray items.
+    const SIZE: i32 = 18;
+    const CENTER: f32 = 8.5;
+    const OUTER: f32 = 8.5;
+    const RIM_WIDTH: f32 = 1.2;
+    let dim = |c: u8| -> u8 { ((c as u16) * 60 / 100) as u8 };
+    let rim = (dim(r), dim(g), dim(b));
 
     let mut pixels = Vec::with_capacity((SIZE * SIZE * 4) as usize);
     for y in 0..SIZE {
@@ -87,12 +90,11 @@ fn make_icon(r: u8, g: u8, b: u8) -> tray_icon::Icon {
             let dx = x as f32 - CENTER;
             let dy = y as f32 - CENTER;
             let dist = (dx * dx + dy * dy).sqrt();
-            let (pr, pg, pb, pa) = if dist <= INNER {
+            let (pr, pg, pb, pa) = if dist <= OUTER - RIM_WIDTH {
                 (r, g, b, 255u8)
             } else if dist <= OUTER {
-                // White ring with anti-aliasing on the outer edge.
                 let alpha = ((OUTER - dist).clamp(0.0, 1.0) * 255.0) as u8;
-                (255u8, 255u8, 255u8, alpha)
+                (rim.0, rim.1, rim.2, alpha.max(180))
             } else {
                 (0, 0, 0, 0)
             };
@@ -117,35 +119,23 @@ fn open_path(path: &Path) {
     {
         let _ = Command::new("explorer").arg(path).spawn();
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        tracing::warn!("open_path: unsupported platform for {}", path.display());
-    }
 }
 
 fn open_log(path: &Path) {
-    #[cfg(target_os = "macos")]
-    {
-        // `-t` opens in the default text editor.
-        let _ = Command::new("open").arg("-t").arg(path).spawn();
-    }
-    #[cfg(not(target_os = "macos"))]
     open_path(path);
 }
 
-// ── Daemon state (U14) ────────────────────────────────────────────────────────
+#[cfg(target_os = "macos")]
+const DAEMON_LABEL: &str = "ai.reviewloop.daemon";
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DaemonState {
     loaded: bool,
     running: bool,
 }
 
-/// Poll launchctl to determine daemon loaded/running state.
-/// Returns `None` on non-macOS or when launchctl is unavailable.
 #[cfg(target_os = "macos")]
 fn poll_daemon_state() -> Option<DaemonState> {
-    const DAEMON_LABEL: &str = "ai.reviewloop.daemon";
     let uid = Command::new("id")
         .arg("-u")
         .output()
@@ -178,29 +168,18 @@ fn poll_daemon_state() -> Option<DaemonState> {
     None
 }
 
-// ── Background state snapshot (N4 / A3) ──────────────────────────────────────
+// ── Background state snapshot ────────────────────────────────────────────────
 
 /// State polled by the background thread, read cheaply by the main event loop.
+#[derive(Default, Clone)]
 struct BarSnapshot {
-    active_jobs: Vec<Job>,
-    failed_jobs: Vec<Job>,
+    all_active: Vec<Job>,
+    all_failed: Vec<Job>,
     daemon_state: Option<DaemonState>,
     db_error: Option<String>,
 }
 
-impl Default for BarSnapshot {
-    fn default() -> Self {
-        Self {
-            active_jobs: Vec::new(),
-            failed_jobs: Vec::new(),
-            daemon_state: None,
-            db_error: None,
-        }
-    }
-}
-
 /// Run `poll_daemon_state()` in a child thread with a 3-second watchdog.
-/// Returns `None` if launchctl hangs or is unavailable.
 fn poll_daemon_state_with_timeout() -> Option<DaemonState> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -210,32 +189,34 @@ fn poll_daemon_state_with_timeout() -> Option<DaemonState> {
 }
 
 /// Spawn a background thread that refreshes `snapshot` every `interval`.
-/// The thread opens its own `Db` connection so the main thread stays free.
 fn start_background_poller(
     db_path: PathBuf,
-    project_id: Option<String>,
     snapshot: Arc<Mutex<BarSnapshot>>,
     interval: Duration,
 ) {
     std::thread::spawn(move || {
         loop {
             let db = Db::new_file(db_path.clone());
-            let (active_jobs, failed_jobs, db_error) = if let Err(e) = db.init_schema() {
-                (Vec::new(), Vec::new(), Some(e.to_string()))
-            } else if let Some(ref pid) = project_id {
-                let active = db.list_active_jobs_for_project(pid).unwrap_or_default();
-                let failed = db.list_failed_jobs_for_project(pid, 20).unwrap_or_default();
-                (active, failed, None)
+            let mut new_snap = BarSnapshot::default();
+            new_snap.daemon_state = poll_daemon_state_with_timeout();
+
+            if let Err(e) = db.init_schema() {
+                new_snap.db_error = Some(format!("init: {e}"));
             } else {
-                (Vec::new(), Vec::new(), None)
-            };
-            let daemon_state = poll_daemon_state_with_timeout();
+                match db.list_active_jobs_all() {
+                    Ok(jobs) => new_snap.all_active = jobs,
+                    Err(e) => new_snap.db_error = Some(format!("active: {e}")),
+                }
+                if new_snap.db_error.is_none() {
+                    match db.list_failed_jobs_all_per_project(FAILURES_PER_PROJECT_LIMIT) {
+                        Ok(jobs) => new_snap.all_failed = jobs,
+                        Err(e) => new_snap.db_error = Some(format!("failed: {e}")),
+                    }
+                }
+            }
 
             if let Ok(mut snap) = snapshot.lock() {
-                snap.active_jobs = active_jobs;
-                snap.failed_jobs = failed_jobs;
-                snap.daemon_state = daemon_state;
-                snap.db_error = db_error;
+                *snap = new_snap;
             }
 
             std::thread::sleep(interval);
@@ -252,6 +233,78 @@ fn truncate_chars(s: &str, n: usize) -> String {
         format!("{truncated}…")
     } else {
         truncated
+    }
+}
+
+/// Returns the project key used for grouping. Empty/whitespace project_ids
+/// (pre-Phase-0 legacy data) collapse to a single synthetic bucket.
+fn project_key(job: &Job) -> &str {
+    if job.project_id.trim().is_empty() {
+        LEGACY_PROJECT_LABEL
+    } else {
+        job.project_id.as_str()
+    }
+}
+
+// ── Aggregation helpers ──────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Aggregate {
+    active_count: usize,
+    failed_count: usize,
+    project_count: usize,
+}
+
+fn aggregate(snap: &BarSnapshot) -> Aggregate {
+    let mut projects: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for j in snap.all_active.iter().chain(snap.all_failed.iter()) {
+        projects.insert(project_key(j));
+    }
+    Aggregate {
+        active_count: snap.all_active.len(),
+        failed_count: snap.all_failed.len(),
+        project_count: projects.len(),
+    }
+}
+
+/// Group active + failed jobs by project, preserving stable (alphabetical) order.
+/// The legacy bucket is appended last so real projects sort first.
+fn group_by_project(snap: &BarSnapshot) -> Vec<ProjectGroup> {
+    let mut map: BTreeMap<String, ProjectGroup> = BTreeMap::new();
+    for j in &snap.all_active {
+        let k = project_key(j).to_string();
+        map.entry(k.clone())
+            .or_insert_with(|| ProjectGroup::new(k))
+            .active
+            .push(j.clone());
+    }
+    for j in &snap.all_failed {
+        let k = project_key(j).to_string();
+        map.entry(k.clone())
+            .or_insert_with(|| ProjectGroup::new(k))
+            .failed
+            .push(j.clone());
+    }
+    let mut groups: Vec<ProjectGroup> = map.into_values().collect();
+    // Move legacy bucket (if present) to the end.
+    groups.sort_by_key(|g| (g.id == LEGACY_PROJECT_LABEL, g.id.clone()));
+    groups
+}
+
+#[derive(Debug, Clone)]
+struct ProjectGroup {
+    id: String,
+    active: Vec<Job>,
+    failed: Vec<Job>,
+}
+
+impl ProjectGroup {
+    fn new(id: String) -> Self {
+        Self {
+            id,
+            active: Vec::new(),
+            failed: Vec::new(),
+        }
     }
 }
 
@@ -312,14 +365,81 @@ enum ClickAction {
     Quit,
 }
 
+// ── Menu signature (rebuild throttling) ──────────────────────────────────────
+
+/// Compact representation of the visible menu state. The main loop only
+/// rebuilds the menu when this changes — `tray.set_menu` while a menu is open
+/// closes it on macOS, so a 5s blanket rebuild would dismiss menus the user is
+/// reading. The icon, by contrast, is updated every tick (cheap and silent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MenuSignature {
+    aggregate: Aggregate,
+    daemon_state: Option<DaemonState>,
+    db_error: Option<String>,
+    last_action: Option<String>,
+    /// (project_id, active_job_id, status, attempt, has_next_poll)
+    active_jobs: Vec<(String, String, JobStatus, u32, bool)>,
+    /// (project_id, failed_job_id, status, attempt, error_snippet)
+    failed_jobs: Vec<(String, String, JobStatus, u32, String)>,
+}
+
+fn compute_signature(snap: &BarSnapshot, last_action: Option<&str>) -> MenuSignature {
+    MenuSignature {
+        aggregate: aggregate(snap),
+        daemon_state: snap.daemon_state,
+        db_error: snap.db_error.clone(),
+        last_action: last_action.map(|s| s.to_string()),
+        active_jobs: snap
+            .all_active
+            .iter()
+            .map(|j| {
+                (
+                    project_key(j).to_string(),
+                    j.id.clone(),
+                    j.status,
+                    j.attempt,
+                    j.next_poll_at.is_some(),
+                )
+            })
+            .collect(),
+        failed_jobs: snap
+            .all_failed
+            .iter()
+            .map(|j| {
+                (
+                    project_key(j).to_string(),
+                    j.id.clone(),
+                    j.status,
+                    j.attempt,
+                    j.last_error
+                        .as_deref()
+                        .map(|e| truncate_chars(e, 60))
+                        .unwrap_or_default(),
+                )
+            })
+            .collect(),
+    }
+}
+
+// ── Icon colour rules ────────────────────────────────────────────────────────
+
+fn icon_color(snap: &BarSnapshot) -> (u8, u8, u8) {
+    if snap.db_error.is_some() {
+        (200, 100, 30) // orange — DB error
+    } else if !snap.all_failed.is_empty() {
+        (200, 30, 30) // red — recent failures
+    } else if !snap.all_active.is_empty() {
+        (30, 100, 200) // blue — active jobs
+    } else {
+        (140, 140, 140) // grey — idle
+    }
+}
+
 // ── Menu builder ─────────────────────────────────────────────────────────────
 
 /// Rebuild the tray menu from scratch and update the click map.
-///
-/// Called on first tick and every 5 s thereafter (reads from cached snapshot).
 fn rebuild_menu(
     tray: &tray_icon::TrayIcon,
-    project_id: Option<&str>,
     artifacts_dir: &Path,
     log_path: &Path,
     snapshot: &BarSnapshot,
@@ -330,7 +450,7 @@ fn rebuild_menu(
 
     let menu = Menu::new();
 
-    // ── Last-action summary (U7) — with TTL (N3) ─────────────────────────────
+    // ── Last-action summary (TTL 5min) ───────────────────────────────────────
     if let Ok(guard) = last_action.lock() {
         if let Some((summary, ts)) = guard.as_ref() {
             let elapsed = ts.elapsed();
@@ -348,58 +468,45 @@ fn rebuild_menu(
         }
     }
 
-    // ── Project header ────────────────────────────────────────────────────────
-    let project_label = match project_id {
-        Some(p) => format!("Project: {p}"),
-        None => "⚠ No project found in $REVIEWLOOP_PROJECT_ID or cwd".to_string(),
-    };
-    let project_item = MenuItem::new(&project_label, false, None);
-    let _ = menu.append(&project_item);
-
-    if project_id.is_none() {
-        let hint = MenuItem::new("Set REVIEWLOOP_PROJECT_ID and restart", false, None);
-        let _ = menu.append(&hint);
-    }
-
-    let _ = menu.append(&PredefinedMenuItem::separator());
-
-    // ── Status summary ────────────────────────────────────────────────────────
-    let (status_label, icon_r, icon_g, icon_b) = if project_id.is_none() {
-        (
-            "No project — set REVIEWLOOP_PROJECT_ID".to_string(),
-            128u8,
-            128u8,
-            128u8,
+    // ── Status header ────────────────────────────────────────────────────────
+    let agg = aggregate(snapshot);
+    let status_label = if let Some(ref e) = snapshot.db_error {
+        format!("DB error: {}", truncate_chars(e, 80))
+    } else if agg.active_count == 0 && agg.failed_count == 0 {
+        "No active jobs".to_string()
+    } else if agg.failed_count > 0 && agg.active_count > 0 {
+        format!(
+            "{} active · {} recent failure(s) · {} project(s)",
+            agg.active_count, agg.failed_count, agg.project_count
         )
-    } else if let Some(ref e) = snapshot.db_error {
-        tracing::warn!("bar: db query error: {e}");
-        (format!("DB error: {e}"), 200u8, 100u8, 30u8)
+    } else if agg.failed_count > 0 {
+        format!(
+            "{} recent failure(s) · {} project(s)",
+            agg.failed_count, agg.project_count
+        )
     } else {
-        let active = snapshot.active_jobs.len();
-        let has_errors = !snapshot.failed_jobs.is_empty();
-        if has_errors {
-            (
-                format!("{active} active · recent error(s)"),
-                200u8,
-                30u8,
-                30u8,
-            )
-        } else if active > 0 {
-            (format!("{active} active job(s)"), 30u8, 100u8, 200u8)
-        } else {
-            ("No active jobs".to_string(), 128u8, 128u8, 128u8)
-        }
+        format!(
+            "{} active · {} project(s)",
+            agg.active_count, agg.project_count
+        )
     };
-    let _ = tray.set_icon(Some(make_icon(icon_r, icon_g, icon_b)));
     let status_item = MenuItem::new(format!("Status: {status_label}"), false, None);
     let _ = menu.append(&status_item);
 
-    // ── Per-active-job submenus ───────────────────────────────────────────────
-    if project_id.is_some() {
-        let jobs = &snapshot.active_jobs;
-        if !jobs.is_empty() {
-            let _ = menu.append(&PredefinedMenuItem::separator());
-            for job in jobs {
+    // ── Per-project submenus ─────────────────────────────────────────────────
+    let groups = group_by_project(snapshot);
+    if !groups.is_empty() {
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        for group in &groups {
+            let header = format!(
+                "{} ({}A · {}F)",
+                group.id,
+                group.active.len(),
+                group.failed.len()
+            );
+            let project_sub = Submenu::new(&header, true);
+
+            for job in &group.active {
                 let label = format_job_label(job);
                 let job_sub = Submenu::new(&label, true);
 
@@ -410,7 +517,7 @@ fn rebuild_menu(
                 let _ = job_sub.append(&retry_item);
                 let _ = job_sub.append(&open_art_item);
                 let _ = job_sub.append(&open_log_item);
-                let _ = menu.append(&job_sub);
+                let _ = project_sub.append(&job_sub);
 
                 let job_artifacts = artifacts_dir.join(&job.id);
                 click_map.insert(
@@ -426,24 +533,26 @@ fn rebuild_menu(
                     ClickAction::OpenJobLog(log_path.to_path_buf()),
                 );
             }
-        }
 
-        // ── Recent failures submenu (U2) ──────────────────────────────────────
-        let failed_jobs = &snapshot.failed_jobs;
-        if !failed_jobs.is_empty() {
-            let _ = menu.append(&PredefinedMenuItem::separator());
-            let failures_sub =
-                Submenu::new(&format!("Recent failures ({})", failed_jobs.len()), true);
-            for job in failed_jobs {
-                let label = format_failed_job_label(job);
-                let retry_item = MenuItem::new(&label, true, None);
-                click_map.insert(
-                    retry_item.id().clone(),
-                    ClickAction::RetryJob(job.id.clone()),
+            if !group.failed.is_empty() {
+                if !group.active.is_empty() {
+                    let _ = project_sub.append(&PredefinedMenuItem::separator());
+                }
+                let failures_header = MenuItem::new(
+                    format!("Recent failures ({})", group.failed.len()),
+                    false,
+                    None,
                 );
-                let _ = failures_sub.append(&retry_item);
+                let _ = project_sub.append(&failures_header);
+                for job in &group.failed {
+                    let label = format_failed_job_label(job);
+                    let item = MenuItem::new(&label, true, None);
+                    click_map.insert(item.id().clone(), ClickAction::RetryJob(job.id.clone()));
+                    let _ = project_sub.append(&item);
+                }
             }
-            let _ = menu.append(&failures_sub);
+
+            let _ = menu.append(&project_sub);
         }
     }
 
@@ -465,27 +574,19 @@ fn rebuild_menu(
 
     let _ = menu.append(&PredefinedMenuItem::separator());
 
-    // "Submit new…" — disabled when no project is configured (U9).
-    let submit_enabled = project_id.is_some();
-    let submit_item = MenuItem::new("Submit new\u{2026}", submit_enabled, None);
-    if submit_enabled {
-        click_map.insert(submit_item.id().clone(), ClickAction::SubmitNew);
-    }
+    // "Submit new…" — always enabled. The spawned `reviewloop run` discovers
+    // its project from the PDF's parent directory at exec time.
+    let submit_item = MenuItem::new("Submit new\u{2026}", true, None);
+    click_map.insert(submit_item.id().clone(), ClickAction::SubmitNew);
     let _ = menu.append(&submit_item);
 
-    // Pause / Resume daemon — state-aware (U14).
+    // Pause / Resume daemon — state-aware.
     #[cfg(target_os = "macos")]
     {
         let _ = menu.append(&PredefinedMenuItem::separator());
         match snapshot.daemon_state {
-            None => {
-                let _ = menu.append(&MenuItem::new(
-                    "Pause/Resume daemon (service not installed)",
-                    false,
-                    None,
-                ));
-            }
-            Some(DaemonState {
+            None
+            | Some(DaemonState {
                 loaded: false,
                 running: _,
             }) => {
@@ -534,17 +635,22 @@ fn rebuild_menu(
     tray.set_menu(Some(Box::new(menu)));
 }
 
-// ── Action executor (U7) ──────────────────────────────────────────────────────
+// ── Action executor ──────────────────────────────────────────────────────────
 
 /// Run a short-lived reviewloop subcommand, capture its output, and update
-/// the last-action summary.  Called on the main thread for all actions except
-/// Submit (which shells out to a background thread to avoid blocking).
+/// the last-action summary.
 fn run_action_cmd(
     args: &[&str],
+    cwd: Option<&Path>,
     action_name: &str,
     last_action: &Arc<Mutex<Option<(String, Instant)>>>,
 ) {
-    match Command::new("reviewloop").args(args).output() {
+    let mut cmd = Command::new("reviewloop");
+    cmd.args(args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    match cmd.output() {
         Ok(out) if out.status.success() => {
             set_last_action(last_action, format!("{action_name}: OK"));
         }
@@ -582,7 +688,12 @@ fn execute_action(
             let job_id = job_id.clone();
             let la = Arc::clone(last_action);
             std::thread::spawn(move || {
-                run_action_cmd(&["retry", "--job-id", &job_id, "--force"], "Retry", &la);
+                run_action_cmd(
+                    &["retry", "--job-id", &job_id, "--force"],
+                    None,
+                    "Retry",
+                    &la,
+                );
             });
         }
         ClickAction::SubmitNew => {
@@ -593,7 +704,7 @@ fn execute_action(
                 .pick_file();
             if let Some(path) = file {
                 let path_str = path.to_string_lossy().into_owned();
-                // Redact: show only the filename, not the full path (N3).
+                let parent_dir = path.parent().map(Path::to_path_buf);
                 let filename = path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -602,7 +713,7 @@ fn execute_action(
                 let la = Arc::clone(last_action);
                 set_last_action(&la, format!("Submit started: {filename}"));
                 std::thread::spawn(move || {
-                    run_action_cmd(&["run", &path_str], "Submit", &la);
+                    run_action_cmd(&["run", &path_str], parent_dir.as_deref(), "Submit", &la);
                 });
             }
         }
@@ -610,14 +721,14 @@ fn execute_action(
             tracing::info!("bar: pausing daemon");
             let la = Arc::clone(last_action);
             std::thread::spawn(move || {
-                run_action_cmd(&["daemon", "pause"], "Pause", &la);
+                run_action_cmd(&["daemon", "pause"], None, "Pause", &la);
             });
         }
         ClickAction::ResumeDaemon => {
             tracing::info!("bar: resuming daemon");
             let la = Arc::clone(last_action);
             std::thread::spawn(move || {
-                run_action_cmd(&["daemon", "resume"], "Resume", &la);
+                run_action_cmd(&["daemon", "resume"], None, "Resume", &la);
             });
         }
         ClickAction::Quit => return true,
@@ -627,37 +738,26 @@ fn execute_action(
 
 // ── Event loop ────────────────────────────────────────────────────────────────
 
-fn run_tray(
-    db: Db,
-    project_id: Option<String>,
-    artifacts_dir: PathBuf,
-    log_path: PathBuf,
-) -> Result<()> {
+fn run_tray(db: Db, artifacts_dir: PathBuf, log_path: PathBuf) -> Result<()> {
     // On macOS, EventLoop must be created first — it initialises NSApplication.
     let event_loop = EventLoopBuilder::<()>::new().build();
 
     // Initial tray icon (grey = loading).
     let tray = TrayIconBuilder::new()
-        .with_icon(make_icon(128, 128, 128))
+        .with_icon(make_icon(140, 140, 140))
         .with_tooltip("reviewloop")
         .build()
         .context("creating tray icon")?;
 
-    // Shared click-action map; rebuilt on each refresh tick.
-    // Rc<RefCell<...>> is fine since tao runs everything on the main thread.
     let click_map: Rc<RefCell<HashMap<muda::MenuId, ClickAction>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
-    // Last-action summary: written by background threads, read on main thread.
     let last_action: Arc<Mutex<Option<(String, Instant)>>> = Arc::new(Mutex::new(None));
 
-    // Shared snapshot: updated by the background poller, read cheaply on tick.
     let snapshot: Arc<Mutex<BarSnapshot>> = Arc::new(Mutex::new(BarSnapshot::default()));
 
-    // Kick off the background poller thread (N4 / A3).
     start_background_poller(
         db.path.clone(),
-        project_id.clone(),
         Arc::clone(&snapshot),
         Duration::from_secs(5),
     );
@@ -666,13 +766,11 @@ fn run_tray(
     let mut last_refresh = Instant::now()
         .checked_sub(Duration::from_secs(10))
         .unwrap_or_else(Instant::now);
+    let mut last_signature: Option<MenuSignature> = None;
 
-    // ── Run ────────────────────────────────────────────────────────────────────
     event_loop.run(move |event, _, control_flow| {
-        // Wake up at most every 5 seconds to refresh status.
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_secs(5));
 
-        // Drain all pending menu-click events.
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             let action = click_map.borrow().get(&ev.id).cloned();
             if let Some(action) = action {
@@ -683,8 +781,6 @@ fn run_tray(
             }
         }
 
-        // Refresh on the very first tick and every ~5 s thereafter.
-        // Reads only the cached snapshot — no I/O on the main thread.
         let is_tick = matches!(
             event,
             Event::NewEvents(StartCause::Init)
@@ -692,29 +788,35 @@ fn run_tray(
         );
         if is_tick && last_refresh.elapsed() >= Duration::from_secs(4) {
             last_refresh = Instant::now();
-            let snap = snapshot
+            let snap = snapshot.lock().map(|g| g.clone()).unwrap_or_default();
+
+            // Always refresh the icon — cheap, silent, no menu disruption.
+            let (r, g, b) = icon_color(&snap);
+            let _ = tray.set_icon(Some(make_icon(r, g, b)));
+
+            // Only rebuild the menu when the visible state has actually
+            // changed. tray.set_menu while a menu is open closes it on
+            // macOS, so we avoid rebuilding on identical ticks.
+            let last_summary = last_action
                 .lock()
-                .map(|g| BarSnapshot {
-                    active_jobs: g.active_jobs.clone(),
-                    failed_jobs: g.failed_jobs.clone(),
-                    daemon_state: g.daemon_state,
-                    db_error: g.db_error.clone(),
-                })
-                .unwrap_or_default();
-            rebuild_menu(
-                &tray,
-                project_id.as_deref(),
-                &artifacts_dir,
-                &log_path,
-                &snap,
-                &last_action,
-                &mut click_map.borrow_mut(),
-            );
+                .ok()
+                .and_then(|g| g.as_ref().map(|(s, _)| s.clone()));
+            let sig = compute_signature(&snap, last_summary.as_deref());
+            let changed = last_signature.as_ref() != Some(&sig);
+            if changed {
+                last_signature = Some(sig);
+                rebuild_menu(
+                    &tray,
+                    &artifacts_dir,
+                    &log_path,
+                    &snap,
+                    &last_action,
+                    &mut click_map.borrow_mut(),
+                );
+            }
         }
     });
 
-    // `event_loop.run` diverges on macOS (returns `!`). On other platforms it
-    // may return; either way this line is never reached in practice.
     #[allow(unreachable_code)]
     Ok(())
 }
@@ -724,6 +826,36 @@ fn run_tray(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use reviewloop::model::JobStatus;
+
+    fn job(project_id: &str, id: &str, status: JobStatus, attempt: u32) -> Job {
+        Job {
+            id: id.to_string(),
+            project_id: project_id.to_string(),
+            paper_id: "paper".to_string(),
+            backend: "stanford".to_string(),
+            pdf_path: "/tmp/x.pdf".to_string(),
+            pdf_hash: format!("hash-{id}"),
+            status,
+            token: None,
+            email: "a@b.c".to_string(),
+            venue: None,
+            git_tag: None,
+            git_commit: None,
+            attempt,
+            started_at: None,
+            next_poll_at: None,
+            last_error: None,
+            fallback_used: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            version_no: 1,
+            round_no: 1,
+            version_source: "pdf_hash".to_string(),
+            version_key: String::new(),
+        }
+    }
 
     #[test]
     fn truncate_chars_ascii() {
@@ -733,12 +865,9 @@ mod tests {
 
     #[test]
     fn truncate_chars_non_ascii_no_panic() {
-        // Chinese characters (3 bytes each) — byte-slice would panic mid-codepoint.
         let chinese = "服务器错误：连接超时，请稍后重试并检查网络设置";
         let result = truncate_chars(chinese, 10);
-        // Must not panic; result must be valid UTF-8.
-        assert!(result.chars().count() <= 11); // 10 chars + ellipsis
-        // Verify it's valid UTF-8.
+        assert!(result.chars().count() <= 11);
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
     }
 
@@ -754,5 +883,128 @@ mod tests {
         let s = "abcde";
         assert_eq!(truncate_chars(s, 5), "abcde");
         assert_eq!(truncate_chars(s, 4), "abcd…");
+    }
+
+    #[test]
+    fn project_key_collapses_blank_ids_to_legacy() {
+        let blank = job("", "j1", JobStatus::Queued, 0);
+        let ws = job("   ", "j2", JobStatus::Queued, 0);
+        let real = job("proj-a", "j3", JobStatus::Queued, 0);
+        assert_eq!(project_key(&blank), LEGACY_PROJECT_LABEL);
+        assert_eq!(project_key(&ws), LEGACY_PROJECT_LABEL);
+        assert_eq!(project_key(&real), "proj-a");
+    }
+
+    #[test]
+    fn aggregate_counts_distinct_projects_across_active_and_failed() {
+        let snap = BarSnapshot {
+            all_active: vec![
+                job("a", "1", JobStatus::Queued, 0),
+                job("b", "2", JobStatus::Processing, 0),
+            ],
+            all_failed: vec![
+                job("b", "3", JobStatus::Failed, 1),
+                job("c", "4", JobStatus::Failed, 1),
+            ],
+            ..Default::default()
+        };
+        let agg = aggregate(&snap);
+        assert_eq!(agg.active_count, 2);
+        assert_eq!(agg.failed_count, 2);
+        assert_eq!(agg.project_count, 3); // a, b, c
+    }
+
+    #[test]
+    fn aggregate_legacy_jobs_count_as_one_project() {
+        let snap = BarSnapshot {
+            all_active: vec![
+                job("", "1", JobStatus::Queued, 0),
+                job("   ", "2", JobStatus::Queued, 0),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(aggregate(&snap).project_count, 1);
+    }
+
+    #[test]
+    fn group_by_project_buckets_jobs_and_pushes_legacy_to_end() {
+        let snap = BarSnapshot {
+            all_active: vec![
+                job("zeta", "z1", JobStatus::Queued, 0),
+                job("alpha", "a1", JobStatus::Queued, 0),
+                job("", "leg1", JobStatus::Queued, 0),
+            ],
+            all_failed: vec![job("alpha", "a2", JobStatus::Failed, 2)],
+            ..Default::default()
+        };
+        let groups = group_by_project(&snap);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].id, "alpha");
+        assert_eq!(groups[0].active.len(), 1);
+        assert_eq!(groups[0].failed.len(), 1);
+        assert_eq!(groups[1].id, "zeta");
+        assert_eq!(groups[2].id, LEGACY_PROJECT_LABEL);
+    }
+
+    #[test]
+    fn icon_color_priority_db_error_over_failures() {
+        let mut snap = BarSnapshot::default();
+        snap.db_error = Some("disk full".to_string());
+        snap.all_failed.push(job("p", "1", JobStatus::Failed, 1));
+        assert_eq!(icon_color(&snap), (200, 100, 30));
+    }
+
+    #[test]
+    fn icon_color_priority_failures_over_active() {
+        let snap = BarSnapshot {
+            all_active: vec![job("p", "1", JobStatus::Queued, 0)],
+            all_failed: vec![job("p", "2", JobStatus::Failed, 1)],
+            ..Default::default()
+        };
+        assert_eq!(icon_color(&snap), (200, 30, 30));
+    }
+
+    #[test]
+    fn icon_color_active_only_is_blue() {
+        let snap = BarSnapshot {
+            all_active: vec![job("p", "1", JobStatus::Queued, 0)],
+            ..Default::default()
+        };
+        assert_eq!(icon_color(&snap), (30, 100, 200));
+    }
+
+    #[test]
+    fn icon_color_idle_is_grey() {
+        assert_eq!(icon_color(&BarSnapshot::default()), (140, 140, 140));
+    }
+
+    #[test]
+    fn signature_unchanged_for_identical_snapshots() {
+        let snap = BarSnapshot {
+            all_active: vec![job("p", "1", JobStatus::Queued, 0)],
+            ..Default::default()
+        };
+        let s1 = compute_signature(&snap, None);
+        let s2 = compute_signature(&snap, None);
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn signature_changes_when_active_count_changes() {
+        let s1 = compute_signature(&BarSnapshot::default(), None);
+        let snap = BarSnapshot {
+            all_active: vec![job("p", "1", JobStatus::Queued, 0)],
+            ..Default::default()
+        };
+        let s2 = compute_signature(&snap, None);
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn signature_changes_when_last_action_changes() {
+        let snap = BarSnapshot::default();
+        let s1 = compute_signature(&snap, None);
+        let s2 = compute_signature(&snap, Some("did a thing"));
+        assert_ne!(s1, s2);
     }
 }

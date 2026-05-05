@@ -1095,6 +1095,69 @@ impl Db {
         collect_rows(rows)
     }
 
+    /// Fleet-wide: every active job across all projects.
+    ///
+    /// Used by `reviewloop-bar` to render a multi-project dashboard. Returned
+    /// rows include the `project_id` column so callers can group by project.
+    /// Bounded by `daemon.max_concurrency * num_projects` in practice; no
+    /// LIMIT clause needed.
+    pub fn list_active_jobs_all(&self) -> Result<Vec<Job>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT *
+            FROM jobs
+            WHERE status IN (?1, ?2, ?3)
+            ORDER BY project_id ASC, created_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![
+                JobStatus::Queued.as_str(),
+                JobStatus::Submitted.as_str(),
+                JobStatus::Processing.as_str(),
+            ],
+            map_job_row,
+        )?;
+        collect_rows(rows)
+    }
+
+    /// Fleet-wide: recent failures across all projects, capped per project.
+    ///
+    /// Uses a window function so a single noisy project cannot starve
+    /// failures from other projects out of the result set. Cancelled jobs
+    /// (`last_error LIKE 'cancelled by user:%'`) are excluded.
+    pub fn list_failed_jobs_all_per_project(&self, per_project_limit: usize) -> Result<Vec<Job>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, paper_id, backend, pdf_path, pdf_hash, status, token, email,
+                   venue, git_tag, git_commit, attempt, started_at, next_poll_at,
+                   last_error, fallback_used, created_at, updated_at,
+                   project_id, version_no, round_no, version_source, version_key
+            FROM (
+                SELECT *,
+                       ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY updated_at DESC) AS rn
+                FROM jobs
+                WHERE status IN (?1, ?2, ?3)
+                  AND (last_error IS NULL OR last_error NOT LIKE 'cancelled by user:%')
+            )
+            WHERE rn <= ?4
+            ORDER BY project_id ASC, updated_at DESC
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![
+                JobStatus::Failed.as_str(),
+                JobStatus::FailedNeedsManual.as_str(),
+                JobStatus::Timeout.as_str(),
+                per_project_limit as i64,
+            ],
+            map_job_row,
+        )?;
+        collect_rows(rows)
+    }
+
     /// Returns the `created_at` timestamp of the most recent event for a project.
     /// Used as a proxy for "last daemon tick time" since no explicit tick events are stored.
     pub fn most_recent_event_created_at(&self, project_id: &str) -> Result<Option<DateTime<Utc>>> {
