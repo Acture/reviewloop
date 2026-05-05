@@ -168,7 +168,9 @@ fn version_and_round_progress_by_project_and_completed_rounds() -> Result<()> {
     assert_eq!(parallel.version_no, 1);
     assert_eq!(parallel.round_no, 1);
 
-    ctx.db.update_job_state(
+    // Shortcutting to Completed directly from Queued (test helper only;
+    // the real worker goes Queued -> Processing -> Completed).
+    ctx.db.update_job_state_unchecked(
         &first.id,
         JobStatus::Completed,
         None,

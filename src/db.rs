@@ -561,7 +561,44 @@ impl Db {
         collect_rows(rows)
     }
 
+    /// Update job state, enforcing `JobStatus::can_transition` as a guard.
+    /// Returns an error on invalid transitions. Use [`update_job_state_unchecked`]
+    /// for deliberate user overrides (retry --force, complete, cancel) that
+    /// legitimately move out of terminal states.
     pub fn update_job_state(
+        &self,
+        job_id: &str,
+        status: JobStatus,
+        attempt: Option<u32>,
+        next_poll_at: Option<Option<DateTime<Utc>>>,
+        last_error: Option<Option<String>>,
+    ) -> Result<()> {
+        // Fetch current state to validate the transition before mutating.
+        let current = {
+            let conn = self.connect()?;
+            conn.query_row(
+                "SELECT * FROM jobs WHERE id = ?1",
+                params![job_id],
+                map_job_row,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("job not found: {job_id}"))?
+        };
+        if !current.status.can_transition(status) {
+            anyhow::bail!(
+                "invalid status transition for job {}: {} -> {}",
+                job_id,
+                current.status.as_str(),
+                status.as_str()
+            );
+        }
+        self.update_job_state_unchecked(job_id, status, attempt, next_poll_at, last_error)
+    }
+
+    /// Update job state without enforcing the state-machine guard.
+    /// Use at CLI override sites (cmd_retry --force, cmd_complete, cmd_cancel)
+    /// that deliberately move jobs out of terminal or otherwise-restricted states.
+    pub fn update_job_state_unchecked(
         &self,
         job_id: &str,
         status: JobStatus,
@@ -1381,11 +1418,27 @@ fn conversion_error(message: String) -> rusqlite::Error {
         )),
     )
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{JobStatus, NewJob};
     use tempfile::tempdir;
+
+    fn make_queued_job(project_id: &str, paper_id: &str) -> NewJob {
+        NewJob {
+            project_id: project_id.to_string(),
+            paper_id: paper_id.to_string(),
+            backend: "stanford".to_string(),
+            pdf_path: "paper.pdf".to_string(),
+            pdf_hash: "abc123".to_string(),
+            status: JobStatus::Queued,
+            email: "test@example.com".to_string(),
+            venue: None,
+            git_tag: None,
+            git_commit: None,
+            next_poll_at: None,
+        }
+    }
 
     /// Verify that WAL journal mode is enabled after init_schema.
     ///
@@ -1407,5 +1460,39 @@ mod tests {
             mode, "wal",
             "expected WAL journal mode after init_schema; got: {mode}"
         );
+    }
+
+    #[test]
+    fn update_job_state_rejects_terminal_to_active_transition() {
+        let db = Db::new_in_memory("guard_test").unwrap();
+        db.init_schema().unwrap();
+
+        let job = db.create_job(&make_queued_job("proj", "p1")).unwrap();
+        // Move to a terminal state via the unchecked path.
+        db.update_job_state_unchecked(&job.id, JobStatus::Completed, None, Some(None), None)
+            .unwrap();
+
+        // The checked path must reject Completed -> Queued.
+        let err = db
+            .update_job_state(&job.id, JobStatus::Queued, None, Some(None), None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid status transition"),
+            "expected 'invalid status transition', got: {err}"
+        );
+    }
+
+    #[test]
+    fn update_job_state_allows_valid_worker_transitions() {
+        let db = Db::new_in_memory("guard_valid_test").unwrap();
+        db.init_schema().unwrap();
+
+        let job = db.create_job(&make_queued_job("proj", "p2")).unwrap();
+        // Queued -> Processing is a valid worker transition.
+        db.update_job_state(&job.id, JobStatus::Processing, None, Some(None), None)
+            .unwrap();
+        // Processing -> Completed is valid.
+        db.update_job_state(&job.id, JobStatus::Completed, None, Some(None), None)
+            .unwrap();
     }
 }

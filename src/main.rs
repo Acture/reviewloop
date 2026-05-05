@@ -2216,7 +2216,9 @@ fn cmd_cancel(config: &Config, db: &Db, job_id: &str, reason: Option<&str>) -> R
     let cancel_reason = reason.unwrap_or("cancelled by user");
     let last_error = format!("cancelled by user: {cancel_reason}");
 
-    db.update_job_state(
+    // user override: PendingApproval -> Failed is not in the state machine but
+    // cancellation is a legitimate user action on any non-terminal job.
+    db.update_job_state_unchecked(
         &job.id,
         JobStatus::Failed,
         None,
@@ -2443,9 +2445,30 @@ fn cmd_status(
     }
 
     if as_json {
+        // Group rows by paper_id and emit the same {paper_id, rows, timeline}
+        // wrapper shape as the single-paper path, so tooling can treat both
+        // identically by iterating `payload.papers`.
+        let mut groups: std::collections::BTreeMap<String, Vec<StatusView>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            groups.entry(row.paper_id.clone()).or_default().push(row);
+        }
+        let papers_json: Vec<_> = groups
+            .iter()
+            .map(|(pid, group_rows)| {
+                let events = db
+                    .list_timeline_events(&config.project_id, pid)
+                    .unwrap_or_default();
+                json!({
+                    "paper_id": pid,
+                    "rows": group_rows.iter().map(|r| status_row_json(r, show_token, Some(&state_dir))).collect::<Vec<_>>(),
+                    "timeline": timeline_json(group_rows, &events, show_token, Some(&state_dir)),
+                })
+            })
+            .collect();
         let payload = json!({
             "project_id": config.project_id,
-            "papers": rows.iter().map(|row| status_row_json(row, show_token, Some(&state_dir))).collect::<Vec<_>>(),
+            "papers": papers_json,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
@@ -2567,7 +2590,8 @@ async fn cmd_retry(
             );
         }
 
-        db.update_job_state(&job.id, JobStatus::Queued, Some(0), Some(None), Some(None))?;
+        // user override: reset terminal job back to Queued for re-submission.
+        db.update_job_state_unchecked(&job.id, JobStatus::Queued, Some(0), Some(None), Some(None))?;
         db.add_event(
             Some(&config.project_id),
             Some(&job.id),
@@ -2594,7 +2618,8 @@ async fn cmd_retry(
             0,
             config.polling.jitter_percent,
         );
-        db.update_job_state(
+        // user override: explicit retry may cross state-machine boundaries.
+        db.update_job_state_unchecked(
             &job.id,
             JobStatus::Processing,
             Some(0),
@@ -2602,7 +2627,8 @@ async fn cmd_retry(
             Some(None),
         )?;
     } else {
-        db.update_job_state(&job.id, JobStatus::Queued, Some(0), Some(None), Some(None))?;
+        // user override: explicit retry may cross state-machine boundaries.
+        db.update_job_state_unchecked(&job.id, JobStatus::Queued, Some(0), Some(None), Some(None))?;
     }
 
     db.add_event(None, Some(&job.id), "retried", json!({}))?;
@@ -2653,7 +2679,8 @@ async fn cmd_complete(
         .unwrap_or_else(|| format!("manual:{}", job.id));
     let (_, summary_md, _) = write_review_artifacts(&config.state_dir(), &job, &token, &raw_json)?;
     db.upsert_review(&job.id, &token, &raw_json.to_string(), &summary_md)?;
-    db.update_job_state(
+    // user override: manual completion may move jobs out of terminal states.
+    db.update_job_state_unchecked(
         &job.id,
         JobStatus::Completed,
         Some(job.attempt + 1),
@@ -4034,19 +4061,37 @@ mod tests {
         }
 
         /// Both single-paper and multi-paper `--json` output share the same
-        /// root shape: `{"project_id": ..., "papers": [...]}`.
+        /// root shape: `{"project_id": ..., "papers": [{paper_id, rows, timeline}]}`.
         #[test]
         fn cmd_status_json_shape_is_consistent() {
             let project_id = "shape_proj";
             let db = make_db_with_jobs(project_id, &["p1", "p2"]);
 
-            // Multi-paper shape.
+            // Multi-paper shape: group by paper_id, same wrapper as single-paper.
             let rows_all = db
                 .list_status_views(project_id, None)
                 .expect("list_status_views all");
+            let mut groups: std::collections::BTreeMap<String, Vec<reviewloop::model::StatusView>> =
+                std::collections::BTreeMap::new();
+            for row in rows_all {
+                groups.entry(row.paper_id.clone()).or_default().push(row);
+            }
+            let multi_papers: Vec<Value> = groups
+                .iter()
+                .map(|(pid, group_rows)| {
+                    let events = db
+                        .list_timeline_events(project_id, pid)
+                        .unwrap_or_default();
+                    serde_json::json!({
+                        "paper_id": pid,
+                        "rows": group_rows.iter().map(|r| status_row_json(r, false, None)).collect::<Vec<Value>>(),
+                        "timeline": timeline_json(group_rows, &events, false, None),
+                    })
+                })
+                .collect();
             let multi = serde_json::json!({
                 "project_id": project_id,
-                "papers": rows_all.iter().map(|r| status_row_json(r, false, None)).collect::<Vec<Value>>(),
+                "papers": multi_papers,
             });
 
             // Single-paper shape.
@@ -4073,6 +4118,21 @@ mod tests {
                     val.get("project_id").is_some(),
                     "{label}: root must have 'project_id'"
                 );
+                // Every item in `papers` must have paper_id, rows, and timeline keys.
+                for (i, paper) in papers.as_array().unwrap().iter().enumerate() {
+                    assert!(
+                        paper.get("paper_id").is_some(),
+                        "{label}[{i}]: paper object must have 'paper_id'"
+                    );
+                    assert!(
+                        paper.get("rows").map(|v| v.is_array()).unwrap_or(false),
+                        "{label}[{i}]: paper object must have 'rows' array"
+                    );
+                    assert!(
+                        paper.get("timeline").map(|v| v.is_array()).unwrap_or(false),
+                        "{label}[{i}]: paper object must have 'timeline' array"
+                    );
+                }
             }
             // Single-paper query → papers array of length 1.
             assert_eq!(
@@ -4080,6 +4140,69 @@ mod tests {
                 1,
                 "single-paper query must produce papers array of length 1"
             );
+            // Multi-paper query → papers array of length 2 (one entry per paper_id).
+            assert_eq!(
+                multi["papers"].as_array().unwrap().len(),
+                2,
+                "multi-paper query must produce one papers entry per paper_id"
+            );
+        }
+
+        /// Regression: both `status --json` (no flag) and `status --paper-id X --json`
+        /// must produce an object with a `papers` array at the root.
+        #[test]
+        fn cmd_status_json_consistent_root_type() {
+            let project_id = "root_type_proj";
+            let db = make_db_with_jobs(project_id, &["alpha", "beta"]);
+
+            // Simulate multi-paper path output.
+            let rows_all = db.list_status_views(project_id, None).unwrap();
+            let mut groups: std::collections::BTreeMap<String, Vec<reviewloop::model::StatusView>> =
+                std::collections::BTreeMap::new();
+            for row in rows_all {
+                groups.entry(row.paper_id.clone()).or_default().push(row);
+            }
+            let multi_papers: Vec<Value> = groups
+                .iter()
+                .map(|(pid, group_rows)| {
+                    let events = db.list_timeline_events(project_id, pid).unwrap_or_default();
+                    serde_json::json!({
+                        "paper_id": pid,
+                        "rows": group_rows.iter().map(|r| status_row_json(r, false, None)).collect::<Vec<Value>>(),
+                        "timeline": timeline_json(group_rows, &events, false, None),
+                    })
+                })
+                .collect();
+            let multi_payload = serde_json::json!({
+                "project_id": project_id,
+                "papers": multi_papers,
+            });
+
+            // Simulate single-paper path output.
+            let rows_one = db.list_status_views(project_id, Some("alpha")).unwrap();
+            let events_one = db.list_timeline_events(project_id, "alpha").unwrap();
+            let single_payload = serde_json::json!({
+                "project_id": project_id,
+                "papers": [{
+                    "paper_id": "alpha",
+                    "rows": rows_one.iter().map(|r| status_row_json(r, false, None)).collect::<Vec<Value>>(),
+                    "timeline": timeline_json(&rows_one, &events_one, false, None),
+                }],
+            });
+
+            for (label, payload) in [("multi", &multi_payload), ("single", &single_payload)] {
+                assert!(
+                    payload.is_object(),
+                    "{label}: root must be a JSON object, not array or scalar"
+                );
+                let papers = payload
+                    .get("papers")
+                    .unwrap_or_else(|| panic!("{label}: root object must have 'papers' key"));
+                assert!(
+                    papers.is_array(),
+                    "{label}: 'papers' value must be a JSON array"
+                );
+            }
         }
     }
 
