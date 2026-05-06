@@ -212,6 +212,12 @@ impl Db {
                 matched_at TEXT NOT NULL,
                 raw_ref TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS projects (
+                project_id   TEXT PRIMARY KEY,
+                config_path  TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL
+            );
             "#,
         )?;
 
@@ -1175,6 +1181,58 @@ impl Db {
             .context("invalid created_at in events table")
     }
 
+    /// Register or refresh the on-disk path of a project's `reviewloop.toml`
+    /// (or a legacy global config carrying project settings).
+    ///
+    /// Called by `main::load_runtime` whenever a CLI invocation or daemon
+    /// startup successfully loads a project context, so the registry stays
+    /// up to date without explicit user action. The `(project_id, path)`
+    /// pair lets `cmd_retry` / future fleet-wide commands resolve the right
+    /// per-project config when called from a directory that has none.
+    pub fn register_project_config(&self, project_id: &str, config_path: &Path) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            INSERT INTO projects (project_id, config_path, last_seen_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(project_id) DO UPDATE SET
+                config_path  = excluded.config_path,
+                last_seen_at = excluded.last_seen_at
+            "#,
+            params![
+                project_id,
+                config_path.to_string_lossy(),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Look up the registered config path for a project_id, if any.
+    pub fn resolve_project_config_path(&self, project_id: &str) -> Result<Option<PathBuf>> {
+        let conn = self.connect()?;
+        let path: Option<String> = conn
+            .query_row(
+                "SELECT config_path FROM projects WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(path.map(PathBuf::from))
+    }
+
+    /// Remove a stale registry entry. Called when a registered path no
+    /// longer exists on disk so the next CLI invocation in that project
+    /// repo can re-register cleanly.
+    pub fn forget_project_registration(&self, project_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "DELETE FROM projects WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        Ok(())
+    }
+
     /// Returns the most recent event of a specific type for a project.
     /// Used by `daemon status` to surface the last `tick_failed` event so
     /// operators can see when (and why) the daemon last died.
@@ -1692,5 +1750,66 @@ mod tests {
         // Processing -> Completed is valid.
         db.update_job_state(&job.id, JobStatus::Completed, None, Some(None), None)
             .unwrap();
+    }
+
+    #[test]
+    fn project_registry_round_trip() {
+        let db = Db::new_in_memory("project_registry_test").unwrap();
+        db.init_schema().unwrap();
+
+        // Empty registry returns None.
+        assert!(
+            db.resolve_project_config_path("never-seen")
+                .unwrap()
+                .is_none()
+        );
+
+        // Register a path.
+        let path = std::path::Path::new("/tmp/project-a/reviewloop.toml");
+        db.register_project_config("proj-a", path).unwrap();
+        assert_eq!(
+            db.resolve_project_config_path("proj-a").unwrap(),
+            Some(path.to_path_buf())
+        );
+
+        // Re-register with a different path overwrites (eg, repo moved).
+        let new_path = std::path::Path::new("/tmp/project-a-renamed/reviewloop.toml");
+        db.register_project_config("proj-a", new_path).unwrap();
+        assert_eq!(
+            db.resolve_project_config_path("proj-a").unwrap(),
+            Some(new_path.to_path_buf())
+        );
+
+        // Forget removes the row.
+        db.forget_project_registration("proj-a").unwrap();
+        assert!(db.resolve_project_config_path("proj-a").unwrap().is_none());
+    }
+
+    #[test]
+    fn project_registry_isolates_different_projects() {
+        let db = Db::new_in_memory("project_registry_isolation").unwrap();
+        db.init_schema().unwrap();
+
+        let path_a = std::path::Path::new("/tmp/a/reviewloop.toml");
+        let path_b = std::path::Path::new("/tmp/b/reviewloop.toml");
+        db.register_project_config("a", path_a).unwrap();
+        db.register_project_config("b", path_b).unwrap();
+
+        assert_eq!(
+            db.resolve_project_config_path("a").unwrap(),
+            Some(path_a.to_path_buf())
+        );
+        assert_eq!(
+            db.resolve_project_config_path("b").unwrap(),
+            Some(path_b.to_path_buf())
+        );
+
+        // Forgetting one does not touch the other.
+        db.forget_project_registration("a").unwrap();
+        assert!(db.resolve_project_config_path("a").unwrap().is_none());
+        assert_eq!(
+            db.resolve_project_config_path("b").unwrap(),
+            Some(path_b.to_path_buf())
+        );
     }
 }

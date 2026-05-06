@@ -1777,7 +1777,43 @@ fn load_runtime(
     let db = Db::from_config(&config)?;
     db.init_schema()?;
 
+    // Register this project's config path so fleet-wide commands (eg the
+    // bar's "Retry now") can resolve `project_id -> config path` later
+    // even when invoked from a directory without a reviewloop.toml.
+    // Falls back to the legacy global config path when project settings
+    // are still served from ~/.config/reviewloop/reviewloop.toml.
+    let registration_path = project_path.as_deref().or(legacy_global_path.as_deref());
+    if !config.project_id.trim().is_empty() {
+        if let Some(path) = registration_path {
+            if let Err(e) = db.register_project_config(&config.project_id, path) {
+                tracing::warn!(
+                    project_id = %config.project_id,
+                    config_path = %path.display(),
+                    error = %e,
+                    "failed to register project config path; cross-project --job-id commands may need a manual cd",
+                );
+            }
+        }
+    }
+
     Ok((config, db))
+}
+
+/// Quietly load a Config for a specific project's config file. Used by
+/// `cmd_retry` when the job's `project_id` does not match the cwd config,
+/// so the worker call gets the right per-project providers/polling/papers.
+///
+/// Skips logging re-init and guardrail prints — the parent command already
+/// printed those for its primary cwd config.
+fn load_runtime_for_path(config_path: &Path) -> Result<Config> {
+    let loaded =
+        Config::load_runtime_with_metadata(Some(config_path), true).with_context(|| {
+            format!(
+                "loading registered project config at {}",
+                config_path.display()
+            )
+        })?;
+    Ok(loaded.config)
 }
 
 fn ensure_runtime_dirs(config: &Config) -> Result<()> {
@@ -2553,8 +2589,19 @@ async fn cmd_retry(
     }
     let force = force || override_rate_limit;
 
-    ensure_project_context(config)?;
-    let job = ensure_project_job(config, db, job_id)?;
+    let job = resolve_job_by_id_any_project(config, db, job_id)?;
+
+    // The worker requires the job's *own* project config (providers, polling,
+    // papers). When the cwd config doesn't match (e.g. the menu bar spawned
+    // us from a directory that has no reviewloop.toml), look up the project's
+    // registered config path and load that quietly.
+    let owned;
+    let effective_config: &Config = if config.project_id == job.project_id {
+        config
+    } else {
+        owned = load_effective_config_for_job(db, &job)?;
+        &owned
+    };
 
     if force {
         let previous_next_poll_at = job.next_poll_at.map(|value| value.to_rfc3339());
@@ -2563,7 +2610,7 @@ async fn cmd_retry(
                 anyhow::bail!("--force for token-backed jobs only supports PROCESSING jobs");
             }
             db.add_event(
-                Some(&config.project_id),
+                Some(&job.project_id),
                 Some(&job.id),
                 "manual_rate_limit_override",
                 json!({
@@ -2576,7 +2623,7 @@ async fn cmd_retry(
                     "round_no": job.round_no
                 }),
             )?;
-            reviewloop::worker::poll_job(config, db, &job).await?;
+            reviewloop::worker::poll_job(effective_config, db, &job).await?;
             println!("Immediately polled job {job_id} with rate-limit override");
             return Ok(());
         }
@@ -2597,7 +2644,7 @@ async fn cmd_retry(
         // user override: reset terminal job back to Queued for re-submission.
         db.update_job_state_unchecked(&job.id, JobStatus::Queued, Some(0), Some(None), Some(None))?;
         db.add_event(
-            Some(&config.project_id),
+            Some(&job.project_id),
             Some(&job.id),
             "manual_rate_limit_override",
             json!({
@@ -2610,7 +2657,7 @@ async fn cmd_retry(
                 "round_no": job.round_no
             }),
         )?;
-        reviewloop::worker::submit_job(config, db, &job.id).await?;
+        reviewloop::worker::submit_job(effective_config, db, &job.id).await?;
         println!("Immediately retried job {job_id} with rate-limit override");
         return Ok(());
     }
@@ -2618,9 +2665,9 @@ async fn cmd_retry(
     if job.token.is_some() {
         let next = compute_next_poll_at(
             Utc::now(),
-            &config.polling.schedule_minutes,
+            &effective_config.polling.schedule_minutes,
             0,
-            config.polling.jitter_percent,
+            effective_config.polling.jitter_percent,
         );
         // user override: explicit retry may cross state-machine boundaries.
         db.update_job_state_unchecked(
@@ -2635,10 +2682,50 @@ async fn cmd_retry(
         db.update_job_state_unchecked(&job.id, JobStatus::Queued, Some(0), Some(None), Some(None))?;
     }
 
-    db.add_event(None, Some(&job.id), "retried", json!({}))?;
+    db.add_event(Some(&job.project_id), Some(&job.id), "retried", json!({}))?;
     println!("Retry scheduled for job {job_id}");
 
     Ok(())
+}
+
+/// Resolve the per-project config for a job whose project_id doesn't match
+/// the cwd config (typically the no-cwd-context menu-bar case).
+///
+/// 1. Reject jobs with empty project_id (legacy data) — there is no
+///    project config to load.
+/// 2. Look up the registered config path; bail with re-register hint
+///    when the project has never been seen.
+/// 3. Load the registered file; on ENOENT, prune the stale registry
+///    entry and bail with a path-moved hint.
+fn load_effective_config_for_job(db: &Db, job: &reviewloop::model::Job) -> Result<Config> {
+    if job.project_id.trim().is_empty() {
+        anyhow::bail!(
+            "job {} has no associated project (legacy data); re-submit the PDF \
+             with `reviewloop run <pdf>` from a configured project repo instead",
+            job.id
+        );
+    }
+    let Some(config_path) = db.resolve_project_config_path(&job.project_id)? else {
+        anyhow::bail!(
+            "project '{}' is not registered. run any reviewloop command \
+             (eg `reviewloop status`) from inside that project's repo once \
+             so the registry can record its config path, then retry.",
+            job.project_id
+        );
+    };
+    if !config_path.exists() {
+        // Self-heal: forget the stale row so the next CLI call from the
+        // moved repo can re-register cleanly.
+        let _ = db.forget_project_registration(&job.project_id);
+        anyhow::bail!(
+            "project '{}' was registered at {} but that file no longer exists. \
+             run any reviewloop command from the project's new location to refresh \
+             the registry, then retry.",
+            job.project_id,
+            config_path.display()
+        );
+    }
+    load_runtime_for_path(&config_path)
 }
 
 async fn cmd_complete(
