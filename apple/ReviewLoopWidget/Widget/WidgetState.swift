@@ -1,3 +1,12 @@
+//
+//  WidgetState.swift
+//  ReviewLoopWidget
+//
+//  This file mirrors the Rust-emitted JSON schema. See
+//  docs/widget-schema.md (in the reviewloop repo) for the full
+//  contract, schema-bump procedure, and field semantics.
+//
+
 import Foundation
 
 // MARK: - Top-level snapshot

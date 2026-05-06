@@ -422,6 +422,93 @@ mod tests {
     }
 
     #[test]
+    fn widget_state_v1_serializes_to_documented_shape() {
+        use chrono::TimeZone;
+
+        let state = WidgetState {
+            schema_version: 1,
+            generated_at: fmt_rfc3339(chrono::Utc.with_ymd_and_hms(2026, 5, 6, 12, 0, 0).unwrap()),
+            project_id: "test-proj".to_string(),
+            summary: WidgetSummary {
+                active_count: 2,
+                failed_recent_24h: 1,
+                completed_today: 3,
+            },
+            active_jobs: vec![WidgetActiveJob {
+                paper_id: "paper-a".to_string(),
+                status: "PROCESSING".to_string(),
+                attempt: 2,
+                next_poll_at: Some(fmt_rfc3339(
+                    chrono::Utc.with_ymd_and_hms(2026, 5, 6, 12, 5, 0).unwrap(),
+                )),
+                started_at: Some(fmt_rfc3339(
+                    chrono::Utc.with_ymd_and_hms(2026, 5, 6, 11, 50, 0).unwrap(),
+                )),
+            }],
+            recent_failures: vec![WidgetFailure {
+                paper_id: "paper-b".to_string(),
+                status: "FAILED".to_string(),
+                last_error: "rate limit exceeded".to_string(),
+                occurred_at: fmt_rfc3339(
+                    chrono::Utc.with_ymd_and_hms(2026, 5, 6, 11, 55, 0).unwrap(),
+                ),
+            }],
+            last_tick_at: Some(fmt_rfc3339(
+                chrono::Utc
+                    .with_ymd_and_hms(2026, 5, 6, 11, 59, 50)
+                    .unwrap(),
+            )),
+            last_tick_error: Some(WidgetTickError {
+                at: fmt_rfc3339(
+                    chrono::Utc
+                        .with_ymd_and_hms(2026, 5, 6, 11, 59, 55)
+                        .unwrap(),
+                ),
+                message: "daemon lost connection".to_string(),
+            }),
+            tick_health: "normal",
+        };
+        let json = serde_json::to_string_pretty(&state).expect("serialise");
+        let expected = r#"{
+  "schema_version": 1,
+  "generated_at": "2026-05-06T12:00:00Z",
+  "project_id": "test-proj",
+  "summary": {
+    "active_count": 2,
+    "failed_recent_24h": 1,
+    "completed_today": 3
+  },
+  "active_jobs": [
+    {
+      "paper_id": "paper-a",
+      "status": "PROCESSING",
+      "attempt": 2,
+      "next_poll_at": "2026-05-06T12:05:00Z",
+      "started_at": "2026-05-06T11:50:00Z"
+    }
+  ],
+  "recent_failures": [
+    {
+      "paper_id": "paper-b",
+      "status": "FAILED",
+      "last_error": "rate limit exceeded",
+      "occurred_at": "2026-05-06T11:55:00Z"
+    }
+  ],
+  "last_tick_at": "2026-05-06T11:59:50Z",
+  "last_tick_error": {
+    "at": "2026-05-06T11:59:55Z",
+    "message": "daemon lost connection"
+  },
+  "tick_health": "normal"
+}"#;
+        assert_eq!(
+            json, expected,
+            "widget JSON shape changed; bump schema_version and update docs/widget-schema.md"
+        );
+    }
+
+    #[test]
     fn write_atomically_round_trips() {
         let db = make_db("widget-roundtrip");
         let cfg = default_config_for("rtrip");
