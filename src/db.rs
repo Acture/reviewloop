@@ -1706,7 +1706,7 @@ mod tests {
 
         let tmp = tempdir().unwrap();
         let db = Db::new(tmp.path());
-        db.init_schema().expect("init_schema must succeed");
+        db.ensure_schema().expect("ensure_schema must succeed");
 
         let mode = std::fs::metadata(&db.path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "database file must be 0o600 after creation");

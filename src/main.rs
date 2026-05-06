@@ -3706,7 +3706,7 @@ mod tests {
         write_project_config(&config_path, project_id);
 
         let db = Db::new_in_memory("cmd_retry_foreign_config_audit").unwrap();
-        db.init_schema().unwrap();
+        db.ensure_schema().unwrap();
         db.register_project_config(project_id, &config_path)
             .unwrap();
         let job = db.create_job(&new_retry_job(project_id)).unwrap();
