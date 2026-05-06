@@ -288,7 +288,7 @@ impl TestContext {
         }];
 
         let db = Db::new(Path::new(&config.core.state_dir));
-        db.init_schema()?;
+        db.ensure_schema()?;
 
         Ok(Self {
             _tmp: tmp,

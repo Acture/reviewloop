@@ -305,7 +305,7 @@ mod tests {
     /// Each test gets a unique name to avoid SQLite shared-cache collisions.
     fn make_db(name: &str) -> Db {
         let db = Db::new_in_memory(name).expect("new_in_memory");
-        db.init_schema().expect("init_schema");
+        db.ensure_schema().expect("ensure_schema");
         db
     }
 

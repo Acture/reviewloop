@@ -477,7 +477,7 @@ mod tests {
         }];
 
         let db = Db::new(Path::new(&config.core.state_dir));
-        db.init_schema()?;
+        db.ensure_schema()?;
         Ok((tmp, config, db))
     }
 
@@ -601,7 +601,7 @@ mod tests {
         }];
 
         let db = Db::new(Path::new(&config.core.state_dir));
-        db.init_schema()?;
+        db.ensure_schema()?;
 
         // Simulate three daemon ticks.
         run_pdf_trigger(&config, &db)?;

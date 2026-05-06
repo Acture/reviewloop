@@ -43,7 +43,7 @@ impl DbTestContext {
         }];
 
         let db = Db::new(Path::new(&config.core.state_dir));
-        db.init_schema()?;
+        db.ensure_schema()?;
 
         Ok(Self {
             _tmp: tmp,
@@ -505,7 +505,7 @@ fn in_memory_db_persists_across_operations_for_same_instance() -> Result<()> {
     }];
 
     let db = Db::from_config(&config)?;
-    db.init_schema()?;
+    db.ensure_schema()?;
 
     let hash = sha256_file(Path::new(&config.papers[0].pdf_path))?;
     let created = db.create_job(&NewJob {

@@ -135,188 +135,30 @@ impl Db {
         // 30-second busy timeout so concurrent writes from emit_failover_event
         // (opening a fresh connection while update_job_state holds a write
         // transaction) retry rather than fail immediately. WAL mode (set in
-        // init_schema) further reduces contention, but having a generous
+        // ensure_schema) further reduces contention, but having a generous
         // timeout is a belt-and-suspenders safeguard.
         conn.busy_timeout(Duration::from_secs(30))?;
         Ok(conn)
     }
 
-    pub fn init_schema(&self) -> Result<()> {
+    pub fn ensure_schema(&self) -> Result<()> {
         let conn = self.connect()?;
-        let current_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        enable_wal_mode(&conn).context("enabling WAL mode")?;
+
+        let current_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .context("reading schema version")?;
         let current_version = u32::try_from(current_version).unwrap_or(0);
-
-        // Enable WAL journal mode for file-based databases.  WAL allows
-        // concurrent readers + one writer without blocking each other, so a
-        // write transaction in one connection (e.g. update_job_state) does
-        // not starve another connection's write (e.g. emit_failover_event).
-        // For in-memory databases this pragma is silently ignored (mode stays
-        // "memory"), which is fine since in-memory DBs are single-process
-        // and don't have the concurrent-connection issue.
-        let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
-
         if current_version >= SCHEMA_VERSION {
             return Ok(());
         }
 
-        // Step 1: create tables. CREATE TABLE IF NOT EXISTS leaves an
-        // existing table's schema untouched, so on upgrade these no-op
-        // and we rely on ensure_column_exists below to backfill any
-        // columns that didn't exist in the older schema.
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS jobs (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL DEFAULT '',
-                paper_id TEXT NOT NULL,
-                backend TEXT NOT NULL,
-                pdf_path TEXT NOT NULL,
-                pdf_hash TEXT NOT NULL,
-                status TEXT NOT NULL,
-                token TEXT,
-                email TEXT NOT NULL,
-                venue TEXT,
-                git_tag TEXT,
-                git_commit TEXT,
-                version_no INTEGER NOT NULL DEFAULT 1,
-                round_no INTEGER NOT NULL DEFAULT 1,
-                version_source TEXT NOT NULL DEFAULT 'pdf_hash',
-                version_key TEXT NOT NULL DEFAULT '',
-                attempt INTEGER NOT NULL DEFAULT 0,
-                started_at TEXT,
-                next_poll_at TEXT,
-                last_error TEXT,
-                fallback_used INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
+        create_tables_if_missing(&conn).context("creating tables")?;
+        migrate_columns(&conn).context("migrating columns")?;
+        create_indexes(&conn).context("creating indexes")?;
 
-            CREATE TABLE IF NOT EXISTS reviews (
-                job_id TEXT PRIMARY KEY,
-                token TEXT NOT NULL,
-                raw_json TEXT NOT NULL,
-                summary_md TEXT NOT NULL,
-                completed_at TEXT NOT NULL,
-                FOREIGN KEY(job_id) REFERENCES jobs(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id TEXT NOT NULL DEFAULT '',
-                job_id TEXT,
-                event_type TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS seen_tags (
-                tag_name TEXT PRIMARY KEY,
-                target_commit TEXT NOT NULL,
-                seen_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS email_tokens (
-                token TEXT PRIMARY KEY,
-                source TEXT NOT NULL,
-                matched_at TEXT NOT NULL,
-                raw_ref TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS projects (
-                project_id   TEXT PRIMARY KEY,
-                config_path  TEXT NOT NULL,
-                last_seen_at TEXT NOT NULL
-            );
-            "#,
-        )?;
-
-        // Step 2: backfill columns that were added in later versions. MUST
-        // run before CREATE INDEX below, since some indexes reference
-        // columns (project_id, version_key) that an older schema lacks --
-        // creating those indexes against a pre-migration table would fail
-        // with "no such column".
-        ensure_column_exists(&conn, "jobs", "project_id", "TEXT NOT NULL DEFAULT ''")?;
-        ensure_column_exists(&conn, "jobs", "started_at", "TEXT")?;
-        ensure_column_exists(&conn, "jobs", "version_no", "INTEGER NOT NULL DEFAULT 1")?;
-        ensure_column_exists(&conn, "jobs", "round_no", "INTEGER NOT NULL DEFAULT 1")?;
-        ensure_column_exists(
-            &conn,
-            "jobs",
-            "version_source",
-            "TEXT NOT NULL DEFAULT 'pdf_hash'",
-        )?;
-        ensure_column_exists(&conn, "jobs", "version_key", "TEXT NOT NULL DEFAULT ''")?;
-        ensure_column_exists(&conn, "events", "project_id", "TEXT NOT NULL DEFAULT ''")?;
-
-        // Step 3: indexes (now that all referenced columns exist).
-        conn.execute_batch(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_jobs_project_status_next_poll ON jobs(project_id, status, next_poll_at);
-            CREATE INDEX IF NOT EXISTS idx_jobs_project_backend_hash ON jobs(project_id, backend, pdf_hash);
-            CREATE INDEX IF NOT EXISTS idx_jobs_project_paper_backend ON jobs(project_id, paper_id, backend);
-            CREATE INDEX IF NOT EXISTS idx_jobs_project_dedupe ON jobs(project_id, paper_id, backend, pdf_hash, version_key, status);
-            CREATE INDEX IF NOT EXISTS idx_events_project_created_at ON events(project_id, created_at);
-            "#,
-        )?;
-
-        if column_exists(&conn, "jobs", "version_no")? {
-            conn.execute(
-                "UPDATE jobs SET version_no = 1 WHERE version_no IS NULL OR version_no = 0",
-                [],
-            )?;
-        }
-        if column_exists(&conn, "jobs", "round_no")? {
-            conn.execute(
-                "UPDATE jobs SET round_no = 1 WHERE round_no IS NULL OR round_no = 0",
-                [],
-            )?;
-        }
-        if column_exists(&conn, "jobs", "version_source")?
-            && column_exists(&conn, "jobs", "git_commit")?
-        {
-            conn.execute(
-                r#"
-                UPDATE jobs
-                SET version_source = CASE
-                        WHEN COALESCE(TRIM(git_commit), '') <> '' THEN 'git_commit'
-                        ELSE 'pdf_hash'
-                    END
-                WHERE COALESCE(TRIM(version_source), '') = ''
-                "#,
-                [],
-            )?;
-        }
-        if column_exists(&conn, "jobs", "version_key")?
-            && column_exists(&conn, "jobs", "git_commit")?
-            && column_exists(&conn, "jobs", "pdf_hash")?
-        {
-            conn.execute(
-                r#"
-                UPDATE jobs
-                SET version_key = CASE
-                        WHEN COALESCE(TRIM(git_commit), '') <> '' THEN git_commit
-                        ELSE pdf_hash
-                    END
-                WHERE COALESCE(TRIM(version_key), '') = ''
-                "#,
-                [],
-            )?;
-        }
-        if column_exists(&conn, "events", "project_id")?
-            && column_exists(&conn, "events", "job_id")?
-            && column_exists(&conn, "jobs", "project_id")?
-        {
-            conn.execute(
-                r#"
-                UPDATE events
-                SET project_id = COALESCE((SELECT jobs.project_id FROM jobs WHERE jobs.id = events.job_id), '')
-                WHERE COALESCE(project_id, '') = ''
-                "#,
-                [],
-            )?;
-        }
-
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION as i64)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION as i64)
+            .context("recording schema version")?;
         Ok(())
     }
 
@@ -1375,6 +1217,190 @@ impl Db {
     }
 }
 
+fn enable_wal_mode(conn: &Connection) -> Result<()> {
+    // Enable WAL journal mode for file-based databases. WAL allows concurrent
+    // readers + one writer without blocking each other, so a write transaction
+    // in one connection (e.g. update_job_state) does not starve another
+    // connection's write (e.g. emit_failover_event). For in-memory databases
+    // this pragma is silently ignored (mode stays "memory"), which is fine
+    // since in-memory DBs are single-process and don't have the
+    // concurrent-connection issue.
+    let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
+
+    // Verify the journal mode; in-memory DBs return "memory", which is expected.
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap_or_else(|_| "unknown".to_string());
+    if !(mode.eq_ignore_ascii_case("wal") || mode.eq_ignore_ascii_case("memory")) {
+        tracing::warn!(
+            actual_mode = %mode,
+            "expected WAL journal mode but got '{}'; concurrency guarantees may be degraded",
+            mode
+        );
+    }
+
+    Ok(())
+}
+
+fn create_tables_if_missing(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS jobs (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL DEFAULT '',
+            paper_id TEXT NOT NULL,
+            backend TEXT NOT NULL,
+            pdf_path TEXT NOT NULL,
+            pdf_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            token TEXT,
+            email TEXT NOT NULL,
+            venue TEXT,
+            git_tag TEXT,
+            git_commit TEXT,
+            version_no INTEGER NOT NULL DEFAULT 1,
+            round_no INTEGER NOT NULL DEFAULT 1,
+            version_source TEXT NOT NULL DEFAULT 'pdf_hash',
+            version_key TEXT NOT NULL DEFAULT '',
+            attempt INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT,
+            next_poll_at TEXT,
+            last_error TEXT,
+            fallback_used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS reviews (
+            job_id TEXT PRIMARY KEY,
+            token TEXT NOT NULL,
+            raw_json TEXT NOT NULL,
+            summary_md TEXT NOT NULL,
+            completed_at TEXT NOT NULL,
+            FOREIGN KEY(job_id) REFERENCES jobs(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT NOT NULL DEFAULT '',
+            job_id TEXT,
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS seen_tags (
+            tag_name TEXT PRIMARY KEY,
+            target_commit TEXT NOT NULL,
+            seen_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS email_tokens (
+            token TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            matched_at TEXT NOT NULL,
+            raw_ref TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS projects (
+            project_id   TEXT PRIMARY KEY,
+            config_path  TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn migrate_columns(conn: &Connection) -> Result<()> {
+    // Backfill columns that were added in later versions. MUST run before
+    // CREATE INDEX, since some indexes reference columns (project_id,
+    // version_key) that an older schema lacks.
+    ensure_column_exists(conn, "jobs", "project_id", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column_exists(conn, "jobs", "started_at", "TEXT")?;
+    ensure_column_exists(conn, "jobs", "version_no", "INTEGER NOT NULL DEFAULT 1")?;
+    ensure_column_exists(conn, "jobs", "round_no", "INTEGER NOT NULL DEFAULT 1")?;
+    ensure_column_exists(
+        conn,
+        "jobs",
+        "version_source",
+        "TEXT NOT NULL DEFAULT 'pdf_hash'",
+    )?;
+    ensure_column_exists(conn, "jobs", "version_key", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column_exists(conn, "events", "project_id", "TEXT NOT NULL DEFAULT ''")?;
+
+    if column_exists(conn, "jobs", "version_no")? {
+        conn.execute(
+            "UPDATE jobs SET version_no = 1 WHERE version_no IS NULL OR version_no = 0",
+            [],
+        )?;
+    }
+    if column_exists(conn, "jobs", "round_no")? {
+        conn.execute(
+            "UPDATE jobs SET round_no = 1 WHERE round_no IS NULL OR round_no = 0",
+            [],
+        )?;
+    }
+    if column_exists(conn, "jobs", "version_source")? && column_exists(conn, "jobs", "git_commit")?
+    {
+        conn.execute(
+            r#"
+            UPDATE jobs
+            SET version_source = CASE
+                    WHEN COALESCE(TRIM(git_commit), '') <> '' THEN 'git_commit'
+                    ELSE 'pdf_hash'
+                END
+            WHERE COALESCE(TRIM(version_source), '') = ''
+            "#,
+            [],
+        )?;
+    }
+    if column_exists(conn, "jobs", "version_key")?
+        && column_exists(conn, "jobs", "git_commit")?
+        && column_exists(conn, "jobs", "pdf_hash")?
+    {
+        conn.execute(
+            r#"
+            UPDATE jobs
+            SET version_key = CASE
+                    WHEN COALESCE(TRIM(git_commit), '') <> '' THEN git_commit
+                    ELSE pdf_hash
+                END
+            WHERE COALESCE(TRIM(version_key), '') = ''
+            "#,
+            [],
+        )?;
+    }
+    if column_exists(conn, "events", "project_id")?
+        && column_exists(conn, "events", "job_id")?
+        && column_exists(conn, "jobs", "project_id")?
+    {
+        conn.execute(
+            r#"
+            UPDATE events
+            SET project_id = COALESCE((SELECT jobs.project_id FROM jobs WHERE jobs.id = events.job_id), '')
+            WHERE COALESCE(project_id, '') = ''
+            "#,
+            [],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn create_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_jobs_project_status_next_poll ON jobs(project_id, status, next_poll_at);
+        CREATE INDEX IF NOT EXISTS idx_jobs_project_backend_hash ON jobs(project_id, backend, pdf_hash);
+        CREATE INDEX IF NOT EXISTS idx_jobs_project_paper_backend ON jobs(project_id, paper_id, backend);
+        CREATE INDEX IF NOT EXISTS idx_jobs_project_dedupe ON jobs(project_id, paper_id, backend, pdf_hash, version_key, status);
+        CREATE INDEX IF NOT EXISTS idx_events_project_created_at ON events(project_id, created_at);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn determine_versioning(conn: &Connection, new_job: &NewJob) -> Result<(u32, u32, String, String)> {
     let version_key = new_job
         .git_commit
@@ -1636,34 +1662,34 @@ mod tests {
         }
     }
 
-    /// Verify that WAL journal mode is enabled after init_schema.
+    /// Verify that WAL journal mode is enabled after ensure_schema.
     ///
     /// With WAL enabled, concurrent writes from separate connections (e.g.
     /// update_job_state holding a transaction while emit_failover_event opens
     /// a fresh connection) are retried rather than failing immediately, fixing
     /// the "failover events silently dropped under load" bug (N2).
     #[test]
-    fn wal_mode_enabled_after_init_schema() {
+    fn wal_mode_enabled_after_ensure_schema() {
         let tmp = tempdir().unwrap();
         let db = Db::new(tmp.path());
-        db.init_schema().expect("init_schema must succeed");
+        db.ensure_schema().expect("ensure_schema must succeed");
 
-        let conn = db.connect().expect("connect after init_schema");
+        let conn = db.connect().expect("connect after ensure_schema");
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .expect("PRAGMA journal_mode must return a row");
         assert_eq!(
             mode, "wal",
-            "expected WAL journal mode after init_schema; got: {mode}"
+            "expected WAL journal mode after ensure_schema; got: {mode}"
         );
     }
 
     #[test]
-    fn init_schema_sets_user_version() {
+    fn ensure_schema_sets_user_version() {
         let db = Db::new_in_memory("schema_version_test").unwrap();
-        db.init_schema().expect("init_schema must succeed");
+        db.ensure_schema().expect("ensure_schema must succeed");
 
-        let conn = db.connect().expect("connect after init_schema");
+        let conn = db.connect().expect("connect after ensure_schema");
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("PRAGMA user_version must return a row");
@@ -1671,7 +1697,7 @@ mod tests {
     }
 
     #[test]
-    fn init_schema_skips_migrations_when_already_at_current_version() {
+    fn ensure_schema_skips_migrations_when_already_at_current_version() {
         let tmp = tempdir().unwrap();
         let db_path = tmp.path().join("current-version.db");
 
@@ -1691,8 +1717,8 @@ mod tests {
         }
 
         let db = Db::new_file(db_path);
-        db.init_schema()
-            .expect("init_schema should be a no-op at current schema version");
+        db.ensure_schema()
+            .expect("ensure_schema should be a no-op at current schema version");
 
         let conn = db.connect().unwrap();
         assert!(
@@ -1710,13 +1736,13 @@ mod tests {
     }
 
     /// Regression: upgrading from a pre-Phase-0 schema (jobs table without
-    /// the project_id column) used to fail in init_schema because CREATE
+    /// the project_id column) used to fail in ensure_schema because CREATE
     /// INDEX on (project_id, ...) ran BEFORE ensure_column_exists added the
     /// missing column. Reproduces the production breakage by hand-crafting
-    /// an old-shape jobs table, then runs init_schema and asserts indexes
+    /// an old-shape jobs table, then runs ensure_schema and asserts indexes
     /// got created and old rows are still readable with existing values intact.
     #[test]
-    fn init_schema_migrates_pre_project_id_table() {
+    fn ensure_schema_migrates_pre_project_id_table() {
         #[derive(Debug, PartialEq)]
         struct LegacyJobSnapshot {
             id: String,
@@ -1815,11 +1841,11 @@ mod tests {
             .unwrap();
         }
 
-        // Now run init_schema -- this used to fail with "no such column:
+        // Now run ensure_schema -- this used to fail with "no such column:
         // project_id" because CREATE INDEX ran before ensure_column_exists.
         let db = Db::new_file(db_path.clone());
-        db.init_schema()
-            .expect("init_schema must succeed on legacy db");
+        db.ensure_schema()
+            .expect("ensure_schema must succeed on legacy db");
 
         let conn = db.connect().unwrap();
         let mut stmt = conn
@@ -1990,7 +2016,7 @@ mod tests {
     }
 
     #[test]
-    fn init_schema_migrates_pre_events_project_id_table() {
+    fn ensure_schema_migrates_pre_events_project_id_table() {
         #[derive(Debug, PartialEq)]
         struct EventSnapshot {
             id: i64,
@@ -2055,8 +2081,8 @@ mod tests {
         }
 
         let db = Db::new_file(db_path);
-        db.init_schema()
-            .expect("init_schema must succeed on legacy events db");
+        db.ensure_schema()
+            .expect("ensure_schema must succeed on legacy events db");
 
         let conn = db.connect().unwrap();
         let mut stmt = conn
@@ -2116,7 +2142,7 @@ mod tests {
     #[test]
     fn update_job_state_rejects_terminal_to_active_transition() {
         let db = Db::new_in_memory("guard_test").unwrap();
-        db.init_schema().unwrap();
+        db.ensure_schema().unwrap();
 
         let job = db.create_job(&make_queued_job("proj", "p1")).unwrap();
         // Move to a terminal state via the unchecked path.
@@ -2136,7 +2162,7 @@ mod tests {
     #[test]
     fn update_job_state_allows_valid_worker_transitions() {
         let db = Db::new_in_memory("guard_valid_test").unwrap();
-        db.init_schema().unwrap();
+        db.ensure_schema().unwrap();
 
         let job = db.create_job(&make_queued_job("proj", "p2")).unwrap();
         // Queued -> Processing is a valid worker transition.
@@ -2150,7 +2176,7 @@ mod tests {
     #[test]
     fn project_registry_round_trip() {
         let db = Db::new_in_memory("project_registry_test").unwrap();
-        db.init_schema().unwrap();
+        db.ensure_schema().unwrap();
 
         // Empty registry returns None.
         assert!(
@@ -2183,7 +2209,7 @@ mod tests {
     #[test]
     fn project_registry_isolates_different_projects() {
         let db = Db::new_in_memory("project_registry_isolation").unwrap();
-        db.init_schema().unwrap();
+        db.ensure_schema().unwrap();
 
         let path_a = std::path::Path::new("/tmp/a/reviewloop.toml");
         let path_b = std::path::Path::new("/tmp/b/reviewloop.toml");

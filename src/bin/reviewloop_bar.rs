@@ -67,7 +67,7 @@ fn main() {
 fn try_main() -> Result<()> {
     let config = Config::load_runtime(None, false).context("loading config")?;
     let db = Db::from_config(&config).context("opening database")?;
-    db.init_schema().context("initialising schema")?;
+    db.ensure_schema().context("ensuring schema")?;
 
     let artifacts_dir = config.state_dir().join("artifacts");
     let log_path: PathBuf = config
@@ -209,7 +209,7 @@ fn start_background_poller(
             let mut new_snap = BarSnapshot::default();
             new_snap.daemon_state = poll_daemon_state_with_timeout();
 
-            if let Err(e) = db.init_schema() {
+            if let Err(e) = db.ensure_schema() {
                 new_snap.db_error = Some(format!("init: {e}"));
             } else {
                 match db.list_active_jobs_all() {

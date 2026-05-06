@@ -110,7 +110,7 @@ the daemon, CLI, menu-bar app, and adds a macOS Widget extension.
   `load_runtime_for_path_does_not_panic_on_repeated_call` and
   `load_effective_config_for_job_self_heals_when_registered_path_missing`.
 - **Schema migration data preservation** (B2). Backfill UPDATEs in
-  `init_schema` are now gated on column existence; pre-existing data
+  `ensure_schema` are now gated on column existence; pre-existing data
   values survive the upgrade. Three new regression tests.
 - **Bar app fleet-view rewrite** (commit 722c58b). Drops requirement
   for `REVIEWLOOP_PROJECT_ID`; reads all projects from shared DB.

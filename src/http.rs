@@ -376,7 +376,7 @@ mod tests {
 
         let tmp = tempdir().unwrap();
         let db = crate::db::Db::new(tmp.path());
-        db.init_schema().unwrap();
+        db.ensure_schema().unwrap();
 
         let mut config = Config::default();
         // One dead proxy, one live.

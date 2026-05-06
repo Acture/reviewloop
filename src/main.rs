@@ -450,7 +450,7 @@ async fn run() -> Result<()> {
                         let config = loaded.config;
                         ensure_runtime_dirs(&config)?;
                         let db = Db::from_config(&config)?;
-                        db.init_schema()?;
+                        db.ensure_schema()?;
                         cmd_daemon_status(Some(&config), Some(&db), json)
                     }
                     Err(_) => cmd_daemon_status(None, None, json),
@@ -1779,7 +1779,7 @@ fn load_runtime(
 
     ensure_runtime_dirs(&config)?;
     let db = Db::from_config(&config)?;
-    db.init_schema()?;
+    db.ensure_schema()?;
 
     // Register this project's config path so fleet-wide commands (eg the
     // bar's "Retry now") can resolve `project_id -> config path` later
@@ -3671,7 +3671,7 @@ mod tests {
         write_project_config(&config_path, project_id);
 
         let db = Db::new_in_memory("cmd_retry_missing_registered_path").unwrap();
-        db.init_schema().unwrap();
+        db.ensure_schema().unwrap();
         db.register_project_config(project_id, &config_path)
             .unwrap();
         let job = db.create_job(&new_retry_job(project_id)).unwrap();
@@ -3724,7 +3724,7 @@ mod tests {
         #[test]
         fn zero_matches_returns_error() {
             let db = Db::new_in_memory("resolve_zero").unwrap();
-            db.init_schema().unwrap();
+            db.ensure_schema().unwrap();
 
             let err = resolve_paper_id_to_job(
                 &db,
@@ -3743,7 +3743,7 @@ mod tests {
         #[test]
         fn one_match_returns_job() {
             let db = Db::new_in_memory("resolve_one").unwrap();
-            db.init_schema().unwrap();
+            db.ensure_schema().unwrap();
 
             let created = db
                 .create_job(&new_job(
@@ -3768,7 +3768,7 @@ mod tests {
         #[test]
         fn multiple_matches_returns_error_with_candidates() {
             let db = Db::new_in_memory("resolve_multi").unwrap();
-            db.init_schema().unwrap();
+            db.ensure_schema().unwrap();
 
             db.create_job(&new_job(
                 "proj1",
@@ -3803,7 +3803,7 @@ mod tests {
         #[test]
         fn filters_by_status_correctly() {
             let db = Db::new_in_memory("resolve_status_filter").unwrap();
-            db.init_schema().unwrap();
+            db.ensure_schema().unwrap();
 
             // A completed job should NOT match when looking for PROCESSING
             db.create_job(&new_job("proj1", "paper1", "hash_a", JobStatus::Completed))
@@ -3942,7 +3942,7 @@ mod tests {
         #[test]
         fn list_active_jobs_returns_queued_submitted_processing() {
             let db = Db::new_in_memory("daemon_status_active").unwrap();
-            db.init_schema().unwrap();
+            db.ensure_schema().unwrap();
 
             db.create_job(&make_job("p1", JobStatus::Queued, 1))
                 .unwrap();
@@ -3968,7 +3968,7 @@ mod tests {
         #[test]
         fn most_recent_event_reflects_last_activity() {
             let db = Db::new_in_memory("daemon_status_event").unwrap();
-            db.init_schema().unwrap();
+            db.ensure_schema().unwrap();
 
             // No events → None
             assert!(db.most_recent_event_created_at("proj").unwrap().is_none());
@@ -3983,7 +3983,7 @@ mod tests {
         #[test]
         fn most_recent_event_of_type_filters_by_type_and_returns_payload() {
             let db = Db::new_in_memory("daemon_status_event_typed").unwrap();
-            db.init_schema().unwrap();
+            db.ensure_schema().unwrap();
 
             // No matching events → None
             assert!(
@@ -4048,7 +4048,7 @@ mod tests {
             // We can't easily capture stdout in unit tests, but we can verify the
             // DB helpers return the right shape that would feed into JSON output.
             let db = Db::new_in_memory("daemon_status_json").unwrap();
-            db.init_schema().unwrap();
+            db.ensure_schema().unwrap();
 
             db.create_job(&make_job("main", JobStatus::Processing, 1))
                 .unwrap();
@@ -4144,7 +4144,7 @@ mod tests {
         #[test]
         fn submit_force_clears_stuck_job_cooldown() {
             let db = Db::new_in_memory("force_clears_cooldown").unwrap();
-            db.init_schema().unwrap();
+            db.ensure_schema().unwrap();
             let config = make_config("proj1");
 
             let stuck = db
@@ -4180,7 +4180,7 @@ mod tests {
         #[test]
         fn submit_force_no_active_jobs_is_noop() {
             let db = Db::new_in_memory("force_noop").unwrap();
-            db.init_schema().unwrap();
+            db.ensure_schema().unwrap();
             let config = make_config("proj1");
             clear_sibling_job_cooldowns(&config, &db, "paper1").unwrap();
         }
@@ -4189,7 +4189,7 @@ mod tests {
         #[test]
         fn submit_force_does_not_touch_completed_jobs() {
             let db = Db::new_in_memory("force_active_only").unwrap();
-            db.init_schema().unwrap();
+            db.ensure_schema().unwrap();
             let config = make_config("proj1");
 
             let completed = db
@@ -4324,7 +4324,7 @@ mod tests {
 
         fn make_db_with_jobs(project_id: &str, paper_ids: &[&str]) -> Db {
             let db = Db::new_in_memory(project_id).expect("in-memory DB");
-            db.init_schema().expect("init schema");
+            db.ensure_schema().expect("ensure schema");
             for paper_id in paper_ids {
                 let job = NewJob {
                     project_id: project_id.to_string(),
@@ -4604,7 +4604,7 @@ mod tests {
         #[test]
         fn narrow_scope_excludes_failed_jobs() {
             let db = Db::new_in_memory("retry_narrow").unwrap();
-            db.init_schema().unwrap();
+            db.ensure_schema().unwrap();
 
             // Only a Failed job exists — narrow scope should not match it.
             db.create_job(&new_job("paper1", "hash_a", JobStatus::Failed))
@@ -4632,7 +4632,7 @@ mod tests {
         #[test]
         fn wide_scope_includes_failed_jobs() {
             let db = Db::new_in_memory("retry_wide").unwrap();
-            db.init_schema().unwrap();
+            db.ensure_schema().unwrap();
 
             let failed = db
                 .create_job(&new_job("paper1", "hash_a", JobStatus::Failed))
@@ -4659,7 +4659,7 @@ mod tests {
         #[test]
         fn narrow_scope_matches_active_queued_job() {
             let db = Db::new_in_memory("retry_active_queued").unwrap();
-            db.init_schema().unwrap();
+            db.ensure_schema().unwrap();
 
             let queued = db
                 .create_job(&new_job("paper1", "hash_a", JobStatus::Queued))
@@ -4688,7 +4688,7 @@ mod tests {
 
         fn make_processing_job(project_id: &str, paper_id: &str) -> (Db, String) {
             let db = Db::new_in_memory(project_id).expect("in-memory DB");
-            db.init_schema().expect("init schema");
+            db.ensure_schema().expect("ensure schema");
             let job = db
                 .create_job(&NewJob {
                     project_id: project_id.to_string(),
@@ -4804,7 +4804,7 @@ mod tests {
 
         fn make_db_multi(project_id: &str, paper_ids: &[&str], jobs_per_paper: usize) -> Db {
             let db = Db::new_in_memory(project_id).expect("in-memory DB");
-            db.init_schema().expect("init schema");
+            db.ensure_schema().expect("ensure schema");
             for paper_id in paper_ids {
                 for _ in 0..jobs_per_paper {
                     db.create_job(&NewJob {
@@ -4864,7 +4864,7 @@ mod tests {
         fn active_filter_excludes_terminal_statuses() {
             let project_id = "filter_proj";
             let db = Db::new_in_memory(project_id).expect("in-memory DB");
-            db.init_schema().expect("init schema");
+            db.ensure_schema().expect("ensure schema");
 
             for status in [
                 JobStatus::Queued,

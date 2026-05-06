@@ -843,7 +843,7 @@ mod tests {
         };
         config.gmail_oauth = Some(gmail_cfg.clone());
         let db = Db::new_in_memory("email_refresh_failure_no_crash").expect("in-memory db");
-        db.init_schema().expect("init schema");
+        db.ensure_schema().expect("ensure schema");
 
         let result =
             super::gmail_impl::poll_gmail_with_provider(&config, &db, &gmail_cfg, &provider).await;
@@ -871,7 +871,7 @@ mod tests {
     #[test]
     fn existing_processing_token_nudges_poll_to_now() {
         let db = Db::new_in_memory("email_nudge_poll_now").expect("in-memory db");
-        db.init_schema().expect("init schema");
+        db.ensure_schema().expect("ensure schema");
 
         let seed = NewJob {
             project_id: "project-email".to_string(),
@@ -911,7 +911,7 @@ mod tests {
     #[test]
     fn terminal_job_token_does_not_nudge_poll() {
         let db = Db::new_in_memory("email_terminal_no_nudge").expect("in-memory db");
-        db.init_schema().expect("init schema");
+        db.ensure_schema().expect("ensure schema");
 
         let seed = NewJob {
             project_id: "project-email".to_string(),
@@ -983,7 +983,7 @@ mod tests {
         });
 
         let db = Db::new_in_memory("email_u6_oauth_refresh").expect("in-memory db");
-        db.init_schema().expect("init schema");
+        db.ensure_schema().expect("ensure schema");
 
         // Should succeed (returns Ok with empty vec) and write the event.
         let result = super::gmail_impl::poll_gmail_if_enabled(&config, &db).await;
