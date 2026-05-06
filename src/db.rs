@@ -14,6 +14,8 @@ use std::{
 };
 use uuid::Uuid;
 
+const SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PruneReport {
     pub email_tokens: usize,
@@ -141,6 +143,9 @@ impl Db {
 
     pub fn init_schema(&self) -> Result<()> {
         let conn = self.connect()?;
+        let current_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let current_version = u32::try_from(current_version).unwrap_or(0);
+
         // Enable WAL journal mode for file-based databases.  WAL allows
         // concurrent readers + one writer without blocking each other, so a
         // write transaction in one connection (e.g. update_job_state) does
@@ -149,6 +154,10 @@ impl Db {
         // "memory"), which is fine since in-memory DBs are single-process
         // and don't have the concurrent-connection issue.
         let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
+
+        if current_version >= SCHEMA_VERSION {
+            return Ok(());
+        }
 
         // Step 1: create tables. CREATE TABLE IF NOT EXISTS leaves an
         // existing table's schema untouched, so on upgrade these no-op
@@ -250,44 +259,64 @@ impl Db {
             "#,
         )?;
 
-        conn.execute(
-            "UPDATE jobs SET version_no = 1 WHERE version_no IS NULL OR version_no = 0",
-            [],
-        )?;
-        conn.execute(
-            "UPDATE jobs SET round_no = 1 WHERE round_no IS NULL OR round_no = 0",
-            [],
-        )?;
-        conn.execute(
-            r#"
-            UPDATE jobs
-            SET version_source = CASE
-                    WHEN COALESCE(TRIM(git_commit), '') <> '' THEN 'git_commit'
-                    ELSE 'pdf_hash'
-                END
-            WHERE COALESCE(TRIM(version_source), '') = ''
-            "#,
-            [],
-        )?;
-        conn.execute(
-            r#"
-            UPDATE jobs
-            SET version_key = CASE
-                    WHEN COALESCE(TRIM(git_commit), '') <> '' THEN git_commit
-                    ELSE pdf_hash
-                END
-            WHERE COALESCE(TRIM(version_key), '') = ''
-            "#,
-            [],
-        )?;
-        conn.execute(
-            r#"
-            UPDATE events
-            SET project_id = COALESCE((SELECT jobs.project_id FROM jobs WHERE jobs.id = events.job_id), '')
-            WHERE COALESCE(project_id, '') = ''
-            "#,
-            [],
-        )?;
+        if column_exists(&conn, "jobs", "version_no")? {
+            conn.execute(
+                "UPDATE jobs SET version_no = 1 WHERE version_no IS NULL OR version_no = 0",
+                [],
+            )?;
+        }
+        if column_exists(&conn, "jobs", "round_no")? {
+            conn.execute(
+                "UPDATE jobs SET round_no = 1 WHERE round_no IS NULL OR round_no = 0",
+                [],
+            )?;
+        }
+        if column_exists(&conn, "jobs", "version_source")?
+            && column_exists(&conn, "jobs", "git_commit")?
+        {
+            conn.execute(
+                r#"
+                UPDATE jobs
+                SET version_source = CASE
+                        WHEN COALESCE(TRIM(git_commit), '') <> '' THEN 'git_commit'
+                        ELSE 'pdf_hash'
+                    END
+                WHERE COALESCE(TRIM(version_source), '') = ''
+                "#,
+                [],
+            )?;
+        }
+        if column_exists(&conn, "jobs", "version_key")?
+            && column_exists(&conn, "jobs", "git_commit")?
+            && column_exists(&conn, "jobs", "pdf_hash")?
+        {
+            conn.execute(
+                r#"
+                UPDATE jobs
+                SET version_key = CASE
+                        WHEN COALESCE(TRIM(git_commit), '') <> '' THEN git_commit
+                        ELSE pdf_hash
+                    END
+                WHERE COALESCE(TRIM(version_key), '') = ''
+                "#,
+                [],
+            )?;
+        }
+        if column_exists(&conn, "events", "project_id")?
+            && column_exists(&conn, "events", "job_id")?
+            && column_exists(&conn, "jobs", "project_id")?
+        {
+            conn.execute(
+                r#"
+                UPDATE events
+                SET project_id = COALESCE((SELECT jobs.project_id FROM jobs WHERE jobs.id = events.job_id), '')
+                WHERE COALESCE(project_id, '') = ''
+                "#,
+                [],
+            )?;
+        }
+
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION as i64)?;
         Ok(())
     }
 
@@ -1549,19 +1578,26 @@ fn extract_score(raw_json: &Option<String>) -> Option<String> {
     }
 }
 
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let pragma = format!(r#"PRAGMA table_info("{table}")"#);
+    let mut stmt = conn.prepare(&pragma)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn ensure_column_exists(
     conn: &Connection,
     table: &str,
     column: &str,
     column_def: &str,
 ) -> Result<()> {
-    let pragma = format!("PRAGMA table_info({table})");
-    let mut stmt = conn.prepare(&pragma)?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    for row in rows {
-        if row? == column {
-            return Ok(());
-        }
+    if column_exists(conn, table, column)? {
+        return Ok(());
     }
     let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {column_def}");
     conn.execute(&alter, [])?;
@@ -1622,14 +1658,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn init_schema_sets_user_version() {
+        let db = Db::new_in_memory("schema_version_test").unwrap();
+        db.init_schema().expect("init_schema must succeed");
+
+        let conn = db.connect().expect("connect after init_schema");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("PRAGMA user_version must return a row");
+        assert_eq!(version, SCHEMA_VERSION as i64);
+    }
+
+    #[test]
+    fn init_schema_skips_migrations_when_already_at_current_version() {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("current-version.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE jobs (
+                    id TEXT PRIMARY KEY,
+                    paper_id TEXT NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION as i64)
+                .unwrap();
+        }
+
+        let db = Db::new_file(db_path);
+        db.init_schema()
+            .expect("init_schema should be a no-op at current schema version");
+
+        let conn = db.connect().unwrap();
+        assert!(
+            !column_exists(&conn, "jobs", "project_id").unwrap(),
+            "current-version DBs should skip legacy column migrations"
+        );
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_jobs_project_status_next_poll'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 0, "current-version DBs should skip index work");
+    }
+
     /// Regression: upgrading from a pre-Phase-0 schema (jobs table without
     /// the project_id column) used to fail in init_schema because CREATE
     /// INDEX on (project_id, ...) ran BEFORE ensure_column_exists added the
     /// missing column. Reproduces the production breakage by hand-crafting
     /// an old-shape jobs table, then runs init_schema and asserts indexes
-    /// got created and old rows are still readable.
+    /// got created and old rows are still readable with existing values intact.
     #[test]
     fn init_schema_migrates_pre_project_id_table() {
+        #[derive(Debug, PartialEq)]
+        struct LegacyJobSnapshot {
+            id: String,
+            paper_id: String,
+            backend: String,
+            pdf_path: String,
+            pdf_hash: String,
+            status: String,
+            token: Option<String>,
+            email: String,
+            venue: Option<String>,
+            git_tag: Option<String>,
+            git_commit: Option<String>,
+            attempt: i64,
+            next_poll_at: Option<String>,
+            last_error: Option<String>,
+            fallback_used: i64,
+            created_at: String,
+            updated_at: String,
+        }
+
+        #[derive(Debug, PartialEq)]
+        struct MigratedJobColumns {
+            id: String,
+            project_id: String,
+            started_at: Option<String>,
+            version_no: i64,
+            round_no: i64,
+            version_source: String,
+            version_key: String,
+        }
+
         let tmp = tempdir().unwrap();
         let db_path = tmp.path().join("legacy.db");
 
@@ -1683,10 +1802,17 @@ mod tests {
                     summary_md TEXT NOT NULL,
                     completed_at TEXT NOT NULL
                 );
-                INSERT INTO jobs (id, paper_id, backend, pdf_path, pdf_hash, status, email, attempt, fallback_used, created_at, updated_at)
-                VALUES ('legacy-job-1', 'main', 'stanford', '/tmp/p.pdf', 'h1', 'COMPLETED', 'test@example.com', 0, 0, '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z');
+                INSERT INTO jobs (
+                    id, paper_id, backend, pdf_path, pdf_hash, status, token, email, venue,
+                    git_tag, git_commit, attempt, next_poll_at, last_error, fallback_used,
+                    created_at, updated_at
+                ) VALUES
+                    ('legacy-job-1', 'paper-a', 'stanford', 'legacy/a.pdf', 'hash-a', 'COMPLETED', 'tok-a', 'a@example.com', 'ICLR', 'v1.0.0', 'commit-a', 2, '2025-01-01T00:05:00Z', 'err-a', 1, '2025-01-01T00:00:00Z', '2025-01-01T00:10:00Z'),
+                    ('legacy-job-2', 'paper-b', 'openreview', 'legacy/b.pdf', 'hash-b', 'QUEUED', NULL, 'b@example.com', 'NeurIPS', NULL, NULL, 0, NULL, NULL, 0, '2025-01-02T00:00:00Z', '2025-01-02T00:10:00Z'),
+                    ('legacy-job-3', 'paper-c', 'stanford', 'legacy/c.pdf', 'hash-c', 'PROCESSING', 'tok-c', 'c@example.com', NULL, 'v3.0.0', '', 5, '2025-01-03T00:05:00Z', 'retrying', 0, '2025-01-03T00:00:00Z', '2025-01-03T00:10:00Z');
                 "#,
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // Now run init_schema -- this used to fail with "no such column:
@@ -1695,17 +1821,162 @@ mod tests {
         db.init_schema()
             .expect("init_schema must succeed on legacy db");
 
-        // Old row is still there and the new column got a default.
         let conn = db.connect().unwrap();
-        let (proj, paper_id): (String, String) = conn
-            .query_row(
-                "SELECT project_id, paper_id FROM jobs WHERE id = ?1",
-                ["legacy-job-1"],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, paper_id, backend, pdf_path, pdf_hash, status, token, email, venue,
+                       git_tag, git_commit, attempt, next_poll_at, last_error, fallback_used,
+                       created_at, updated_at
+                FROM jobs
+                ORDER BY id
+                "#,
             )
-            .expect("legacy row preserved");
-        assert_eq!(proj, "");
-        assert_eq!(paper_id, "main");
+            .unwrap();
+        let rows: Vec<LegacyJobSnapshot> = stmt
+            .query_map([], |row| {
+                Ok(LegacyJobSnapshot {
+                    id: row.get(0)?,
+                    paper_id: row.get(1)?,
+                    backend: row.get(2)?,
+                    pdf_path: row.get(3)?,
+                    pdf_hash: row.get(4)?,
+                    status: row.get(5)?,
+                    token: row.get(6)?,
+                    email: row.get(7)?,
+                    venue: row.get(8)?,
+                    git_tag: row.get(9)?,
+                    git_commit: row.get(10)?,
+                    attempt: row.get(11)?,
+                    next_poll_at: row.get(12)?,
+                    last_error: row.get(13)?,
+                    fallback_used: row.get(14)?,
+                    created_at: row.get(15)?,
+                    updated_at: row.get(16)?,
+                })
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                LegacyJobSnapshot {
+                    id: "legacy-job-1".to_string(),
+                    paper_id: "paper-a".to_string(),
+                    backend: "stanford".to_string(),
+                    pdf_path: "legacy/a.pdf".to_string(),
+                    pdf_hash: "hash-a".to_string(),
+                    status: "COMPLETED".to_string(),
+                    token: Some("tok-a".to_string()),
+                    email: "a@example.com".to_string(),
+                    venue: Some("ICLR".to_string()),
+                    git_tag: Some("v1.0.0".to_string()),
+                    git_commit: Some("commit-a".to_string()),
+                    attempt: 2,
+                    next_poll_at: Some("2025-01-01T00:05:00Z".to_string()),
+                    last_error: Some("err-a".to_string()),
+                    fallback_used: 1,
+                    created_at: "2025-01-01T00:00:00Z".to_string(),
+                    updated_at: "2025-01-01T00:10:00Z".to_string(),
+                },
+                LegacyJobSnapshot {
+                    id: "legacy-job-2".to_string(),
+                    paper_id: "paper-b".to_string(),
+                    backend: "openreview".to_string(),
+                    pdf_path: "legacy/b.pdf".to_string(),
+                    pdf_hash: "hash-b".to_string(),
+                    status: "QUEUED".to_string(),
+                    token: None,
+                    email: "b@example.com".to_string(),
+                    venue: Some("NeurIPS".to_string()),
+                    git_tag: None,
+                    git_commit: None,
+                    attempt: 0,
+                    next_poll_at: None,
+                    last_error: None,
+                    fallback_used: 0,
+                    created_at: "2025-01-02T00:00:00Z".to_string(),
+                    updated_at: "2025-01-02T00:10:00Z".to_string(),
+                },
+                LegacyJobSnapshot {
+                    id: "legacy-job-3".to_string(),
+                    paper_id: "paper-c".to_string(),
+                    backend: "stanford".to_string(),
+                    pdf_path: "legacy/c.pdf".to_string(),
+                    pdf_hash: "hash-c".to_string(),
+                    status: "PROCESSING".to_string(),
+                    token: Some("tok-c".to_string()),
+                    email: "c@example.com".to_string(),
+                    venue: None,
+                    git_tag: Some("v3.0.0".to_string()),
+                    git_commit: Some("".to_string()),
+                    attempt: 5,
+                    next_poll_at: Some("2025-01-03T00:05:00Z".to_string()),
+                    last_error: Some("retrying".to_string()),
+                    fallback_used: 0,
+                    created_at: "2025-01-03T00:00:00Z".to_string(),
+                    updated_at: "2025-01-03T00:10:00Z".to_string(),
+                },
+            ]
+        );
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, project_id, started_at, version_no, round_no, version_source, version_key
+                FROM jobs
+                ORDER BY id
+                "#,
+            )
+            .unwrap();
+        let migrated_columns: Vec<MigratedJobColumns> = stmt
+            .query_map([], |row| {
+                Ok(MigratedJobColumns {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    started_at: row.get(2)?,
+                    version_no: row.get(3)?,
+                    round_no: row.get(4)?,
+                    version_source: row.get(5)?,
+                    version_key: row.get(6)?,
+                })
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            migrated_columns,
+            vec![
+                MigratedJobColumns {
+                    id: "legacy-job-1".to_string(),
+                    project_id: "".to_string(),
+                    started_at: None,
+                    version_no: 1,
+                    round_no: 1,
+                    version_source: "pdf_hash".to_string(),
+                    version_key: "commit-a".to_string(),
+                },
+                MigratedJobColumns {
+                    id: "legacy-job-2".to_string(),
+                    project_id: "".to_string(),
+                    started_at: None,
+                    version_no: 1,
+                    round_no: 1,
+                    version_source: "pdf_hash".to_string(),
+                    version_key: "hash-b".to_string(),
+                },
+                MigratedJobColumns {
+                    id: "legacy-job-3".to_string(),
+                    project_id: "".to_string(),
+                    started_at: None,
+                    version_no: 1,
+                    round_no: 1,
+                    version_source: "pdf_hash".to_string(),
+                    version_key: "hash-c".to_string(),
+                },
+            ]
+        );
 
         // Indexes referencing project_id were actually created.
         let idx_count: i64 = conn
@@ -1716,6 +1987,130 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx_count, 1, "project_id-prefixed index must exist");
+    }
+
+    #[test]
+    fn init_schema_migrates_pre_events_project_id_table() {
+        #[derive(Debug, PartialEq)]
+        struct EventSnapshot {
+            id: i64,
+            project_id: String,
+            job_id: Option<String>,
+            event_type: String,
+            payload_json: String,
+            created_at: String,
+        }
+
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("legacy-events.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE jobs (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL DEFAULT '',
+                    paper_id TEXT NOT NULL,
+                    backend TEXT NOT NULL,
+                    pdf_path TEXT NOT NULL,
+                    pdf_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    token TEXT,
+                    email TEXT NOT NULL,
+                    venue TEXT,
+                    git_tag TEXT,
+                    git_commit TEXT,
+                    version_no INTEGER NOT NULL DEFAULT 1,
+                    round_no INTEGER NOT NULL DEFAULT 1,
+                    version_source TEXT NOT NULL DEFAULT 'pdf_hash',
+                    version_key TEXT NOT NULL DEFAULT '',
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    started_at TEXT,
+                    next_poll_at TEXT,
+                    last_error TEXT,
+                    fallback_used INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO jobs (id, project_id, paper_id, backend, pdf_path, pdf_hash, status, email, created_at, updated_at)
+                VALUES
+                    ('job-a', 'proj-a', 'paper-a', 'stanford', 'legacy/a.pdf', 'hash-a', 'COMPLETED', 'a@example.com', '2025-02-01T00:00:00Z', '2025-02-01T00:10:00Z'),
+                    ('job-b', 'proj-b', 'paper-b', 'openreview', 'legacy/b.pdf', 'hash-b', 'QUEUED', 'b@example.com', '2025-02-02T00:00:00Z', '2025-02-02T00:10:00Z');
+                INSERT INTO events (job_id, event_type, payload_json, created_at)
+                VALUES
+                    ('job-a', 'job.completed', '{"paper_id":"paper-a","score":8}', '2025-02-01T00:11:00Z'),
+                    ('job-b', 'job.queued', '{"paper_id":"paper-b"}', '2025-02-02T00:01:00Z'),
+                    (NULL, 'orphan.event', '{"note":"orphan"}', '2025-02-03T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let db = Db::new_file(db_path);
+        db.init_schema()
+            .expect("init_schema must succeed on legacy events db");
+
+        let conn = db.connect().unwrap();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, project_id, job_id, event_type, payload_json, created_at
+                FROM events
+                ORDER BY id
+                "#,
+            )
+            .unwrap();
+        let rows: Vec<EventSnapshot> = stmt
+            .query_map([], |row| {
+                Ok(EventSnapshot {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    job_id: row.get(2)?,
+                    event_type: row.get(3)?,
+                    payload_json: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                EventSnapshot {
+                    id: 1,
+                    project_id: "proj-a".to_string(),
+                    job_id: Some("job-a".to_string()),
+                    event_type: "job.completed".to_string(),
+                    payload_json: r#"{"paper_id":"paper-a","score":8}"#.to_string(),
+                    created_at: "2025-02-01T00:11:00Z".to_string(),
+                },
+                EventSnapshot {
+                    id: 2,
+                    project_id: "proj-b".to_string(),
+                    job_id: Some("job-b".to_string()),
+                    event_type: "job.queued".to_string(),
+                    payload_json: r#"{"paper_id":"paper-b"}"#.to_string(),
+                    created_at: "2025-02-02T00:01:00Z".to_string(),
+                },
+                EventSnapshot {
+                    id: 3,
+                    project_id: "".to_string(),
+                    job_id: None,
+                    event_type: "orphan.event".to_string(),
+                    payload_json: r#"{"note":"orphan"}"#.to_string(),
+                    created_at: "2025-02-03T00:00:00Z".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
