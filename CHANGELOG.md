@@ -6,6 +6,59 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.2.1] — 2026-05-06
+
+Non-blocking polish + defense-in-depth wave from eval3.
+
+### Added
+
+- **`Db::ensure_schema`** (was `init_schema`) — renamed for clarity (the
+  function is idempotent and runs migrations, not just initialization).
+  Split into private helpers (`enable_wal_mode`, `create_tables_if_missing`,
+  `migrate_columns`, `create_indexes`) for targeted error context.
+- **WAL pragma read-back** — `ensure_schema` now warns when SQLite falls
+  back to a non-WAL journal mode on file-backed DBs (silent failure was
+  the prior behaviour).
+- **Foreign config validation** (`validate_for_foreign_load`) — when the
+  CLI loads a project config from the registry path (not cwd), it now
+  rejects `fallback_script` paths outside `$HOME` and warns on absolute
+  `widget_state_dir` outside `$HOME` and proxy URLs with embedded
+  credentials. Audit event `foreign_config_loaded` recorded in the
+  events table for every such load.
+
+### Fixed
+
+- **0o600 file permissions** on widget-state.json, config.toml, and the
+  SQLite DB on Unix (was 0o644 from default umask). Failures are now
+  logged via `tracing::warn!` rather than silently discarded.
+- **Bar UX** — active-job labels reorder to `paper-id (status, in Xs)`
+  with paper name leftmost; `attempt=N` dropped when N=0; project
+  submenu headers now read `(N active, M failed)` instead of cryptic
+  `(NA · MF)`.
+- **Bar performance** — background poller holds one `Db` instance for
+  its lifetime instead of reopening per 5s tick. `ensure_schema` runs
+  once at bar startup, not 720 times per hour.
+- **Error vocabulary** — standardized to `"X not found: {id}"` for
+  lookup misses; reserved `"no longer exists"` for genuine post-lookup
+  races. Eliminates 5 different phrasings of the same situation.
+- **`daemon status` timestamps** human-readable path now suffixes with
+  ` UTC` (was `Z` which users in non-UTC zones often misread). `--json`
+  output unchanged (still RFC3339 with `Z`).
+- **`cancel --reason`** default cleaned up — no-reason path now writes
+  `"cancelled by user"` instead of redundant `"cancelled by user: cancelled by user"`.
+
+### Documentation
+
+- **`reviewloop init`** doc comment + success output now point to
+  `reviewloop init project --project-id <id>` as the next step.
+- **`reviewloop retry --include-failed`** help text expanded with
+  ambiguity example and `--job-id` fallback hint.
+- **`reviewloop daemon status`** on non-macOS now suggests a SQLite
+  fallback query in its error message.
+- **README "Exit codes" section** added.
+- **`status --active`** now mentioned in the doc comment + README
+  command reference.
+
 ## [0.2.0] — 2026-05-06
 
 First minor release after the Phase 0–8 UX overhaul. Touches every layer of
