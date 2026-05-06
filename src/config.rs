@@ -825,7 +825,19 @@ where
     );
     let tmp_path = path.with_file_name(tmp_name);
     {
-        let mut f = fs::File::create(&tmp_path)
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)
+                .with_context(|| format!("failed to create temp config: {}", tmp_path.display()))?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::File::create(&tmp_path)
             .with_context(|| format!("failed to create temp config: {}", tmp_path.display()))?;
         use std::io::Write;
         f.write_all(content.as_bytes())
@@ -1491,6 +1503,24 @@ mod tests {
         original.save(&path).expect("second save");
         let loaded2 = ProjectConfigFile::load(&path).expect("load2");
         assert_eq!(loaded2.project_id, original.project_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_file_is_0o600_after_atomic_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("reviewloop.toml");
+        let cfg = ProjectConfigFile {
+            project_id: "private-project".to_string(),
+            ..ProjectConfigFile::default()
+        };
+
+        cfg.save(&path).expect("save");
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "config file must be 0o600 after save");
     }
 
     #[test]

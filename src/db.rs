@@ -75,7 +75,15 @@ impl Db {
                     .open(&path)
                 {
                     drop(f);
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                    if let Err(e) =
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "failed to enforce 0o600 on database file; credentials may be world-readable"
+                        );
+                    }
                 }
             }
         }
@@ -1682,6 +1690,19 @@ mod tests {
             mode, "wal",
             "expected WAL journal mode after ensure_schema; got: {mode}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_file_is_0o600_after_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().unwrap();
+        let db = Db::new(tmp.path());
+        db.init_schema().expect("init_schema must succeed");
+
+        let mode = std::fs::metadata(&db.path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "database file must be 0o600 after creation");
     }
 
     #[test]

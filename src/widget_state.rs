@@ -253,7 +253,24 @@ pub fn write_atomically(path: &Path, state: &WidgetState) -> Result<()> {
     );
     let tmp_path = path.with_file_name(tmp_name);
     {
-        let mut f = fs::File::create(&tmp_path).with_context(|| {
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)
+                .with_context(|| {
+                    format!(
+                        "failed to create temp widget state file: {}",
+                        tmp_path.display()
+                    )
+                })?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::File::create(&tmp_path).with_context(|| {
             format!(
                 "failed to create temp widget state file: {}",
                 tmp_path.display()
@@ -544,6 +561,23 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
         assert!(leftover.is_empty(), "leftover tmp files: {leftover:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn widget_state_file_is_0o600_after_atomic_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let db = make_db("widget-mode");
+        let cfg = default_config_for("mode-test");
+        let state = build(&cfg, &db).expect("build");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("widget-state.json");
+
+        write_atomically(&path, &state).expect("write_atomically");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "widget state must be 0o600 after write");
     }
 
     #[test]
