@@ -845,8 +845,14 @@ where
 
 fn discover_project_config_path(explicit_path: Option<&Path>) -> Result<Option<PathBuf>> {
     if let Some(path) = explicit_path {
-        if !path.exists() {
-            return Err(anyhow!("project config file not found: {}", path.display()));
+        if let Err(err) = fs::metadata(path) {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return Err(err)
+                    .with_context(|| format!("project config file not found: {}", path.display()));
+            }
+            return Err(err).with_context(|| {
+                format!("failed to access project config file: {}", path.display())
+            });
         }
         return Ok(Some(path.to_path_buf()));
     }

@@ -1803,12 +1803,14 @@ fn load_runtime(
     Ok((config, db))
 }
 
-/// Quietly load a Config for a specific project's config file. Used by
+/// Quietly load only the Config for a specific project's config file. Used by
 /// `cmd_retry` when the job's `project_id` does not match the cwd config,
 /// so the worker call gets the right per-project providers/polling/papers.
 ///
-/// Skips logging re-init and guardrail prints — the parent command already
-/// printed those for its primary cwd config.
+/// This intentionally calls `Config::load_runtime_with_metadata` directly
+/// instead of `load_runtime`, so the already-initialised logging subscriber,
+/// guardrail output, runtime directory setup, DB init, and registry refresh are
+/// not repeated for the secondary project config.
 fn load_runtime_for_path(config_path: &Path) -> Result<Config> {
     let loaded =
         Config::load_runtime_with_metadata(Some(config_path), true).with_context(|| {
@@ -2717,19 +2719,30 @@ fn load_effective_config_for_job(db: &Db, job: &reviewloop::model::Job) -> Resul
             job.project_id
         );
     };
-    if !config_path.exists() {
-        // Self-heal: forget the stale row so the next CLI call from the
-        // moved repo can re-register cleanly.
-        let _ = db.forget_project_registration(&job.project_id);
-        anyhow::bail!(
-            "project '{}' was registered at {} but that file no longer exists. \
-             run any reviewloop command from the project's new location to refresh \
-             the registry, then retry.",
-            job.project_id,
-            config_path.display()
-        );
+    match load_runtime_for_path(&config_path) {
+        Ok(config) => Ok(config),
+        Err(err) if error_chain_contains_not_found(&err) => {
+            // Self-heal: forget the stale row so the next CLI call from the
+            // moved repo can re-register cleanly.
+            let _ = db.forget_project_registration(&job.project_id);
+            anyhow::bail!(
+                "project '{}' was registered at {} but that file no longer exists. \
+                 run any reviewloop command from the project's new location to refresh \
+                 the registry, then retry.",
+                job.project_id,
+                config_path.display()
+            );
+        }
+        Err(err) => Err(err),
     }
-    load_runtime_for_path(&config_path)
+}
+
+fn error_chain_contains_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 async fn cmd_complete(
@@ -3519,8 +3532,154 @@ async fn fetch_google_profile_email(access_token: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::render_guardrail_notice;
+    use super::{load_effective_config_for_job, load_runtime_for_path, render_guardrail_notice};
     use reviewloop::config::Config;
+    use reviewloop::db::Db;
+    use reviewloop::model::{JobStatus, NewJob};
+    use std::{
+        ffi::OsString,
+        fs,
+        path::{Path, PathBuf},
+        sync::{Mutex, MutexGuard},
+    };
+    use tempfile::TempDir;
+
+    static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct IsolatedConfigEnv {
+        _guard: MutexGuard<'static, ()>,
+        temp_dir: TempDir,
+        old_home: Option<OsString>,
+        old_reviewloop_state_dir: Option<OsString>,
+        old_xdg_config_home: Option<OsString>,
+    }
+
+    impl IsolatedConfigEnv {
+        fn new() -> Self {
+            let guard = CONFIG_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let old_home = std::env::var_os("HOME");
+            let old_reviewloop_state_dir = std::env::var_os("REVIEWLOOP_STATE_DIR");
+            let old_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+
+            set_env_path("HOME", &temp_dir.path().join("home"));
+            set_env_path(
+                "REVIEWLOOP_STATE_DIR",
+                &temp_dir.path().join("reviewloop-state"),
+            );
+            set_env_path("XDG_CONFIG_HOME", &temp_dir.path().join("xdg-config"));
+
+            Self {
+                _guard: guard,
+                temp_dir,
+                old_home,
+                old_reviewloop_state_dir,
+                old_xdg_config_home,
+            }
+        }
+
+        fn project_config_path(&self) -> PathBuf {
+            self.temp_dir.path().join("project").join("reviewloop.toml")
+        }
+    }
+
+    impl Drop for IsolatedConfigEnv {
+        fn drop(&mut self) {
+            restore_env("XDG_CONFIG_HOME", self.old_xdg_config_home.as_ref());
+            restore_env(
+                "REVIEWLOOP_STATE_DIR",
+                self.old_reviewloop_state_dir.as_ref(),
+            );
+            restore_env("HOME", self.old_home.as_ref());
+        }
+    }
+
+    fn set_env_path(key: &str, value: &Path) {
+        // SAFETY: These tests hold CONFIG_ENV_LOCK while mutating process-wide
+        // environment variables and do not spawn threads while the override is set.
+        unsafe {
+            std::env::set_var(key, value.as_os_str());
+        }
+    }
+
+    fn restore_env(key: &str, value: Option<&OsString>) {
+        // SAFETY: See set_env_path; Drop runs before releasing CONFIG_ENV_LOCK.
+        unsafe {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    fn write_project_config(path: &Path, project_id: &str) {
+        fs::create_dir_all(path.parent().expect("project config parent")).expect("mkdir project");
+        fs::write(
+            path,
+            format!("project_id = \"{project_id}\"\npapers = []\n"),
+        )
+        .expect("write project config");
+    }
+
+    fn new_retry_job(project_id: &str) -> NewJob {
+        NewJob {
+            project_id: project_id.to_string(),
+            paper_id: "main".to_string(),
+            backend: "stanford".to_string(),
+            pdf_path: "paper.pdf".to_string(),
+            pdf_hash: "abc123".to_string(),
+            status: JobStatus::Queued,
+            email: "test@example.com".to_string(),
+            venue: None,
+            git_tag: None,
+            git_commit: None,
+            next_poll_at: None,
+        }
+    }
+
+    #[test]
+    fn load_runtime_for_path_does_not_panic_on_repeated_call() {
+        let env = IsolatedConfigEnv::new();
+        let config_path = env.project_config_path();
+        write_project_config(&config_path, "repeated-load-project");
+
+        let first = load_runtime_for_path(&config_path).expect("first load succeeds");
+        let second = load_runtime_for_path(&config_path).expect("second load succeeds");
+
+        assert_eq!(first.project_id, "repeated-load-project");
+        assert_eq!(second.project_id, "repeated-load-project");
+    }
+
+    #[test]
+    fn load_effective_config_for_job_self_heals_when_registered_path_missing() {
+        let env = IsolatedConfigEnv::new();
+        let project_id = "missing-path-project";
+        let config_path = env.project_config_path();
+        write_project_config(&config_path, project_id);
+
+        let db = Db::new_in_memory("cmd_retry_missing_registered_path").unwrap();
+        db.init_schema().unwrap();
+        db.register_project_config(project_id, &config_path)
+            .unwrap();
+        let job = db.create_job(&new_retry_job(project_id)).unwrap();
+
+        fs::remove_file(&config_path).expect("remove registered config");
+        let err = load_effective_config_for_job(&db, &job).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("no longer exists") || msg.contains("not found"),
+            "got: {msg}"
+        );
+        assert!(
+            db.resolve_project_config_path(project_id)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn guardrail_notice_mentions_core_limits() {
