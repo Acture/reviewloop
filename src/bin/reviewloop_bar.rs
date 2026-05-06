@@ -746,12 +746,31 @@ fn execute_action(
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path_str.clone());
-                tracing::info!("bar: submitting {path_str}");
-                let la = Arc::clone(last_action);
-                set_last_action(&la, format!("Submit started: {filename}"));
-                std::thread::spawn(move || {
-                    run_action_cmd(&["run", &path_str], parent_dir.as_deref(), "Submit", &la);
-                });
+                let has_project_config = parent_dir
+                    .as_ref()
+                    .map(|parent| parent.join("reviewloop.toml").exists())
+                    .unwrap_or(false);
+                if !has_project_config {
+                    tracing::info!(
+                        file = %path_str,
+                        "bar: submit skipped because selected PDF is not in a directory with reviewloop.toml"
+                    );
+                    rfd::MessageDialog::new()
+                        .set_title("PDF must be inside a project repo")
+                        .set_description(format!(
+                            "The selected PDF must be in a directory with a `reviewloop.toml` \
+                             (created via `reviewloop init project`). Picked file: `{filename}`."
+                        ))
+                        .set_buttons(rfd::MessageButtons::Ok)
+                        .show();
+                } else {
+                    tracing::info!("bar: submitting {path_str}");
+                    let la = Arc::clone(last_action);
+                    set_last_action(&la, format!("Submit started: {filename}"));
+                    std::thread::spawn(move || {
+                        run_action_cmd(&["run", &path_str], parent_dir.as_deref(), "Submit", &la);
+                    });
+                }
             }
         }
         ClickAction::PauseDaemon => {

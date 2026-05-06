@@ -2014,7 +2014,11 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
     let write_path = resolve_mutable_project_config_path(config_override)?;
     if !write_path.exists() {
         anyhow::bail!(
-            "no project config found. run `reviewloop init project --project-id <id>` in this repo first"
+            "no project config found at ./reviewloop.toml\n\n\
+             reviewloop run needs a project config to know where to store job state (database, artifacts).\n\n\
+             Run this first:\n\
+               reviewloop init project --project-id <id>\n\n\
+             (If you're in a temporary directory, cd to your paper repo first.)"
         );
     }
 
@@ -2713,9 +2717,12 @@ fn load_effective_config_for_job(db: &Db, job: &reviewloop::model::Job) -> Resul
     }
     let Some(config_path) = db.resolve_project_config_path(&job.project_id)? else {
         anyhow::bail!(
-            "project '{}' is not registered. run any reviewloop command \
-             (eg `reviewloop status`) from inside that project's repo once \
-             so the registry can record its config path, then retry.",
+            "project '{}' cannot be located — reviewloop hasn't seen this project yet.\n\n\
+             To fix:\n\
+             1. cd /path/to/that/repo\n\
+             2. run: reviewloop status\n\
+             3. then retry this job from the Bar again\n\n\
+             (This tells reviewloop where to find the project's config file.)",
             job.project_id
         );
     };
@@ -2726,9 +2733,12 @@ fn load_effective_config_for_job(db: &Db, job: &reviewloop::model::Job) -> Resul
             // moved repo can re-register cleanly.
             let _ = db.forget_project_registration(&job.project_id);
             anyhow::bail!(
-                "project '{}' was registered at {} but that file no longer exists. \
-                 run any reviewloop command from the project's new location to refresh \
-                 the registry, then retry.",
+                "project '{}' cannot be located — its config file used to be at {} but that path no longer exists.\n\n\
+                 To fix:\n\
+                 1. cd /path/to/that/repo (wherever you moved it)\n\
+                 2. run: reviewloop status\n\
+                 3. then retry this job from the Bar again\n\n\
+                 (This updates reviewloop's internal project location cache.)",
                 job.project_id,
                 config_path.display()
             );
