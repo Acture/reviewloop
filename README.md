@@ -96,6 +96,28 @@ reviewloop daemon install --start true
 The daemon runs every 30 seconds, handles retries, token ingestion, and retention pruning
 automatically. Use `reviewloop status` and `reviewloop check` to monitor it.
 
+## Deployment model (v0.2.0)
+
+reviewloop is **single-daemon-per-machine** in v0.2.0:
+
+- One launchd LaunchAgent label is used: `ai.reviewloop.daemon`. Running
+  `reviewloop daemon install` from a second project repo overwrites the first
+  plist; only the most recently installed daemon will run.
+- The shared SQLite database (`~/.local/state/reviewloop/reviewloop.db`)
+  stores job state for **all** projects you've ever used reviewloop in. The
+  menu bar app (`reviewloop-bar`) reads this DB and shows a fleet view —
+  jobs across every registered project.
+- The active daemon services jobs **only** for its installed project. Other
+  projects' jobs are visible in the bar but won't be processed until you
+  reinstall the daemon for them.
+- The bar's "Pause / Resume daemon" buttons control the single installed
+  daemon. There is no per-project pause control.
+
+**Multi-daemon support** (one daemon per project, with distinct launchd
+labels) is on the v0.3.0 roadmap. For v0.2.0, if you switch between project
+repos, run `reviewloop daemon install` again from the new repo to point the
+daemon at it.
+
 ## Installation
 
 ### Homebrew (recommended on macOS)

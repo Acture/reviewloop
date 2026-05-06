@@ -219,6 +219,10 @@ enum DaemonCommand {
         panel: bool,
     },
     /// Install and optionally start the launchd service (macOS only).
+    ///
+    /// Note: this overwrites any previously-installed reviewloop daemon plist.
+    /// The launchd label `ai.reviewloop.daemon` is shared across all projects
+    /// (multi-daemon deployment is planned for v0.3.0).
     Install {
         #[arg(long, default_value_t = true)]
         start: bool,

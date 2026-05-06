@@ -22,6 +22,15 @@
 //! - Submit new… spawns `reviewloop run <pdf>` with cwd set to the PDF's
 //!   parent directory so the CLI's own config discovery picks the project
 //! - Pause/Resume daemon — state-aware via launchctl
+//!
+//! ## Daemon scoping (v0.2.0)
+//!
+//! The bar shows fleet-wide job data from all projects registered in the
+//! shared SQLite database. However, the daemon is single-project-bound:
+//! the launchd label `ai.reviewloop.daemon` is shared across all projects,
+//! and only one daemon can be installed at a time. The bar's "Pause /
+//! Resume daemon" buttons control that single daemon. Multi-daemon support
+//! is planned for v0.3.0.
 
 use anyhow::{Context as _, Result};
 use chrono::Utc;

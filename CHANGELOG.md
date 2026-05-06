@@ -19,6 +19,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   **`core.widget_state_dir`** (default `None` → `state_dir`) config fields for
   controlling widget snapshot output.
 
+### Known limitations
+
+- **Single daemon per machine.** The launchd label `ai.reviewloop.daemon`
+  is hardcoded; installing the daemon from a second project repo overwrites
+  the first plist. The bar shows fleet-wide job data from all projects, but
+  the active daemon services jobs for only one project at a time. Multi-
+  daemon (label-per-project) support is planned for v0.3.0.
+
 ---
 
 ## [Unreleased] — 2025-05-05
