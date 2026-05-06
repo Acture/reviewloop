@@ -291,7 +291,7 @@ mod gmail_impl {
         config::{Config, GmailOauthConfig},
         db::Db,
         email::{EmailMatch, bind_matches, detect_backend_from_header, extract_match},
-        oauth::{self, google::GoogleOauthProvider},
+        oauth::{self, OauthProvider, google::GoogleOauthProvider},
     };
     use anyhow::{Context, Result};
     use base64::{
@@ -335,6 +335,16 @@ mod gmail_impl {
         data: Option<String>,
     }
 
+    const GMAIL_TOKEN_REFRESH_SKEW_SECONDS: i64 = 5 * 60;
+    const GMAIL_REAUTH_HINT: &str = "run `reviewloop email login` to re-authenticate.";
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("gmail oauth token refresh failed: {source}")]
+    struct GmailOauthRefreshError {
+        #[source]
+        source: anyhow::Error,
+    }
+
     pub async fn poll_gmail_if_enabled(config: &Config, db: &Db) -> Result<Vec<crate::model::Job>> {
         let Some(gmail_cfg) = &config.gmail_oauth else {
             return Ok(vec![]);
@@ -346,12 +356,23 @@ mod gmail_impl {
         let Some(provider) = GoogleOauthProvider::from_config(config)? else {
             return Ok(vec![]);
         };
-        let access_token = match oauth::ensure_valid_access_token(&provider).await {
-            Ok(token) => token,
-            Err(err) => {
+        poll_gmail_with_provider(config, db, gmail_cfg, &provider).await
+    }
+
+    pub(super) async fn poll_gmail_with_provider(
+        config: &Config,
+        db: &Db,
+        gmail_cfg: &GmailOauthConfig,
+        provider: &dyn OauthProvider,
+    ) -> Result<Vec<crate::model::Job>> {
+        let client = crate::http::build_reqwest_client(config)?;
+        let matches = match fetch_matches(gmail_cfg, provider, &client).await {
+            Ok(matches) => matches,
+            Err(err) if err.downcast_ref::<GmailOauthRefreshError>().is_some() => {
                 tracing::warn!(
                     error = %err,
-                    "gmail oauth refresh failed; email ingestion paused this tick"
+                    hint = GMAIL_REAUTH_HINT,
+                    "Gmail token refresh failed; run `reviewloop email login` to re-authenticate."
                 );
                 // Surface the failure as a db event so `daemon status` can
                 // highlight it without requiring the user to check logs.
@@ -359,28 +380,36 @@ mod gmail_impl {
                     Some(&config.project_id),
                     None,
                     "gmail_oauth_refresh_failed",
-                    json!({"error": err.to_string()}),
+                    json!({"error": err.to_string(), "hint": GMAIL_REAUTH_HINT}),
                 );
                 return Ok(vec![]);
             }
+            Err(err) => return Err(err),
         };
 
-        let client = crate::http::build_reqwest_client(config)?;
-        let matches = fetch_matches(gmail_cfg, &access_token, &client).await?;
         bind_matches(db, &config.project_id, "gmail", matches)
+    }
+
+    pub(super) async fn load_daemon_gmail_access_token(
+        provider: &dyn OauthProvider,
+    ) -> Result<String> {
+        oauth::ensure_valid_access_token_with_skew(provider, GMAIL_TOKEN_REFRESH_SKEW_SECONDS)
+            .await
+            .map_err(|source| GmailOauthRefreshError { source }.into())
     }
 
     async fn fetch_matches(
         cfg: &GmailOauthConfig,
-        access_token: &str,
+        provider: &dyn OauthProvider,
         client: &reqwest::Client,
     ) -> Result<Vec<EmailMatch>> {
         let query = build_unread_query(cfg);
         let max_results = cfg.max_messages_per_poll.to_string();
 
+        let access_token = load_daemon_gmail_access_token(provider).await?;
         let list_resp = client
             .get("https://gmail.googleapis.com/gmail/v1/users/me/messages")
-            .bearer_auth(access_token)
+            .bearer_auth(&access_token)
             .query(&[("q", query.as_str()), ("maxResults", max_results.as_str())])
             .send()
             .await
@@ -399,7 +428,8 @@ mod gmail_impl {
         let mut matches = Vec::new();
 
         for msg in list_payload.messages.unwrap_or_default() {
-            let metadata = fetch_message_metadata(client, access_token, &msg.id).await?;
+            let access_token = load_daemon_gmail_access_token(provider).await?;
+            let metadata = fetch_message_metadata(client, &access_token, &msg.id).await?;
             let header_text = metadata
                 .payload
                 .as_ref()
@@ -417,7 +447,8 @@ mod gmail_impl {
                 continue;
             }
 
-            let full = fetch_message_full(client, access_token, &msg.id).await?;
+            let access_token = load_daemon_gmail_access_token(provider).await?;
+            let full = fetch_message_full(client, &access_token, &msg.id).await?;
             let mut text = String::new();
             if let Some(snippet) = full.snippet {
                 text.push_str(&snippet);
@@ -432,7 +463,8 @@ mod gmail_impl {
             {
                 matches.push(matched);
                 if cfg.mark_seen {
-                    mark_message_seen(client, access_token, &msg.id).await?;
+                    let access_token = load_daemon_gmail_access_token(provider).await?;
+                    mark_message_seen(client, &access_token, &msg.id).await?;
                 }
             }
         }
@@ -589,14 +621,105 @@ pub async fn poll_imap_if_enabled(config: &Config, db: &Db) -> Result<Vec<Job>> 
 #[cfg(test)]
 mod tests {
     use crate::{
-        config::{GmailOauthConfig, ImapConfig},
+        config::{Config, GmailOauthConfig, ImapConfig},
         db::Db,
         email::detect_backend_from_header,
         model::{JobStatus, NewJob},
+        oauth::{
+            DeviceCodePoll, DeviceCodeStart, OauthProvider, OauthTokenRecord, OauthTokenResponse,
+            load_token_record, save_token_record,
+        },
     };
+    use async_trait::async_trait;
     #[cfg(feature = "imap")]
     use chrono::TimeZone;
-    use chrono::{Duration, Utc};
+    use chrono::{DateTime, Duration, Utc};
+    use std::{
+        path::PathBuf,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    struct MockOauthProvider {
+        path: PathBuf,
+        refresh_calls: Arc<AtomicUsize>,
+        refresh_results: Arc<Mutex<Vec<std::result::Result<OauthTokenResponse, String>>>>,
+    }
+
+    impl MockOauthProvider {
+        fn new(
+            path: PathBuf,
+            refresh_results: Vec<std::result::Result<OauthTokenResponse, String>>,
+        ) -> Self {
+            Self {
+                path,
+                refresh_calls: Arc::new(AtomicUsize::new(0)),
+                refresh_results: Arc::new(Mutex::new(refresh_results)),
+            }
+        }
+
+        fn refresh_calls(&self) -> usize {
+            self.refresh_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl OauthProvider for MockOauthProvider {
+        fn name(&self) -> &'static str {
+            "mock-google"
+        }
+
+        fn token_store_path(&self) -> PathBuf {
+            self.path.clone()
+        }
+
+        async fn start_device_flow(&self) -> anyhow::Result<DeviceCodeStart> {
+            unimplemented!()
+        }
+
+        async fn poll_device_flow(&self, _: &str) -> anyhow::Result<DeviceCodePoll> {
+            unimplemented!()
+        }
+
+        async fn refresh_access_token(
+            &self,
+            refresh_token: &str,
+        ) -> anyhow::Result<OauthTokenResponse> {
+            if refresh_token != "refresh-token" {
+                anyhow::bail!("unexpected refresh token: {refresh_token}");
+            }
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            let mut results = self.refresh_results.lock().expect("refresh results mutex");
+            match results.remove(0) {
+                Ok(response) => Ok(response),
+                Err(message) => Err(anyhow::anyhow!(message)),
+            }
+        }
+    }
+
+    fn unique_oauth_token_path(test_name: &str) -> PathBuf {
+        let dir = std::env::current_dir()
+            .expect("cwd")
+            .join("target")
+            .join("email-oauth-tests")
+            .join(format!("{}-{}", test_name, uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create test oauth dir");
+        dir.join("google_token.json")
+    }
+
+    fn token_record(access_token: &str, expires_at: DateTime<Utc>) -> OauthTokenRecord {
+        OauthTokenRecord {
+            refresh_token: "refresh-token".to_string(),
+            access_token: access_token.to_string(),
+            expires_at,
+            expires_at_unix: expires_at.timestamp(),
+            scope: Some("gmail.readonly".to_string()),
+            token_type: Some("bearer".to_string()),
+            updated_at_unix: Utc::now().timestamp(),
+        }
+    }
 
     #[test]
     fn header_match_detects_stanford_sender() {
@@ -657,6 +780,92 @@ mod tests {
         };
         let query = super::gmail_impl::build_unread_query(&cfg);
         assert_eq!(query, "is:unread");
+    }
+
+    #[tokio::test]
+    async fn preemptive_refresh_called_when_token_about_to_expire() {
+        let token_path = unique_oauth_token_path("preemptive-refresh");
+        let provider = MockOauthProvider::new(
+            token_path.clone(),
+            vec![Ok(OauthTokenResponse {
+                access_token: "fresh-access-token".to_string(),
+                refresh_token: None,
+                expires_in_seconds: 3600,
+                scope: Some("gmail.readonly".to_string()),
+                token_type: Some("bearer".to_string()),
+            })],
+        );
+        let expiring_at = Utc::now() + Duration::minutes(2);
+        save_token_record(&provider, &token_record("stale-access-token", expiring_at))
+            .expect("save expiring token");
+
+        let before_refresh = Utc::now();
+        let access_token = super::gmail_impl::load_daemon_gmail_access_token(&provider)
+            .await
+            .expect("refresh succeeds");
+
+        assert_eq!(access_token, "fresh-access-token");
+        assert_eq!(provider.refresh_calls(), 1);
+        let saved = load_token_record(&provider)
+            .expect("load saved token")
+            .expect("token exists");
+        assert_eq!(saved.access_token, "fresh-access-token");
+        assert_eq!(saved.refresh_token, "refresh-token");
+        assert!(saved.expires_at > before_refresh + Duration::minutes(55));
+        assert_eq!(saved.expires_at_unix, saved.expires_at.timestamp());
+        let raw = std::fs::read_to_string(token_path).expect("read saved token json");
+        assert!(raw.contains("\"expires_at\""));
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_does_not_crash_poll_loop() {
+        let token_path = unique_oauth_token_path("refresh-failure");
+        let provider = MockOauthProvider::new(
+            token_path.clone(),
+            vec![Err("refresh endpoint returned 401".to_string())],
+        );
+        let expiring_at = Utc::now() + Duration::minutes(2);
+        save_token_record(&provider, &token_record("stale-access-token", expiring_at))
+            .expect("save expiring token");
+
+        let mut config = Config {
+            project_id: "proj-refresh-failure".to_string(),
+            ..Config::default()
+        };
+        let state_dir = token_path.parent().expect("token parent").join("state");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        config.core.state_dir = state_dir.to_string_lossy().to_string();
+        let gmail_cfg = GmailOauthConfig {
+            enabled: true,
+            client_id: "dummy-client-id".to_string(),
+            token_store_path: Some(token_path.to_string_lossy().to_string()),
+            ..GmailOauthConfig::default()
+        };
+        config.gmail_oauth = Some(gmail_cfg.clone());
+        let db = Db::new_in_memory("email_refresh_failure_no_crash").expect("in-memory db");
+        db.init_schema().expect("init schema");
+
+        let result =
+            super::gmail_impl::poll_gmail_with_provider(&config, &db, &gmail_cfg, &provider).await;
+
+        assert!(result.is_ok(), "poll must not crash: {result:?}");
+        assert!(result.expect("poll ok").is_empty());
+        assert_eq!(provider.refresh_calls(), 1);
+        let ev = db
+            .most_recent_event_of_type(&config.project_id, "gmail_oauth_refresh_failed")
+            .expect("db query")
+            .expect("expected gmail_oauth_refresh_failed event");
+        assert!(
+            ev.payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|error| error.contains("refresh endpoint returned 401")),
+            "event payload must contain the refresh failure"
+        );
+        assert_eq!(
+            ev.payload.get("hint").and_then(serde_json::Value::as_str),
+            Some("run `reviewloop email login` to re-authenticate.")
+        );
     }
 
     #[test]
@@ -752,16 +961,14 @@ mod tests {
     /// `gmail_oauth_refresh_failed` event so `daemon status` can surface it.
     #[tokio::test]
     async fn gmail_poll_writes_oauth_refresh_failed_event_on_error() {
-        use crate::config::{Config, GmailOauthConfig};
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let state_dir = tmp.path().join("state");
+        let token_path = unique_oauth_token_path("missing-token");
+        let state_dir = token_path.parent().expect("token parent").join("state");
         std::fs::create_dir_all(&state_dir).expect("create state_dir");
 
         // Point to a token file that does not exist — ensure_valid_access_token
         // returns Err("no oauth token found …") which is the same error path
         // as a revoked refresh token.
-        let token_path = tmp.path().join("no_token.json");
+        std::fs::remove_file(&token_path).ok();
 
         let mut config = Config {
             project_id: "proj-u6-gmail".to_string(),

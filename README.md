@@ -366,6 +366,7 @@ reviewloop email login --provider google
 ```
 
 `email login` will try to open your default browser automatically and wait in CLI for OAuth completion.
+The daemon refreshes Gmail OAuth tokens when they are within five minutes of expiry.
 
 ReviewLoop runs Gmail API polling first when available, then IMAP fallback.
 

@@ -3,18 +3,70 @@ pub mod google;
 use crate::config::Config;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, process::Command};
+use chrono::{DateTime, Duration, TimeZone, Utc};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+const DEFAULT_ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 60;
+
+#[derive(Debug, Clone, Serialize)]
 pub struct OauthTokenRecord {
     pub refresh_token: String,
     pub access_token: String,
+    /// RFC3339 timestamp in the persisted JSON. `expires_at_unix` is kept for
+    /// backwards compatibility with older ReviewLoop token files.
+    pub expires_at: DateTime<Utc>,
     pub expires_at_unix: i64,
     pub scope: Option<String>,
     pub token_type: Option<String>,
     pub updated_at_unix: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawOauthTokenRecord {
+    refresh_token: String,
+    access_token: String,
+    #[serde(default)]
+    expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    expires_at_unix: Option<i64>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    token_type: Option<String>,
+    #[serde(default)]
+    updated_at_unix: Option<i64>,
+}
+
+impl<'de> Deserialize<'de> for OauthTokenRecord {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawOauthTokenRecord::deserialize(deserializer)?;
+        let now = Utc::now();
+        let expires_at = raw
+            .expires_at
+            .or_else(|| raw.expires_at_unix.and_then(unix_timestamp_to_datetime))
+            .unwrap_or_else(|| now + Duration::hours(1));
+
+        Ok(Self {
+            refresh_token: raw.refresh_token,
+            access_token: raw.access_token,
+            expires_at_unix: expires_at.timestamp(),
+            expires_at,
+            scope: raw.scope,
+            token_type: raw.token_type,
+            updated_at_unix: raw.updated_at_unix.unwrap_or_else(|| now.timestamp()),
+        })
+    }
+}
+
+fn unix_timestamp_to_datetime(timestamp: i64) -> Option<DateTime<Utc>> {
+    Utc.timestamp_opt(timestamp, 0).single()
 }
 
 #[derive(Debug, Clone)]
@@ -89,33 +141,75 @@ pub fn save_token_record(provider: &dyn OauthProvider, token: &OauthTokenRecord)
             )
         })?;
     }
+
     let raw = serde_json::to_string_pretty(token)?;
+    let tmp_path = temporary_token_path(&path);
+    let write_result = (|| -> Result<()> {
+        write_token_file(&tmp_path, raw.as_bytes())?;
+        std::fs::rename(&tmp_path, &path).with_context(|| {
+            format!(
+                "failed to atomically replace oauth token file {}",
+                path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        sync_token_directory(&path)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_result
+}
+
+fn temporary_token_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|v| v.to_string_lossy())
+        .unwrap_or_else(|| "oauth_token".into());
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce))
+}
+
+fn write_token_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .with_context(|| format!("failed to open oauth token file {}", path.display()))?;
-        f.write_all(raw.as_bytes())
-            .with_context(|| format!("failed to write oauth token file {}", path.display()))?;
-        f.sync_all()
-            .with_context(|| format!("failed to sync oauth token file {}", path.display()))?;
+        options.mode(0o600);
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&path, raw)
-            .with_context(|| format!("failed to write oauth token file {}", path.display()))?;
+
+    let mut f = options
+        .open(path)
+        .with_context(|| format!("failed to open oauth token file {}", path.display()))?;
+    f.write_all(bytes)
+        .with_context(|| format!("failed to write oauth token file {}", path.display()))?;
+    f.sync_all()
+        .with_context(|| format!("failed to sync oauth token file {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_token_directory(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|f| f.sync_all())
+            .with_context(|| {
+                format!("failed to sync oauth token directory {}", parent.display())
+            })?;
     }
     Ok(())
 }
 
 pub fn token_is_valid(token: &OauthTokenRecord, skew_seconds: i64) -> bool {
-    (token.expires_at_unix - skew_seconds) > Utc::now().timestamp()
+    token.expires_at > Utc::now() + Duration::seconds(skew_seconds)
 }
 
 pub fn merge_token_response(
@@ -131,18 +225,27 @@ pub fn merge_token_response(
             ));
         }
     };
-    let now = Utc::now().timestamp();
+    let now = Utc::now();
+    let expires_at = now + Duration::seconds(response.expires_in_seconds as i64);
     Ok(OauthTokenRecord {
         refresh_token,
         access_token: response.access_token,
-        expires_at_unix: now + response.expires_in_seconds as i64,
+        expires_at,
+        expires_at_unix: expires_at.timestamp(),
         scope: response.scope,
         token_type: response.token_type,
-        updated_at_unix: now,
+        updated_at_unix: now.timestamp(),
     })
 }
 
 pub async fn ensure_valid_access_token(provider: &dyn OauthProvider) -> Result<String> {
+    ensure_valid_access_token_with_skew(provider, DEFAULT_ACCESS_TOKEN_REFRESH_SKEW_SECONDS).await
+}
+
+pub async fn ensure_valid_access_token_with_skew(
+    provider: &dyn OauthProvider,
+    skew_seconds: i64,
+) -> Result<String> {
     let Some(current) = load_token_record(provider)? else {
         return Err(anyhow!(
             "no oauth token found for provider {}; run auth login first",
@@ -150,7 +253,7 @@ pub async fn ensure_valid_access_token(provider: &dyn OauthProvider) -> Result<S
         ));
     };
 
-    if token_is_valid(&current, 60) {
+    if token_is_valid(&current, skew_seconds) {
         return Ok(current.access_token);
     }
 
@@ -284,10 +387,12 @@ mod tests {
         let provider = MockProvider {
             path: token_path.clone(),
         };
+        let expires_at = unix_timestamp_to_datetime(9999999999).expect("valid timestamp");
         let token = OauthTokenRecord {
             refresh_token: "rt".to_string(),
             access_token: "at".to_string(),
-            expires_at_unix: 9999999999,
+            expires_at,
+            expires_at_unix: expires_at.timestamp(),
             scope: None,
             token_type: None,
             updated_at_unix: 0,
@@ -301,5 +406,23 @@ mod tests {
             "token file should have mode 0600, got {:o}",
             mode
         );
+    }
+
+    #[test]
+    fn legacy_token_without_rfc3339_expiry_uses_unix_expiry() {
+        let legacy_expires_at = Utc::now() + Duration::minutes(42);
+        let raw = serde_json::json!({
+            "refresh_token": "rt",
+            "access_token": "at",
+            "expires_at_unix": legacy_expires_at.timestamp(),
+            "scope": null,
+            "token_type": "bearer",
+            "updated_at_unix": 1,
+        });
+
+        let parsed: OauthTokenRecord = serde_json::from_value(raw).expect("legacy token parses");
+
+        assert_eq!(parsed.expires_at.timestamp(), legacy_expires_at.timestamp());
+        assert_eq!(parsed.expires_at_unix, legacy_expires_at.timestamp());
     }
 }
