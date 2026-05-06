@@ -1812,6 +1812,10 @@ fn load_runtime(
 /// guardrail output, runtime directory setup, DB init, and registry refresh are
 /// not repeated for the secondary project config.
 fn load_runtime_for_path(config_path: &Path) -> Result<Config> {
+    tracing::warn!(
+        path = %config_path.display(),
+        "loading project config from registry-resolved path; this is non-cwd config"
+    );
     let loaded =
         Config::load_runtime_with_metadata(Some(config_path), true).with_context(|| {
             format!(
@@ -1819,7 +1823,9 @@ fn load_runtime_for_path(config_path: &Path) -> Result<Config> {
                 config_path.display()
             )
         })?;
-    Ok(loaded.config)
+    let config = loaded.config;
+    config.validate_for_foreign_load()?;
+    Ok(config)
 }
 
 fn ensure_runtime_dirs(config: &Config) -> Result<()> {
@@ -2726,6 +2732,17 @@ fn load_effective_config_for_job(db: &Db, job: &reviewloop::model::Job) -> Resul
             job.project_id
         );
     };
+    db.add_event(
+        Some(&job.project_id),
+        Some(&job.id),
+        "foreign_config_loaded",
+        json!({
+            "config_path": config_path.display().to_string(),
+            "cwd": env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from)),
+        }),
+    )?;
     match load_runtime_for_path(&config_path) {
         Ok(config) => Ok(config),
         Err(err) if error_chain_contains_not_found(&err) => {
@@ -3591,7 +3608,11 @@ mod tests {
         }
 
         fn project_config_path(&self) -> PathBuf {
-            self.temp_dir.path().join("project").join("reviewloop.toml")
+            self.temp_dir
+                .path()
+                .join("home")
+                .join("project")
+                .join("reviewloop.toml")
         }
     }
 
@@ -3661,6 +3682,37 @@ mod tests {
 
         assert_eq!(first.project_id, "repeated-load-project");
         assert_eq!(second.project_id, "repeated-load-project");
+    }
+
+    #[test]
+    fn load_effective_config_for_job_records_foreign_config_audit_event() {
+        let env = IsolatedConfigEnv::new();
+        let project_id = "audit-project";
+        let config_path = env.project_config_path();
+        write_project_config(&config_path, project_id);
+
+        let db = Db::new_in_memory("cmd_retry_foreign_config_audit").unwrap();
+        db.init_schema().unwrap();
+        db.register_project_config(project_id, &config_path)
+            .unwrap();
+        let job = db.create_job(&new_retry_job(project_id)).unwrap();
+
+        let config = load_effective_config_for_job(&db, &job).expect("load registered config");
+        assert_eq!(config.project_id, project_id);
+
+        let event = db
+            .most_recent_event_of_type(project_id, "foreign_config_loaded")
+            .unwrap()
+            .expect("foreign config audit event");
+        assert_eq!(event.job_id.as_deref(), Some(job.id.as_str()));
+        let config_path_string = config_path.display().to_string();
+        assert_eq!(
+            event
+                .payload
+                .get("config_path")
+                .and_then(|value| value.as_str()),
+            Some(config_path_string.as_str())
+        );
     }
 
     #[test]

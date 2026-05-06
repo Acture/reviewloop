@@ -565,6 +565,105 @@ impl Config {
         }
         Ok(())
     }
+
+    /// Stricter validation for configs loaded from outside the current working
+    /// directory (for example, via the project registry). Rejects high-risk
+    /// values while warning on lower-confidence suspicious settings.
+    pub fn validate_for_foreign_load(&self) -> Result<()> {
+        let script = self.providers.stanford.fallback_script.trim();
+        if !script.is_empty() {
+            let path = Path::new(script);
+            if path.is_absolute() {
+                let home = home_dir_for_security()?;
+                if !path_is_within_dir(path, &home) {
+                    anyhow::bail!(
+                        "registered config has fallback_script outside HOME: {}; refusing to load (security)",
+                        script
+                    );
+                }
+            }
+        }
+
+        if let Some(dir) = self.core.widget_state_dir.as_deref().map(str::trim)
+            && !dir.is_empty()
+        {
+            let path = Path::new(dir);
+            if path.is_absolute() {
+                match home_dir_for_security() {
+                    Ok(home) if !path_is_within_dir(path, &home) => {
+                        tracing::warn!(
+                            path = %dir,
+                            "registered config has widget_state_dir outside HOME; allowing but logging"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %dir,
+                            error = %err,
+                            "registered config has absolute widget_state_dir but HOME could not be verified; allowing but logging"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for (index, url) in self.core.proxies.iter().enumerate() {
+            if proxy_url_has_embedded_credentials(url) {
+                tracing::warn!(
+                    proxy_index = index,
+                    "registered config has proxy URL with embedded credentials; \
+                     this could leak via debug logs. consider env var or keychain instead"
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn home_dir_for_security() -> Result<PathBuf> {
+    let home = env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("HOME unavailable"))?;
+    if !home.is_absolute() {
+        anyhow::bail!("HOME must be an absolute path");
+    }
+    Ok(home)
+}
+
+fn path_is_within_dir(path: &Path, dir: &Path) -> bool {
+    if let (Ok(canonical_path), Ok(canonical_dir)) = (path.canonicalize(), dir.canonicalize()) {
+        return canonical_path.starts_with(canonical_dir);
+    }
+
+    normalize_for_security(path).starts_with(normalize_for_security(dir))
+}
+
+fn normalize_for_security(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
+fn proxy_url_has_embedded_credentials(url: &str) -> bool {
+    let Some((_, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    authority.contains('@')
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1468,7 +1567,7 @@ pub struct ProjectNotificationsConfig {
 mod tests {
     use super::{
         Config, GlobalConfigFile, LegacyConfig, PaperConfig, PaperConfigFile, ProjectConfigFile,
-        Redacted, default_project_config_path, find_git_root,
+        Redacted, default_project_config_path, find_git_root, home_dir_for_security,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -2048,6 +2147,41 @@ db_path = "db.sqlite"
         // Relative without `..` and no project root is fine (script won't resolve
         // but also won't be invoked).
         assert!(cfg.validate_fallback_script().is_ok());
+    }
+
+    #[test]
+    fn foreign_load_rejects_absolute_fallback_script_outside_home() {
+        let mut cfg = Config::default();
+        cfg.providers.stanford.fallback_script = "/tmp/evil/script.js".to_string();
+
+        let err = cfg
+            .validate_for_foreign_load()
+            .expect_err("absolute fallback_script outside HOME must be rejected")
+            .to_string();
+        assert!(
+            err.contains("fallback_script outside HOME"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn foreign_load_allows_relative_fallback_script() {
+        let mut cfg = Config::default();
+        cfg.providers.stanford.fallback_script = "tools/fallback.mjs".to_string();
+
+        assert!(cfg.validate_for_foreign_load().is_ok());
+    }
+
+    #[test]
+    fn foreign_load_allows_absolute_fallback_script_under_home() {
+        let mut cfg = Config::default();
+        let script = home_dir_for_security()
+            .expect("HOME is required for this test")
+            .join(".reviewloop")
+            .join("fallback.mjs");
+        cfg.providers.stanford.fallback_script = script.to_string_lossy().to_string();
+
+        assert!(cfg.validate_for_foreign_load().is_ok());
     }
 
     // ──────────────────────────────────────────────────────────────────────
