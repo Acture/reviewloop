@@ -33,7 +33,7 @@
 //! is planned for v0.3.0.
 
 use anyhow::{Context as _, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use reviewloop::config::Config;
 use reviewloop::db::Db;
@@ -198,29 +198,22 @@ fn poll_daemon_state_with_timeout() -> Option<DaemonState> {
 }
 
 /// Spawn a background thread that refreshes `snapshot` every `interval`.
-fn start_background_poller(
-    db_path: PathBuf,
-    snapshot: Arc<Mutex<BarSnapshot>>,
-    interval: Duration,
-) {
+/// The schema is initialised once in `try_main`; this poller reuses that `Db`
+/// handle instead of rebuilding it and rerunning migrations on every tick.
+fn start_background_poller(db: Db, snapshot: Arc<Mutex<BarSnapshot>>, interval: Duration) {
     std::thread::spawn(move || {
         loop {
-            let db = Db::new_file(db_path.clone());
             let mut new_snap = BarSnapshot::default();
             new_snap.daemon_state = poll_daemon_state_with_timeout();
 
-            if let Err(e) = db.ensure_schema() {
-                new_snap.db_error = Some(format!("init: {e}"));
-            } else {
-                match db.list_active_jobs_all() {
-                    Ok(jobs) => new_snap.all_active = jobs,
-                    Err(e) => new_snap.db_error = Some(format!("active: {e}")),
-                }
-                if new_snap.db_error.is_none() {
-                    match db.list_failed_jobs_all_per_project(FAILURES_PER_PROJECT_LIMIT) {
-                        Ok(jobs) => new_snap.all_failed = jobs,
-                        Err(e) => new_snap.db_error = Some(format!("failed: {e}")),
-                    }
+            match db.list_active_jobs_all() {
+                Ok(jobs) => new_snap.all_active = jobs,
+                Err(e) => new_snap.db_error = Some(format!("active: {e}")),
+            }
+            if new_snap.db_error.is_none() {
+                match db.list_failed_jobs_all_per_project(FAILURES_PER_PROJECT_LIMIT) {
+                    Ok(jobs) => new_snap.all_failed = jobs,
+                    Err(e) => new_snap.db_error = Some(format!("failed: {e}")),
                 }
             }
 
@@ -320,24 +313,42 @@ impl ProjectGroup {
 // ── Job label formatting ──────────────────────────────────────────────────────
 
 fn format_job_label(job: &Job) -> String {
-    let poll_info = match job.next_poll_at {
-        Some(next) => {
-            let secs = next.signed_duration_since(Utc::now()).num_seconds();
-            if secs > 0 {
-                format!(" · in {secs}s")
-            } else {
-                " · polling…".to_string()
-            }
+    format_job_label_at(job, Utc::now())
+}
+
+fn format_job_label_at(job: &Job, now: DateTime<Utc>) -> String {
+    let status = job.status.as_str();
+    let poll_info = job.next_poll_at.map(|next| {
+        let secs = next.signed_duration_since(now).num_seconds();
+        if secs > 0 {
+            format!("in {secs}s")
+        } else {
+            "polling…".to_string()
         }
-        None => String::new(),
-    };
-    format!(
-        "{} · {} · attempt={}{}",
-        job.paper_id,
-        job.status.as_str(),
-        job.attempt,
-        poll_info
-    )
+    });
+
+    match (job.attempt, poll_info) {
+        (0, None) => format!("{} ({status})", job.paper_id),
+        (0, Some(poll)) => format!("{} ({status}, {poll})", job.paper_id),
+        (attempt, None) => format!("{} ({status}, attempt {attempt})", job.paper_id),
+        (attempt, Some(poll)) => format!("{} ({status} attempt {attempt}, {poll})", job.paper_id),
+    }
+}
+
+fn format_project_header(project_id: &str, active_count: usize, failed_count: usize) -> String {
+    let mut counts = Vec::new();
+    if active_count > 0 {
+        counts.push(format!("{active_count} active"));
+    }
+    if failed_count > 0 {
+        counts.push(format!("{failed_count} failed"));
+    }
+
+    if counts.is_empty() {
+        project_id.to_string()
+    } else {
+        format!("{project_id} ({})", counts.join(", "))
+    }
 }
 
 fn format_failed_job_label(job: &Job) -> String {
@@ -509,12 +520,7 @@ fn rebuild_menu(
     if !groups.is_empty() {
         let _ = menu.append(&PredefinedMenuItem::separator());
         for group in &groups {
-            let header = format!(
-                "{} ({}A · {}F)",
-                group.id,
-                group.active.len(),
-                group.failed.len()
-            );
+            let header = format_project_header(&group.id, group.active.len(), group.failed.len());
             let project_sub = Submenu::new(&header, true);
 
             for job in &group.active {
@@ -812,11 +818,7 @@ fn run_tray(db: Db, artifacts_dir: PathBuf, log_path: PathBuf) -> Result<()> {
 
     let snapshot: Arc<Mutex<BarSnapshot>> = Arc::new(Mutex::new(BarSnapshot::default()));
 
-    start_background_poller(
-        db.path.clone(),
-        Arc::clone(&snapshot),
-        Duration::from_secs(5),
-    );
+    start_background_poller(db, Arc::clone(&snapshot), Duration::from_secs(5));
 
     // Force an immediate refresh on the first timer tick.
     let mut last_refresh = Instant::now()
@@ -882,7 +884,7 @@ fn run_tray(db: Db, artifacts_dir: PathBuf, log_path: PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{Duration as ChronoDuration, Utc};
     use reviewloop::model::JobStatus;
 
     fn job(project_id: &str, id: &str, status: JobStatus, attempt: u32) -> Job {
@@ -949,6 +951,61 @@ mod tests {
         assert_eq!(project_key(&blank), LEGACY_PROJECT_LABEL);
         assert_eq!(project_key(&ws), LEGACY_PROJECT_LABEL);
         assert_eq!(project_key(&real), "proj-a");
+    }
+
+    #[test]
+    fn format_job_label_prioritises_paper_and_hides_zero_attempts() {
+        let now = Utc::now();
+        let mut submitted = job("p", "j1", JobStatus::Submitted, 0);
+        submitted.paper_id = "camera_ready".to_string();
+        submitted.next_poll_at = Some(now + ChronoDuration::seconds(5));
+        assert_eq!(
+            format_job_label_at(&submitted, now),
+            "camera_ready (SUBMITTED, in 5s)"
+        );
+
+        let mut queued = job("p", "j2", JobStatus::Queued, 0);
+        queued.paper_id = "rebuttal".to_string();
+        assert_eq!(format_job_label_at(&queued, now), "rebuttal (QUEUED)");
+    }
+
+    #[test]
+    fn format_job_label_keeps_retry_attempts_without_equals_noise() {
+        let now = Utc::now();
+        let mut processing = job("p", "j3", JobStatus::Processing, 3);
+        processing.paper_id = "main".to_string();
+        processing.next_poll_at = Some(now + ChronoDuration::seconds(42));
+        assert_eq!(
+            format_job_label_at(&processing, now),
+            "main (PROCESSING attempt 3, in 42s)"
+        );
+
+        let mut queued = job("p", "j4", JobStatus::Queued, 2);
+        queued.paper_id = "rebuttal".to_string();
+        assert_eq!(
+            format_job_label_at(&queued, now),
+            "rebuttal (QUEUED, attempt 2)"
+        );
+    }
+
+    #[test]
+    fn format_project_header_spells_out_counts_and_omits_zeroes() {
+        assert_eq!(
+            format_project_header("main", 2, 1),
+            "main (2 active, 1 failed)"
+        );
+        assert_eq!(
+            format_project_header("camera-ready", 0, 3),
+            "camera-ready (3 failed)"
+        );
+        assert_eq!(
+            format_project_header("rebuttal", 1, 0),
+            "rebuttal (1 active)"
+        );
+        assert_eq!(
+            format_project_header(LEGACY_PROJECT_LABEL, 1, 0),
+            "(legacy) (1 active)"
+        );
     }
 
     #[test]
