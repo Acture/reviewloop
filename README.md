@@ -230,7 +230,7 @@ reviewloop submit --paper-id main [--force]
 reviewloop approve --job-id <job-id>
 reviewloop import-token --paper-id main --token <token> [--source email]
 reviewloop check [--job-id <job-id> | --paper-id <paper-id>] [--all-processing]
-reviewloop status [--paper-id main] [--json] [--show-token]
+reviewloop status [--paper-id main] [--json] [--show-token] [--active]
 reviewloop retry --job-id <job-id> [--force]  # (was --override-rate-limit, deprecated since vNext)
 reviewloop complete --job-id <job-id> [--summary-text <text> | --summary-url <url> | --empty-summary] [--score <value>]
 reviewloop config init
@@ -247,6 +247,12 @@ reviewloop self-update [--method auto|brew|cargo] [--yes] [--dry-run]
 - global config (`~/.config/reviewloop/config.toml`)
 - global data directory (database, artifacts, logs)
 - project-local configs
+
+## Exit Codes
+
+- `reviewloop run`: 0 = Completed, 2 = terminal failure, 130 = Ctrl+C
+- `reviewloop import-token`: 0 = token attached + poll success, 2 = poll resolved to failure
+- All other commands: 0 = success, 1 = error
 
 ## Runtime Model
 

@@ -33,8 +33,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Initialize global config (~/.config/reviewloop/config.toml) and data
-    /// dir. Run once per machine before any other command.
+    /// Initialize global config (~/.config/reviewloop/config.toml) and data dir.
+    /// Run once per machine. For per-repo setup, also run
+    /// `reviewloop init project --project-id <id>` from each paper repo.
     Init(InitArgs),
     /// Manage configuration files. Subcommands: init, init project,
     /// migrate-project.
@@ -68,7 +69,8 @@ enum Command {
         job_ref: JobOrPaperRef,
     },
     /// Manually inject a review token for a paper (source defaults to
-    /// "manual"). Useful when a token arrives out-of-band.
+    /// "manual"). Useful when a token arrives out-of-band; see README
+    /// 'Exit Codes' section.
     ImportToken {
         #[arg(long)]
         paper_id: String,
@@ -83,9 +85,9 @@ enum Command {
         #[command(flatten)]
         target: CheckTarget,
     },
-    /// Show the current status of jobs. Use --paper-id to filter to one
-    /// paper; --json for machine-readable output (always {"papers":[...]}).
-    /// Use --active to show only non-terminal jobs.
+    /// Show the current status of jobs. Use --paper-id to filter to one paper;
+    /// --json for machine-readable output (always {"papers":[...]}); --active
+    /// to show only non-terminal jobs (excludes Completed, Failed, etc).
     Status {
         #[arg(long)]
         paper_id: Option<String>,
@@ -115,10 +117,11 @@ enum Command {
     /// clear any cooldown. Accepts --job-id or --paper-id.
     ///
     /// When using --paper-id, only active jobs (QUEUED, SUBMITTED, PROCESSING)
-    /// are matched by default to avoid ambiguity from historical failures. Pass
-    /// --include-failed to also consider FAILED, FAILED_NEEDS_MANUAL, and
-    /// TIMEOUT jobs (useful when no active job exists and you want to retry a
-    /// previously-failed run).
+    /// are matched by default. This avoids ambiguity when multiple failed jobs
+    /// exist for the same paper (e.g., a failed v1 and a failed v2). Pass
+    /// --include-failed to also consider FAILED, FAILED_NEEDS_MANUAL, and TIMEOUT
+    /// jobs. If multiple failed jobs match, you'll get a candidate list and must
+    /// use --job-id to pick one explicitly.
     Retry {
         #[command(flatten)]
         job_ref: JobOrPaperRef,
@@ -661,7 +664,7 @@ fn cmd_init_global(config_override: Option<&Path>) -> Result<()> {
         .ok_or_else(|| anyhow!("failed to determine global data dir"))?;
 
     println!(
-        "Initialized global reviewloop paths.\n- global config: {}\n- global data dir: {}",
+        "Initialized global reviewloop paths.\n- global config: {}\n- global data dir: {}\n\nNext: cd to your paper repo and run `reviewloop init project --project-id <id>`",
         global_path.display(),
         data_dir.display()
     );
@@ -1682,7 +1685,11 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (config, db, as_json);
-        anyhow::bail!("`daemon status` is currently supported on macOS only");
+        anyhow::bail!(
+            "`daemon status` is currently supported on macOS only (requires launchctl).\n  \
+             tip: query the database directly for job state:\n    \
+             sqlite3 ~/.review_loop/reviewloop.db 'SELECT id, paper_id, status FROM jobs WHERE status NOT IN (\"COMPLETED\", \"FAILED\");'"
+        );
     }
 }
 
