@@ -13,7 +13,7 @@ contents.
 | `generated_at` | RFC3339 UTC timestamp string | required | UTC timestamp of when this snapshot was written. Rust currently emits whole-second timestamps like `2026-05-06T12:00:00Z`. |
 | `project_id` | string | required | The daemon's `project_id`. May be empty for legacy installs; v0.2.0+ projects should have one. |
 | `summary.active_count` | integer | required | Total active jobs for the project (`QUEUED`, `SUBMITTED`, and `PROCESSING`) before the `active_jobs` display cap is applied. |
-| `summary.failed_recent_24h` | integer | required | Count of the capped recent-failure result (the five newest non-cancelled `FAILED`, `FAILED_NEEDS_MANUAL`, or `TIMEOUT` jobs) whose `updated_at` is in the last 24 hours. Excludes user cancellations (`last_error LIKE 'cancelled by user:%'`). |
+| `summary.failed_recent_24h` | integer | required | Count of the capped recent-failure result (the five newest non-cancelled `FAILED`, `FAILED_NEEDS_MANUAL`, or `TIMEOUT` jobs) whose `updated_at` is in the last 24 hours. Excludes user cancellations (`last_error = 'cancelled by user'` or `last_error LIKE 'cancelled by user:%'`). |
 | `summary.completed_today` | integer | required | Jobs completed since 00:00 UTC of the current calendar date, computed from `COMPLETED` jobs whose `updated_at` starts with today's UTC date. |
 | `active_jobs` | array (max 10) | required | Active jobs for the project. Rust orders by `next_poll_at` ascending with `null` first; equal poll times preserve database order (`created_at` ascending). |
 | `active_jobs[].paper_id` | string | required | Paper-id from project config. Swift uses this as the row identity. |

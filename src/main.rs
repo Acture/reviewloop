@@ -101,8 +101,9 @@ enum Command {
     /// mistake or the paper is no longer wanted. Does NOT contact the backend.
     ///
     /// Implementation note: uses `JobStatus::Failed` with last_error set to
-    /// "cancelled by user: <reason>" and writes a `cancelled` event with
-    /// `{reason, previous_status}`. No new enum variant is needed.
+    /// "cancelled by user" or "cancelled by user: <reason>" and writes a
+    /// `cancelled` event with `{reason, previous_status}`. No new enum variant
+    /// is needed.
     Cancel {
         #[command(flatten)]
         job_ref: JobOrPaperRef,
@@ -939,7 +940,7 @@ fn cmd_paper_remove(config_path: &Path, paper_id: &str, purge_history: bool) -> 
             config_path.display()
         );
     } else {
-        println!("paper_id {paper_id} not found in config; only history purge was applied.");
+        println!("paper_id not found: {paper_id}; only history purge was applied.");
     }
 
     if let Some((jobs, reviews, events, artifacts)) = purge_summary {
@@ -983,9 +984,12 @@ fn cmd_config_migrate_project(
     project_root: Option<&Path>,
     project_id: &str,
 ) -> Result<()> {
-    let Some(legacy_path) = Config::legacy_global_config_path().filter(|path| path.exists()) else {
-        anyhow::bail!("legacy global config not found; nothing to migrate");
+    let Some(legacy_path) = Config::legacy_global_config_path() else {
+        anyhow::bail!("legacy global config path unavailable; nothing to migrate");
     };
+    if !legacy_path.exists() {
+        anyhow::bail!("legacy global config not found: {}", legacy_path.display());
+    }
     let legacy = LegacyConfig::load(&legacy_path)?;
 
     let project_path = if let Some(path) = config_override {
@@ -1598,16 +1602,16 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
                 let ago = format_elapsed(ts, now);
                 println!(
                     "  last activity: {} ({ago} ago)",
-                    ts.format("%Y-%m-%dT%H:%M:%SZ")
+                    ts.format("%Y-%m-%dT%H:%M:%S UTC")
                 );
                 match tick_health {
                     "stale" => println!(
                         "  last tick: {} (NOTE: older than usual 30s tick)",
-                        ts.format("%Y-%m-%dT%H:%M:%SZ")
+                        ts.format("%Y-%m-%dT%H:%M:%S UTC")
                     ),
                     "stuck" => println!(
                         "  last tick: {} (WARNING: daemon may be stuck or stopped)",
-                        ts.format("%Y-%m-%dT%H:%M:%SZ")
+                        ts.format("%Y-%m-%dT%H:%M:%S UTC")
                     ),
                     _ => {}
                 }
@@ -1622,7 +1626,7 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
                 let ago = format_elapsed(*ts, now);
                 println!(
                     "  last tick error: {} ({ago} ago)",
-                    ts.format("%Y-%m-%dT%H:%M:%SZ")
+                    ts.format("%Y-%m-%dT%H:%M:%S UTC")
                 );
                 // Indent the message so it's clearly grouped under the label.
                 for line in msg.lines() {
@@ -1636,7 +1640,7 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
         if let Some((ts, _msg)) = &gmail_oauth_stale {
             println!(
                 "  gmail oauth: stale (refresh failed at {}); run 'reviewloop email login --provider google' to re-authorize",
-                ts.format("%Y-%m-%dT%H:%M:%SZ")
+                ts.format("%Y-%m-%dT%H:%M:%S UTC")
             );
         }
         if failovers_1h > 0 {
@@ -1658,7 +1662,7 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
                         if secs <= 0 {
                             "now".to_string()
                         } else {
-                            format!("{} (in {}s)", t.format("%H:%M:%SZ"), secs)
+                            format!("{} (in {}s)", t.format("%H:%M:%S UTC"), secs)
                         }
                     }
                 };
@@ -2139,7 +2143,7 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
 
         let updated = db
             .get_job(&job.id)?
-            .ok_or_else(|| anyhow!("job {} disappeared from database", job.id))?;
+            .ok_or_else(|| anyhow!("job no longer exists: {}", job.id))?;
 
         if !args.quiet {
             let elapsed_secs = start.elapsed().as_secs();
@@ -2244,8 +2248,9 @@ fn cmd_approve(config: &Config, db: &Db, job_id: &str) -> Result<()> {
 ///
 /// Implementation choice (option b): reuses `JobStatus::Failed` instead of
 /// adding a new `JobStatus::Cancelled` variant, keeping the schema unchanged.
-/// The `last_error` field is set to "cancelled by user: <reason>" and a
-/// `cancelled` event is written with `{reason, previous_status}`.
+/// The `last_error` field is set to "cancelled by user" or
+/// "cancelled by user: <reason>" and a `cancelled` event is written with
+/// `{reason, previous_status}`.
 fn cmd_cancel(config: &Config, db: &Db, job_id: &str, reason: Option<&str>) -> Result<()> {
     // Cancel only updates DB rows for the named job — no worker, no provider
     // config required. Allow it to run without project context so the menu
@@ -2269,8 +2274,10 @@ fn cmd_cancel(config: &Config, db: &Db, job_id: &str, reason: Option<&str>) -> R
     }
 
     let previous_status = job.status.as_str().to_string();
-    let cancel_reason = reason.unwrap_or("cancelled by user");
-    let last_error = format!("cancelled by user: {cancel_reason}");
+    let last_error = match reason {
+        Some(reason) => format!("cancelled by user: {reason}"),
+        None => "cancelled by user".to_string(),
+    };
 
     // user override: PendingApproval -> Failed is not in the state machine but
     // cancellation is a legitimate user action on any non-terminal job.
@@ -2286,7 +2293,7 @@ fn cmd_cancel(config: &Config, db: &Db, job_id: &str, reason: Option<&str>) -> R
         Some(&job.id),
         "cancelled",
         json!({
-            "reason": cancel_reason,
+            "reason": reason,
             "previous_status": previous_status,
         }),
     )?;
@@ -2841,7 +2848,7 @@ async fn cmd_complete(
 
 fn ensure_project_job(config: &Config, db: &Db, job_id: &str) -> Result<reviewloop::model::Job> {
     db.get_project_job(&config.project_id, job_id)?
-        .ok_or_else(|| anyhow!("job not found in project {}: {}", config.project_id, job_id))
+        .ok_or_else(|| anyhow!("job not found: {job_id}"))
 }
 
 /// Look up a job by ID with optional project scoping.
@@ -2858,7 +2865,7 @@ fn resolve_job_by_id_any_project(
 ) -> Result<reviewloop::model::Job> {
     if config.project_id.trim().is_empty() {
         db.get_job(job_id)?
-            .ok_or_else(|| anyhow!("job not found: {}", job_id))
+            .ok_or_else(|| anyhow!("job not found: {job_id}"))
     } else {
         ensure_project_job(config, db, job_id)
     }
@@ -2869,13 +2876,13 @@ fn paper_not_found_error(paper_id: &str, config: &Config) -> anyhow::Error {
     let known: Vec<&str> = config.papers.iter().map(|p| p.id.as_str()).collect();
     if known.is_empty() {
         anyhow!(
-            "paper_id not found in project config: {paper_id}\n  \
+            "paper_id not found: {paper_id}\n  \
              no papers configured yet — add one with `reviewloop paper add --paper-id {paper_id} --pdf-path <path>`"
         )
     } else {
         let known_str = known.join(", ");
         anyhow!(
-            "paper_id not found in project config: {paper_id}\n  \
+            "paper_id not found: {paper_id}\n  \
              known paper_ids: {known_str}\n  \
              add this paper with `reviewloop paper add --paper-id {paper_id} --pdf-path <path>`"
         )
@@ -2927,7 +2934,7 @@ fn resolve_paper_id_to_job(
         }
         1 => db
             .get_project_job(project_id, &matching[0].id)?
-            .ok_or_else(|| anyhow!("job disappeared after lookup: {}", matching[0].id)),
+            .ok_or_else(|| anyhow!("job no longer exists: {}", matching[0].id)),
         _ => {
             let candidates = matching
                 .iter()
@@ -3940,10 +3947,7 @@ mod tests {
             let cfg = config_with_papers(&[]);
             let err = paper_not_found_error("myid", &cfg);
             let msg = err.to_string();
-            assert!(
-                msg.contains("paper_id not found in project config: myid"),
-                "got: {msg}"
-            );
+            assert!(msg.contains("paper_id not found: myid"), "got: {msg}");
             assert!(msg.contains("no papers configured yet"), "got: {msg}");
             assert!(
                 msg.contains("reviewloop paper add --paper-id myid"),
@@ -3956,10 +3960,7 @@ mod tests {
             let cfg = config_with_papers(&["main", "camera_ready"]);
             let err = paper_not_found_error("foo", &cfg);
             let msg = err.to_string();
-            assert!(
-                msg.contains("paper_id not found in project config: foo"),
-                "got: {msg}"
-            );
+            assert!(msg.contains("paper_id not found: foo"), "got: {msg}");
             assert!(msg.contains("known paper_ids:"), "got: {msg}");
             assert!(msg.contains("main"), "got: {msg}");
             assert!(msg.contains("camera_ready"), "got: {msg}");
@@ -4735,6 +4736,8 @@ mod tests {
 
     /// Tests for U10 — `cancel` command.
     mod cancel {
+        use super::super::cmd_cancel;
+        use reviewloop::config::Config;
         use reviewloop::db::Db;
         use reviewloop::model::{JobStatus, NewJob};
 
@@ -4765,25 +4768,7 @@ mod tests {
             let project_id = "cancel_proj";
             let (db, job_id) = make_processing_job(project_id, "paper-a");
 
-            // Perform the cancellation directly via DB (mirrors cmd_cancel logic).
-            db.update_job_state(
-                &job_id,
-                JobStatus::Failed,
-                None,
-                Some(None),
-                Some(Some("cancelled by user: test reason".to_string())),
-            )
-            .expect("update_job_state");
-            db.add_event(
-                None,
-                Some(&job_id),
-                "cancelled",
-                serde_json::json!({
-                    "reason": "test reason",
-                    "previous_status": "PROCESSING",
-                }),
-            )
-            .expect("add_event");
+            cmd_cancel(&Config::default(), &db, &job_id, Some("test reason")).expect("cmd_cancel");
 
             // Assert status is now Failed.
             let updated = db.get_job(&job_id).expect("get_job").expect("job present");
@@ -4818,6 +4803,33 @@ mod tests {
                 cancel_event.payload.get("reason").and_then(|v| v.as_str()),
                 Some("test reason"),
                 "cancelled event must record reason"
+            );
+        }
+
+        #[test]
+        fn cancel_without_reason_uses_plain_last_error() {
+            let project_id = "cancel_default_proj";
+            let (db, job_id) = make_processing_job(project_id, "paper-a");
+
+            cmd_cancel(&Config::default(), &db, &job_id, None).expect("cmd_cancel");
+
+            let updated = db.get_job(&job_id).expect("get_job").expect("job present");
+            assert_eq!(updated.status, JobStatus::Failed);
+            assert_eq!(updated.last_error.as_deref(), Some("cancelled by user"));
+
+            let events = db
+                .list_timeline_events(project_id, "paper-a")
+                .expect("list_timeline_events");
+            let cancel_event = events
+                .iter()
+                .find(|e| e.event_type == "cancelled")
+                .expect("cancelled event must be present");
+            assert!(
+                cancel_event
+                    .payload
+                    .get("reason")
+                    .is_some_and(|value| value.is_null()),
+                "cancelled event reason should be null when no reason is supplied"
             );
         }
 

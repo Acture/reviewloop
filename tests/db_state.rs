@@ -787,21 +787,28 @@ fn list_failed_jobs_all_per_project_excludes_user_cancellations() -> Result<()> 
     let ctx = DbTestContext::new()?;
 
     let cancelled = ctx.create_job_with_project_and_hash("p", JobStatus::Failed, "cancel-1")?;
+    let cancelled_with_reason =
+        ctx.create_job_with_project_and_hash("p", JobStatus::Failed, "cancel-2")?;
     let real_failure = ctx.create_job_with_project_and_hash("p", JobStatus::Failed, "real-1")?;
 
-    // Mark one as user-cancelled.
+    // Mark two as user-cancelled: one with the default message and one with a reason.
     let conn = rusqlite::Connection::open(&ctx.db.path)?;
+    conn.execute(
+        "UPDATE jobs SET last_error = ?1 WHERE id = ?2",
+        params!["cancelled by user", cancelled.id],
+    )?;
     conn.execute(
         "UPDATE jobs SET last_error = ?1 WHERE id = ?2",
         params![
             "cancelled by user: requested via reviewloop cancel",
-            cancelled.id
+            cancelled_with_reason.id
         ],
     )?;
 
     let results = ctx.db.list_failed_jobs_all_per_project(10)?;
     let ids: std::collections::HashSet<_> = results.iter().map(|j| j.id.as_str()).collect();
     assert!(!ids.contains(cancelled.id.as_str()));
+    assert!(!ids.contains(cancelled_with_reason.id.as_str()));
     assert!(ids.contains(real_failure.id.as_str()));
 
     Ok(())

@@ -397,7 +397,7 @@ mod tests {
             "test-proj",
             "paper-d",
             JobStatus::Failed,
-            Some("cancelled by user: explicit cancel"),
+            Some("cancelled by user"),
         );
         // 1 Completed today
         make_job(&db, "test-proj", "paper-e", JobStatus::Completed, None);

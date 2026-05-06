@@ -962,7 +962,10 @@ impl Db {
             FROM jobs
             WHERE project_id = ?1
               AND status IN (?2, ?3, ?4)
-              AND (last_error IS NULL OR last_error NOT LIKE 'cancelled by user:%')
+              AND (
+                  last_error IS NULL
+                  OR (last_error != 'cancelled by user' AND last_error NOT LIKE 'cancelled by user:%')
+              )
             ORDER BY updated_at DESC
             LIMIT ?5
             "#,
@@ -1011,7 +1014,8 @@ impl Db {
     ///
     /// Uses a window function so a single noisy project cannot starve
     /// failures from other projects out of the result set. Cancelled jobs
-    /// (`last_error LIKE 'cancelled by user:%'`) are excluded.
+    /// (`last_error = 'cancelled by user'` or `last_error LIKE 'cancelled by user:%'`)
+    /// are excluded.
     pub fn list_failed_jobs_all_per_project(&self, per_project_limit: usize) -> Result<Vec<Job>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -1025,7 +1029,10 @@ impl Db {
                        ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY updated_at DESC) AS rn
                 FROM jobs
                 WHERE status IN (?1, ?2, ?3)
-                  AND (last_error IS NULL OR last_error NOT LIKE 'cancelled by user:%')
+                  AND (
+                      last_error IS NULL
+                      OR (last_error != 'cancelled by user' AND last_error NOT LIKE 'cancelled by user:%')
+                  )
             )
             WHERE rn <= ?4
             ORDER BY project_id ASC, updated_at DESC
