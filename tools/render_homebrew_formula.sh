@@ -13,7 +13,7 @@ tag_name="${TAG_NAME:-v${version}}"
 source_sha256="${SOURCE_SHA256:?SOURCE_SHA256 is required}"
 
 formula_class=$(echo "${crate_name}" | awk -F '[-_]' '{for (i=1; i<=NF; i++) printf toupper(substr($i,1,1)) substr($i,2)}')
-description="$(sed -nE 's/^description[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -n1)"
+description="Durable automation for academic review workflows on paperreview.ai"
 homepage="$(sed -nE 's/^homepage[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -n1)"
 license_name="$(sed -nE 's/^license[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -n1)"
 repository_url="$(sed -nE 's/^repository[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -n1)"
@@ -38,12 +38,12 @@ class ${formula_class} < Formula
   depends_on "rust" => :build
 
   on_linux do
-    depends_on "openssl@3"
     depends_on "pkgconf" => :build
+    depends_on "openssl@3"
   end
 
   def install
-    ENV["OPENSSL_DIR"] = Formula["openssl@3"].opt_prefix if OS.linux?
+    ENV["OPENSSL_DIR"] = formula_opt_prefix("openssl@3") if OS.linux?
     ENV["OPENSSL_NO_VENDOR"] = "1" if OS.linux?
 
     system "cargo", "install", *std_cargo_args(path: ".")
@@ -54,25 +54,34 @@ class ${formula_class} < Formula
     ENV["XDG_CONFIG_HOME"] = testpath/".config"
     ENV["REVIEWLOOP_STATE_DIR"] = testpath/".review_loop"
 
-    (testpath/"paper.pdf").write("%PDF-1.4\\n")
-    (testpath/"reviewloop-test.toml").write <<~TOML
+    system bin/"${crate_name}", "init"
+    config_path = testpath/".config/reviewloop/config.toml"
+    assert_path_exists config_path
+    assert_includes config_path.read, "[providers.stanford]"
+    config_path.write <<~TOML
       [logging]
-      output = "file"
+      output = "stderr"
     TOML
 
-    system bin/"${crate_name}", "--config", testpath/"reviewloop-test.toml",
+    project_path = testpath/"reviewloop.toml"
+    system bin/"${crate_name}", "--config", project_path, "init", "project", "--project-id", "main"
+    assert_path_exists project_path
+    assert_includes project_path.read, 'project_id = "main"'
+
+    (testpath/"paper.pdf").write("%PDF-1.4\\n")
+    system bin/"${crate_name}", "--config", project_path,
       "paper", "add",
       "--paper-id", "main",
       "--pdf-path", testpath/"paper.pdf",
       "--backend", "stanford",
       "--no-submit-prompt"
 
-    config_path = testpath/".config/reviewloop/reviewloop.toml"
-    assert_path_exists config_path
-    assert_includes config_path.read, "[providers.stanford]"
+    assert_includes project_path.read, "[[papers]]"
+    assert_match(/^id = "main"$/, project_path.read)
 
-    output = shell_output("#{bin}/${crate_name} --config #{testpath/"reviewloop-test.toml"} status --json")
-    assert_equal "[]\\n", output
+    output = JSON.parse(shell_output("#{bin}/${crate_name} --config #{project_path} status --json"))
+    assert_equal "main", output.fetch("project_id")
+    assert_empty output.fetch("papers")
     assert_path_exists testpath/".review_loop/reviewloop.db"
   end
 end
