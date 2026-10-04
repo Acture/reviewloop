@@ -28,7 +28,7 @@ required-features = ["bar"]
 
 [dependencies]
 anyhow = "1.0"
-async-trait = "0.1"
+async-trait = "0.1.92"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4.5", features = ["derive"] }

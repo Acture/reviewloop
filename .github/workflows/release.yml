@@ -86,9 +86,11 @@ jobs:
             tag_name="${GITHUB_REF_NAME}"
           fi
 
-          echo "crate_name=$crate_name" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag_name=$tag_name" >> "$GITHUB_OUTPUT"
+          {
+            echo "crate_name=$crate_name"
+            echo "version=$version"
+            echo "tag_name=$tag_name"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Release quality gates
         run: ./scripts/quality-gates.sh
@@ -124,14 +126,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
-            echo "Missing required secret: CARGO_REGISTRY_TOKEN" >&2
-            exit 1
-          fi
-
           if [[ "${SKIP_CRATES_PUBLISH}" == "true" ]]; then
             echo "Skipping cargo publish by manual request."
             exit 0
+          fi
+
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "Missing required secret: CARGO_REGISTRY_TOKEN" >&2
+            exit 1
           fi
 
           if curl -fsSL \
