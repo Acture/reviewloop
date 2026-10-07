@@ -4,10 +4,45 @@ use rand::Rng;
 use regex::bytes::Regex;
 use sha2::{Digest, Sha256};
 use std::{
+    ffi::OsStr,
     fs::File,
     io::{BufReader, Read},
     path::Path,
+    process::Command,
 };
+
+/// Variables that make git ignore `-C` and act on another repository; the
+/// list is `git rev-parse --local-env-vars`.
+const GIT_REPO_ENV_VARS: [&str; 15] = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// `git -C <repo_dir>` that really operates on `repo_dir`. Inside a git hook
+/// (or any shell with `GIT_DIR` / `GIT_INDEX_FILE` exported) those variables
+/// would otherwise override `-C` and send every command to the repository
+/// that is running the hook.
+pub fn git_in(repo_dir: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo_dir);
+    for var in GIT_REPO_ENV_VARS {
+        command.env_remove(var);
+    }
+    command
+}
 
 pub fn sha256_file(path: &Path) -> Result<String> {
     let file =

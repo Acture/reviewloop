@@ -4,6 +4,7 @@ use reviewloop::{
     db::Db,
     model::JobStatus,
     trigger::{run_git_tag_trigger, run_pdf_trigger},
+    util::git_in,
 };
 use std::{
     fs,
@@ -96,13 +97,8 @@ fn git_available() -> bool {
 }
 
 fn run_git(repo_dir: &Path, args: &[&str]) -> Result<()> {
-    let output = Command::new("git")
-        .args([
-            "-C",
-            repo_dir.to_string_lossy().as_ref(),
-            "-c",
-            "commit.gpgsign=false",
-        ])
+    let output = git_in(repo_dir)
+        .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .output()
         .with_context(|| format!("failed to execute git command: {:?}", args))?;
@@ -189,14 +185,7 @@ fn git_trigger_auto_delete_processed_tag_removes_local_tag() -> Result<()> {
 
     run_git_tag_trigger(&ctx.config, &ctx.db)?;
 
-    let output = Command::new("git")
-        .args([
-            "-C",
-            ctx.repo_dir.to_string_lossy().as_ref(),
-            "tag",
-            "--list",
-        ])
-        .output()?;
+    let output = git_in(&ctx.repo_dir).args(["tag", "--list"]).output()?;
     let tags = String::from_utf8_lossy(&output.stdout);
     assert!(
         !tags
@@ -226,14 +215,7 @@ fn pdf_trigger_auto_create_tag_records_git_metadata_on_job() -> Result<()> {
     assert!(tag.starts_with("review-stanford/main/auto-"));
     assert!(job.git_commit.as_deref().unwrap_or_default().len() >= 7);
 
-    let output = Command::new("git")
-        .args([
-            "-C",
-            ctx.repo_dir.to_string_lossy().as_ref(),
-            "tag",
-            "--list",
-        ])
-        .output()?;
+    let output = git_in(&ctx.repo_dir).args(["tag", "--list"]).output()?;
     let tags = String::from_utf8_lossy(&output.stdout);
     assert!(
         tags.lines().any(|t| t.trim() == tag),

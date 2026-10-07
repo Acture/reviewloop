@@ -3,7 +3,7 @@ use crate::{
     db::Db,
     email_account::resolve_submission_email,
     model::{Job, JobStatus, NewJob},
-    util::sha256_file,
+    util::{git_in, sha256_file},
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -12,7 +12,6 @@ use serde_json::json;
 use std::{
     collections::HashSet,
     path::Path,
-    process::Command,
     sync::{Mutex, OnceLock},
 };
 use tracing::warn;
@@ -60,8 +59,8 @@ pub fn run_git_tag_trigger(config: &Config, db: &Db) -> Result<()> {
     let repo_dir = config.trigger.git.repo_dir.trim();
     let repo_dir = if repo_dir.is_empty() { "." } else { repo_dir };
 
-    let output = Command::new("git")
-        .args(["-C", repo_dir, "tag", "--list", "review-*"])
+    let output = git_in(repo_dir)
+        .args(["tag", "--list", "review-*"])
         .output()
         .with_context(|| format!("failed to list git tags in repo_dir={repo_dir}"))?;
 
@@ -199,8 +198,8 @@ fn select_paper<'a>(config: &'a Config, parsed: &ParsedTag) -> Option<&'a PaperC
 }
 
 fn resolve_tag_commit(repo_dir: &str, tag: &str) -> Option<String> {
-    let output = Command::new("git")
-        .args(["-C", repo_dir, "rev-list", "-n", "1", tag])
+    let output = git_in(repo_dir)
+        .args(["rev-list", "-n", "1", tag])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -289,8 +288,8 @@ fn maybe_create_auto_tag(
         Utc::now().timestamp_millis()
     );
 
-    let output = Command::new("git")
-        .args(["-C", repo_dir, "tag", &tag])
+    let output = git_in(repo_dir)
+        .args(["tag", &tag])
         .output()
         .with_context(|| format!("failed to create auto git tag: {tag}"))?;
 
@@ -306,8 +305,8 @@ fn maybe_create_auto_tag(
 }
 
 fn delete_local_tag(repo_dir: &str, tag: &str) -> Result<()> {
-    let output = Command::new("git")
-        .args(["-C", repo_dir, "tag", "-d", tag])
+    let output = git_in(repo_dir)
+        .args(["tag", "-d", tag])
         .output()
         .with_context(|| format!("failed to run git tag -d for tag={tag}"))?;
     if !output.status.success() {
