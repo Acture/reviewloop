@@ -354,10 +354,14 @@ fn pinned_input(config: &Config, db: &Db, job: &Job) -> Result<Option<PathBuf>> 
             Ok(Some(input.snapshot_path))
         }
         JobInput::Blocked { reason } => {
+            // Retry with --force so resubmission follows the restore at once:
+            // a PDF watcher that sees the restored file first enqueues it as a
+            // new job, which makes the retry unnecessary.
             let message = format!(
                 "submission blocked: {reason}; expected sha256 {hash}. Recover by restoring that \
-                 version at {source} and running `reviewloop retry --job-id {id}`, or review the \
-                 current file instead with `reviewloop submit --paper-id {paper}`",
+                 version at {source} and immediately running `reviewloop retry --job-id {id} --force` \
+                 (skip the retry if the PDF watcher has already enqueued the restored file), or \
+                 review the current file instead with `reviewloop submit --paper-id {paper}`",
                 hash = job.pdf_hash,
                 source = job.pdf_path,
                 id = job.id,

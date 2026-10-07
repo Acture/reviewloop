@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     fs::{self, File},
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -214,30 +214,51 @@ pub fn prune_unreferenced_snapshots(
         let name = entry.file_name().to_string_lossy().into_owned();
         if name == STAGING_DIR {
             for staged in fs::read_dir(&path)? {
-                let staged = staged?;
-                if staged.metadata()?.modified()? < cutoff {
-                    fs::remove_file(staged.path())
-                        .with_context(|| format!("failed to remove {}", staged.path().display()))?;
+                let staged = staged?.path();
+                let modified = fs::metadata(&staged).and_then(|meta| meta.modified());
+                let Some(modified) = skip_vanished(modified)? else {
+                    continue;
+                };
+                if modified < cutoff
+                    && skip_vanished(fs::remove_file(&staged))
+                        .with_context(|| format!("failed to remove {}", staged.display()))?
+                        .is_some()
+                {
                     removed += 1;
                 }
             }
             continue;
         }
-        if referenced_hashes.contains(&name)
-            || !entry.file_type()?.is_dir()
-            || newest_mtime(&path)? >= cutoff
-        {
+        if referenced_hashes.contains(&name) || !entry.file_type()?.is_dir() {
             continue;
         }
-        fs::remove_dir_all(&path)
-            .with_context(|| format!("failed to remove {}", path.display()))?;
-        removed += 1;
+        let Some(newest) = skip_vanished(newest_mtime(&path))? else {
+            continue;
+        };
+        if newest < cutoff
+            && skip_vanished(fs::remove_dir_all(&path))
+                .with_context(|| format!("failed to remove {}", path.display()))?
+                .is_some()
+        {
+            removed += 1;
+        }
     }
 
     Ok(removed)
 }
 
-fn newest_mtime(dir: &Path) -> Result<SystemTime> {
+/// Map `NotFound` to `None`: during a sweep, a concurrent `prepare_input` may
+/// rename its staging file and another process's GC may delete the same entry
+/// first. Either way the entry is already gone, so the sweep carries on.
+fn skip_vanished<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn newest_mtime(dir: &Path) -> io::Result<SystemTime> {
     let mut newest = fs::metadata(dir)?.modified()?;
     for entry in fs::read_dir(dir)? {
         newest = newest.max(entry?.metadata()?.modified()?);
@@ -470,6 +491,22 @@ mod tests {
         assert!(!old_part.exists());
         assert!(fresh_part.exists());
         Ok(())
+    }
+
+    #[test]
+    fn gc_treats_vanished_entries_as_removed_but_surfaces_other_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("raced-away.part");
+        assert!(skip_vanished(fs::metadata(&missing)).unwrap().is_none());
+        assert!(
+            skip_vanished(fs::remove_dir_all(&missing))
+                .unwrap()
+                .is_none()
+        );
+
+        let not_a_dir = tmp.path().join("file");
+        fs::write(&not_a_dir, b"x").unwrap();
+        assert!(skip_vanished(fs::read_dir(&not_a_dir)).is_err());
     }
 
     #[test]

@@ -1201,7 +1201,7 @@ async fn legacy_job_with_edited_source_is_blocked_until_recovered() -> Result<()
     assert!(error.contains(&job.pdf_hash), "{error}");
     assert!(error.contains(&sha256_hex(EDITED_PDF)), "{error}");
     assert!(
-        error.contains(&format!("reviewloop retry --job-id {}", job.id)),
+        error.contains(&format!("reviewloop retry --job-id {} --force", job.id)),
         "{error}"
     );
     assert!(
