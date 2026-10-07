@@ -9,6 +9,9 @@ use crate::{
     model::{Job, JobStatus},
     notifier::{self, NotificationKind},
     panel::render_tick_panel,
+    submission_input::{
+        JobInput, SNAPSHOT_GC_GRACE, prune_unreferenced_snapshots, resolve_job_input,
+    },
     trigger::{run_git_tag_trigger, run_pdf_trigger},
     util::{compute_next_poll_at, estimate_pdf_page_count},
     widget_state,
@@ -16,7 +19,10 @@ use crate::{
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use serde_json::json;
-use std::{path::Path, time::Duration as StdDuration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration as StdDuration,
+};
 use tracing::{error, info, warn};
 
 /// Offload a notification call onto a blocking thread so a slow or absent
@@ -222,20 +228,26 @@ pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<()> {
     )
     .entered();
 
-    let paper = config
-        .find_paper(&job.paper_id)
-        .with_context(|| format!("paper not found in config: {}", job.paper_id))?;
+    let Some(snapshot_path) = pinned_input(config, db, &job)? else {
+        return Ok(());
+    };
 
     let backend = build_backend(config, &job.backend, Some(db), Some(&config.project_id))?;
 
     let email = resolve_submission_email(config, &job.backend, Some(&job.email))?;
+    // The paper may have been removed from config since enqueue; the job's
+    // snapshot is self-contained, so the config is only a venue fallback.
     let venue = match job.backend.as_str() {
         "stanford" => job
             .venue
             .clone()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
-            .or_else(|| config.venue_for(paper)),
+            .or_else(|| {
+                config
+                    .find_paper(&job.paper_id)
+                    .and_then(|p| config.venue_for(p))
+            }),
         _ => job.venue.clone(),
     };
 
@@ -252,7 +264,7 @@ pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<()> {
     // unused by the worker (still a valid value for future use).
 
     let submit_req = SubmitRequest {
-        pdf_path: Path::new(&paper.pdf_path).to_path_buf(),
+        pdf_path: snapshot_path.clone(),
         email,
         venue,
     };
@@ -271,7 +283,12 @@ pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<()> {
                 None,
                 Some(&job.id),
                 "submitted",
-                json!({ "backend": backend.name(), "token": receipt.token }),
+                json!({
+                    "backend": backend.name(),
+                    "token": receipt.token,
+                    "pdf_hash": job.pdf_hash,
+                    "snapshot_path": snapshot_path,
+                }),
             )?;
             info!(job_id = %job.id, backend = %backend.name(), "job submitted");
             Ok(())
@@ -310,7 +327,70 @@ pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<()> {
             warn!(job_id = %job.id, retry_after_source, "submit rate limited; next attempt scheduled");
             Ok(())
         }
-        Err(err) => handle_submit_error_with_fallback(config, db, &job, err).await,
+        Err(err) => handle_submit_error_with_fallback(config, db, &job, &snapshot_path, err).await,
+    }
+}
+
+/// Resolve the verified snapshot `job` must upload, backfilling one for jobs
+/// enqueued before snapshots existed. Returns `None` after moving the job to
+/// FAILED_NEEDS_MANUAL when no bytes matching `job.pdf_hash` can be found, so
+/// a different PDF is never submitted under this job's identity.
+fn pinned_input(config: &Config, db: &Db, job: &Job) -> Result<Option<PathBuf>> {
+    match resolve_job_input(&config.state_dir(), job)? {
+        JobInput::Ready(snapshot_path) => Ok(Some(snapshot_path)),
+        JobInput::Backfilled(input) => {
+            db.set_job_snapshot(&job.id, &input.snapshot_path)?;
+            db.add_event(
+                None,
+                Some(&job.id),
+                "snapshot_backfilled",
+                json!({
+                    "pdf_path": job.pdf_path,
+                    "pdf_hash": job.pdf_hash,
+                    "snapshot_path": input.snapshot_path,
+                }),
+            )?;
+            info!(job_id = %job.id, snapshot = %input.snapshot_path.display(), "backfilled PDF snapshot for job");
+            Ok(Some(input.snapshot_path))
+        }
+        JobInput::Blocked { reason } => {
+            let message = format!(
+                "submission blocked: {reason}; expected sha256 {hash}. Recover by restoring that \
+                 version at {source} and running `reviewloop retry --job-id {id}`, or review the \
+                 current file instead with `reviewloop submit --paper-id {paper}`",
+                hash = job.pdf_hash,
+                source = job.pdf_path,
+                id = job.id,
+                paper = job.paper_id,
+            );
+            db.update_job_state(
+                &job.id,
+                JobStatus::FailedNeedsManual,
+                Some(job.attempt),
+                Some(None),
+                Some(Some(message.clone())),
+            )?;
+            db.add_event(
+                None,
+                Some(&job.id),
+                "submit_blocked_input_mismatch",
+                json!({
+                    "reason": reason,
+                    "pdf_path": job.pdf_path,
+                    "pdf_hash": job.pdf_hash,
+                    "snapshot_path": job.snapshot_path,
+                }),
+            )?;
+            fire_notification(
+                &config.notifications,
+                NotificationKind::FailedNeedsManual,
+                Some(&job.paper_id),
+                Some(&job.id),
+                Some(&message),
+            );
+            error!(job_id = %job.id, reason = %reason, "submission blocked: no PDF matches the job's pinned hash");
+            Ok(None)
+        }
     }
 }
 
@@ -318,6 +398,7 @@ async fn handle_submit_error_with_fallback(
     config: &Config,
     db: &Db,
     job: &Job,
+    snapshot_path: &Path,
     err: BackendError,
 ) -> Result<()> {
     let can_fallback = job.backend == "stanford"
@@ -343,7 +424,7 @@ async fn handle_submit_error_with_fallback(
         match submit_with_node_playwright(
             Path::new(&config.providers.stanford.fallback_script),
             &config.providers.stanford.base_url,
-            Path::new(&job.pdf_path),
+            snapshot_path,
             &email,
             fallback_venue.as_deref(),
         )
@@ -362,7 +443,11 @@ async fn handle_submit_error_with_fallback(
                     None,
                     Some(&job.id),
                     "submitted_via_fallback",
-                    json!({ "token": receipt.token }),
+                    json!({
+                        "token": receipt.token,
+                        "pdf_hash": job.pdf_hash,
+                        "snapshot_path": snapshot_path,
+                    }),
                 )?;
                 warn!(job_id = %job.id, "job submitted via fallback script");
                 return Ok(());
@@ -651,10 +736,12 @@ fn timeout_for_job(config: &Config, job: &Job) -> Duration {
         return Duration::hours(base_hours);
     }
 
-    let pages = match estimate_pdf_page_count(Path::new(&job.pdf_path)) {
+    // Count pages of what was uploaded; the source may have changed or vanished.
+    let pdf_path = job.snapshot_path.as_deref().unwrap_or(&job.pdf_path);
+    let pages = match estimate_pdf_page_count(Path::new(pdf_path)) {
         Ok(n) => n,
         Err(e) => {
-            tracing::warn!(error = %e, pdf_path = %job.pdf_path, "failed to estimate PDF page count; using base timeout");
+            tracing::warn!(error = %e, pdf_path = %pdf_path, "failed to estimate PDF page count; using base timeout");
             0
         }
     };
@@ -680,7 +767,13 @@ pub fn prune_retention(config: &Config, db: &Db, tick: Option<u64>) -> Result<()
     }
 
     let report = db.prune_retention(&config.retention, Utc::now())?;
-    if report.total_deleted() == 0 {
+    // After job rows are pruned, so their snapshots become unreferenced.
+    let snapshots = prune_unreferenced_snapshots(
+        &config.state_dir(),
+        &db.list_job_pdf_hashes()?,
+        SNAPSHOT_GC_GRACE,
+    )?;
+    if report.total_deleted() + snapshots == 0 {
         return Ok(());
     }
 
@@ -693,16 +786,18 @@ pub fn prune_retention(config: &Config, db: &Db, tick: Option<u64>) -> Result<()
             "seen_tags": report.seen_tags,
             "events": report.events,
             "reviews": report.reviews,
-            "jobs": report.jobs
+            "jobs": report.jobs,
+            "snapshots": snapshots
         }),
     )?;
     info!(
-        deleted = report.total_deleted(),
+        deleted = report.total_deleted() + snapshots,
         email_tokens = report.email_tokens,
         seen_tags = report.seen_tags,
         events = report.events,
         reviews = report.reviews,
         jobs = report.jobs,
+        snapshots,
         "retention pruning deleted stale records"
     );
     Ok(())
