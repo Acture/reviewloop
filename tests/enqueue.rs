@@ -7,7 +7,7 @@ use chrono::Utc;
 use reviewloop::{
     db::Db,
     model::{
-        EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, ExistingReason, Job,
+        EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, ExistingReason, Job, JobPdf,
         JobStatus, NewJob,
     },
 };
@@ -71,8 +71,10 @@ fn new_job(hash: &str, venue: Option<&str>) -> NewJob {
         project_id: PROJECT.to_string(),
         paper_id: "main".to_string(),
         backend: "stanford".to_string(),
-        pdf_path: "paper/main.pdf".to_string(),
-        pdf_hash: hash.to_string(),
+        pdf: JobPdf::Unpinned {
+            pdf_path: "paper/main.pdf".to_string(),
+            pdf_hash: hash.to_string(),
+        },
         status: JobStatus::Queued,
         email: "author@example.edu".to_string(),
         venue: venue.map(str::to_string),
@@ -376,7 +378,10 @@ fn request_details_outside_the_review_identity_do_not_conflict() -> Result<()> {
     ))?);
 
     let mut moved = new_job("h1", Some("  ICLR "));
-    moved.pdf_path = "build/renamed.pdf".to_string();
+    moved.pdf = JobPdf::Unpinned {
+        pdf_path: "build/renamed.pdf".to_string(),
+        pdf_hash: "h1".to_string(),
+    };
     moved.email = "coauthor@example.edu".to_string();
     // The key owns its job whatever mode the replay asks for.
     let replay = existing(

@@ -12,7 +12,7 @@ use reviewloop::config::{
 use reviewloop::db::Db;
 use reviewloop::email_account;
 use reviewloop::model::{
-    EnqueueMode, EnqueueRequest, EventRecord, ExistingReason, JobStatus, NewJob, StatusView,
+    EnqueueMode, EnqueueRequest, EventRecord, ExistingReason, JobPdf, JobStatus, NewJob, StatusView,
 };
 use reviewloop::oauth::{self, google::GoogleOauthProvider};
 use reviewloop::util::sha256_file;
@@ -2161,8 +2161,10 @@ async fn cmd_import_token(
                 project_id: config.project_id.clone(),
                 paper_id: paper.id.clone(),
                 backend: paper.backend.clone(),
-                pdf_path: paper.pdf_path.clone(),
-                pdf_hash,
+                pdf: JobPdf::Unpinned {
+                    pdf_path: paper.pdf_path.clone(),
+                    pdf_hash,
+                },
                 status: JobStatus::Processing,
                 email,
                 venue,
@@ -3216,7 +3218,7 @@ mod tests {
     use super::{load_effective_config_for_job, load_runtime_for_path, render_guardrail_notice};
     use reviewloop::config::Config;
     use reviewloop::db::Db;
-    use reviewloop::model::{JobStatus, NewJob};
+    use reviewloop::model::{JobPdf, JobStatus, NewJob};
     use std::{
         ffi::OsString,
         fs,
@@ -3314,8 +3316,10 @@ mod tests {
             project_id: project_id.to_string(),
             paper_id: "main".to_string(),
             backend: "stanford".to_string(),
-            pdf_path: "paper.pdf".to_string(),
-            pdf_hash: "abc123".to_string(),
+            pdf: JobPdf::Unpinned {
+                pdf_path: "paper.pdf".to_string(),
+                pdf_hash: "abc123".to_string(),
+            },
             status: JobStatus::Queued,
             email: "test@example.com".to_string(),
             venue: None,
@@ -3450,7 +3454,7 @@ mod tests {
 
     mod daemon_status_db {
         use reviewloop::db::Db;
-        use reviewloop::model::{JobStatus, NewJob};
+        use reviewloop::model::{JobPdf, JobStatus, NewJob};
         use serde_json::Value;
 
         fn make_job(paper_id: &str, status: JobStatus, idx: u32) -> NewJob {
@@ -3458,8 +3462,10 @@ mod tests {
                 project_id: "proj".to_string(),
                 paper_id: paper_id.to_string(),
                 backend: "stanford".to_string(),
-                pdf_path: "/fake/paper.pdf".to_string(),
-                pdf_hash: format!("hash{idx}"),
+                pdf: JobPdf::Unpinned {
+                    pdf_path: "/fake/paper.pdf".to_string(),
+                    pdf_hash: format!("hash{idx}"),
+                },
                 status,
                 email: "test@example.com".to_string(),
                 venue: None,
@@ -3745,7 +3751,7 @@ mod tests {
     mod status_json_shape {
         use super::super::{status_row_json, timeline_json};
         use reviewloop::db::Db;
-        use reviewloop::model::{JobStatus, NewJob};
+        use reviewloop::model::{JobPdf, JobStatus, NewJob};
         use serde_json::Value;
 
         fn make_db_with_jobs(project_id: &str, paper_ids: &[&str]) -> Db {
@@ -3756,8 +3762,10 @@ mod tests {
                     project_id: project_id.to_string(),
                     paper_id: paper_id.to_string(),
                     backend: "stanford".to_string(),
-                    pdf_path: "/test/paper.pdf".to_string(),
-                    pdf_hash: "abc123".to_string(),
+                    pdf: JobPdf::Unpinned {
+                        pdf_path: "/test/paper.pdf".to_string(),
+                        pdf_hash: "abc123".to_string(),
+                    },
                     status: JobStatus::Queued,
                     email: "test@example.com".to_string(),
                     venue: None,
@@ -4013,7 +4021,7 @@ mod tests {
         use reviewloop::application::JobRef;
         use reviewloop::config::Config;
         use reviewloop::db::Db;
-        use reviewloop::model::{JobStatus, NewJob};
+        use reviewloop::model::{JobPdf, JobStatus, NewJob};
 
         fn make_processing_job(project_id: &str, paper_id: &str) -> (Db, String) {
             let db = Db::new_in_memory(project_id).expect("in-memory DB");
@@ -4023,8 +4031,10 @@ mod tests {
                     project_id: project_id.to_string(),
                     paper_id: paper_id.to_string(),
                     backend: "stanford".to_string(),
-                    pdf_path: "/test/paper.pdf".to_string(),
-                    pdf_hash: "abc123".to_string(),
+                    pdf: JobPdf::Unpinned {
+                        pdf_path: "/test/paper.pdf".to_string(),
+                        pdf_hash: "abc123".to_string(),
+                    },
                     status: JobStatus::Processing,
                     email: "test@example.com".to_string(),
                     venue: None,
@@ -4136,7 +4146,7 @@ mod tests {
     /// Tests for U12 — status grouping by paper_id.
     mod status_grouping {
         use reviewloop::db::Db;
-        use reviewloop::model::{JobStatus, NewJob};
+        use reviewloop::model::{JobPdf, JobStatus, NewJob};
 
         fn make_db_multi(project_id: &str, paper_ids: &[&str], jobs_per_paper: usize) -> Db {
             let db = Db::new_in_memory(project_id).expect("in-memory DB");
@@ -4147,8 +4157,10 @@ mod tests {
                         project_id: project_id.to_string(),
                         paper_id: paper_id.to_string(),
                         backend: "stanford".to_string(),
-                        pdf_path: "/test/paper.pdf".to_string(),
-                        pdf_hash: "abc123".to_string(),
+                        pdf: JobPdf::Unpinned {
+                            pdf_path: "/test/paper.pdf".to_string(),
+                            pdf_hash: "abc123".to_string(),
+                        },
                         status: JobStatus::Queued,
                         email: "test@example.com".to_string(),
                         venue: None,
@@ -4212,8 +4224,10 @@ mod tests {
                     project_id: project_id.to_string(),
                     paper_id: "p1".to_string(),
                     backend: "stanford".to_string(),
-                    pdf_path: "/test/paper.pdf".to_string(),
-                    pdf_hash: "abc123".to_string(),
+                    pdf: JobPdf::Unpinned {
+                        pdf_path: "/test/paper.pdf".to_string(),
+                        pdf_hash: "abc123".to_string(),
+                    },
                     status,
                     email: "test@example.com".to_string(),
                     venue: None,

@@ -70,9 +70,13 @@ pub struct JobView {
     pub review_available: bool,
     pub review_completed_at: Option<DateTime<Utc>>,
     pub attempt: u32,
-    /// The PDF path recorded when the job was created.
+    /// The paper's PDF the job was enqueued from; it may have changed since.
     pub pdf_path: String,
-    /// SHA-256 of the PDF bytes hashed when the job was created.
+    /// The immutable copy every submission of the job uploads. Null only for
+    /// jobs from before snapshots (the worker backfills it when the source
+    /// still matches `pdf_hash`) and for imported tokens.
+    pub snapshot_path: Option<String>,
+    /// SHA-256 of the snapshot bytes.
     pub pdf_hash: String,
     pub venue: Option<String>,
     pub version_no: u32,
@@ -108,6 +112,7 @@ impl JobView {
             review_completed_at,
             attempt: job.attempt,
             pdf_path: job.pdf_path.clone(),
+            snapshot_path: job.snapshot_path.clone(),
             pdf_hash: job.pdf_hash.clone(),
             venue: job.venue.clone(),
             version_no: job.version_no,
@@ -170,12 +175,17 @@ pub struct PaperView {
     pub tag_trigger: Option<String>,
 }
 
-/// What a request asked to review: the paper's current PDF and the review
-/// identity that decides coverage.
+/// What a request asked to review: the snapshot of the paper's PDF taken for
+/// it and the review identity that decides coverage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ManuscriptInput {
     pub paper_id: String,
+    /// The paper's configured PDF the snapshot was copied from.
     pub pdf_path: String,
+    /// The immutable copy taken for this request. On `existing`, the returned
+    /// job keeps its own snapshot (`JobView.snapshot_path`).
+    pub snapshot_path: Option<String>,
+    /// SHA-256 of the snapshot bytes.
     pub pdf_hash: String,
     pub backend: String,
     pub venue: Option<String>,
@@ -188,7 +198,8 @@ impl ManuscriptInput {
         let identity = job.review_identity();
         ManuscriptInput {
             paper_id: identity.paper_id,
-            pdf_path: job.pdf_path.clone(),
+            pdf_path: job.pdf.pdf_path(),
+            snapshot_path: job.pdf.snapshot_path(),
             pdf_hash: identity.pdf_hash,
             backend: identity.backend,
             venue: identity.venue,

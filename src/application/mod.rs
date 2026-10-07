@@ -1,10 +1,10 @@
 //! Review operations shared by the CLI and the MCP adapter.
 //!
 //! Every operation is synchronous and works only on a loaded [`Config`], the
-//! [`Db`] and the artifact directory. Operations never print (state changes
-//! emit `tracing` events at INFO), never exit the process and never contact a
-//! review provider: submitting to and polling the
-//! provider stay with the caller (the CLI's immediate submit, the daemon's
+//! [`Db`] and the state directory (review artifacts and PDF snapshots).
+//! Operations never print (state changes emit `tracing` events at INFO), never
+//! exit the process and never contact a review provider: submitting to and
+//! polling the provider stay with the caller (the CLI's immediate submit, the daemon's
 //! worker). Results are token-free DTOs that serialize to the JSON documented
 //! in `docs/review-operations.md`; failures are [`OpError`]s with a stable
 //! [`OpError::code`].

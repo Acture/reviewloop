@@ -25,6 +25,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Git tag requests are idempotent** — a tag first processed on schema v2
   whose seen-tag record is lost (crash, retention pruning) returns its
   original job instead of enqueueing again, while that job is retained.
+- **Pinned PDF snapshots** — every job uploads an immutable copy of its PDF
+  taken at enqueue, stored owner-only (0o600 files, 0o700 directories on Unix)
+  at `<state_dir>/snapshots/<sha256>/<file name>`.
+  Editing or deleting the source, or repointing the paper in config, after
+  enqueue no longer changes what is submitted: the primary submit, the Node
+  fallback and the timeout page count all read the snapshot, re-verified
+  against the job's hash before every upload. `submission_input::prepare_input`
+  returns the `PreparedInput` that enqueue callers pass as `JobPdf::Pinned`.
+  Schema v3 adds `jobs.snapshot_path`; `meta.json` records it.
+- **Unpinned jobs are verified before submission.** A job created before
+  snapshots existed (or whose snapshot is lost) is snapshotted at submit time
+  only if its `pdf_path` still hashes to its `pdf_hash` (event
+  `snapshot_backfilled`). Otherwise it moves to `FAILED_NEEDS_MANUAL` with the
+  recovery commands in `last_error` (event `submit_blocked_input_mismatch`)
+  and nothing is uploaded.
 
 - **`reviewloop::application`** — review operations shared by the CLI and
   the upcoming MCP adapter: `ReviewOps` with `list_projects`,
@@ -32,8 +47,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `approve_job`, `retry_job` and `cancel_job`. Operations are synchronous,
   never print, exit or contact the provider, return token-free DTOs and
   fail with `OpError` codes carrying a recovery hint and structured
-  details. `request_review` enqueues through `Db::enqueue` (request keys
-  included); the CLI still submits immediately for `submit` and `run`.
+  details. `request_review` pins a PDF snapshot and enqueues through
+  `Db::enqueue` (request keys included); the CLI still submits immediately
+  for `submit` and `run`.
 - **`docs/review-operations.md`** — the operation contract: MCP tool
   names, request and result fields, job phases, retry semantics, error
   codes with recovery hints, and what later issues still own.
@@ -59,6 +75,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   actually created.
 - `submit` resolves the submitter email before checking for an existing job,
   so it now needs a configured email even when it only reports one.
+- A job's `pdf_hash` is the hash of its snapshot bytes, so coverage and
+  request identity compare what will actually be uploaded.
+- A queued job no longer needs its paper to stay in config: the snapshot is
+  self-contained and config only supplies a fallback venue. Previously a
+  removed paper failed every tick at submit.
+- Retention pruning also removes snapshot directories that no job row
+  references, after a one-hour grace; `retention_pruned` reports `snapshots`.
+  `paper remove --purge-history` leaves them to the next pruning cycle.
+- `submitted` / `submitted_via_fallback` events include `pdf_hash` and
+  `snapshot_path`.
 
 - `approve`, `cancel`, `retry`, `submit`, `run` and `complete --paper-id`
   call the shared operations. Arguments, events and exit codes are

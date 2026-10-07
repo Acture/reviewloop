@@ -17,8 +17,12 @@ use crate::{
     config::Config,
     db::Db,
     email_account::resolve_submission_email,
-    model::{EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, Job, JobStatus, NewJob},
-    util::{compute_next_poll_at, sha256_file},
+    model::{
+        EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, Job, JobPdf, JobStatus,
+        NewJob,
+    },
+    submission_input::prepare_input,
+    util::compute_next_poll_at,
 };
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -99,8 +103,9 @@ impl<'a> ReviewOps<'a> {
             .collect())
     }
 
-    /// Enqueue a review of the paper's current PDF through [`Db::enqueue`]. The
-    /// job is only stored: it is QUEUED (or PENDING_APPROVAL), not submitted,
+    /// Snapshot the paper's current PDF and enqueue a review of it through
+    /// [`Db::enqueue`]. The job is only stored: it is QUEUED (or
+    /// PENDING_APPROVAL), not submitted,
     /// until a worker or the caller submits it. A replayed `request_key`
     /// returns the job it first resolved to; unless `force`, a pending,
     /// in-flight or completed job with the same review identity is returned
@@ -143,8 +148,9 @@ impl<'a> ReviewOps<'a> {
             project_id: project_id.to_string(),
             paper_id: paper.id.clone(),
             backend: paper.backend.clone(),
-            pdf_path: paper.pdf_path.clone(),
-            pdf_hash: sha256_file(pdf_path)?,
+            // Pinned before enqueueing, so coverage and the request key see the
+            // bytes every submission of the job will upload.
+            pdf: JobPdf::Pinned(prepare_input(&self.config.state_dir(), pdf_path)?),
             status: match request.approval {
                 Approval::Granted => JobStatus::Queued,
                 Approval::Required => JobStatus::PendingApproval,

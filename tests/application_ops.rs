@@ -12,7 +12,7 @@ use reviewloop::{
     artifact::write_review_artifacts,
     config::{Config, PaperConfig},
     db::Db,
-    model::{EnqueueConflict, ExistingReason, Job, JobStatus, NewJob},
+    model::{EnqueueConflict, ExistingReason, Job, JobPdf, JobStatus, NewJob},
     util::sha256_file,
 };
 use serde::Serialize;
@@ -89,8 +89,10 @@ impl Fixture {
             project_id: project_id.to_string(),
             paper_id: "main".to_string(),
             backend: "stanford".to_string(),
-            pdf_path: self.config.papers[0].pdf_path.clone(),
-            pdf_hash: hash.to_string(),
+            pdf: JobPdf::Unpinned {
+                pdf_path: self.config.papers[0].pdf_path.clone(),
+                pdf_hash: hash.to_string(),
+            },
             status,
             email: "test@example.edu".to_string(),
             venue: None,
@@ -245,6 +247,19 @@ fn request_review_enqueues_without_submitting() -> Result<()> {
     assert_eq!(outcome.input.version_source, "pdf_hash");
     assert_eq!(outcome.input.version_key, hash);
     assert_eq!(job.pdf_hash, hash);
+
+    // The job is pinned to a snapshot that later edits of the source leave alone.
+    let snapshot = job.snapshot_path.clone().expect("request pins a snapshot");
+    assert_eq!(
+        outcome.input.snapshot_path.as_deref(),
+        Some(snapshot.as_str())
+    );
+    assert_eq!(job.pdf_path, fx.config.papers[0].pdf_path);
+    fs::write(
+        fx.pdf_path(),
+        b"%PDF-1.4\n% edited after the request\n%%EOF\n",
+    )?;
+    assert_eq!(sha256_file(Path::new(&snapshot))?, hash);
 
     assert_eq!(outcome.reason, None);
     let enqueued = fx.events("job_enqueued")?;

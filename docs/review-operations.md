@@ -10,7 +10,7 @@ every operation against a temporary config and database.
 ## Ground rules
 
 - Operations are synchronous and touch only the loaded `Config`, the SQLite
-  database and the artifact directory. They never print, never exit the
+  database and the state directory (review artifacts and PDF snapshots). They never print, never exit the
   process and never contact a review provider. State changes emit `tracing`
   events at INFO; the host's logging configuration decides where they go
   (the CLI's default is stdout, so an MCP host MUST log to stderr).
@@ -40,7 +40,7 @@ every operation against a temporary config and database.
 | `paper_id` | Unique within a project; configured in `[[papers]]`. |
 | `job_id` | A UUID, unique across projects. Jobs are scoped to their project. |
 | Job reference | A job id, or a paper id. A paper reference needs a project and resolves to the single job of that paper whose status the operation accepts (newest `updated_at` first). Zero matches is `no_eligible_job`; several is `ambiguous_job`. |
-| Manuscript version | `pdf_hash` is the SHA-256 of the PDF bytes hashed at request time. Without a git commit, `version_source` is `"pdf_hash"` and `version_key` equals `pdf_hash`. `version_no` increases when a paper's version key changes; `round_no` is one past the highest round held by a pending, in-flight or completed job of that version (failed attempts give their round back). |
+| Manuscript version | A request copies the paper's PDF into an immutable, content-addressed snapshot (`snapshot_path`) and `pdf_hash` is the SHA-256 of those bytes; every submission of the job uploads that snapshot, whatever happens to the source file afterwards. Without a git commit, `version_source` is `"pdf_hash"` and `version_key` equals `pdf_hash`. `version_no` increases when a paper's version key changes; `round_no` is one past the highest round held by a pending, in-flight or completed job of that version (failed attempts give their round back). |
 
 ## Operations
 
@@ -48,7 +48,7 @@ every operation against a temporary config and database.
 |---|---|---|---|---|---|
 | `list_projects` | `ReviewOps::list_projects` | yes | none | `ProjectView[]` | none |
 | `list_papers` | `ReviewOps::list_papers` | yes | none (needs a project) | `PaperView[]` | none |
-| `request_review` | `ReviewOps::request_review` | no | `ReviewRequest` (needs a project) | `ReviewRequestOutcome` | Created: a job row and one `job_enqueued` event (`source` `manual_submit`, `run` or `agent_request`; `enqueue_mode`; `request_key`), plus with `force` a `force_clear_cooldown` event per other active job of the paper. Existing because covered: a `duplicate_skipped` event. Existing because the key was replayed: nothing. |
+| `request_review` | `ReviewOps::request_review` | no | `ReviewRequest` (needs a project) | `ReviewRequestOutcome` | Always: a PDF snapshot under the state directory (retention prunes snapshots no job references). Created: a job row and one `job_enqueued` event (`source` `manual_submit`, `run` or `agent_request`; `enqueue_mode`; `request_key`), plus with `force` a `force_clear_cooldown` event per other active job of the paper. Existing because covered: a `duplicate_skipped` event. Existing because the key was replayed: nothing. |
 | `get_job` | `ReviewOps::get_job` | yes | `job_id` | `JobView` | none |
 | `list_jobs` | `ReviewOps::list_jobs` | yes | `JobListQuery` (needs a project) | `JobList` | none |
 | `get_review` | `ReviewOps::get_review` | yes | `ReviewQuery` | `ReviewView` | none |
@@ -135,8 +135,9 @@ caller leaves it to the worker's next tick.
 | `review_available` | boolean | required | A review is stored; `get_review` succeeds. |
 | `review_completed_at` | RFC3339 UTC timestamp string | nullable | When the review was stored. |
 | `attempt` | integer | required | Attempts in the current submit or poll cycle. |
-| `pdf_path` | string | required | PDF path recorded when the job was created. |
-| `pdf_hash` | string | required | SHA-256 of the PDF hashed when the job was created. |
+| `pdf_path` | string | required | The paper's PDF the job was enqueued from. It may have changed or disappeared since. |
+| `snapshot_path` | string | nullable | The immutable copy every submission of the job uploads. `null` only for jobs created before snapshots existed (the worker backfills it while the source still matches `pdf_hash`) and for jobs created by `import-token`. |
+| `pdf_hash` | string | required | SHA-256 of the snapshot bytes. |
 | `venue` | string | nullable | Venue recorded at request time. When it is null, a stanford worker sends the paper's configured venue at submission time, which this field does not show. |
 | `version_no` | integer | required | Manuscript version number within the paper. |
 | `round_no` | integer | required | Review round within the version. |
@@ -158,7 +159,7 @@ caller leaves it to the worker's next tick.
 | `ReviewRequestOutcome.disposition` | string | required | `"created"`: a new job was stored. `"existing"`: an earlier job answers the request and is returned; no job was stored. |
 | `ReviewRequestOutcome.reason` | string | nullable | For `existing`: `"request_replay"` (the request key was already bound to this job) or `"covered"` (a pending, in-flight or completed job has the same review identity). `null` for `created`. |
 | `ReviewRequestOutcome.job` | `JobView` | required | The created or existing job. |
-| `ReviewRequestOutcome.input` | `ManuscriptInput` | required | What this request asked to review: `paper_id`, `pdf_path`, `pdf_hash`, `backend`, `venue` (trimmed, `null` when unset), `version_source`, `version_key`. Compare with the job's fields to confirm which PDF it reviews; on `request_replay` they may differ only where coverage ignores them (path). |
+| `ReviewRequestOutcome.input` | `ManuscriptInput` | required | What this request asked to review: `paper_id`, `pdf_path` (the source), `snapshot_path` (the copy taken for this request), `pdf_hash` (of the snapshot), `backend`, `venue` (trimmed, `null` when unset), `version_source`, `version_key`. On `existing` the returned job keeps its own snapshot; compare `pdf_hash` to confirm it reviews the same bytes. |
 | `JobList.jobs` | `JobView[]` | required | Newest first. |
 | `JobList.truncated` | boolean | required | More jobs matched than `limit`. |
 | `TransitionOutcome.job` | `JobView` | required | The job after the change. |
@@ -267,6 +268,7 @@ job ends FAILED, FAILED_NEEDS_MANUAL or TIMEOUT and 130 on Ctrl-C, and
     "review_completed_at": null,
     "attempt": 0,
     "pdf_path": "/home/me/my-paper/paper/main.pdf",
+    "snapshot_path": "/home/me/.review_loop/snapshots/3f1a…c9/main.pdf",
     "pdf_hash": "3f1a…c9",
     "venue": "ICLR",
     "version_no": 1,
@@ -285,6 +287,7 @@ job ends FAILED, FAILED_NEEDS_MANUAL or TIMEOUT and 130 on Ctrl-C, and
   "input": {
     "paper_id": "main",
     "pdf_path": "/home/me/my-paper/paper/main.pdf",
+    "snapshot_path": "/home/me/.review_loop/snapshots/3f1a…c9/main.pdf",
     "pdf_hash": "3f1a…c9",
     "backend": "stanford",
     "venue": "ICLR",
@@ -328,10 +331,8 @@ let job = ops.get_job(&outcome.job.job_id)?; // database only
 
 These are deliberately outside this contract and owned by follow-up issues:
 
-- **PDF snapshots (OSS-335).** `pdf_hash` is computed at request time, but the
-  worker uploads the paper's current file. A PDF edited between request and
-  submission is not detected. Likewise a job stored without a venue is sent
-  with the venue configured at submission time.
+- **Venue at submission.** A job stored without a venue is sent with the
+  venue configured at submission time, which `JobView.venue` does not show.
 - **Worker claims and uncertain submissions (OSS-337).** A QUEUED job may be
   picked by more than one process, and there is no "outcome unknown" phase
   for a submission that may have reached the provider.

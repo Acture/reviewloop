@@ -24,6 +24,9 @@ pub fn write_review_artifacts(
         "generated_at": Utc::now().to_rfc3339(),
         "pdf_path": job.pdf_path,
         "pdf_hash": job.pdf_hash,
+        // The bytes actually uploaded; null for a job submitted before
+        // snapshots existed, whose uploaded version was never pinned.
+        "snapshot_path": job.snapshot_path,
     }))?;
 
     let review_json_path = artifact_dir.join("review.json");

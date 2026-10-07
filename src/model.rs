@@ -1,3 +1,4 @@
+use crate::submission_input::PreparedInput;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -171,8 +172,15 @@ pub struct Job {
     pub project_id: String,
     pub paper_id: String,
     pub backend: String,
+    /// Source PDF the job was enqueued from. It may change or disappear after
+    /// enqueue; submissions upload `snapshot_path` instead.
     pub pdf_path: String,
+    /// SHA-256 of the pinned snapshot bytes.
     pub pdf_hash: String,
+    /// Immutable copy uploaded by every submission of this job. `None` only for
+    /// jobs created before snapshots existed; the worker backfills it from
+    /// `pdf_path` when that file still matches `pdf_hash`.
+    pub snapshot_path: Option<String>,
     pub status: JobStatus,
     pub token: Option<String>,
     pub email: String,
@@ -197,8 +205,7 @@ pub struct NewJob {
     pub project_id: String,
     pub paper_id: String,
     pub backend: String,
-    pub pdf_path: String,
-    pub pdf_hash: String,
+    pub pdf: JobPdf,
     pub status: JobStatus,
     pub email: String,
     pub venue: Option<String>,
@@ -213,10 +220,44 @@ impl NewJob {
         ReviewIdentity::new(
             &self.paper_id,
             &self.backend,
-            &self.pdf_hash,
+            self.pdf.pdf_hash(),
             self.venue.as_deref(),
             self.git_commit.as_deref(),
         )
+    }
+}
+
+/// The PDF a new job is created for.
+#[derive(Debug, Clone)]
+pub enum JobPdf {
+    /// Snapshot taken at enqueue; every submission uploads exactly these bytes.
+    Pinned(PreparedInput),
+    /// No snapshot, e.g. a token imported for a submission made outside
+    /// reviewloop. If such a job is ever submitted, the worker first snapshots
+    /// `pdf_path`, and only when it still hashes to `pdf_hash`.
+    Unpinned { pdf_path: String, pdf_hash: String },
+}
+
+impl JobPdf {
+    pub fn pdf_path(&self) -> String {
+        match self {
+            JobPdf::Pinned(input) => input.source_path.to_string_lossy().into_owned(),
+            JobPdf::Unpinned { pdf_path, .. } => pdf_path.clone(),
+        }
+    }
+
+    pub fn pdf_hash(&self) -> &str {
+        match self {
+            JobPdf::Pinned(input) => &input.sha256,
+            JobPdf::Unpinned { pdf_hash, .. } => pdf_hash,
+        }
+    }
+
+    pub fn snapshot_path(&self) -> Option<String> {
+        match self {
+            JobPdf::Pinned(input) => Some(input.snapshot_path.to_string_lossy().into_owned()),
+            JobPdf::Unpinned { .. } => None,
+        }
     }
 }
 
