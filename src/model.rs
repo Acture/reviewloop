@@ -196,6 +196,217 @@ pub struct NewJob {
     pub next_poll_at: Option<DateTime<Utc>>,
 }
 
+impl NewJob {
+    /// The fields that decide what a review means; see [`ReviewIdentity`].
+    pub fn review_identity(&self) -> ReviewIdentity {
+        ReviewIdentity::new(
+            &self.paper_id,
+            &self.backend,
+            &self.pdf_hash,
+            self.venue.as_deref(),
+            self.git_commit.as_deref(),
+        )
+    }
+}
+
+/// Where a job's `version_key` came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionSource {
+    GitCommit,
+    PdfHash,
+}
+
+impl VersionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VersionSource::GitCommit => "git_commit",
+            VersionSource::PdfHash => "pdf_hash",
+        }
+    }
+}
+
+/// Normalized content of a review request within one project: the manuscript
+/// bytes, where and how it is reviewed, and which manuscript version it is.
+///
+/// Two requests with equal identities ask for the same review, so an active or
+/// completed job with this identity covers both. The file path and submitter
+/// email are deliberately absent: neither changes what gets reviewed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewIdentity {
+    pub paper_id: String,
+    pub backend: String,
+    pub pdf_hash: String,
+    /// Trimmed; `None` when unset or blank.
+    pub venue: Option<String>,
+    pub version_source: VersionSource,
+    /// The git commit when known, otherwise the manuscript hash.
+    pub version_key: String,
+}
+
+impl ReviewIdentity {
+    pub fn new(
+        paper_id: &str,
+        backend: &str,
+        pdf_hash: &str,
+        venue: Option<&str>,
+        git_commit: Option<&str>,
+    ) -> Self {
+        let commit = git_commit.map(str::trim).filter(|value| !value.is_empty());
+        let (version_source, version_key) = match commit {
+            Some(commit) => (VersionSource::GitCommit, commit.to_string()),
+            None => (VersionSource::PdfHash, pdf_hash.to_string()),
+        };
+        Self {
+            paper_id: paper_id.to_string(),
+            backend: backend.to_string(),
+            pdf_hash: pdf_hash.to_string(),
+            venue: venue
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            version_source,
+            version_key,
+        }
+    }
+
+    /// Fields whose values differ between `self` (the recorded request) and
+    /// `requested`, in declaration order.
+    pub fn mismatches(&self, requested: &Self) -> Vec<FieldMismatch> {
+        let fields: [(&'static str, Option<&str>, Option<&str>); 6] = [
+            ("paper_id", Some(&self.paper_id), Some(&requested.paper_id)),
+            ("backend", Some(&self.backend), Some(&requested.backend)),
+            ("pdf_hash", Some(&self.pdf_hash), Some(&requested.pdf_hash)),
+            ("venue", self.venue.as_deref(), requested.venue.as_deref()),
+            (
+                "version_source",
+                Some(self.version_source.as_str()),
+                Some(requested.version_source.as_str()),
+            ),
+            (
+                "version_key",
+                Some(&self.version_key),
+                Some(&requested.version_key),
+            ),
+        ];
+        fields
+            .into_iter()
+            .filter(|(_, recorded, requested)| recorded != requested)
+            .map(|(field, recorded, requested)| FieldMismatch {
+                field,
+                recorded: recorded.map(str::to_string),
+                requested: requested.map(str::to_string),
+            })
+            .collect()
+    }
+}
+
+/// What `Db::enqueue` does when a job with the same [`ReviewIdentity`] is
+/// already pending, in flight, or completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnqueueMode {
+    /// Return the covering job instead of enqueueing another one.
+    Deduplicate,
+    /// Explicit re-review: always enqueue a job in a new review round.
+    NewRound,
+}
+
+impl EnqueueMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EnqueueMode::Deduplicate => "deduplicate",
+            EnqueueMode::NewRound => "new_round",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EnqueueRequest {
+    pub job: NewJob,
+    /// Caller-chosen idempotency key, scoped to `job.project_id`. The first
+    /// request with a key binds it to the job it resolved to; replaying the key
+    /// returns that job for as long as it exists, even once it has finished.
+    /// A new review round therefore needs a new key. `None` skips request
+    /// idempotency and relies on [`EnqueueMode`] alone.
+    pub request_key: Option<String>,
+    pub mode: EnqueueMode,
+    /// Which entry point asked, recorded on the enqueue event.
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExistingReason {
+    /// The request key was already bound to this job.
+    RequestReplay,
+    /// An active or completed job with the same review identity covers the request.
+    Covered,
+}
+
+#[derive(Debug, Clone)]
+pub enum EnqueueOutcome {
+    Created(Job),
+    Existing { job: Job, reason: ExistingReason },
+}
+
+impl EnqueueOutcome {
+    pub fn job(&self) -> &Job {
+        match self {
+            EnqueueOutcome::Created(job) | EnqueueOutcome::Existing { job, .. } => job,
+        }
+    }
+
+    pub fn into_job(self) -> Job {
+        match self {
+            EnqueueOutcome::Created(job) | EnqueueOutcome::Existing { job, .. } => job,
+        }
+    }
+
+    pub fn is_created(&self) -> bool {
+        matches!(self, EnqueueOutcome::Created(_))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FieldMismatch {
+    pub field: &'static str,
+    pub recorded: Option<String>,
+    pub requested: Option<String>,
+}
+
+/// A request key was replayed with different review content. Nothing was
+/// enqueued; the caller either resends the original request or picks a new key.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error(
+    "request key {request_key:?} in project {project_id} is already bound to job {existing_job_id} \
+     with different content ({}); resend the original request to get that job back, \
+     or use a new request key to ask for a different review",
+    describe_mismatches(.mismatches)
+)]
+pub struct EnqueueConflict {
+    pub project_id: String,
+    pub request_key: String,
+    pub existing_job_id: String,
+    pub mismatches: Vec<FieldMismatch>,
+}
+
+fn describe_mismatches(mismatches: &[FieldMismatch]) -> String {
+    let show = |value: &Option<String>| value.as_deref().unwrap_or("<unset>").to_string();
+    mismatches
+        .iter()
+        .map(|m| {
+            format!(
+                "{}: recorded {}, requested {}",
+                m.field,
+                show(&m.recorded),
+                show(&m.requested)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusView {
     pub id: String,

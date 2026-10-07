@@ -2,7 +2,10 @@ use crate::{
     config::{Config, PaperConfig},
     db::Db,
     email_account::resolve_submission_email,
-    model::{Job, JobStatus, NewJob},
+    model::{
+        EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, Job, JobStatus, NewJob,
+        ReviewIdentity,
+    },
     util::{git_in, sha256_file},
 };
 use anyhow::{Context, Result};
@@ -14,7 +17,7 @@ use std::{
     path::Path,
     sync::{Mutex, OnceLock},
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTag {
@@ -126,27 +129,31 @@ pub fn run_pdf_trigger(config: &Config, db: &Db) -> Result<()> {
         }
 
         let hash = sha256_file(path)?;
-        let (version_source, version_key) = version_identity(None, &hash);
-        if let Some(existing) = db.find_duplicate_covering_job(
-            &config.project_id,
+        // Content an earlier job without git metadata covers. Checked before
+        // the auto tag below; enqueue repeats the check atomically. This
+        // records a duplicate_skipped event on every tick while the file stays
+        // covered, and daemon health currently reads those events as its tick
+        // heartbeat, so the skip must stay ahead of the unchanged-file check.
+        let identity = ReviewIdentity::new(
             &paper.id,
             &paper.backend,
             &hash,
-            &version_key,
-        )? {
-            record_duplicate_skip(DuplicateSkipContext {
-                config,
-                db,
-                paper,
-                pdf_hash: &hash,
-                version_source: &version_source,
-                version_key: &version_key,
-                existing: &existing,
-                source: "pdf_trigger",
-            })?;
+            provider_venue(config, paper).as_deref(),
+            None,
+        );
+        if let Some(existing) = db.find_duplicate_covering_job(&config.project_id, &identity)? {
+            warn_duplicate(&config.project_id, &existing, "pdf_change_trigger");
+            db.record_duplicate_skip(
+                &config.project_id,
+                &identity,
+                &existing,
+                "pdf_change_trigger",
+            )?;
             continue;
         }
 
+        // Unchanged since the paper's latest job, whatever became of it: a
+        // failed job is not resubmitted just because the file is still there.
         let latest_hash =
             db.latest_hash_for_paper(&config.project_id, &paper.id, &paper.backend)?;
         if latest_hash.as_deref() == Some(hash.as_str()) {
@@ -172,14 +179,14 @@ pub fn run_pdf_trigger(config: &Config, db: &Db) -> Result<()> {
             }
         };
 
-        enqueue_for_paper(
-            config,
+        enqueue_trigger_request(
             db,
-            paper,
-            status,
-            auto_tag,
-            auto_commit,
-            "pdf_change_trigger",
+            EnqueueRequest {
+                job: new_trigger_job(config, paper, status, auto_tag, auto_commit)?,
+                request_key: None,
+                mode: EnqueueMode::Deduplicate,
+                source: "pdf_change_trigger".to_string(),
+            },
         )?;
     }
 
@@ -221,15 +228,43 @@ fn process_tag_entry(config: &Config, db: &Db, tag: &str, commit: &str) -> Resul
     }
 
     if let Some(paper) = select_paper_for_tag(config, tag) {
-        enqueue_for_paper(
-            config,
-            db,
-            paper,
-            JobStatus::Queued,
-            Some(tag.to_string()),
-            Some(commit.to_string()),
-            "git_tag_trigger",
-        )?;
+        // The tag is the request: if marking it seen below is lost (crash,
+        // retention pruning), replaying it returns the job it already made,
+        // as long as that job has not been pruned itself.
+        let request = EnqueueRequest {
+            job: new_trigger_job(
+                config,
+                paper,
+                JobStatus::Queued,
+                Some(tag.to_string()),
+                Some(commit.to_string()),
+            )?,
+            request_key: Some(format!("git-tag:{tag}@{commit}")),
+            mode: EnqueueMode::Deduplicate,
+            source: "git_tag_trigger".to_string(),
+        };
+        if let Err(err) = enqueue_trigger_request(db, request) {
+            // The tag already produced a job, but the manuscript or venue has
+            // changed since. Treat it as processed instead of failing every tick.
+            let conflict = err.downcast::<EnqueueConflict>()?;
+            warn!(
+                tag,
+                existing_job_id = %conflict.existing_job_id,
+                error = %conflict,
+                "git tag was already enqueued with different content; not enqueueing again"
+            );
+            db.add_event(
+                Some(&config.project_id),
+                Some(&conflict.existing_job_id),
+                "enqueue_conflict",
+                json!({
+                    "source": "git_tag_trigger",
+                    "paper_id": paper.id,
+                    "request_key": conflict.request_key,
+                    "mismatches": conflict.mismatches,
+                }),
+            )?;
+        }
     }
 
     db.mark_tag_seen(&scoped_tag, commit)?;
@@ -318,64 +353,43 @@ fn delete_local_tag(repo_dir: &str, tag: &str) -> Result<()> {
     Ok(())
 }
 
-fn enqueue_for_paper(
+fn new_trigger_job(
     config: &Config,
-    db: &Db,
     paper: &PaperConfig,
     status: JobStatus,
     git_tag: Option<String>,
     git_commit: Option<String>,
-    source: &str,
-) -> Result<()> {
-    let pdf_hash = sha256_file(Path::new(&paper.pdf_path))?;
-    let (version_source, version_key) = version_identity(git_commit.as_deref(), &pdf_hash);
-
-    if let Some(existing) = db.find_duplicate_covering_job(
-        &config.project_id,
-        &paper.id,
-        &paper.backend,
-        &pdf_hash,
-        &version_key,
-    )? {
-        record_duplicate_skip(DuplicateSkipContext {
-            config,
-            db,
-            paper,
-            pdf_hash: &pdf_hash,
-            version_source: &version_source,
-            version_key: &version_key,
-            existing: &existing,
-            source,
-        })?;
-        return Ok(());
-    }
-
-    let job = db.create_job(&NewJob {
+) -> Result<NewJob> {
+    Ok(NewJob {
         project_id: config.project_id.clone(),
         paper_id: paper.id.clone(),
         backend: paper.backend.clone(),
         pdf_path: paper.pdf_path.clone(),
-        pdf_hash,
+        pdf_hash: sha256_file(Path::new(&paper.pdf_path))?,
         status,
         email: provider_email(config, &paper.backend)?,
         venue: provider_venue(config, paper),
         git_tag,
         git_commit,
         next_poll_at: None,
-    })?;
+    })
+}
 
-    db.add_event(
-        None,
-        Some(&job.id),
-        "job_enqueued",
-        json!({
-            "source": source,
-            "status": job.status.as_str(),
-            "paper_id": job.paper_id,
-            "backend": job.backend,
-        }),
-    )?;
-
+fn enqueue_trigger_request(db: &Db, request: EnqueueRequest) -> Result<()> {
+    match db.enqueue(&request)? {
+        EnqueueOutcome::Created(job) => info!(
+            project_id = %job.project_id,
+            paper_id = %job.paper_id,
+            job_id = %job.id,
+            source = %request.source,
+            version_no = job.version_no,
+            round_no = job.round_no,
+            "trigger enqueued job"
+        ),
+        EnqueueOutcome::Existing { job, .. } => {
+            warn_duplicate(&request.job.project_id, &job, &request.source)
+        }
+    }
     Ok(())
 }
 
@@ -383,54 +397,16 @@ fn scoped_tag_name(project_id: &str, tag: &str) -> String {
     format!("{project_id}::{tag}")
 }
 
-fn version_identity(git_commit: Option<&str>, pdf_hash: &str) -> (String, String) {
-    if let Some(commit) = git_commit.map(str::trim).filter(|value| !value.is_empty()) {
-        ("git_commit".to_string(), commit.to_string())
-    } else {
-        ("pdf_hash".to_string(), pdf_hash.to_string())
-    }
-}
-
-struct DuplicateSkipContext<'a> {
-    config: &'a Config,
-    db: &'a Db,
-    paper: &'a PaperConfig,
-    pdf_hash: &'a str,
-    version_source: &'a str,
-    version_key: &'a str,
-    existing: &'a Job,
-    source: &'a str,
-}
-
-fn record_duplicate_skip(ctx: DuplicateSkipContext<'_>) -> Result<()> {
+fn warn_duplicate(project_id: &str, existing: &Job, source: &str) {
     warn!(
-        project_id = %ctx.config.project_id,
-        paper_id = %ctx.paper.id,
-        backend = %ctx.paper.backend,
-        source = %ctx.source,
-        existing_job_id = %ctx.existing.id,
-        existing_status = %ctx.existing.status.as_str(),
+        project_id = %project_id,
+        paper_id = %existing.paper_id,
+        backend = %existing.backend,
+        source = %source,
+        existing_job_id = %existing.id,
+        existing_status = %existing.status.as_str(),
         "skipped duplicate trigger enqueue"
     );
-    ctx.db.add_event(
-        Some(&ctx.config.project_id),
-        None,
-        "duplicate_skipped",
-        json!({
-            "project_id": ctx.config.project_id,
-            "paper_id": ctx.paper.id,
-            "backend": ctx.paper.backend,
-            "pdf_hash": ctx.pdf_hash,
-            "version_no": ctx.existing.version_no,
-            "round_no": ctx.existing.round_no,
-            "version_source": ctx.version_source,
-            "version_key": ctx.version_key,
-            "existing_job_id": ctx.existing.id,
-            "existing_job_status": ctx.existing.status.as_str(),
-            "source": ctx.source
-        }),
-    )?;
-    Ok(())
 }
 
 fn provider_email(config: &Config, backend: &str) -> Result<String> {
@@ -524,6 +500,103 @@ mod tests {
             "simulated duplicate tag should not enqueue twice"
         );
 
+        Ok(())
+    }
+
+    /// Losing the seen-tag record (crash before it is written, or retention
+    /// pruning) must not turn a tag whose job failed into a second job.
+    #[test]
+    fn replayed_tag_returns_its_job_after_seen_record_is_lost() -> anyhow::Result<()> {
+        let (_tmp, config, db) = setup_simulation_context()?;
+        let tag = "review-stanford/main/replay";
+        assert!(process_tag_entry(&config, &db, tag, "c0ffee")?);
+        let job = db
+            .find_latest_open_job_for_paper(&config.project_id, "main")?
+            .context("expected job for tag")?;
+        db.update_job_state_unchecked(&job.id, JobStatus::Failed, None, Some(None), None)?;
+        forget_seen_tags(&db)?;
+
+        assert!(process_tag_entry(&config, &db, tag, "c0ffee")?);
+
+        let rows = db.list_status_views(&config.project_id, Some("main"))?;
+        assert_eq!(rows.len(), 1, "replayed tag must not enqueue again");
+        assert!(db.is_tag_seen(&format!("{}::{}", config.project_id, tag))?);
+        Ok(())
+    }
+
+    /// A replayed tag whose manuscript has changed since it was enqueued is
+    /// marked processed and reported, rather than failing every tick.
+    #[test]
+    fn replayed_tag_with_changed_manuscript_is_reported_not_enqueued() -> anyhow::Result<()> {
+        let (_tmp, config, db) = setup_simulation_context()?;
+        let tag = "review-stanford/main/changed";
+        assert!(process_tag_entry(&config, &db, tag, "c0ffee")?);
+        forget_seen_tags(&db)?;
+        fs::write(&config.papers[0].pdf_path, b"%PDF-1.4\n% edited\n%%EOF\n")?;
+
+        assert!(process_tag_entry(&config, &db, tag, "c0ffee")?);
+
+        assert_eq!(
+            db.list_status_views(&config.project_id, Some("main"))?
+                .len(),
+            1
+        );
+        let event = db
+            .most_recent_event_of_type(&config.project_id, "enqueue_conflict")?
+            .context("expected enqueue_conflict event")?;
+        assert_eq!(event.payload["mismatches"][0]["field"], "pdf_hash");
+        assert!(db.is_tag_seen(&format!("{}::{}", config.project_id, tag))?);
+        Ok(())
+    }
+
+    /// An unchanged PDF is enqueued once, however many ticks see it.
+    #[test]
+    fn pdf_trigger_enqueues_unchanged_pdf_once() -> anyhow::Result<()> {
+        let (_tmp, mut config, db) = setup_simulation_context()?;
+        config.trigger.pdf.enabled = true;
+
+        for _ in 0..3 {
+            run_pdf_trigger(&config, &db)?;
+        }
+
+        assert_eq!(
+            db.list_status_views(&config.project_id, Some("main"))?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    /// Reverting the PDF to content an earlier job still covers is skipped and
+    /// recorded as a duplicate instead of enqueueing a second review.
+    #[test]
+    fn pdf_trigger_skips_reverted_pdf_covered_by_earlier_job() -> anyhow::Result<()> {
+        let (_tmp, mut config, db) = setup_simulation_context()?;
+        config.trigger.pdf.enabled = true;
+        let pdf = config.papers[0].pdf_path.clone();
+        let original = fs::read(&pdf)?;
+
+        run_pdf_trigger(&config, &db)?;
+        fs::write(&pdf, b"%PDF-1.4\n% revision 2\n%%EOF\n")?;
+        run_pdf_trigger(&config, &db)?;
+        fs::write(&pdf, original)?;
+        run_pdf_trigger(&config, &db)?;
+
+        assert_eq!(
+            db.list_status_views(&config.project_id, Some("main"))?
+                .len(),
+            2
+        );
+        let skipped = db
+            .most_recent_event_of_type(&config.project_id, "duplicate_skipped")?
+            .context("expected duplicate_skipped event")?;
+        assert_eq!(skipped.payload["source"], "pdf_change_trigger");
+        Ok(())
+    }
+
+    fn forget_seen_tags(db: &Db) -> anyhow::Result<()> {
+        let conn = rusqlite::Connection::open(&db.path)?;
+        conn.execute("DELETE FROM seen_tags", [])?;
         Ok(())
     }
 

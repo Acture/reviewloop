@@ -1,12 +1,17 @@
 use crate::{
     config::Config,
-    model::{EventRecord, Job, JobStatus, NewJob, StatusView},
+    model::{
+        EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, EventRecord, ExistingReason,
+        Job, JobStatus, NewJob, ReviewIdentity, StatusView,
+    },
     util::{parse_rfc3339, to_rfc3339},
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
-use serde_json::Value;
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, TransactionBehavior, params, params_from_iter,
+};
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -14,7 +19,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PruneReport {
@@ -183,44 +188,34 @@ impl Db {
         Ok(())
     }
 
+    /// Insert a job unconditionally: no request-key lookup, no coverage check,
+    /// no event. Version and round are allocated exactly as [`Db::enqueue`]
+    /// allocates them. Entry points that accept review requests use `enqueue`.
     pub fn create_job(&self, new_job: &NewJob) -> Result<Job> {
-        let now = Utc::now();
-        let id = Uuid::new_v4().to_string();
-        let conn = self.connect()?;
-        let (version_no, round_no, version_source, version_key) =
-            determine_versioning(&conn, new_job)?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let job = insert_job(&tx, new_job, &new_job.review_identity())?;
+        tx.commit()?;
+        Ok(job)
+    }
 
-        conn.execute(
-            r#"
-            INSERT INTO jobs (
-                id, project_id, paper_id, backend, pdf_path, pdf_hash, status, token, email, venue,
-                git_tag, git_commit, version_no, round_no, version_source, version_key,
-                attempt, started_at, next_poll_at, last_error, fallback_used, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, NULL, ?16, NULL, 0, ?17, ?17)
-            "#,
-            params![
-                id,
-                new_job.project_id,
-                new_job.paper_id,
-                new_job.backend,
-                new_job.pdf_path,
-                new_job.pdf_hash,
-                new_job.status.as_str(),
-                new_job.email,
-                new_job.venue,
-                new_job.git_tag,
-                new_job.git_commit,
-                version_no as i64,
-                round_no as i64,
-                version_source,
-                version_key,
-                new_job.next_poll_at.map(to_rfc3339),
-                to_rfc3339(now),
-            ],
-        )?;
-
-        self.get_job(&id)?
-            .ok_or_else(|| anyhow!("failed to load inserted job: {id}"))
+    /// Enqueue a review request, or return the job that already answers it.
+    ///
+    /// One `BEGIN IMMEDIATE` transaction resolves the request key, checks
+    /// coverage, allocates version and round, inserts the job, binds the key
+    /// and writes the enqueue event, so concurrent callers on separate
+    /// connections or processes serialize here and never both create a job.
+    /// A key replayed with different content fails with [`EnqueueConflict`]
+    /// and writes nothing.
+    pub fn enqueue(&self, request: &EnqueueRequest) -> Result<EnqueueOutcome> {
+        if let Some(key) = &request.request_key {
+            ensure!(!key.trim().is_empty(), "request key must not be blank");
+        }
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let outcome = enqueue_in_tx(&tx, request)?;
+        tx.commit()?;
+        Ok(outcome)
     }
 
     pub fn get_job(&self, job_id: &str) -> Result<Option<Job>> {
@@ -314,44 +309,33 @@ impl Db {
         collect_rows(rows)
     }
 
+    /// The newest pending, in-flight or completed job with this identity.
     pub fn find_duplicate_covering_job(
         &self,
         project_id: &str,
-        paper_id: &str,
-        backend: &str,
-        pdf_hash: &str,
-        version_key: &str,
+        identity: &ReviewIdentity,
     ) -> Result<Option<Job>> {
-        let conn = self.connect()?;
-        conn.query_row(
-            r#"
-            SELECT *
-            FROM jobs
-            WHERE project_id = ?1
-              AND paper_id = ?2
-              AND backend = ?3
-              AND pdf_hash = ?4
-              AND version_key = ?5
-              AND status IN (?6, ?7, ?8, ?9, ?10)
-            ORDER BY created_at DESC
-            LIMIT 1
-            "#,
-            params![
-                project_id,
-                paper_id,
-                backend,
-                pdf_hash,
-                version_key,
-                JobStatus::PendingApproval.as_str(),
-                JobStatus::Queued.as_str(),
-                JobStatus::Submitted.as_str(),
-                JobStatus::Processing.as_str(),
-                JobStatus::Completed.as_str(),
-            ],
-            map_job_row,
+        find_covering_job(&self.connect()?, project_id, identity)
+    }
+
+    /// Record that a request was skipped because `existing` already covers it.
+    /// [`Db::enqueue`] records this itself; this is for callers that check
+    /// coverage before preparing a request.
+    pub fn record_duplicate_skip(
+        &self,
+        project_id: &str,
+        identity: &ReviewIdentity,
+        existing: &Job,
+        source: &str,
+    ) -> Result<()> {
+        insert_duplicate_skipped(
+            &self.connect()?,
+            project_id,
+            identity,
+            existing,
+            None,
+            source,
         )
-        .optional()
-        .map_err(Into::into)
     }
 
     pub fn list_active_jobs_for_paper(&self, project_id: &str, paper_id: &str) -> Result<Vec<Job>> {
@@ -638,27 +622,7 @@ impl Db {
         event_type: &str,
         payload: Value,
     ) -> Result<()> {
-        let conn = self.connect()?;
-        conn.execute(
-            r#"
-            INSERT INTO events(project_id, job_id, event_type, payload_json, created_at)
-            VALUES (
-                COALESCE(?1, COALESCE((SELECT jobs.project_id FROM jobs WHERE jobs.id = ?2), '')),
-                ?2,
-                ?3,
-                ?4,
-                ?5
-            )
-            "#,
-            params![
-                project_id,
-                job_id,
-                event_type,
-                payload.to_string(),
-                to_rfc3339(Utc::now()),
-            ],
-        )?;
-        Ok(())
+        insert_event(&self.connect()?, project_id, job_id, event_type, &payload)
     }
 
     pub fn is_tag_seen(&self, tag_name: &str) -> Result<bool> {
@@ -824,6 +788,10 @@ impl Db {
             "DELETE FROM events WHERE project_id = ?1 AND (job_id IN (SELECT id FROM jobs WHERE project_id = ?1 AND paper_id = ?2) OR json_extract(payload_json, '$.paper_id') = ?2)",
             params![project_id, paper_id],
         )?;
+        tx.execute(
+            "DELETE FROM enqueue_requests WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?1 AND paper_id = ?2)",
+            params![project_id, paper_id],
+        )?;
         let jobs = tx.execute(
             "DELETE FROM jobs WHERE project_id = ?1 AND paper_id = ?2",
             params![project_id, paper_id],
@@ -914,6 +882,10 @@ impl Db {
                 )?;
                 report.events += tx.execute(
                     &format!("DELETE FROM events WHERE job_id IN ({placeholders})"),
+                    params_from_iter(chunk.iter()),
+                )?;
+                tx.execute(
+                    &format!("DELETE FROM enqueue_requests WHERE job_id IN ({placeholders})"),
                     params_from_iter(chunk.iter()),
                 )?;
                 report.jobs += tx.execute(
@@ -1322,6 +1294,18 @@ fn create_tables_if_missing(conn: &Connection) -> Result<()> {
             config_path  TEXT NOT NULL,
             last_seen_at TEXT NOT NULL
         );
+
+        -- Idempotency keys: each binds to the job its first request resolved
+        -- to. Several keys may share one job (a covered request records its
+        -- key against the covering job).
+        CREATE TABLE IF NOT EXISTS enqueue_requests (
+            project_id    TEXT NOT NULL,
+            request_key   TEXT NOT NULL,
+            identity_json TEXT NOT NULL,
+            job_id        TEXT NOT NULL,
+            created_at    TEXT NOT NULL,
+            PRIMARY KEY (project_id, request_key)
+        );
         "#,
     )?;
     Ok(())
@@ -1411,30 +1395,295 @@ fn create_indexes(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_jobs_project_paper_backend ON jobs(project_id, paper_id, backend);
         CREATE INDEX IF NOT EXISTS idx_jobs_project_dedupe ON jobs(project_id, paper_id, backend, pdf_hash, version_key, status);
         CREATE INDEX IF NOT EXISTS idx_events_project_created_at ON events(project_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_enqueue_requests_job ON enqueue_requests(job_id);
         "#,
     )?;
     Ok(())
 }
 
-fn determine_versioning(conn: &Connection, new_job: &NewJob) -> Result<(u32, u32, String, String)> {
-    let version_key = new_job
-        .git_commit
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| new_job.pdf_hash.clone());
-    let version_source = if new_job
-        .git_commit
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-    {
-        "git_commit".to_string()
-    } else {
-        "pdf_hash".to_string()
-    };
+/// Statuses of a job that answers its review request: pending, in flight, or
+/// done. Failed, timed-out and cancelled jobs answer nothing, so they neither
+/// cover a new request nor hold a review round.
+const COVERING_STATUSES: [JobStatus; 5] = [
+    JobStatus::PendingApproval,
+    JobStatus::Queued,
+    JobStatus::Submitted,
+    JobStatus::Processing,
+    JobStatus::Completed,
+];
 
+fn enqueue_in_tx(conn: &Connection, request: &EnqueueRequest) -> Result<EnqueueOutcome> {
+    let new_job = &request.job;
+    let project_id = new_job.project_id.as_str();
+    let identity = new_job.review_identity();
+
+    if let Some(key) = request.request_key.as_deref() {
+        let bound: Option<(String, String)> = conn
+            .query_row(
+                "SELECT identity_json, job_id FROM enqueue_requests WHERE project_id = ?1 AND request_key = ?2",
+                params![project_id, key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((identity_json, job_id)) = bound {
+            let recorded: ReviewIdentity = serde_json::from_str(&identity_json)
+                .with_context(|| format!("corrupt identity recorded for request key {key:?}"))?;
+            let mismatches = recorded.mismatches(&identity);
+            if !mismatches.is_empty() {
+                return Err(EnqueueConflict {
+                    project_id: project_id.to_string(),
+                    request_key: key.to_string(),
+                    existing_job_id: job_id,
+                    mismatches,
+                }
+                .into());
+            }
+            let job = load_job(conn, &job_id)?.ok_or_else(|| {
+                anyhow!("request key {key:?} is bound to job {job_id}, which no longer exists")
+            })?;
+            return Ok(EnqueueOutcome::Existing {
+                job,
+                reason: ExistingReason::RequestReplay,
+            });
+        }
+    }
+
+    if request.mode == EnqueueMode::Deduplicate
+        && let Some(job) = find_covering_job(conn, project_id, &identity)?
+    {
+        bind_request_key(conn, request, &identity, &job.id)?;
+        insert_duplicate_skipped(
+            conn,
+            project_id,
+            &identity,
+            &job,
+            request.request_key.as_deref(),
+            &request.source,
+        )?;
+        return Ok(EnqueueOutcome::Existing {
+            job,
+            reason: ExistingReason::Covered,
+        });
+    }
+
+    let job = insert_job(conn, new_job, &identity)?;
+    bind_request_key(conn, request, &identity, &job.id)?;
+    insert_event(
+        conn,
+        Some(project_id),
+        Some(&job.id),
+        "job_enqueued",
+        &json!({
+            "source": request.source,
+            "enqueue_mode": request.mode.as_str(),
+            "request_key": request.request_key,
+            "status": job.status.as_str(),
+            "paper_id": job.paper_id,
+            "backend": job.backend,
+            "pdf_hash": job.pdf_hash,
+            "venue": job.venue,
+            "version_no": job.version_no,
+            "round_no": job.round_no,
+            "version_source": job.version_source,
+            "version_key": job.version_key,
+        }),
+    )?;
+    Ok(EnqueueOutcome::Created(job))
+}
+
+fn insert_duplicate_skipped(
+    conn: &Connection,
+    project_id: &str,
+    identity: &ReviewIdentity,
+    existing: &Job,
+    request_key: Option<&str>,
+    source: &str,
+) -> Result<()> {
+    insert_event(
+        conn,
+        Some(project_id),
+        None,
+        "duplicate_skipped",
+        &json!({
+            "project_id": project_id,
+            "paper_id": identity.paper_id,
+            "backend": identity.backend,
+            "pdf_hash": identity.pdf_hash,
+            "venue": identity.venue,
+            "version_no": existing.version_no,
+            "round_no": existing.round_no,
+            "version_source": identity.version_source.as_str(),
+            "version_key": identity.version_key,
+            "existing_job_id": existing.id,
+            "existing_job_status": existing.status.as_str(),
+            "request_key": request_key,
+            "source": source,
+        }),
+    )
+}
+
+fn bind_request_key(
+    conn: &Connection,
+    request: &EnqueueRequest,
+    identity: &ReviewIdentity,
+    job_id: &str,
+) -> Result<()> {
+    let Some(key) = request.request_key.as_deref() else {
+        return Ok(());
+    };
+    conn.execute(
+        r#"
+        INSERT INTO enqueue_requests(project_id, request_key, identity_json, job_id, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+        params![
+            request.job.project_id,
+            key,
+            serde_json::to_string(identity)?,
+            job_id,
+            to_rfc3339(Utc::now()),
+        ],
+    )?;
+    Ok(())
+}
+
+fn find_covering_job(
+    conn: &Connection,
+    project_id: &str,
+    identity: &ReviewIdentity,
+) -> Result<Option<Job>> {
+    // Rows written before venues were normalized may hold blanks or padding.
+    let [s1, s2, s3, s4, s5] = COVERING_STATUSES.map(JobStatus::as_str);
+    conn.query_row(
+        r#"
+        SELECT *
+        FROM jobs
+        WHERE project_id = ?1
+          AND paper_id = ?2
+          AND backend = ?3
+          AND pdf_hash = ?4
+          AND version_key = ?5
+          AND COALESCE(TRIM(venue), '') = ?6
+          AND status IN (?7, ?8, ?9, ?10, ?11)
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+        params![
+            project_id,
+            identity.paper_id,
+            identity.backend,
+            identity.pdf_hash,
+            identity.version_key,
+            identity.venue.as_deref().unwrap_or(""),
+            s1,
+            s2,
+            s3,
+            s4,
+            s5,
+        ],
+        map_job_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn insert_job(conn: &Connection, new_job: &NewJob, identity: &ReviewIdentity) -> Result<Job> {
+    let now = Utc::now();
+    let id = Uuid::new_v4().to_string();
+    let (version_no, round_no) = determine_versioning(
+        conn,
+        &new_job.project_id,
+        &new_job.paper_id,
+        &identity.version_key,
+    )?;
+
+    conn.execute(
+        r#"
+        INSERT INTO jobs (
+            id, project_id, paper_id, backend, pdf_path, pdf_hash, status, token, email, venue,
+            git_tag, git_commit, version_no, round_no, version_source, version_key,
+            attempt, started_at, next_poll_at, last_error, fallback_used, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, NULL, ?16, NULL, 0, ?17, ?17)
+        "#,
+        params![
+            id,
+            new_job.project_id,
+            new_job.paper_id,
+            new_job.backend,
+            new_job.pdf_path,
+            new_job.pdf_hash,
+            new_job.status.as_str(),
+            new_job.email,
+            identity.venue,
+            new_job.git_tag,
+            new_job.git_commit,
+            version_no as i64,
+            round_no as i64,
+            identity.version_source.as_str(),
+            identity.version_key,
+            new_job.next_poll_at.map(to_rfc3339),
+            to_rfc3339(now),
+        ],
+    )?;
+
+    load_job(conn, &id)?.ok_or_else(|| anyhow!("failed to load inserted job: {id}"))
+}
+
+/// Read through `conn` so rows written earlier in the same transaction are visible.
+fn load_job(conn: &Connection, job_id: &str) -> Result<Option<Job>> {
+    conn.query_row(
+        "SELECT * FROM jobs WHERE id = ?1",
+        params![job_id],
+        map_job_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn insert_event(
+    conn: &Connection,
+    project_id: Option<&str>,
+    job_id: Option<&str>,
+    event_type: &str,
+    payload: &Value,
+) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO events(project_id, job_id, event_type, payload_json, created_at)
+        VALUES (
+            COALESCE(?1, COALESCE((SELECT jobs.project_id FROM jobs WHERE jobs.id = ?2), '')),
+            ?2,
+            ?3,
+            ?4,
+            ?5
+        )
+        "#,
+        params![
+            project_id,
+            job_id,
+            event_type,
+            payload.to_string(),
+            to_rfc3339(Utc::now()),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Allocate `(version_no, round_no)` for a new job of `paper_id`.
+///
+/// The version stays the same while the version key matches the paper's most
+/// recent job and otherwise takes the next unused number. The round is one past
+/// the highest round still held by a pending, in-flight or completed job of
+/// that version, so every live review of a version has its own round, while a
+/// failed attempt gives its round back to the retry. Callers must hold the
+/// write lock (see [`Db::enqueue`]) so that concurrent jobs cannot be handed
+/// the same numbers.
+fn determine_versioning(
+    conn: &Connection,
+    project_id: &str,
+    paper_id: &str,
+    version_key: &str,
+) -> Result<(u32, u32)> {
     let latest: Option<(u32, String)> = conn
         .query_row(
             r#"
@@ -1444,48 +1693,38 @@ fn determine_versioning(conn: &Connection, new_job: &NewJob) -> Result<(u32, u32
             ORDER BY created_at DESC, id DESC
             LIMIT 1
             "#,
-            params![new_job.project_id, new_job.paper_id],
+            params![project_id, paper_id],
             |row| Ok((row.get::<_, i64>(0)? as u32, row.get::<_, String>(1)?)),
         )
         .optional()?;
 
-    let version_no = if let Some((latest_version_no, latest_version_key)) = latest {
-        if latest_version_key == version_key {
+    let version_no = match latest {
+        Some((latest_version_no, latest_version_key)) if latest_version_key == version_key => {
             latest_version_no
-        } else {
-            conn.query_row(
-                "SELECT COALESCE(MAX(version_no), 0) + 1 FROM jobs WHERE project_id = ?1 AND paper_id = ?2",
-                params![new_job.project_id, new_job.paper_id],
-                |row| Ok(row.get::<_, i64>(0)? as u32),
-            )?
         }
-    } else {
-        1
+        Some(_) => conn.query_row(
+            "SELECT COALESCE(MAX(version_no), 0) + 1 FROM jobs WHERE project_id = ?1 AND paper_id = ?2",
+            params![project_id, paper_id],
+            |row| Ok(row.get::<_, i64>(0)? as u32),
+        )?,
+        None => 1,
     };
 
-    let completed_round_max: Option<u32> = conn
-        .query_row(
-            r#"
-            SELECT MAX(round_no)
-            FROM jobs
-            WHERE project_id = ?1
-              AND paper_id = ?2
-              AND version_no = ?3
-              AND status = ?4
-            "#,
-            params![
-                new_job.project_id,
-                new_job.paper_id,
-                version_no as i64,
-                JobStatus::Completed.as_str()
-            ],
-            |row| Ok(row.get::<_, Option<i64>>(0)?.map(|value| value as u32)),
-        )
-        .optional()?
-        .flatten();
-    let round_no = completed_round_max.unwrap_or(0) + 1;
+    let [s1, s2, s3, s4, s5] = COVERING_STATUSES.map(JobStatus::as_str);
+    let round_no = conn.query_row(
+        r#"
+        SELECT COALESCE(MAX(round_no), 0) + 1
+        FROM jobs
+        WHERE project_id = ?1
+          AND paper_id = ?2
+          AND version_no = ?3
+          AND status IN (?4, ?5, ?6, ?7, ?8)
+        "#,
+        params![project_id, paper_id, version_no as i64, s1, s2, s3, s4, s5],
+        |row| Ok(row.get::<_, i64>(0)? as u32),
+    )?;
 
-    Ok((version_no, round_no, version_source, version_key))
+    Ok((version_no, round_no))
 }
 
 fn collect_rows<T, F>(rows: rusqlite::MappedRows<'_, F>) -> Result<Vec<T>>
@@ -1722,6 +1961,52 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("PRAGMA user_version must return a row");
         assert_eq!(version, SCHEMA_VERSION as i64);
+    }
+
+    /// A v1 database (everything but the request-key table) gains the table
+    /// and index on upgrade, keeps its jobs, and enqueues against them.
+    #[test]
+    fn ensure_schema_upgrades_v1_database_with_enqueue_requests() {
+        let tmp = tempdir().unwrap();
+        let db = Db::new(tmp.path());
+        db.ensure_schema().unwrap();
+        let legacy = db.create_job(&make_queued_job("proj", "paper")).unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute_batch("DROP TABLE enqueue_requests;").unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+
+        db.ensure_schema().unwrap();
+
+        let conn = db.connect().unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION as i64);
+        let index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_enqueue_requests_job'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
+        let outcome = db
+            .enqueue(&EnqueueRequest {
+                job: make_queued_job("proj", "paper"),
+                request_key: Some("after-upgrade".to_string()),
+                mode: EnqueueMode::Deduplicate,
+                source: "test".to_string(),
+            })
+            .unwrap();
+        match outcome {
+            EnqueueOutcome::Existing { job, reason } => {
+                assert_eq!(job.id, legacy.id);
+                assert_eq!(reason, ExistingReason::Covered);
+            }
+            other => panic!("legacy job should cover the request, got {other:?}"),
+        }
     }
 
     #[test]
