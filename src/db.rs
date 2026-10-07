@@ -13,13 +13,13 @@ use rusqlite::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PruneReport {
@@ -583,6 +583,31 @@ impl Db {
         Ok(())
     }
 
+    /// Pin a backfilled snapshot to a job created before snapshots existed.
+    pub fn set_job_snapshot(&self, job_id: &str, snapshot_path: &Path) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE jobs SET snapshot_path = ?1, updated_at = ?2 WHERE id = ?3",
+            params![
+                snapshot_path.to_string_lossy(),
+                to_rfc3339(Utc::now()),
+                job_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Hashes of every job row, across all projects. Snapshot directories are
+    /// keyed by hash and shared by all projects using this database, so any
+    /// remaining row keeps its snapshot alive (including legacy rows that may
+    /// still be backfilled).
+    pub fn list_job_pdf_hashes(&self) -> Result<HashSet<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare("SELECT DISTINCT pdf_hash FROM jobs")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
     pub fn mark_fallback_used(&self, job_id: &str) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
@@ -992,7 +1017,7 @@ impl Db {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, paper_id, backend, pdf_path, pdf_hash, status, token, email,
+            SELECT id, paper_id, backend, pdf_path, pdf_hash, snapshot_path, status, token, email,
                    venue, git_tag, git_commit, attempt, started_at, next_poll_at,
                    last_error, fallback_used, created_at, updated_at,
                    project_id, version_no, round_no, version_source, version_key
@@ -1239,6 +1264,7 @@ fn create_tables_if_missing(conn: &Connection) -> Result<()> {
             backend TEXT NOT NULL,
             pdf_path TEXT NOT NULL,
             pdf_hash TEXT NOT NULL,
+            snapshot_path TEXT,
             status TEXT NOT NULL,
             token TEXT,
             email TEXT NOT NULL,
@@ -1327,6 +1353,7 @@ fn migrate_columns(conn: &Connection) -> Result<()> {
     )?;
     ensure_column_exists(conn, "jobs", "version_key", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column_exists(conn, "events", "project_id", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column_exists(conn, "jobs", "snapshot_path", "TEXT")?;
 
     if column_exists(conn, "jobs", "version_no")? {
         conn.execute(
@@ -1600,18 +1627,19 @@ fn insert_job(conn: &Connection, new_job: &NewJob, identity: &ReviewIdentity) ->
     conn.execute(
         r#"
         INSERT INTO jobs (
-            id, project_id, paper_id, backend, pdf_path, pdf_hash, status, token, email, venue,
-            git_tag, git_commit, version_no, round_no, version_source, version_key,
+            id, project_id, paper_id, backend, pdf_path, pdf_hash, snapshot_path, status, token,
+            email, venue, git_tag, git_commit, version_no, round_no, version_source, version_key,
             attempt, started_at, next_poll_at, last_error, fallback_used, created_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, NULL, ?16, NULL, 0, ?17, ?17)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 0, NULL, ?17, NULL, 0, ?18, ?18)
         "#,
         params![
             id,
             new_job.project_id,
             new_job.paper_id,
             new_job.backend,
-            new_job.pdf_path,
-            new_job.pdf_hash,
+            new_job.pdf.pdf_path(),
+            new_job.pdf.pdf_hash(),
+            new_job.pdf.snapshot_path(),
             new_job.status.as_str(),
             new_job.email,
             identity.venue,
@@ -1768,6 +1796,7 @@ fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         backend: row.get("backend")?,
         pdf_path: row.get("pdf_path")?,
         pdf_hash: row.get("pdf_hash")?,
+        snapshot_path: row.get("snapshot_path")?,
         status,
         token: row.get("token")?,
         email: row.get("email")?,
@@ -1897,7 +1926,7 @@ fn conversion_error(message: String) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{JobStatus, NewJob};
+    use crate::model::{JobPdf, JobStatus, NewJob};
     use tempfile::tempdir;
 
     fn make_queued_job(project_id: &str, paper_id: &str) -> NewJob {
@@ -1905,8 +1934,10 @@ mod tests {
             project_id: project_id.to_string(),
             paper_id: paper_id.to_string(),
             backend: "stanford".to_string(),
-            pdf_path: "paper.pdf".to_string(),
-            pdf_hash: "abc123".to_string(),
+            pdf: JobPdf::Unpinned {
+                pdf_path: "paper.pdf".to_string(),
+                pdf_hash: "abc123".to_string(),
+            },
             status: JobStatus::Queued,
             email: "test@example.com".to_string(),
             venue: None,
@@ -1965,6 +1996,64 @@ mod tests {
 
     /// A v1 database (everything but the request-key table) gains the table
     /// and index on upgrade, keeps its jobs, and enqueues against them.
+    /// A v2 database (no `snapshot_path`) upgrades in place: existing rows
+    /// read back unpinned, and new rows can be pinned.
+    #[test]
+    fn ensure_schema_adds_snapshot_path_to_v2_database() {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("v2.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            create_tables_if_missing(&conn).unwrap();
+            conn.execute_batch(
+                r#"
+                ALTER TABLE jobs DROP COLUMN snapshot_path;
+                INSERT INTO jobs (id, project_id, paper_id, backend, pdf_path, pdf_hash, status, email, created_at, updated_at)
+                VALUES ('legacy', 'proj', 'paper', 'stanford', 'legacy/a.pdf', 'hash-a', 'QUEUED', 'a@example.com', '2025-02-01T00:00:00Z', '2025-02-01T00:00:00Z');
+                PRAGMA user_version = 2;
+                "#,
+            )
+            .unwrap();
+            assert!(!column_exists(&conn, "jobs", "snapshot_path").unwrap());
+        }
+
+        let db = Db::new_file(db_path);
+        db.ensure_schema().expect("v2 -> v3 migration");
+
+        let legacy = db.get_job("legacy").unwrap().expect("legacy row");
+        assert_eq!(legacy.snapshot_path, None);
+        assert_eq!(legacy.pdf_hash, "hash-a");
+
+        db.set_job_snapshot("legacy", Path::new("snapshots/hash-a/a.pdf"))
+            .unwrap();
+        let backfilled = db.get_job("legacy").unwrap().expect("legacy row");
+        assert_eq!(
+            backfilled.snapshot_path.as_deref(),
+            Some("snapshots/hash-a/a.pdf")
+        );
+
+        let pinned = db
+            .create_job(&NewJob {
+                pdf: JobPdf::Pinned(crate::submission_input::PreparedInput {
+                    source_path: "paper.pdf".into(),
+                    snapshot_path: "snapshots/hash-b/paper.pdf".into(),
+                    sha256: "hash-b".to_string(),
+                }),
+                ..make_queued_job("proj", "paper")
+            })
+            .unwrap();
+        assert_eq!(pinned.pdf_path, "paper.pdf");
+        assert_eq!(pinned.pdf_hash, "hash-b");
+        assert_eq!(
+            pinned.snapshot_path.as_deref(),
+            Some("snapshots/hash-b/paper.pdf")
+        );
+        assert_eq!(
+            db.list_job_pdf_hashes().unwrap(),
+            HashSet::from(["hash-a".to_string(), "hash-b".to_string()])
+        );
+    }
+
     #[test]
     fn ensure_schema_upgrades_v1_database_with_enqueue_requests() {
         let tmp = tempdir().unwrap();

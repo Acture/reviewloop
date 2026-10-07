@@ -315,7 +315,7 @@ mod tests {
     use crate::{
         config::Config,
         db::Db,
-        model::{JobStatus, NewJob},
+        model::{JobPdf, JobStatus, NewJob},
     };
 
     /// Create a fresh, schema-initialized in-memory DB for each test.
@@ -347,8 +347,10 @@ mod tests {
             project_id: project_id.to_string(),
             paper_id: paper_id.to_string(),
             backend: "test".to_string(),
-            pdf_path: "/dev/null".to_string(),
-            pdf_hash: "deadbeef".to_string(),
+            pdf: JobPdf::Unpinned {
+                pdf_path: "/dev/null".to_string(),
+                pdf_hash: "deadbeef".to_string(),
+            },
             status: JobStatus::Queued,
             email: "t@example.com".to_string(),
             venue: None,

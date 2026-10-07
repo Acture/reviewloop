@@ -3,9 +3,10 @@ use crate::{
     db::Db,
     email_account::resolve_submission_email,
     model::{
-        EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, Job, JobStatus, NewJob,
-        ReviewIdentity,
+        EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, Job, JobPdf, JobStatus,
+        NewJob, ReviewIdentity,
     },
+    submission_input::prepare_input,
     util::{git_in, sha256_file},
 };
 use anyhow::{Context, Result};
@@ -364,8 +365,10 @@ fn new_trigger_job(
         project_id: config.project_id.clone(),
         paper_id: paper.id.clone(),
         backend: paper.backend.clone(),
-        pdf_path: paper.pdf_path.clone(),
-        pdf_hash: sha256_file(Path::new(&paper.pdf_path))?,
+        pdf: JobPdf::Pinned(prepare_input(
+            &config.state_dir(),
+            Path::new(&paper.pdf_path),
+        )?),
         status,
         email: provider_email(config, &paper.backend)?,
         venue: provider_venue(config, paper),
@@ -489,6 +492,9 @@ mod tests {
         assert_eq!(job.status, JobStatus::Queued);
         assert_eq!(job.git_tag.as_deref(), Some(tag));
         assert_eq!(job.git_commit.as_deref(), Some("deadbeef"));
+        let snapshot = job.snapshot_path.as_deref().context("job must be pinned")?;
+        assert_eq!(crate::util::sha256_file(Path::new(snapshot))?, job.pdf_hash);
+        assert_eq!(fs::read(snapshot)?, fs::read(&config.papers[0].pdf_path)?);
         assert!(db.is_tag_seen(&format!("{}::{}", config.project_id, tag))?);
 
         let processed = process_tag_entry(&config, &db, tag, "deadbeef")?;

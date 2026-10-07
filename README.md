@@ -285,6 +285,8 @@ Output artifacts per completed job:
 - `<state_dir>/artifacts/<job-id>/review.md`
 - `<state_dir>/artifacts/<job-id>/meta.json`
 
+Each job also pins the exact PDF it uploads at `<state_dir>/snapshots/<sha256>/<file name>`, copied at enqueue; `meta.json` records it as `snapshot_path`.
+
 ## What Makes It Reliable
 
 - **State machine, not ad-hoc scripts**: jobs move through explicit statuses (`PENDING_APPROVAL`, `QUEUED`, `PROCESSING`, `COMPLETED`, etc.)

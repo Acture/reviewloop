@@ -895,6 +895,7 @@ mod tests {
             backend: "stanford".to_string(),
             pdf_path: "/tmp/x.pdf".to_string(),
             pdf_hash: format!("hash-{id}"),
+            snapshot_path: None,
             status,
             token: None,
             email: "a@b.c".to_string(),

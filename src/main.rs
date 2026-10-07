@@ -8,10 +8,11 @@ use reviewloop::config::{
 use reviewloop::db::Db;
 use reviewloop::email_account;
 use reviewloop::model::{
-    EnqueueMode, EnqueueOutcome, EnqueueRequest, EventRecord, ExistingReason, Job, JobStatus,
-    NewJob, StatusView,
+    EnqueueMode, EnqueueOutcome, EnqueueRequest, EventRecord, ExistingReason, Job, JobPdf,
+    JobStatus, NewJob, StatusView,
 };
 use reviewloop::oauth::{self, google::GoogleOauthProvider};
+use reviewloop::submission_input::prepare_input;
 use reviewloop::util::{compute_next_poll_at, sha256_file};
 use serde_json::{Value, json};
 use std::{
@@ -1962,7 +1963,7 @@ async fn cmd_submit(
         anyhow::bail!("pdf file not found: {}", pdf_path.display());
     }
 
-    let pdf_hash = sha256_file(pdf_path)?;
+    let input = prepare_input(&config.state_dir(), pdf_path)?;
     let (email, venue) = match paper.backend.as_str() {
         "stanford" => (
             email_account::resolve_submission_email(config, "stanford", None)
@@ -1977,8 +1978,7 @@ async fn cmd_submit(
             project_id: config.project_id.clone(),
             paper_id: paper.id.clone(),
             backend: paper.backend.clone(),
-            pdf_path: paper.pdf_path.clone(),
-            pdf_hash,
+            pdf: JobPdf::Pinned(input),
             status: JobStatus::Queued,
             email,
             venue,
@@ -2099,7 +2099,7 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
         anyhow::bail!("pdf file not found: {}", pdf_path.display());
     }
 
-    let pdf_hash = sha256_file(pdf_path)?;
+    let input = prepare_input(&config.state_dir(), pdf_path)?;
     let (email, venue) = match paper.backend.as_str() {
         "stanford" => (
             email_account::resolve_submission_email(&config, "stanford", None)
@@ -2116,8 +2116,7 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
                 project_id: config.project_id.clone(),
                 paper_id: paper.id.clone(),
                 backend: paper.backend.clone(),
-                pdf_path: paper.pdf_path.clone(),
-                pdf_hash,
+                pdf: JobPdf::Pinned(input),
                 status: JobStatus::Queued,
                 email,
                 venue,
@@ -2394,8 +2393,10 @@ async fn cmd_import_token(
                 project_id: config.project_id.clone(),
                 paper_id: paper.id.clone(),
                 backend: paper.backend.clone(),
-                pdf_path: paper.pdf_path.clone(),
-                pdf_hash,
+                pdf: JobPdf::Unpinned {
+                    pdf_path: paper.pdf_path.clone(),
+                    pdf_hash,
+                },
                 status: JobStatus::Processing,
                 email,
                 venue,
@@ -3553,7 +3554,7 @@ mod tests {
     use super::{load_effective_config_for_job, load_runtime_for_path, render_guardrail_notice};
     use reviewloop::config::Config;
     use reviewloop::db::Db;
-    use reviewloop::model::{JobStatus, NewJob};
+    use reviewloop::model::{JobPdf, JobStatus, NewJob};
     use std::{
         ffi::OsString,
         fs,
@@ -3651,8 +3652,10 @@ mod tests {
             project_id: project_id.to_string(),
             paper_id: "main".to_string(),
             backend: "stanford".to_string(),
-            pdf_path: "paper.pdf".to_string(),
-            pdf_hash: "abc123".to_string(),
+            pdf: JobPdf::Unpinned {
+                pdf_path: "paper.pdf".to_string(),
+                pdf_hash: "abc123".to_string(),
+            },
             status: JobStatus::Queued,
             email: "test@example.com".to_string(),
             venue: None,
@@ -3746,15 +3749,17 @@ mod tests {
     mod resolve_paper_id {
         use super::super::resolve_paper_id_to_job;
         use reviewloop::db::Db;
-        use reviewloop::model::{JobStatus, NewJob};
+        use reviewloop::model::{JobPdf, JobStatus, NewJob};
 
         fn new_job(project_id: &str, paper_id: &str, pdf_hash: &str, status: JobStatus) -> NewJob {
             NewJob {
                 project_id: project_id.to_string(),
                 paper_id: paper_id.to_string(),
                 backend: "stanford".to_string(),
-                pdf_path: "/test/paper.pdf".to_string(),
-                pdf_hash: pdf_hash.to_string(),
+                pdf: JobPdf::Unpinned {
+                    pdf_path: "/test/paper.pdf".to_string(),
+                    pdf_hash: pdf_hash.to_string(),
+                },
                 status,
                 email: "test@example.com".to_string(),
                 venue: None,
@@ -3957,7 +3962,7 @@ mod tests {
 
     mod daemon_status_db {
         use reviewloop::db::Db;
-        use reviewloop::model::{JobStatus, NewJob};
+        use reviewloop::model::{JobPdf, JobStatus, NewJob};
         use serde_json::Value;
 
         fn make_job(paper_id: &str, status: JobStatus, idx: u32) -> NewJob {
@@ -3965,8 +3970,10 @@ mod tests {
                 project_id: "proj".to_string(),
                 paper_id: paper_id.to_string(),
                 backend: "stanford".to_string(),
-                pdf_path: "/fake/paper.pdf".to_string(),
-                pdf_hash: format!("hash{idx}"),
+                pdf: JobPdf::Unpinned {
+                    pdf_path: "/fake/paper.pdf".to_string(),
+                    pdf_hash: format!("hash{idx}"),
+                },
                 status,
                 email: "test@example.com".to_string(),
                 venue: None,
@@ -4151,7 +4158,7 @@ mod tests {
         use chrono::Utc;
         use reviewloop::config::Config;
         use reviewloop::db::Db;
-        use reviewloop::model::{JobStatus, NewJob};
+        use reviewloop::model::{JobPdf, JobStatus, NewJob};
 
         fn make_config(project_id: &str) -> Config {
             Config {
@@ -4165,8 +4172,10 @@ mod tests {
                 project_id: project_id.to_string(),
                 paper_id: paper_id.to_string(),
                 backend: "stanford".to_string(),
-                pdf_path: "/test/paper.pdf".to_string(),
-                pdf_hash: "testhash".to_string(),
+                pdf: JobPdf::Unpinned {
+                    pdf_path: "/test/paper.pdf".to_string(),
+                    pdf_hash: "testhash".to_string(),
+                },
                 status: JobStatus::Processing,
                 email: "test@example.com".to_string(),
                 venue: None,
@@ -4234,8 +4243,10 @@ mod tests {
                     project_id: "proj1".to_string(),
                     paper_id: "paper1".to_string(),
                     backend: "stanford".to_string(),
-                    pdf_path: "/test/paper.pdf".to_string(),
-                    pdf_hash: "hash_done".to_string(),
+                    pdf: JobPdf::Unpinned {
+                        pdf_path: "/test/paper.pdf".to_string(),
+                        pdf_hash: "hash_done".to_string(),
+                    },
                     status: JobStatus::Completed,
                     email: "test@example.com".to_string(),
                     venue: None,
@@ -4356,7 +4367,7 @@ mod tests {
     mod status_json_shape {
         use super::super::{status_row_json, timeline_json};
         use reviewloop::db::Db;
-        use reviewloop::model::{JobStatus, NewJob};
+        use reviewloop::model::{JobPdf, JobStatus, NewJob};
         use serde_json::Value;
 
         fn make_db_with_jobs(project_id: &str, paper_ids: &[&str]) -> Db {
@@ -4367,8 +4378,10 @@ mod tests {
                     project_id: project_id.to_string(),
                     paper_id: paper_id.to_string(),
                     backend: "stanford".to_string(),
-                    pdf_path: "/test/paper.pdf".to_string(),
-                    pdf_hash: "abc123".to_string(),
+                    pdf: JobPdf::Unpinned {
+                        pdf_path: "/test/paper.pdf".to_string(),
+                        pdf_hash: "abc123".to_string(),
+                    },
                     status: JobStatus::Queued,
                     email: "test@example.com".to_string(),
                     venue: None,
@@ -4586,7 +4599,7 @@ mod tests {
         use crate::{Cli, Command};
         use clap::Parser;
         use reviewloop::db::Db;
-        use reviewloop::model::{JobStatus, NewJob};
+        use reviewloop::model::{JobPdf, JobStatus, NewJob};
 
         use super::super::resolve_paper_id_to_job;
 
@@ -4595,8 +4608,10 @@ mod tests {
                 project_id: "proj".to_string(),
                 paper_id: paper_id.to_string(),
                 backend: "stanford".to_string(),
-                pdf_path: "/test/paper.pdf".to_string(),
-                pdf_hash: pdf_hash.to_string(),
+                pdf: JobPdf::Unpinned {
+                    pdf_path: "/test/paper.pdf".to_string(),
+                    pdf_hash: pdf_hash.to_string(),
+                },
                 status,
                 email: "test@example.com".to_string(),
                 venue: None,
@@ -4723,7 +4738,7 @@ mod tests {
         use super::super::cmd_cancel;
         use reviewloop::config::Config;
         use reviewloop::db::Db;
-        use reviewloop::model::{JobStatus, NewJob};
+        use reviewloop::model::{JobPdf, JobStatus, NewJob};
 
         fn make_processing_job(project_id: &str, paper_id: &str) -> (Db, String) {
             let db = Db::new_in_memory(project_id).expect("in-memory DB");
@@ -4733,8 +4748,10 @@ mod tests {
                     project_id: project_id.to_string(),
                     paper_id: paper_id.to_string(),
                     backend: "stanford".to_string(),
-                    pdf_path: "/test/paper.pdf".to_string(),
-                    pdf_hash: "abc123".to_string(),
+                    pdf: JobPdf::Unpinned {
+                        pdf_path: "/test/paper.pdf".to_string(),
+                        pdf_hash: "abc123".to_string(),
+                    },
                     status: JobStatus::Processing,
                     email: "test@example.com".to_string(),
                     venue: None,
@@ -4848,7 +4865,7 @@ mod tests {
     /// Tests for U12 — status grouping by paper_id.
     mod status_grouping {
         use reviewloop::db::Db;
-        use reviewloop::model::{JobStatus, NewJob};
+        use reviewloop::model::{JobPdf, JobStatus, NewJob};
 
         fn make_db_multi(project_id: &str, paper_ids: &[&str], jobs_per_paper: usize) -> Db {
             let db = Db::new_in_memory(project_id).expect("in-memory DB");
@@ -4859,8 +4876,10 @@ mod tests {
                         project_id: project_id.to_string(),
                         paper_id: paper_id.to_string(),
                         backend: "stanford".to_string(),
-                        pdf_path: "/test/paper.pdf".to_string(),
-                        pdf_hash: "abc123".to_string(),
+                        pdf: JobPdf::Unpinned {
+                            pdf_path: "/test/paper.pdf".to_string(),
+                            pdf_hash: "abc123".to_string(),
+                        },
                         status: JobStatus::Queued,
                         email: "test@example.com".to_string(),
                         venue: None,
@@ -4924,8 +4943,10 @@ mod tests {
                     project_id: project_id.to_string(),
                     paper_id: "p1".to_string(),
                     backend: "stanford".to_string(),
-                    pdf_path: "/test/paper.pdf".to_string(),
-                    pdf_hash: "abc123".to_string(),
+                    pdf: JobPdf::Unpinned {
+                        pdf_path: "/test/paper.pdf".to_string(),
+                        pdf_hash: "abc123".to_string(),
+                    },
                     status,
                     email: "test@example.com".to_string(),
                     venue: None,

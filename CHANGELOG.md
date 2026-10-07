@@ -25,6 +25,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Git tag requests are idempotent** — a tag first processed on schema v2
   whose seen-tag record is lost (crash, retention pruning) returns its
   original job instead of enqueueing again, while that job is retained.
+- **Pinned PDF snapshots** — every job uploads an immutable copy of its PDF
+  taken at enqueue, stored owner-only (0o600 files, 0o700 directories on Unix)
+  at `<state_dir>/snapshots/<sha256>/<file name>`.
+  Editing or deleting the source, or repointing the paper in config, after
+  enqueue no longer changes what is submitted: the primary submit, the Node
+  fallback and the timeout page count all read the snapshot, re-verified
+  against the job's hash before every upload. `submission_input::prepare_input`
+  returns the `PreparedInput` that enqueue callers pass as `JobPdf::Pinned`.
+  Schema v3 adds `jobs.snapshot_path`; `meta.json` records it.
+- **Unpinned jobs are verified before submission.** A job created before
+  snapshots existed (or whose snapshot is lost) is snapshotted at submit time
+  only if its `pdf_path` still hashes to its `pdf_hash` (event
+  `snapshot_backfilled`). Otherwise it moves to `FAILED_NEEDS_MANUAL` with the
+  recovery commands in `last_error` (event `submit_blocked_input_mismatch`)
+  and nothing is uploaded.
 
 ### Changed
 
@@ -45,6 +60,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   actually created.
 - `submit` resolves the submitter email before checking for an existing job,
   so it now needs a configured email even when it only reports one.
+- A job's `pdf_hash` is the hash of its snapshot bytes, so coverage and
+  request identity compare what will actually be uploaded.
+- A queued job no longer needs its paper to stay in config: the snapshot is
+  self-contained and config only supplies a fallback venue. Previously a
+  removed paper failed every tick at submit.
+- Retention pruning also removes snapshot directories that no job row
+  references, after a one-hour grace; `retention_pruned` reports `snapshots`.
+  `paper remove --purge-history` leaves them to the next pruning cycle.
+- `submitted` / `submitted_via_fallback` events include `pdf_hash` and
+  `snapshot_path`.
 
 ### Fixed
 
