@@ -2,7 +2,7 @@ use crate::{
     config::Config,
     model::{
         EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, EventRecord, ExistingReason,
-        Job, JobStatus, NewJob, ReviewIdentity, StatusView,
+        Job, JobStatus, NewJob, RegisteredProject, ReviewIdentity, ReviewRecord, StatusView,
     },
     util::{parse_rfc3339, to_rfc3339},
 };
@@ -640,6 +640,92 @@ impl Db {
         Ok(())
     }
 
+    /// Read a job's stored review.
+    pub fn get_review(&self, job_id: &str) -> Result<Option<ReviewRecord>> {
+        let conn = self.connect()?;
+        let row = conn
+            .query_row(
+                "SELECT token, raw_json, completed_at FROM reviews WHERE job_id = ?1",
+                params![job_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((token, raw_json, completed_at)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(ReviewRecord {
+            token,
+            raw_json: serde_json::from_str(&raw_json)
+                .with_context(|| format!("invalid review JSON stored for job {job_id}"))?,
+            completed_at: parse_rfc3339(&completed_at)?,
+        }))
+    }
+
+    /// When the job's review was stored, if it has one.
+    pub fn review_completed_at(&self, job_id: &str) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.connect()?;
+        let completed_at: Option<String> = conn
+            .query_row(
+                "SELECT completed_at FROM reviews WHERE job_id = ?1",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        completed_at.map(|value| parse_rfc3339(&value)).transpose()
+    }
+
+    /// A project's jobs, newest first, each with the time its review was
+    /// stored. `active_only` keeps PENDING_APPROVAL, QUEUED, SUBMITTED and
+    /// PROCESSING jobs.
+    pub fn list_project_jobs(
+        &self,
+        project_id: &str,
+        paper_id: Option<&str>,
+        active_only: bool,
+        limit: usize,
+    ) -> Result<Vec<(Job, Option<DateTime<Utc>>)>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT j.*, r.completed_at AS review_completed_at
+            FROM jobs j
+            LEFT JOIN reviews r ON r.job_id = j.id
+            WHERE j.project_id = ?1
+              AND (?2 IS NULL OR j.paper_id = ?2)
+              AND (?3 = 0 OR j.status IN (?4, ?5, ?6, ?7))
+            ORDER BY j.created_at DESC, j.id DESC
+            LIMIT ?8
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                paper_id,
+                active_only,
+                JobStatus::PendingApproval.as_str(),
+                JobStatus::Queued.as_str(),
+                JobStatus::Submitted.as_str(),
+                JobStatus::Processing.as_str(),
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            ],
+            |row| {
+                let review_completed_at = row
+                    .get::<_, Option<String>>("review_completed_at")?
+                    .map(|value| parse_rfc3339(&value))
+                    .transpose()
+                    .map_err(|e| conversion_error(e.to_string()))?;
+                Ok((map_job_row(row)?, review_completed_at))
+            },
+        )?;
+        collect_rows(rows)
+    }
+
     pub fn add_event(
         &self,
         project_id: Option<&str>,
@@ -1102,6 +1188,24 @@ impl Db {
             )
             .optional()?;
         Ok(path.map(PathBuf::from))
+    }
+
+    /// Every registered project, ordered by project_id.
+    pub fn list_registered_projects(&self) -> Result<Vec<RegisteredProject>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT project_id, config_path, last_seen_at FROM projects ORDER BY project_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let last_seen_at: String = row.get(2)?;
+            Ok(RegisteredProject {
+                project_id: row.get(0)?,
+                config_path: PathBuf::from(row.get::<_, String>(1)?),
+                last_seen_at: parse_rfc3339(&last_seen_at)
+                    .map_err(|e| conversion_error(e.to_string()))?,
+            })
+        })?;
+        collect_rows(rows)
     }
 
     /// Remove a stale registry entry. Called when a registered path no

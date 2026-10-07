@@ -43,6 +43,17 @@ impl JobStatus {
         }
     }
 
+    /// Completed, Failed, FailedNeedsManual and Timeout end a job.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            JobStatus::Completed
+                | JobStatus::Failed
+                | JobStatus::FailedNeedsManual
+                | JobStatus::Timeout
+        )
+    }
+
     /// Returns true if a job in `self` is permitted to move to `to`.
     ///
     /// The state machine is intentionally narrow:
@@ -482,4 +493,23 @@ pub struct EventRecord {
     pub event_type: String,
     pub payload: Value,
     pub created_at: DateTime<Utc>,
+}
+
+/// A stored review, read through `Db::get_review`. `token` is the provider
+/// token the review was fetched with, kept so callers can redact it; it is
+/// not necessarily the job's current token.
+#[derive(Debug, Clone)]
+pub struct ReviewRecord {
+    pub token: String,
+    pub raw_json: Value,
+    pub completed_at: DateTime<Utc>,
+}
+
+/// One row of the project registry (`projects` table): where the CLI last
+/// found a project's `reviewloop.toml`.
+#[derive(Debug, Clone)]
+pub struct RegisteredProject {
+    pub project_id: String,
+    pub config_path: std::path::PathBuf,
+    pub last_seen_at: DateTime<Utc>,
 }
