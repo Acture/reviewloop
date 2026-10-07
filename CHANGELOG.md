@@ -26,7 +26,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   whose seen-tag record is lost (crash, retention pruning) returns its
   original job instead of enqueueing again, while that job is retained.
 - **Pinned PDF snapshots** — every job uploads an immutable copy of its PDF
-  taken at enqueue, stored at `<state_dir>/snapshots/<sha256>/<file name>`.
+  taken at enqueue, stored owner-only (0o600 files, 0o700 directories on Unix)
+  at `<state_dir>/snapshots/<sha256>/<file name>`.
   Editing or deleting the source, or repointing the paper in config, after
   enqueue no longer changes what is submitted: the primary submit, the Node
   fallback and the timeout page count all read the snapshot, re-verified

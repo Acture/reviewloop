@@ -64,7 +64,7 @@ pub fn prepare_input(state_dir: &Path, source: &Path) -> Result<PreparedInput> {
         .with_context(|| format!("PDF path has no file name: {}", source.display()))?;
     let root = snapshots_root(state_dir);
     let staging_dir = root.join(STAGING_DIR);
-    fs::create_dir_all(&staging_dir)
+    create_private_dir(&staging_dir)
         .with_context(|| format!("failed to create {}", staging_dir.display()))?;
 
     let staged = staging_dir.join(format!("{}.part", Uuid::new_v4()));
@@ -78,7 +78,7 @@ pub fn prepare_input(state_dir: &Path, source: &Path) -> Result<PreparedInput> {
     };
 
     let snapshot_dir = root.join(&sha256);
-    fs::create_dir_all(&snapshot_dir)
+    create_private_dir(&snapshot_dir)
         .with_context(|| format!("failed to create {}", snapshot_dir.display()))?;
     let snapshot_path = snapshot_dir.join(file_name);
 
@@ -114,10 +114,36 @@ pub fn prepare_input(state_dir: &Path, source: &Path) -> Result<PreparedInput> {
     })
 }
 
+// Snapshots are unpublished manuscripts: keep them owner-only (Unix), like
+// the database and config files.
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(path)
+}
+
+fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut options = File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 fn copy_and_hash(source: &Path, dest: &Path) -> Result<String> {
     let mut reader =
         File::open(source).with_context(|| format!("failed to open PDF: {}", source.display()))?;
-    let mut writer = File::create_new(dest)
+    let mut writer = create_private_file(dest)
         .with_context(|| format!("failed to create staging file: {}", dest.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -333,6 +359,25 @@ mod tests {
         assert_eq!(fs::read(&input.snapshot_path)?, ORIGINAL);
         let staging = snapshots_root(tmp.path()).join(STAGING_DIR);
         assert_eq!(fs::read_dir(staging)?.count(), 0, "staging must be empty");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshots_are_owner_only() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir()?;
+        let source = tmp.path().join("main.pdf");
+        fs::write(&source, ORIGINAL)?;
+
+        let input = prepare_input(tmp.path(), &source)?;
+
+        let mode =
+            |path: &Path| -> Result<u32> { Ok(fs::metadata(path)?.permissions().mode() & 0o777) };
+        assert_eq!(mode(&input.snapshot_path)?, 0o600);
+        assert_eq!(mode(input.snapshot_path.parent().unwrap())?, 0o700);
+        assert_eq!(mode(&snapshots_root(tmp.path()))?, 0o700);
+        assert_eq!(mode(&snapshots_root(tmp.path()).join(STAGING_DIR))?, 0o700);
         Ok(())
     }
 
