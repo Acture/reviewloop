@@ -226,7 +226,7 @@ reviewloop daemon run --panel false
 reviewloop daemon install [--start true]
 reviewloop daemon uninstall
 reviewloop daemon status
-reviewloop submit --paper-id main [--force]
+reviewloop submit --paper-id main [--force] [--request-key <key>]
 reviewloop approve --job-id <job-id>
 reviewloop import-token --paper-id main --token <token> [--source email]
 reviewloop check [--job-id <job-id> | --paper-id <paper-id>] [--all-processing]
@@ -242,6 +242,16 @@ reviewloop email switch --account <account-id-or-email>
 reviewloop email logout [--account <account-id-or-email>]
 reviewloop self-update [--method auto|brew|cargo] [--yes] [--dry-run]
 ```
+
+`submit` does not enqueue a second job when one that is pending, in flight or
+completed already covers the same manuscript bytes, backend, venue and version
+(the git commit for tag-triggered jobs, otherwise the manuscript hash); it
+prints that job instead. `--force` asks for a new review round regardless.
+`--request-key <key>` makes the request idempotent: repeating it with the same
+key returns the job it first resolved to, even after that job has finished
+(until retention prunes it), and reusing the key for a different manuscript or
+venue fails with a conflict naming the existing job. Use a new key for each
+new review round.
 
 `self-update` only replaces the executable. It does not delete:
 - global config (`~/.config/reviewloop/config.toml`)

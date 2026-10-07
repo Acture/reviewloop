@@ -3,12 +3,14 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use reviewloop::artifact::write_review_artifacts;
 use reviewloop::config::{
-    Config, LegacyConfig, PaperConfig, PaperConfigFile, ProjectConfigFile,
-    default_project_config_path,
+    Config, LegacyConfig, PaperConfigFile, ProjectConfigFile, default_project_config_path,
 };
 use reviewloop::db::Db;
 use reviewloop::email_account;
-use reviewloop::model::{EventRecord, Job, JobStatus, NewJob, StatusView};
+use reviewloop::model::{
+    EnqueueMode, EnqueueOutcome, EnqueueRequest, EventRecord, ExistingReason, Job, JobStatus,
+    NewJob, StatusView,
+};
 use reviewloop::oauth::{self, google::GoogleOauthProvider};
 use reviewloop::util::{compute_next_poll_at, sha256_file};
 use serde_json::{Value, json};
@@ -55,13 +57,23 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    /// Enqueue a paper for submission. Use --force to bypass dedupe and clear
-    /// any pending cooldown for prior siblings.
+    /// Enqueue a paper for submission. A pending, in-flight or completed job
+    /// for the same manuscript bytes, backend, venue and version is reported
+    /// instead of submitting again.
+    /// Use --force to start a new review round anyway and clear any pending
+    /// cooldown for prior siblings.
     Submit {
         #[arg(long)]
         paper_id: String,
         #[arg(long)]
         force: bool,
+        /// Idempotency key for this request. Repeating the command with the
+        /// same key returns the job it first resolved to, even after that job
+        /// finished (until retention prunes it), instead of enqueueing again;
+        /// using the key for different content is an error. A new review
+        /// round needs a new key.
+        #[arg(long, value_name = "KEY")]
+        request_key: Option<String>,
     },
     /// Mark a job as approved so the daemon can proceed to submission.
     Approve {
@@ -415,7 +427,7 @@ async fn run() -> Result<()> {
                     })?;
                     if should_submit {
                         let (config, db) = load_runtime(Some(write_path.as_path()), false, true)?;
-                        cmd_submit(&config, &db, &paper_id, false).await?;
+                        cmd_submit(&config, &db, &paper_id, false, None).await?;
                     }
                     Ok(())
                 }
@@ -461,9 +473,13 @@ async fn run() -> Result<()> {
                 }
             }
         },
-        Command::Submit { paper_id, force } => {
+        Command::Submit {
+            paper_id,
+            force,
+            request_key,
+        } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
-            cmd_submit(&config, &db, &paper_id, force).await
+            cmd_submit(&config, &db, &paper_id, force, request_key.as_deref()).await
         }
         Command::Approve { job_ref } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
@@ -1896,12 +1912,19 @@ fn print_guardrail_warnings(config: &Config) {
     }
 }
 
-/// When `submit --force` is used, clear `next_poll_at` and reset `attempt = 0`
-/// for any existing QUEUED / SUBMITTED / PROCESSING job for the same paper so
-/// the worker picks them up immediately instead of waiting out a cooldown.
-fn clear_sibling_job_cooldowns(config: &Config, db: &Db, paper_id: &str) -> Result<()> {
+/// After `submit --force` (or `run`) enqueues `new_job_id`, clear
+/// `next_poll_at` and reset `attempt = 0` for every other QUEUED / SUBMITTED /
+/// PROCESSING job for the same paper so the worker picks them up immediately
+/// instead of waiting out a cooldown. Only called for a newly created job, so
+/// replaying a request never clears cooldowns.
+fn clear_sibling_job_cooldowns(
+    config: &Config,
+    db: &Db,
+    paper_id: &str,
+    new_job_id: &str,
+) -> Result<()> {
     let siblings = db.list_active_jobs_for_paper(&config.project_id, paper_id)?;
-    for s in siblings {
+    for s in siblings.into_iter().filter(|s| s.id != new_job_id) {
         if matches!(
             s.status,
             JobStatus::Processing | JobStatus::Submitted | JobStatus::Queued
@@ -1922,7 +1945,13 @@ fn clear_sibling_job_cooldowns(config: &Config, db: &Db, paper_id: &str) -> Resu
     Ok(())
 }
 
-async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Result<()> {
+async fn cmd_submit(
+    config: &Config,
+    db: &Db,
+    paper_id: &str,
+    force: bool,
+    request_key: Option<&str>,
+) -> Result<()> {
     ensure_project_context(config)?;
     let paper = config
         .find_paper(paper_id)
@@ -1934,39 +1963,6 @@ async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Re
     }
 
     let pdf_hash = sha256_file(pdf_path)?;
-    let (version_source, version_key) = version_identity(None, &pdf_hash);
-    if !force
-        && let Some(existing) = db.find_duplicate_covering_job(
-            &config.project_id,
-            &paper.id,
-            &paper.backend,
-            &pdf_hash,
-            &version_key,
-        )?
-    {
-        record_duplicate_skip(DuplicateSkipContext {
-            config,
-            db,
-            paper,
-            pdf_hash: &pdf_hash,
-            version_source: &version_source,
-            version_key: &version_key,
-            existing: &existing,
-            source: "manual_submit",
-        })?;
-        println!(
-            "Skipped submit: existing active/completed job already covers project_id={} paper_id={} backend={} hash={} version={} existing_job_id={} status={}",
-            config.project_id,
-            paper.id,
-            paper.backend,
-            pdf_hash,
-            existing.version_no,
-            existing.id,
-            existing.status.as_str()
-        );
-        return Ok(());
-    }
-
     let (email, venue) = match paper.backend.as_str() {
         "stanford" => (
             email_account::resolve_submission_email(config, "stanford", None)
@@ -1976,30 +1972,53 @@ async fn cmd_submit(config: &Config, db: &Db, paper_id: &str, force: bool) -> Re
         _ => (String::new(), config.venue_for(paper)),
     };
 
-    if force {
-        clear_sibling_job_cooldowns(config, db, paper_id)?;
-    }
-
-    let job = db.create_job(&NewJob {
-        project_id: config.project_id.clone(),
-        paper_id: paper.id.clone(),
-        backend: paper.backend.clone(),
-        pdf_path: paper.pdf_path.clone(),
-        pdf_hash,
-        status: JobStatus::Queued,
-        email,
-        venue,
-        git_tag: None,
-        git_commit: None,
-        next_poll_at: None,
+    let outcome = db.enqueue(&EnqueueRequest {
+        job: NewJob {
+            project_id: config.project_id.clone(),
+            paper_id: paper.id.clone(),
+            backend: paper.backend.clone(),
+            pdf_path: paper.pdf_path.clone(),
+            pdf_hash,
+            status: JobStatus::Queued,
+            email,
+            venue,
+            git_tag: None,
+            git_commit: None,
+            next_poll_at: None,
+        },
+        request_key: request_key.map(str::to_string),
+        mode: if force {
+            EnqueueMode::NewRound
+        } else {
+            EnqueueMode::Deduplicate
+        },
+        source: "manual_submit".to_string(),
     })?;
+    let job = match outcome {
+        EnqueueOutcome::Created(job) => job,
+        EnqueueOutcome::Existing { job, reason } => {
+            let why = match reason {
+                ExistingReason::RequestReplay => "request key already used for",
+                ExistingReason::Covered => "already covered by",
+            };
+            println!(
+                "Skipped submit: {why} existing job {} (project_id={} paper_id={} backend={} hash={} version={} round={} status={})",
+                job.id,
+                job.project_id,
+                job.paper_id,
+                job.backend,
+                job.pdf_hash,
+                job.version_no,
+                job.round_no,
+                job.status.as_str()
+            );
+            return Ok(());
+        }
+    };
 
-    db.add_event(
-        None,
-        Some(&job.id),
-        "manual_submit_requested",
-        json!({ "paper_id": paper_id, "force": force }),
-    )?;
+    if force {
+        clear_sibling_job_cooldowns(config, db, paper_id, &job.id)?;
+    }
 
     reviewloop::worker::submit_job(config, db, &job.id).await?;
 
@@ -2090,29 +2109,28 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
         _ => (String::new(), config.venue_for(paper)),
     };
 
-    // Force: clear cooldowns on any sibling jobs.
-    clear_sibling_job_cooldowns(&config, &db, &paper_id)?;
-
-    let job = db.create_job(&NewJob {
-        project_id: config.project_id.clone(),
-        paper_id: paper.id.clone(),
-        backend: paper.backend.clone(),
-        pdf_path: paper.pdf_path.clone(),
-        pdf_hash,
-        status: JobStatus::Queued,
-        email,
-        venue,
-        git_tag: None,
-        git_commit: None,
-        next_poll_at: None,
-    })?;
-
-    db.add_event(
-        None,
-        Some(&job.id),
-        "run_submit_requested",
-        json!({ "paper_id": paper_id, "force": true }),
-    )?;
+    // `run` always asks for a fresh review, like `submit --force`.
+    let job = db
+        .enqueue(&EnqueueRequest {
+            job: NewJob {
+                project_id: config.project_id.clone(),
+                paper_id: paper.id.clone(),
+                backend: paper.backend.clone(),
+                pdf_path: paper.pdf_path.clone(),
+                pdf_hash,
+                status: JobStatus::Queued,
+                email,
+                venue,
+                git_tag: None,
+                git_commit: None,
+                next_poll_at: None,
+            },
+            request_key: None,
+            mode: EnqueueMode::NewRound,
+            source: "run".to_string(),
+        })?
+        .into_job();
+    clear_sibling_job_cooldowns(&config, &db, &paper_id, &job.id)?;
 
     // Submit immediately (equivalent to cmd_submit with force=true).
     reviewloop::worker::submit_job(&config, &db, &job.id).await?;
@@ -2368,19 +2386,28 @@ async fn cmd_import_token(
         _ => (String::new(), config.venue_for(paper)),
     };
 
-    let job = db.create_job(&NewJob {
-        project_id: config.project_id.clone(),
-        paper_id: paper.id.clone(),
-        backend: paper.backend.clone(),
-        pdf_path: paper.pdf_path.clone(),
-        pdf_hash,
-        status: JobStatus::Processing,
-        email,
-        venue,
-        git_tag: None,
-        git_commit: None,
-        next_poll_at: Some(Utc::now()),
-    })?;
+    // The token belongs to a submission made elsewhere, so it gets its own job
+    // even when an earlier one covers the same manuscript.
+    let job = db
+        .enqueue(&EnqueueRequest {
+            job: NewJob {
+                project_id: config.project_id.clone(),
+                paper_id: paper.id.clone(),
+                backend: paper.backend.clone(),
+                pdf_path: paper.pdf_path.clone(),
+                pdf_hash,
+                status: JobStatus::Processing,
+                email,
+                venue,
+                git_tag: None,
+                git_commit: None,
+                next_poll_at: Some(Utc::now()),
+            },
+            request_key: None,
+            mode: EnqueueMode::NewRound,
+            source: "import_token".to_string(),
+        })?
+        .into_job();
     db.attach_token_to_job(&job.id, token, Utc::now())?;
 
     db.add_event(
@@ -2955,56 +2982,6 @@ fn resolve_paper_id_to_job(
             )
         }
     }
-}
-
-fn version_identity(git_commit: Option<&str>, pdf_hash: &str) -> (String, String) {
-    if let Some(commit) = git_commit.map(str::trim).filter(|value| !value.is_empty()) {
-        ("git_commit".to_string(), commit.to_string())
-    } else {
-        ("pdf_hash".to_string(), pdf_hash.to_string())
-    }
-}
-
-struct DuplicateSkipContext<'a> {
-    config: &'a Config,
-    db: &'a Db,
-    paper: &'a PaperConfig,
-    pdf_hash: &'a str,
-    version_source: &'a str,
-    version_key: &'a str,
-    existing: &'a Job,
-    source: &'a str,
-}
-
-fn record_duplicate_skip(ctx: DuplicateSkipContext<'_>) -> Result<()> {
-    warn!(
-        project_id = %ctx.config.project_id,
-        paper_id = %ctx.paper.id,
-        backend = %ctx.paper.backend,
-        source = %ctx.source,
-        existing_job_id = %ctx.existing.id,
-        existing_status = %ctx.existing.status.as_str(),
-        "skipped duplicate submit"
-    );
-    ctx.db.add_event(
-        Some(&ctx.config.project_id),
-        None,
-        "duplicate_skipped",
-        json!({
-            "project_id": ctx.config.project_id,
-            "paper_id": ctx.paper.id,
-            "backend": ctx.paper.backend,
-            "pdf_hash": ctx.pdf_hash,
-            "version_no": ctx.existing.version_no,
-            "round_no": ctx.existing.round_no,
-            "version_source": ctx.version_source,
-            "version_key": ctx.version_key,
-            "existing_job_id": ctx.existing.id,
-            "existing_job_status": ctx.existing.status.as_str(),
-            "source": ctx.source
-        }),
-    )?;
-    Ok(())
 }
 
 fn maybe_record_manual_poll_override(
@@ -4224,7 +4201,7 @@ mod tests {
             assert_eq!(before.attempt, 3);
             assert!(before.next_poll_at.is_some());
 
-            clear_sibling_job_cooldowns(&config, &db, "paper1").unwrap();
+            clear_sibling_job_cooldowns(&config, &db, "paper1", "no-new-job").unwrap();
 
             let after = db.get_job(&stuck.id).unwrap().unwrap();
             assert_eq!(after.attempt, 0, "attempt should be reset to 0");
@@ -4242,7 +4219,7 @@ mod tests {
             let db = Db::new_in_memory("force_noop").unwrap();
             db.ensure_schema().unwrap();
             let config = make_config("proj1");
-            clear_sibling_job_cooldowns(&config, &db, "paper1").unwrap();
+            clear_sibling_job_cooldowns(&config, &db, "paper1", "no-new-job").unwrap();
         }
 
         /// COMPLETED jobs are not in scope for cooldown clearing.
@@ -4268,7 +4245,7 @@ mod tests {
                 })
                 .unwrap();
 
-            clear_sibling_job_cooldowns(&config, &db, "paper1").unwrap();
+            clear_sibling_job_cooldowns(&config, &db, "paper1", "no-new-job").unwrap();
 
             let after = db.get_job(&completed.id).unwrap().unwrap();
             assert_eq!(after.status, JobStatus::Completed);

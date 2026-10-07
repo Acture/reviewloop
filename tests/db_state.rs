@@ -3,7 +3,7 @@ use chrono::{Duration, Utc};
 use reviewloop::{
     config::{Config, PaperConfig},
     db::Db,
-    model::{Job, JobStatus, NewJob},
+    model::{Job, JobStatus, NewJob, ReviewIdentity},
     util::sha256_file,
     worker,
 };
@@ -69,6 +69,17 @@ impl DbTestContext {
         })
     }
 
+    fn identity(&self, hash: &str) -> ReviewIdentity {
+        let paper = &self.config.papers[0];
+        ReviewIdentity::new(
+            &paper.id,
+            &paper.backend,
+            hash,
+            self.config.providers.stanford.venue.as_deref(),
+            None,
+        )
+    }
+
     fn create_job(&self, status: JobStatus) -> Result<Job> {
         let paper = &self.config.papers[0];
         let hash = sha256_file(Path::new(&paper.pdf_path))?;
@@ -105,26 +116,14 @@ fn duplicate_guard_ignores_failed_jobs() -> Result<()> {
     ctx.create_job_with_hash(JobStatus::Failed, "same-hash")?;
     assert!(
         ctx.db
-            .find_duplicate_covering_job(
-                &ctx.config.project_id,
-                "main",
-                "stanford",
-                "same-hash",
-                "same-hash"
-            )?
+            .find_duplicate_covering_job(&ctx.config.project_id, &ctx.identity("same-hash"))?
             .is_none()
     );
 
     ctx.create_job_with_hash(JobStatus::Queued, "same-hash")?;
     assert!(
         ctx.db
-            .find_duplicate_covering_job(
-                &ctx.config.project_id,
-                "main",
-                "stanford",
-                "same-hash",
-                "same-hash"
-            )?
+            .find_duplicate_covering_job(&ctx.config.project_id, &ctx.identity("same-hash"))?
             .is_some()
     );
 
@@ -138,13 +137,7 @@ fn duplicate_guard_is_project_scoped() -> Result<()> {
     ctx.create_job_with_hash(JobStatus::Queued, "same-hash")?;
     assert!(
         ctx.db
-            .find_duplicate_covering_job(
-                "other-project",
-                "main",
-                "stanford",
-                "same-hash",
-                "same-hash"
-            )?
+            .find_duplicate_covering_job("other-project", &ctx.identity("same-hash"))?
             .is_none()
     );
 
@@ -152,7 +145,10 @@ fn duplicate_guard_is_project_scoped() -> Result<()> {
 }
 
 #[test]
-fn version_and_round_progress_by_project_and_completed_rounds() -> Result<()> {
+/// Rounds count the live (pending, in-flight or completed) reviews of a
+/// version: a second job for the same version while the first is still queued
+/// is a separate review and gets the next round.
+fn version_and_round_progress_by_project_and_live_rounds() -> Result<()> {
     let ctx = DbTestContext::new()?;
     let paper = &ctx.config.papers[0];
 
@@ -188,7 +184,7 @@ fn version_and_round_progress_by_project_and_completed_rounds() -> Result<()> {
         next_poll_at: None,
     })?;
     assert_eq!(parallel.version_no, 1);
-    assert_eq!(parallel.round_no, 1);
+    assert_eq!(parallel.round_no, 2);
 
     // Shortcutting to Completed directly from Queued (test helper only;
     // the real worker goes Queued -> Processing -> Completed).
@@ -214,7 +210,7 @@ fn version_and_round_progress_by_project_and_completed_rounds() -> Result<()> {
         next_poll_at: None,
     })?;
     assert_eq!(next_round.version_no, 1);
-    assert_eq!(next_round.round_no, 2);
+    assert_eq!(next_round.round_no, 3);
 
     let new_version = ctx.db.create_job(&NewJob {
         project_id: ctx.config.project_id.clone(),
@@ -248,7 +244,7 @@ fn version_and_round_progress_by_project_and_completed_rounds() -> Result<()> {
         next_poll_at: None,
     })?;
     assert_eq!(same_version.version_no, 2);
-    assert_eq!(same_version.round_no, 1);
+    assert_eq!(same_version.round_no, 2);
 
     let other_project = ctx.db.create_job(&NewJob {
         project_id: "other-project".to_string(),

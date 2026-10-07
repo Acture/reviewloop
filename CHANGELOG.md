@@ -6,6 +6,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Atomic, idempotent enqueue** — `Db::enqueue` resolves a request in one
+  `BEGIN IMMEDIATE` transaction: request-key lookup, coverage check,
+  version/round allocation, job insert, key binding and the `job_enqueued`
+  event. Concurrent requests from separate connections or processes can no
+  longer both pass the duplicate check. It returns `Created` or `Existing`
+  (`RequestReplay` / `Covered`) with the job, and a typed `EnqueueConflict`
+  listing the differing fields when a key is reused for different content.
+  Schema v2 adds the `enqueue_requests` table; existing databases upgrade in
+  place.
+- **`submit --request-key <key>`** — replaying a key returns the job it first
+  resolved to, even once finished (until retention prunes that job), without
+  starting a new round or clearing any cooldown.
+- **Git tag requests are idempotent** — a tag first processed on schema v2
+  whose seen-tag record is lost (crash, retention pruning) returns its
+  original job instead of enqueueing again, while that job is retained.
+
+### Changed
+
+- **Coverage includes the venue.** A job covers a request with the same
+  manuscript hash, backend, venue and version key; the same manuscript for a
+  different venue is a new review. Venues are compared trimmed, blank meaning
+  unset.
+- **Round numbers count live reviews.** A new job takes one past the highest
+  round of any pending, in-flight or completed job of the same version
+  (previously: completed jobs only), so an explicit re-review started while
+  another is in flight no longer shares its round. Failed attempts still give
+  their round back.
+- `submit`, `run`, `import-token` and both triggers record a single
+  `job_enqueued` event (`source` says which, `enqueue_mode` whether it was a
+  deduplicating request or an explicit new round) instead of
+  `manual_submit_requested` / `run_submit_requested`.
+- `submit --force` / `run` clear sibling cooldowns only after a job was
+  actually created.
+- `submit` resolves the submitter email before checking for an existing job,
+  so it now needs a configured email even when it only reports one.
+
+### Fixed
+
+- Git commands for a project repository ignore `GIT_DIR` / `GIT_INDEX_FILE`
+  inherited from the environment. Run from a git hook (the pre-commit quality
+  gate), the git trigger and its tests used to act on the repository being
+  committed instead of the configured one.
+
 ## [0.2.1] — 2026-05-06
 
 Non-blocking polish + defense-in-depth wave from eval3.
