@@ -1,3 +1,4 @@
+pub mod application;
 pub mod artifact;
 pub mod backend;
 pub mod config;

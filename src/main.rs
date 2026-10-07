@@ -1,6 +1,10 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use reviewloop::application::{
+    Approval, CancelRequest, Eligibility, JobRef, OpError, RequestOrigin, RetryAction,
+    RetryRequest, ReviewOps, ReviewRequest, require_project,
+};
 use reviewloop::artifact::write_review_artifacts;
 use reviewloop::config::{
     Config, LegacyConfig, PaperConfigFile, ProjectConfigFile, default_project_config_path,
@@ -8,11 +12,10 @@ use reviewloop::config::{
 use reviewloop::db::Db;
 use reviewloop::email_account;
 use reviewloop::model::{
-    EnqueueMode, EnqueueOutcome, EnqueueRequest, EventRecord, ExistingReason, Job, JobStatus,
-    NewJob, StatusView,
+    EnqueueMode, EnqueueRequest, EventRecord, ExistingReason, JobStatus, NewJob, StatusView,
 };
 use reviewloop::oauth::{self, google::GoogleOauthProvider};
-use reviewloop::util::{compute_next_poll_at, sha256_file};
+use reviewloop::util::sha256_file;
 use serde_json::{Value, json};
 use std::{
     env, fs,
@@ -335,6 +338,16 @@ struct JobOrPaperRef {
     paper_id: Option<String>,
 }
 
+impl JobOrPaperRef {
+    fn into_job_ref(self) -> JobRef {
+        match (self.job_id, self.paper_id) {
+            (Some(job_id), _) => JobRef::Id(job_id),
+            (None, Some(paper_id)) => JobRef::Paper(paper_id),
+            (None, None) => unreachable!("clap requires --job-id or --paper-id"),
+        }
+    }
+}
+
 /// Arguments for `reviewloop run <pdf-path>`.
 #[derive(Debug, Args)]
 struct RunArgs {
@@ -483,20 +496,7 @@ async fn run() -> Result<()> {
         }
         Command::Approve { job_ref } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
-            let job_id = match job_ref.job_id {
-                Some(id) => id,
-                None => {
-                    resolve_paper_id_to_job(
-                        &db,
-                        &config.project_id,
-                        &job_ref.paper_id.unwrap(),
-                        &[JobStatus::PendingApproval],
-                        "approve",
-                    )?
-                    .id
-                }
-            };
-            cmd_approve(&config, &db, &job_id)
+            cmd_approve(&config, &db, &job_ref.into_job_ref())
         }
         Command::ImportToken {
             paper_id,
@@ -528,39 +528,7 @@ async fn run() -> Result<()> {
         }
         Command::Cancel { job_ref, reason } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
-            let job_id = match job_ref.job_id {
-                Some(id) => id,
-                None => {
-                    let paper_id = job_ref.paper_id.unwrap();
-                    resolve_paper_id_to_job(
-                        &db,
-                        &config.project_id,
-                        &paper_id,
-                        &[
-                            JobStatus::PendingApproval,
-                            JobStatus::Queued,
-                            JobStatus::Submitted,
-                            JobStatus::Processing,
-                        ],
-                        "cancel",
-                    )
-                    .map_err(|e| {
-                        let msg = e.to_string();
-                        if msg.contains("no") && msg.contains("job") {
-                            anyhow::anyhow!(
-                                "{msg}\n\
-                                 hint: cancel only applies to active jobs; for already-completed/failed \
-                                 jobs no action is needed; for rerunning, use \
-                                 'reviewloop retry --paper-id {paper_id} --include-failed'"
-                            )
-                        } else {
-                            e
-                        }
-                    })?
-                    .id
-                }
-            };
-            cmd_cancel(&config, &db, &job_id, reason.as_deref())
+            cmd_cancel(&config, &db, &job_ref.into_job_ref(), reason.as_deref())
         }
         Command::Retry {
             job_ref,
@@ -569,45 +537,15 @@ async fn run() -> Result<()> {
             include_failed,
         } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
-            let job_id = match job_ref.job_id {
-                Some(id) => id,
-                None => {
-                    let paper_id = job_ref.paper_id.unwrap();
-                    let active_statuses = &[
-                        JobStatus::Queued,
-                        JobStatus::Submitted,
-                        JobStatus::Processing,
-                    ];
-                    let extended_statuses = &[
-                        JobStatus::Queued,
-                        JobStatus::Submitted,
-                        JobStatus::Processing,
-                        JobStatus::Failed,
-                        JobStatus::FailedNeedsManual,
-                        JobStatus::Timeout,
-                    ];
-                    let statuses: &[JobStatus] = if include_failed {
-                        extended_statuses
-                    } else {
-                        active_statuses
-                    };
-                    resolve_paper_id_to_job(&db, &config.project_id, &paper_id, statuses, "retry")
-                        .map_err(|e| {
-                            let msg = e.to_string();
-                            if !include_failed && msg.contains("no retry-eligible job") {
-                                anyhow!(
-                                    "{msg}\n\
-                                     hint: no active job for paper_id={paper_id}; \
-                                     pass --include-failed to retry a previously-failed job"
-                                )
-                            } else {
-                                e
-                            }
-                        })?
-                        .id
-                }
-            };
-            cmd_retry(&config, &db, &job_id, force, override_rate_limit).await
+            cmd_retry(
+                &config,
+                &db,
+                &job_ref.into_job_ref(),
+                force,
+                override_rate_limit,
+                include_failed,
+            )
+            .await
         }
         Command::Complete {
             job_ref,
@@ -617,17 +555,12 @@ async fn run() -> Result<()> {
             score,
         } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
-            let job_id = match job_ref.job_id {
-                Some(id) => id,
-                None => {
-                    resolve_paper_id_to_job(
-                        &db,
-                        &config.project_id,
-                        &job_ref.paper_id.unwrap(),
-                        &[JobStatus::Processing, JobStatus::Submitted],
-                        "complete",
-                    )?
-                    .id
+            let job_id = match job_ref.into_job_ref() {
+                JobRef::Id(id) => id,
+                paper_ref => {
+                    ReviewOps::new(&config, &db)
+                        .find_job(&paper_ref, COMPLETE_ELIGIBILITY)?
+                        .id
                 }
             };
             cmd_complete(
@@ -1912,33 +1845,25 @@ fn print_guardrail_warnings(config: &Config) {
     }
 }
 
-/// After `submit --force` (or `run`) enqueues `new_job_id`, clear
-/// `next_poll_at` and reset `attempt = 0` for every other QUEUED / SUBMITTED /
-/// PROCESSING job for the same paper so the worker picks them up immediately
-/// instead of waiting out a cooldown. Only called for a newly created job, so
-/// replaying a request never clears cooldowns.
-fn clear_sibling_job_cooldowns(
-    config: &Config,
-    db: &Db,
-    paper_id: &str,
-    new_job_id: &str,
-) -> Result<()> {
-    let siblings = db.list_active_jobs_for_paper(&config.project_id, paper_id)?;
-    for s in siblings.into_iter().filter(|s| s.id != new_job_id) {
-        if matches!(
-            s.status,
-            JobStatus::Processing | JobStatus::Submitted | JobStatus::Queued
-        ) {
-            db.update_job_state(&s.id, s.status, Some(0), Some(None), None)?;
-            db.add_event(
-                Some(&config.project_id),
-                Some(&s.id),
-                "force_clear_cooldown",
-                json!({
-                    "from_command": "submit --force",
-                    "previous_attempt": s.attempt,
-                    "previous_next_poll_at": s.next_poll_at.map(|t| t.to_rfc3339()),
-                }),
+/// The CLI's immediate execution of a job `request_review` just enqueued:
+/// submit it now and pull its first poll forward to ~60s so the user gets
+/// fast feedback.
+async fn submit_now(config: &Config, db: &Db, job_id: &str) -> Result<()> {
+    reviewloop::worker::submit_job(config, db, job_id).await?;
+    if let Some(submitted) = db.get_job(job_id)?
+        && submitted.token.is_some()
+    {
+        let fast_first = Utc::now() + chrono::Duration::seconds(60);
+        let current = submitted
+            .next_poll_at
+            .unwrap_or(fast_first + chrono::Duration::seconds(1));
+        if fast_first < current {
+            db.update_job_state(
+                &submitted.id,
+                submitted.status,
+                None,
+                Some(Some(fast_first)),
+                None,
             )?;
         }
     }
@@ -1952,97 +1877,38 @@ async fn cmd_submit(
     force: bool,
     request_key: Option<&str>,
 ) -> Result<()> {
-    ensure_project_context(config)?;
-    let paper = config
-        .find_paper(paper_id)
-        .ok_or_else(|| paper_not_found_error(paper_id, config))?;
+    let requested = ReviewOps::new(config, db)
+        .request_review(&ReviewRequest {
+            paper_id: paper_id.to_string(),
+            request_key: request_key.map(str::to_string),
+            force,
+            approval: Approval::Granted,
+            origin: RequestOrigin::Submit,
+        })
+        .map_err(|err| with_email_hint(err, "submit"))?;
+    let job = &requested.job;
 
-    let pdf_path = Path::new(&paper.pdf_path);
-    if !pdf_path.exists() {
-        anyhow::bail!("pdf file not found: {}", pdf_path.display());
+    if let Some(reason) = requested.reason {
+        let why = match reason {
+            ExistingReason::RequestReplay => "request key already used for",
+            ExistingReason::Covered => "already covered by",
+        };
+        println!(
+            "Skipped submit: {why} existing job {} (project_id={} paper_id={} backend={} hash={} version={} round={} status={})",
+            job.job_id,
+            job.project_id,
+            job.paper_id,
+            job.backend,
+            job.pdf_hash,
+            job.version_no,
+            job.round_no,
+            job.status.as_str()
+        );
+        return Ok(());
     }
 
-    let pdf_hash = sha256_file(pdf_path)?;
-    let (email, venue) = match paper.backend.as_str() {
-        "stanford" => (
-            email_account::resolve_submission_email(config, "stanford", None)
-                .with_context(|| "reviewloop submit requires a submitter email. set providers.stanford.email in ~/.config/reviewloop/config.toml or run 'reviewloop email login --provider google' to use OAuth (see README 'Email Token Ingestion' section).")?,
-            config.venue_for(paper),
-        ),
-        _ => (String::new(), config.venue_for(paper)),
-    };
-
-    let outcome = db.enqueue(&EnqueueRequest {
-        job: NewJob {
-            project_id: config.project_id.clone(),
-            paper_id: paper.id.clone(),
-            backend: paper.backend.clone(),
-            pdf_path: paper.pdf_path.clone(),
-            pdf_hash,
-            status: JobStatus::Queued,
-            email,
-            venue,
-            git_tag: None,
-            git_commit: None,
-            next_poll_at: None,
-        },
-        request_key: request_key.map(str::to_string),
-        mode: if force {
-            EnqueueMode::NewRound
-        } else {
-            EnqueueMode::Deduplicate
-        },
-        source: "manual_submit".to_string(),
-    })?;
-    let job = match outcome {
-        EnqueueOutcome::Created(job) => job,
-        EnqueueOutcome::Existing { job, reason } => {
-            let why = match reason {
-                ExistingReason::RequestReplay => "request key already used for",
-                ExistingReason::Covered => "already covered by",
-            };
-            println!(
-                "Skipped submit: {why} existing job {} (project_id={} paper_id={} backend={} hash={} version={} round={} status={})",
-                job.id,
-                job.project_id,
-                job.paper_id,
-                job.backend,
-                job.pdf_hash,
-                job.version_no,
-                job.round_no,
-                job.status.as_str()
-            );
-            return Ok(());
-        }
-    };
-
-    if force {
-        clear_sibling_job_cooldowns(config, db, paper_id, &job.id)?;
-    }
-
-    reviewloop::worker::submit_job(config, db, &job.id).await?;
-
-    // Force the first poll to fire within ~60s regardless of the polling schedule,
-    // so the user gets fast feedback after submit.
-    if let Some(updated_job) = db.get_job(&job.id)?
-        && updated_job.token.is_some()
-    {
-        let fast_first = Utc::now() + chrono::Duration::seconds(60);
-        let current = updated_job
-            .next_poll_at
-            .unwrap_or(fast_first + chrono::Duration::seconds(1));
-        if fast_first < current {
-            db.update_job_state(
-                &updated_job.id,
-                updated_job.status,
-                None,
-                Some(Some(fast_first)),
-                None,
-            )?;
-        }
-    }
-
-    println!("Submitted job {} for paper_id={paper_id}", job.id);
+    submit_now(config, db, &job.job_id).await?;
+    println!("Submitted job {} for paper_id={paper_id}", job.job_id);
     Ok(())
 }
 
@@ -2088,74 +1954,23 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
     }
 
     let (config, db) = load_runtime(Some(&write_path), false, true)?;
-    ensure_project_context(&config)?;
-
-    let paper = config
-        .find_paper(&paper_id)
-        .ok_or_else(|| paper_not_found_error(&paper_id, &config))?;
-
-    let pdf_path = Path::new(&paper.pdf_path);
-    if !pdf_path.exists() {
-        anyhow::bail!("pdf file not found: {}", pdf_path.display());
-    }
-
-    let pdf_hash = sha256_file(pdf_path)?;
-    let (email, venue) = match paper.backend.as_str() {
-        "stanford" => (
-            email_account::resolve_submission_email(&config, "stanford", None)
-                .with_context(|| "reviewloop run requires a submitter email. set providers.stanford.email in ~/.config/reviewloop/config.toml or run 'reviewloop email login --provider google' to use OAuth (see README 'Email Token Ingestion' section).")?,
-            config.venue_for(paper),
-        ),
-        _ => (String::new(), config.venue_for(paper)),
-    };
-
     // `run` always asks for a fresh review, like `submit --force`.
-    let job = db
-        .enqueue(&EnqueueRequest {
-            job: NewJob {
-                project_id: config.project_id.clone(),
-                paper_id: paper.id.clone(),
-                backend: paper.backend.clone(),
-                pdf_path: paper.pdf_path.clone(),
-                pdf_hash,
-                status: JobStatus::Queued,
-                email,
-                venue,
-                git_tag: None,
-                git_commit: None,
-                next_poll_at: None,
-            },
+    let requested = ReviewOps::new(&config, &db)
+        .request_review(&ReviewRequest {
+            paper_id: paper_id.clone(),
             request_key: None,
-            mode: EnqueueMode::NewRound,
-            source: "run".to_string(),
-        })?
-        .into_job();
-    clear_sibling_job_cooldowns(&config, &db, &paper_id, &job.id)?;
+            force: true,
+            approval: Approval::Granted,
+            origin: RequestOrigin::Run,
+        })
+        .map_err(|err| with_email_hint(err, "run"))?;
+    let job_id = requested.job.job_id;
 
     // Submit immediately (equivalent to cmd_submit with force=true).
-    reviewloop::worker::submit_job(&config, &db, &job.id).await?;
-
-    // Fast-forward the first poll window for snappy feedback.
-    if let Some(submitted) = db.get_job(&job.id)?
-        && submitted.token.is_some()
-    {
-        let fast_first = Utc::now() + chrono::Duration::seconds(60);
-        let current = submitted
-            .next_poll_at
-            .unwrap_or(fast_first + chrono::Duration::seconds(1));
-        if fast_first < current {
-            db.update_job_state(
-                &submitted.id,
-                submitted.status,
-                None,
-                Some(Some(fast_first)),
-                None,
-            )?;
-        }
-    }
+    submit_now(&config, &db, &job_id).await?;
 
     if !args.quiet {
-        println!("Submitted job {} for paper_id={paper_id}", job.id);
+        println!("Submitted job {} for paper_id={paper_id}", job_id);
     }
 
     // Foreground polling loop.
@@ -2167,8 +1982,8 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
         }
 
         let updated = db
-            .get_job(&job.id)?
-            .ok_or_else(|| anyhow!("job no longer exists: {}", job.id))?;
+            .get_job(&job_id)?
+            .ok_or_else(|| anyhow!("job no longer exists: {}", job_id))?;
 
         if !args.quiet {
             let elapsed_secs = start.elapsed().as_secs();
@@ -2208,8 +2023,8 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
             }
             match updated.status {
                 JobStatus::Completed => {
-                    let artifact_root = config.state_dir().join("artifacts").join(&job.id);
-                    println!("✓ Review complete for job {}", job.id);
+                    let artifact_root = config.state_dir().join("artifacts").join(&job_id);
+                    println!("✓ Review complete for job {}", job_id);
                     for name in &["review.md", "review.json", "meta.json"] {
                         let p = artifact_root.join(name);
                         if p.exists() {
@@ -2222,7 +2037,7 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
                     let reason = updated.last_error.as_deref().unwrap_or("(no details)");
                     eprintln!(
                         "✗ Job {} reached {}: {}",
-                        job.id,
+                        job_id,
                         updated.status.as_str(),
                         reason
                     );
@@ -2238,7 +2053,7 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
                 }
                 eprintln!(
                     "^C  job {} left in {} state; resume tracking with 'reviewloop status --paper-id {}' or 'reviewloop check --paper-id {}'",
-                    job.id,
+                    job_id,
                     updated.status.as_str(),
                     paper_id,
                     paper_id,
@@ -2250,80 +2065,32 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
     }
 }
 
-fn cmd_approve(config: &Config, db: &Db, job_id: &str) -> Result<()> {
-    ensure_project_context(config)?;
-    let job = ensure_project_job(config, db, job_id)?;
-
-    if job.status != JobStatus::PendingApproval {
-        anyhow::bail!(
-            "job {} is in status {}, only PENDING_APPROVAL can be approved",
-            job_id,
-            job.status.as_str()
-        );
-    }
-
-    db.update_job_state(job_id, JobStatus::Queued, None, Some(None), Some(None))?;
-    db.add_event(None, Some(job_id), "approved", json!({}))?;
-
-    println!("Approved job {job_id}, now QUEUED");
+fn cmd_approve(config: &Config, db: &Db, job_ref: &JobRef) -> Result<()> {
+    let outcome = ReviewOps::new(config, db).approve_job(job_ref)?;
+    println!(
+        "Approved job {}, now {}",
+        outcome.job.job_id,
+        outcome.job.status.as_str()
+    );
     Ok(())
 }
 
-/// Cancel a non-terminal job by marking it Failed with a cancellation reason.
-///
-/// Implementation choice (option b): reuses `JobStatus::Failed` instead of
-/// adding a new `JobStatus::Cancelled` variant, keeping the schema unchanged.
-/// The `last_error` field is set to "cancelled by user" or
-/// "cancelled by user: <reason>" and a `cancelled` event is written with
-/// `{reason, previous_status}`.
-fn cmd_cancel(config: &Config, db: &Db, job_id: &str, reason: Option<&str>) -> Result<()> {
-    // Cancel only updates DB rows for the named job — no worker, no provider
-    // config required. Allow it to run without project context so the menu
-    // bar companion can cancel any job from any cwd. When project context IS
-    // set, we still scope-check so a paper-repo cwd cannot accidentally act
-    // on a different project's jobs.
-    let job = resolve_job_by_id_any_project(config, db, job_id)?;
-
-    if matches!(
-        job.status,
-        JobStatus::Completed
-            | JobStatus::Failed
-            | JobStatus::FailedNeedsManual
-            | JobStatus::Timeout
-    ) {
-        anyhow::bail!(
-            "job {} is already in terminal status {}; cannot cancel",
-            job.id,
-            job.status.as_str()
-        );
-    }
-
-    let previous_status = job.status.as_str().to_string();
-    let last_error = match reason {
-        Some(reason) => format!("cancelled by user: {reason}"),
-        None => "cancelled by user".to_string(),
-    };
-
-    // user override: PendingApproval -> Failed is not in the state machine but
-    // cancellation is a legitimate user action on any non-terminal job.
-    db.update_job_state_unchecked(
-        &job.id,
-        JobStatus::Failed,
-        None,
-        Some(None),
-        Some(Some(last_error)),
-    )?;
-    db.add_event(
-        None,
-        Some(&job.id),
-        "cancelled",
-        json!({
-            "reason": reason,
-            "previous_status": previous_status,
-        }),
-    )?;
-
-    println!("Cancelled job {} (was {})", job.id, previous_status);
+/// Cancel a non-terminal job (stored as FAILED with a "cancelled by user"
+/// last_error). Needs no project context, so the menu bar companion can
+/// cancel any job by id from any cwd; a paper-repo cwd still scopes the
+/// lookup to its own project.
+fn cmd_cancel(config: &Config, db: &Db, job_ref: &JobRef, reason: Option<&str>) -> Result<()> {
+    let outcome = ReviewOps::new(config, db)
+        .cancel_job(&CancelRequest {
+            job: job_ref.clone(),
+            reason: reason.map(str::to_string),
+        })
+        .map_err(with_cancel_hint)?;
+    println!(
+        "Cancelled job {} (was {})",
+        outcome.job.job_id,
+        outcome.previous_status.as_str()
+    );
     Ok(())
 }
 
@@ -2334,7 +2101,7 @@ async fn cmd_import_token(
     token: &str,
     source: &str,
 ) -> Result<()> {
-    ensure_project_context(config)?;
+    require_project(config)?;
     db.record_email_token(token, source, None)?;
 
     if let Some(job) = db.find_latest_open_job_for_paper(&config.project_id, paper_id)? {
@@ -2370,7 +2137,7 @@ async fn cmd_import_token(
 
     let paper = config
         .find_paper(paper_id)
-        .ok_or_else(|| paper_not_found_error(paper_id, config))?;
+        .ok_or_else(|| OpError::paper_not_found(paper_id, config))?;
 
     let pdf_hash = if Path::new(&paper.pdf_path).exists() {
         sha256_file(Path::new(&paper.pdf_path))?
@@ -2448,7 +2215,7 @@ async fn cmd_check(
     paper_id: Option<&str>,
     all_processing: bool,
 ) -> Result<()> {
-    ensure_project_context(config)?;
+    require_project(config)?;
 
     let mut targets = Vec::new();
     if let Some(job_id) = job_id {
@@ -2508,7 +2275,7 @@ fn cmd_status(
     show_token: bool,
     active: bool,
 ) -> Result<()> {
-    ensure_project_context(config)?;
+    require_project(config)?;
     let state_dir = config.state_dir();
     let all_rows = db.list_status_views(&config.project_id, paper_id)?;
 
@@ -2636,9 +2403,10 @@ fn format_elapsed(started: chrono::DateTime<Utc>, now: chrono::DateTime<Utc>) ->
 async fn cmd_retry(
     config: &Config,
     db: &Db,
-    job_id: &str,
+    job_ref: &JobRef,
     force: bool,
     override_rate_limit: bool,
+    include_failed: bool,
 ) -> Result<()> {
     if override_rate_limit {
         eprintln!("warning: --override-rate-limit is deprecated; use --force instead");
@@ -2646,102 +2414,56 @@ async fn cmd_retry(
     }
     let force = force || override_rate_limit;
 
-    let job = resolve_job_by_id_any_project(config, db, job_id)?;
+    let job = ReviewOps::new(config, db)
+        .find_job(job_ref, Eligibility::retry(include_failed))
+        .map_err(|err| with_retry_hint(err, include_failed))?;
 
-    // The worker requires the job's *own* project config (providers, polling,
-    // papers). When the cwd config doesn't match (e.g. the menu bar spawned
-    // us from a directory that has no reviewloop.toml), look up the project's
-    // registered config path and load that quietly.
+    // The retry and the worker need the job's *own* project config (providers,
+    // polling, papers). When the cwd config doesn't match (e.g. the menu bar
+    // spawned us from a directory that has no reviewloop.toml), look up the
+    // project's registered config path and load that quietly.
     let owned;
-    let effective_config: &Config = if config.project_id == job.project_id {
+    let job_config: &Config = if config.project_id == job.project_id {
         config
     } else {
         owned = load_effective_config_for_job(db, &job)?;
+        // The registered file may now declare another project_id.
+        if owned.project_id != job.project_id {
+            return Err(OpError::ProjectMismatch {
+                job_id: job.id,
+                job_project_id: job.project_id,
+                context_project_id: owned.project_id,
+            }
+            .into());
+        }
         &owned
     };
 
-    if force {
-        let previous_next_poll_at = job.next_poll_at.map(|value| value.to_rfc3339());
-        if job.token.is_some() {
-            if job.status != JobStatus::Processing {
-                anyhow::bail!("--force for token-backed jobs only supports PROCESSING jobs");
-            }
-            db.add_event(
-                Some(&job.project_id),
-                Some(&job.id),
-                "manual_rate_limit_override",
-                json!({
-                    "paper_id": job.paper_id,
-                    "mode": "poll",
-                    "reason": "manual_override",
-                    "previous_status": job.status.as_str(),
-                    "previous_next_poll_at": previous_next_poll_at,
-                    "version_no": job.version_no,
-                    "round_no": job.round_no
-                }),
-            )?;
-            reviewloop::worker::poll_job(effective_config, db, &job).await?;
-            println!("Immediately polled job {job_id} with rate-limit override");
-            return Ok(());
+    let outcome = ReviewOps::new(job_config, db).retry_job(&RetryRequest {
+        job: JobRef::Id(job.id.clone()),
+        force,
+        include_failed,
+        caller_executes: force,
+    })?;
+    match outcome.action {
+        RetryAction::PollNow => {
+            let due = db
+                .get_job(&job.id)?
+                .ok_or_else(|| anyhow!("job not found: {}", job.id))?;
+            reviewloop::worker::poll_job(job_config, db, &due).await?;
+            println!("Immediately polled job {} with rate-limit override", job.id);
         }
-
-        if !matches!(
-            job.status,
-            JobStatus::Queued
-                | JobStatus::Submitted
-                | JobStatus::Failed
-                | JobStatus::FailedNeedsManual
-                | JobStatus::Timeout
-        ) {
-            anyhow::bail!(
-                "--force for tokenless jobs only supports QUEUED/SUBMITTED/FAILED/FAILED_NEEDS_MANUAL/TIMEOUT"
+        RetryAction::SubmitNow => {
+            reviewloop::worker::submit_job(job_config, db, &job.id).await?;
+            println!(
+                "Immediately retried job {} with rate-limit override",
+                job.id
             );
         }
-
-        // user override: reset terminal job back to Queued for re-submission.
-        db.update_job_state_unchecked(&job.id, JobStatus::Queued, Some(0), Some(None), Some(None))?;
-        db.add_event(
-            Some(&job.project_id),
-            Some(&job.id),
-            "manual_rate_limit_override",
-            json!({
-                "paper_id": job.paper_id,
-                "mode": "submit",
-                "reason": "manual_override",
-                "previous_status": job.status.as_str(),
-                "previous_next_poll_at": previous_next_poll_at,
-                "version_no": job.version_no,
-                "round_no": job.round_no
-            }),
-        )?;
-        reviewloop::worker::submit_job(effective_config, db, &job.id).await?;
-        println!("Immediately retried job {job_id} with rate-limit override");
-        return Ok(());
+        RetryAction::PollScheduled | RetryAction::SubmissionQueued => {
+            println!("Retry scheduled for job {}", job.id);
+        }
     }
-
-    if job.token.is_some() {
-        let next = compute_next_poll_at(
-            Utc::now(),
-            &effective_config.polling.schedule_minutes,
-            0,
-            effective_config.polling.jitter_percent,
-        );
-        // user override: explicit retry may cross state-machine boundaries.
-        db.update_job_state_unchecked(
-            &job.id,
-            JobStatus::Processing,
-            Some(0),
-            Some(Some(next)),
-            Some(None),
-        )?;
-    } else {
-        // user override: explicit retry may cross state-machine boundaries.
-        db.update_job_state_unchecked(&job.id, JobStatus::Queued, Some(0), Some(None), Some(None))?;
-    }
-
-    db.add_event(Some(&job.project_id), Some(&job.id), "retried", json!({}))?;
-    println!("Retry scheduled for job {job_id}");
-
     Ok(())
 }
 
@@ -2822,7 +2544,7 @@ async fn cmd_complete(
     empty_summary: bool,
     score: Option<f64>,
 ) -> Result<()> {
-    ensure_project_context(config)?;
+    require_project(config)?;
     let job = ensure_project_job(config, db, job_id)?;
     if !matches!(
         job.status,
@@ -2885,102 +2607,43 @@ fn ensure_project_job(config: &Config, db: &Db, job_id: &str) -> Result<reviewlo
         .ok_or_else(|| anyhow!("job not found: {job_id}"))
 }
 
-/// Look up a job by ID with optional project scoping.
-///
-/// When `config.project_id` is non-empty, the lookup is project-scoped (so
-/// callers in a paper repo cannot accidentally act on another project's
-/// jobs). When `config.project_id` is empty, falls back to a global lookup
-/// — useful for the menu bar companion which runs from any directory and
-/// needs to act on jobs across every project.
-fn resolve_job_by_id_any_project(
-    config: &Config,
-    db: &Db,
-    job_id: &str,
-) -> Result<reviewloop::model::Job> {
-    if config.project_id.trim().is_empty() {
-        db.get_job(job_id)?
-            .ok_or_else(|| anyhow!("job not found: {job_id}"))
-    } else {
-        ensure_project_job(config, db, job_id)
+/// `complete --paper-id` matches jobs still waiting on the provider.
+const COMPLETE_ELIGIBILITY: Eligibility = Eligibility {
+    action: "complete",
+    statuses: &[JobStatus::Processing, JobStatus::Submitted],
+};
+
+/// Re-attach the command-specific advice the CLI has always printed when no
+/// submitter email is configured.
+fn with_email_hint(err: OpError, command: &str) -> anyhow::Error {
+    match err {
+        OpError::SubmitterEmailUnavailable { .. } => anyhow::Error::new(err).context(format!(
+            "reviewloop {command} requires a submitter email. set providers.stanford.email in ~/.config/reviewloop/config.toml or run 'reviewloop email login --provider google' to use OAuth (see README 'Email Token Ingestion' section)."
+        )),
+        other => other.into(),
     }
 }
 
-/// Build a rich error for a missing paper_id that lists known paper_ids.
-fn paper_not_found_error(paper_id: &str, config: &Config) -> anyhow::Error {
-    let known: Vec<&str> = config.papers.iter().map(|p| p.id.as_str()).collect();
-    if known.is_empty() {
-        anyhow!(
-            "paper_id not found: {paper_id}\n  \
-             no papers configured yet — add one with `reviewloop paper add --paper-id {paper_id} --pdf-path <path>`"
-        )
-    } else {
-        let known_str = known.join(", ");
-        anyhow!(
-            "paper_id not found: {paper_id}\n  \
-             known paper_ids: {known_str}\n  \
-             add this paper with `reviewloop paper add --paper-id {paper_id} --pdf-path <path>`"
-        )
+fn with_cancel_hint(err: OpError) -> anyhow::Error {
+    match &err {
+        OpError::NoEligibleJob { paper_id, .. } => anyhow!(
+            "{err}\n\
+             hint: cancel only applies to active jobs; for already-completed/failed \
+             jobs no action is needed; for rerunning, use \
+             'reviewloop retry --paper-id {paper_id} --include-failed'"
+        ),
+        _ => err.into(),
     }
 }
 
-fn ensure_project_context(config: &Config) -> Result<()> {
-    if config.project_id.trim().is_empty() {
-        anyhow::bail!(
-            "this command requires a project config. run `reviewloop init project --project-id <id>` in your repo first"
-        );
-    }
-    Ok(())
-}
-
-/// Resolve a `--paper-id` value to a single `Job` eligible for `command`.
-///
-/// Queries jobs for `(project_id, paper_id)` whose status is in
-/// `allowed_statuses` (ordered by `updated_at DESC`) and returns:
-/// - the job when exactly one match is found,
-/// - an error with a clear message when 0 or >1 jobs match.
-fn resolve_paper_id_to_job(
-    db: &Db,
-    project_id: &str,
-    paper_id: &str,
-    allowed_statuses: &[JobStatus],
-    command: &str,
-) -> Result<Job> {
-    let status_strs: Vec<&str> = allowed_statuses.iter().map(|s| s.as_str()).collect();
-    let all_views = db.list_status_views(project_id, Some(paper_id))?;
-    let mut matching: Vec<_> = all_views
-        .iter()
-        .filter(|v| status_strs.contains(&v.status.as_str()))
-        .collect();
-    // Sort by updated_at DESC for consistent ordering.
-    matching.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
-
-    match matching.len() {
-        0 => {
-            let statuses_str = allowed_statuses
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::bail!(
-                "no {command}-eligible job for paper_id={paper_id} \
-                 (looking for statuses: {statuses_str})"
-            )
-        }
-        1 => db
-            .get_project_job(project_id, &matching[0].id)?
-            .ok_or_else(|| anyhow!("job no longer exists: {}", matching[0].id)),
-        _ => {
-            let candidates = matching
-                .iter()
-                .take(5)
-                .map(|v| format!("{} ({})", v.id, v.status))
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::bail!(
-                "multiple jobs match paper_id={paper_id} for {command}; \
-                 pass --job-id explicitly. candidates: {candidates}"
-            )
-        }
+fn with_retry_hint(err: OpError, include_failed: bool) -> anyhow::Error {
+    match &err {
+        OpError::NoEligibleJob { paper_id, .. } if !include_failed => anyhow!(
+            "{err}\n\
+             hint: no active job for paper_id={paper_id}; \
+             pass --include-failed to retry a previously-failed job"
+        ),
+        _ => err.into(),
     }
 }
 
@@ -3743,130 +3406,6 @@ mod tests {
         assert!(notice.contains("starts at 10m"));
     }
 
-    mod resolve_paper_id {
-        use super::super::resolve_paper_id_to_job;
-        use reviewloop::db::Db;
-        use reviewloop::model::{JobStatus, NewJob};
-
-        fn new_job(project_id: &str, paper_id: &str, pdf_hash: &str, status: JobStatus) -> NewJob {
-            NewJob {
-                project_id: project_id.to_string(),
-                paper_id: paper_id.to_string(),
-                backend: "stanford".to_string(),
-                pdf_path: "/test/paper.pdf".to_string(),
-                pdf_hash: pdf_hash.to_string(),
-                status,
-                email: "test@example.com".to_string(),
-                venue: None,
-                git_tag: None,
-                git_commit: None,
-                next_poll_at: None,
-            }
-        }
-
-        #[test]
-        fn zero_matches_returns_error() {
-            let db = Db::new_in_memory("resolve_zero").unwrap();
-            db.ensure_schema().unwrap();
-
-            let err = resolve_paper_id_to_job(
-                &db,
-                "proj1",
-                "paper1",
-                &[JobStatus::PendingApproval],
-                "approve",
-            )
-            .unwrap_err();
-            let msg = err.to_string();
-            assert!(msg.contains("no approve-eligible job"), "got: {msg}");
-            assert!(msg.contains("paper_id=paper1"), "got: {msg}");
-            assert!(msg.contains("PENDING_APPROVAL"), "got: {msg}");
-        }
-
-        #[test]
-        fn one_match_returns_job() {
-            let db = Db::new_in_memory("resolve_one").unwrap();
-            db.ensure_schema().unwrap();
-
-            let created = db
-                .create_job(&new_job(
-                    "proj1",
-                    "paper1",
-                    "hash_a",
-                    JobStatus::PendingApproval,
-                ))
-                .unwrap();
-
-            let resolved = resolve_paper_id_to_job(
-                &db,
-                "proj1",
-                "paper1",
-                &[JobStatus::PendingApproval],
-                "approve",
-            )
-            .unwrap();
-            assert_eq!(resolved.id, created.id);
-        }
-
-        #[test]
-        fn multiple_matches_returns_error_with_candidates() {
-            let db = Db::new_in_memory("resolve_multi").unwrap();
-            db.ensure_schema().unwrap();
-
-            db.create_job(&new_job(
-                "proj1",
-                "paper1",
-                "hash_a",
-                JobStatus::PendingApproval,
-            ))
-            .unwrap();
-            db.create_job(&new_job(
-                "proj1",
-                "paper1",
-                "hash_b",
-                JobStatus::PendingApproval,
-            ))
-            .unwrap();
-
-            let err = resolve_paper_id_to_job(
-                &db,
-                "proj1",
-                "paper1",
-                &[JobStatus::PendingApproval],
-                "approve",
-            )
-            .unwrap_err();
-            let msg = err.to_string();
-            assert!(msg.contains("multiple jobs match"), "got: {msg}");
-            assert!(msg.contains("paper_id=paper1"), "got: {msg}");
-            assert!(msg.contains("pass --job-id explicitly"), "got: {msg}");
-            assert!(msg.contains("candidates:"), "got: {msg}");
-        }
-
-        #[test]
-        fn filters_by_status_correctly() {
-            let db = Db::new_in_memory("resolve_status_filter").unwrap();
-            db.ensure_schema().unwrap();
-
-            // A completed job should NOT match when looking for PROCESSING
-            db.create_job(&new_job("proj1", "paper1", "hash_a", JobStatus::Completed))
-                .unwrap();
-            let processing_job = db
-                .create_job(&new_job("proj1", "paper1", "hash_b", JobStatus::Processing))
-                .unwrap();
-
-            let resolved = resolve_paper_id_to_job(
-                &db,
-                "proj1",
-                "paper1",
-                &[JobStatus::Processing, JobStatus::Submitted],
-                "complete",
-            )
-            .unwrap();
-            assert_eq!(resolved.id, processing_job.id);
-        }
-    }
-
     mod check_arggroup {
         use crate::Cli;
         use clap::Parser;
@@ -3906,52 +3445,6 @@ mod tests {
         #[test]
         fn check_with_paper_id_succeeds() {
             Cli::try_parse_from(["reviewloop", "check", "--paper-id", "main"]).unwrap();
-        }
-    }
-
-    mod error_messages {
-        use super::super::paper_not_found_error;
-        use reviewloop::config::Config;
-
-        fn config_with_papers(paper_ids: &[&str]) -> Config {
-            let mut cfg = Config::default();
-            for id in paper_ids {
-                cfg.papers.push(reviewloop::config::PaperConfig {
-                    id: id.to_string(),
-                    pdf_path: format!("/fake/{id}.pdf"),
-                    backend: "stanford".to_string(),
-                    venue: None,
-                });
-            }
-            cfg
-        }
-
-        #[test]
-        fn paper_not_found_no_papers_suggests_add() {
-            let cfg = config_with_papers(&[]);
-            let err = paper_not_found_error("myid", &cfg);
-            let msg = err.to_string();
-            assert!(msg.contains("paper_id not found: myid"), "got: {msg}");
-            assert!(msg.contains("no papers configured yet"), "got: {msg}");
-            assert!(
-                msg.contains("reviewloop paper add --paper-id myid"),
-                "got: {msg}"
-            );
-        }
-
-        #[test]
-        fn paper_not_found_with_known_papers_lists_them() {
-            let cfg = config_with_papers(&["main", "camera_ready"]);
-            let err = paper_not_found_error("foo", &cfg);
-            let msg = err.to_string();
-            assert!(msg.contains("paper_id not found: foo"), "got: {msg}");
-            assert!(msg.contains("known paper_ids:"), "got: {msg}");
-            assert!(msg.contains("main"), "got: {msg}");
-            assert!(msg.contains("camera_ready"), "got: {msg}");
-            assert!(
-                msg.contains("reviewloop paper add --paper-id foo"),
-                "got: {msg}"
-            );
         }
     }
 
@@ -4147,110 +3640,6 @@ mod tests {
     }
 
     mod force_flag {
-        use super::super::clear_sibling_job_cooldowns;
-        use chrono::Utc;
-        use reviewloop::config::Config;
-        use reviewloop::db::Db;
-        use reviewloop::model::{JobStatus, NewJob};
-
-        fn make_config(project_id: &str) -> Config {
-            Config {
-                project_id: project_id.to_string(),
-                ..Default::default()
-            }
-        }
-
-        fn new_processing_job(project_id: &str, paper_id: &str) -> NewJob {
-            NewJob {
-                project_id: project_id.to_string(),
-                paper_id: paper_id.to_string(),
-                backend: "stanford".to_string(),
-                pdf_path: "/test/paper.pdf".to_string(),
-                pdf_hash: "testhash".to_string(),
-                status: JobStatus::Processing,
-                email: "test@example.com".to_string(),
-                venue: None,
-                git_tag: None,
-                git_commit: None,
-                next_poll_at: None,
-            }
-        }
-
-        /// `submit --force` clears `next_poll_at` and resets `attempt = 0` on a
-        /// stuck sibling job for the same paper.
-        #[test]
-        fn submit_force_clears_stuck_job_cooldown() {
-            let db = Db::new_in_memory("force_clears_cooldown").unwrap();
-            db.ensure_schema().unwrap();
-            let config = make_config("proj1");
-
-            let stuck = db
-                .create_job(&new_processing_job("proj1", "paper1"))
-                .unwrap();
-            let future_time = Utc::now() + chrono::Duration::hours(2);
-            db.update_job_state(
-                &stuck.id,
-                JobStatus::Processing,
-                Some(3),
-                Some(Some(future_time)),
-                None,
-            )
-            .unwrap();
-
-            let before = db.get_job(&stuck.id).unwrap().unwrap();
-            assert_eq!(before.attempt, 3);
-            assert!(before.next_poll_at.is_some());
-
-            clear_sibling_job_cooldowns(&config, &db, "paper1", "no-new-job").unwrap();
-
-            let after = db.get_job(&stuck.id).unwrap().unwrap();
-            assert_eq!(after.attempt, 0, "attempt should be reset to 0");
-            assert!(
-                after.next_poll_at.is_none(),
-                "next_poll_at should be cleared"
-            );
-            // Status should be unchanged.
-            assert_eq!(after.status, JobStatus::Processing);
-        }
-
-        /// No active jobs → noop, no error.
-        #[test]
-        fn submit_force_no_active_jobs_is_noop() {
-            let db = Db::new_in_memory("force_noop").unwrap();
-            db.ensure_schema().unwrap();
-            let config = make_config("proj1");
-            clear_sibling_job_cooldowns(&config, &db, "paper1", "no-new-job").unwrap();
-        }
-
-        /// COMPLETED jobs are not in scope for cooldown clearing.
-        #[test]
-        fn submit_force_does_not_touch_completed_jobs() {
-            let db = Db::new_in_memory("force_active_only").unwrap();
-            db.ensure_schema().unwrap();
-            let config = make_config("proj1");
-
-            let completed = db
-                .create_job(&NewJob {
-                    project_id: "proj1".to_string(),
-                    paper_id: "paper1".to_string(),
-                    backend: "stanford".to_string(),
-                    pdf_path: "/test/paper.pdf".to_string(),
-                    pdf_hash: "hash_done".to_string(),
-                    status: JobStatus::Completed,
-                    email: "test@example.com".to_string(),
-                    venue: None,
-                    git_tag: None,
-                    git_commit: None,
-                    next_poll_at: None,
-                })
-                .unwrap();
-
-            clear_sibling_job_cooldowns(&config, &db, "paper1", "no-new-job").unwrap();
-
-            let after = db.get_job(&completed.id).unwrap().unwrap();
-            assert_eq!(after.status, JobStatus::Completed);
-        }
-
         /// `--override-rate-limit` is still accepted by the clap parser and
         /// maps to the `override_rate_limit` field (backward compat).
         #[test]
@@ -4585,27 +3974,6 @@ mod tests {
     mod retry_include_failed {
         use crate::{Cli, Command};
         use clap::Parser;
-        use reviewloop::db::Db;
-        use reviewloop::model::{JobStatus, NewJob};
-
-        use super::super::resolve_paper_id_to_job;
-
-        fn new_job(paper_id: &str, pdf_hash: &str, status: JobStatus) -> NewJob {
-            NewJob {
-                project_id: "proj".to_string(),
-                paper_id: paper_id.to_string(),
-                backend: "stanford".to_string(),
-                pdf_path: "/test/paper.pdf".to_string(),
-                pdf_hash: pdf_hash.to_string(),
-                status,
-                email: "test@example.com".to_string(),
-                venue: None,
-                git_tag: None,
-                git_commit: None,
-                next_poll_at: None,
-            }
-        }
-
         #[test]
         fn retry_without_include_failed_parses_default_false() {
             let args = Cli::try_parse_from(["reviewloop", "retry", "--paper-id", "main"]).unwrap();
@@ -4637,90 +4005,12 @@ mod tests {
                 _ => panic!("expected Retry command"),
             }
         }
-
-        #[test]
-        fn narrow_scope_excludes_failed_jobs() {
-            let db = Db::new_in_memory("retry_narrow").unwrap();
-            db.ensure_schema().unwrap();
-
-            // Only a Failed job exists — narrow scope should not match it.
-            db.create_job(&new_job("paper1", "hash_a", JobStatus::Failed))
-                .unwrap();
-
-            let err = resolve_paper_id_to_job(
-                &db,
-                "proj",
-                "paper1",
-                &[
-                    JobStatus::Queued,
-                    JobStatus::Submitted,
-                    JobStatus::Processing,
-                ],
-                "retry",
-            )
-            .unwrap_err();
-            assert!(
-                err.to_string().contains("no retry-eligible job"),
-                "got: {}",
-                err
-            );
-        }
-
-        #[test]
-        fn wide_scope_includes_failed_jobs() {
-            let db = Db::new_in_memory("retry_wide").unwrap();
-            db.ensure_schema().unwrap();
-
-            let failed = db
-                .create_job(&new_job("paper1", "hash_a", JobStatus::Failed))
-                .unwrap();
-
-            let resolved = resolve_paper_id_to_job(
-                &db,
-                "proj",
-                "paper1",
-                &[
-                    JobStatus::Queued,
-                    JobStatus::Submitted,
-                    JobStatus::Processing,
-                    JobStatus::Failed,
-                    JobStatus::FailedNeedsManual,
-                    JobStatus::Timeout,
-                ],
-                "retry",
-            )
-            .unwrap();
-            assert_eq!(resolved.id, failed.id);
-        }
-
-        #[test]
-        fn narrow_scope_matches_active_queued_job() {
-            let db = Db::new_in_memory("retry_active_queued").unwrap();
-            db.ensure_schema().unwrap();
-
-            let queued = db
-                .create_job(&new_job("paper1", "hash_a", JobStatus::Queued))
-                .unwrap();
-
-            let resolved = resolve_paper_id_to_job(
-                &db,
-                "proj",
-                "paper1",
-                &[
-                    JobStatus::Queued,
-                    JobStatus::Submitted,
-                    JobStatus::Processing,
-                ],
-                "retry",
-            )
-            .unwrap();
-            assert_eq!(resolved.id, queued.id);
-        }
     }
 
     /// Tests for U10 — `cancel` command.
     mod cancel {
         use super::super::cmd_cancel;
+        use reviewloop::application::JobRef;
         use reviewloop::config::Config;
         use reviewloop::db::Db;
         use reviewloop::model::{JobStatus, NewJob};
@@ -4752,7 +4042,13 @@ mod tests {
             let project_id = "cancel_proj";
             let (db, job_id) = make_processing_job(project_id, "paper-a");
 
-            cmd_cancel(&Config::default(), &db, &job_id, Some("test reason")).expect("cmd_cancel");
+            cmd_cancel(
+                &Config::default(),
+                &db,
+                &JobRef::Id(job_id.clone()),
+                Some("test reason"),
+            )
+            .expect("cmd_cancel");
 
             // Assert status is now Failed.
             let updated = db.get_job(&job_id).expect("get_job").expect("job present");
@@ -4795,7 +4091,8 @@ mod tests {
             let project_id = "cancel_default_proj";
             let (db, job_id) = make_processing_job(project_id, "paper-a");
 
-            cmd_cancel(&Config::default(), &db, &job_id, None).expect("cmd_cancel");
+            cmd_cancel(&Config::default(), &db, &JobRef::Id(job_id.clone()), None)
+                .expect("cmd_cancel");
 
             let updated = db.get_job(&job_id).expect("get_job").expect("job present");
             assert_eq!(updated.status, JobStatus::Failed);
@@ -4817,31 +4114,22 @@ mod tests {
             );
         }
 
-        /// Cancelling an already-terminal job is rejected at the CLI layer.
+        /// Cancelling an already-terminal job is rejected and leaves it alone.
         #[test]
         fn cancel_terminal_job_is_rejected() {
-            use reviewloop::model::JobStatus;
-            // The guard in cmd_cancel checks for terminal states.
-            let terminal = [
-                JobStatus::Completed,
-                JobStatus::Failed,
-                JobStatus::FailedNeedsManual,
-                JobStatus::Timeout,
-            ];
-            for status in terminal {
-                let is_terminal = matches!(
-                    status,
-                    JobStatus::Completed
-                        | JobStatus::Failed
-                        | JobStatus::FailedNeedsManual
-                        | JobStatus::Timeout
-                );
-                assert!(
-                    is_terminal,
-                    "{:?} should be detected as terminal by cmd_cancel guard",
-                    status
-                );
-            }
+            let (db, job_id) = make_processing_job("cancel_terminal_proj", "paper-a");
+            db.update_job_state(&job_id, JobStatus::Completed, None, None, None)
+                .expect("complete job");
+
+            let err = cmd_cancel(&Config::default(), &db, &JobRef::Id(job_id.clone()), None)
+                .expect_err("terminal job must not be cancelled");
+            assert_eq!(
+                err.to_string(),
+                format!("job {job_id} is already in terminal status COMPLETED; cannot cancel")
+            );
+            let job = db.get_job(&job_id).expect("get_job").expect("job present");
+            assert_eq!(job.status, JobStatus::Completed);
+            assert_eq!(job.last_error, None);
         }
     }
 

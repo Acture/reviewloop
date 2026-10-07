@@ -26,6 +26,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   whose seen-tag record is lost (crash, retention pruning) returns its
   original job instead of enqueueing again, while that job is retained.
 
+- **`reviewloop::application`** — review operations shared by the CLI and
+  the upcoming MCP adapter: `ReviewOps` with `list_projects`,
+  `list_papers`, `request_review`, `get_job`, `list_jobs`, `get_review`,
+  `approve_job`, `retry_job` and `cancel_job`. Operations are synchronous,
+  never print, exit or contact the provider, return token-free DTOs and
+  fail with `OpError` codes carrying a recovery hint and structured
+  details. `request_review` enqueues through `Db::enqueue` (request keys
+  included); the CLI still submits immediately for `submit` and `run`.
+- **`docs/review-operations.md`** — the operation contract: MCP tool
+  names, request and result fields, job phases, retry semantics, error
+  codes with recovery hints, and what later issues still own.
+- `Db::get_review`, `Db::review_completed_at`, `Db::list_project_jobs` and
+  `Db::list_registered_projects` (read-only).
+
 ### Changed
 
 - **Coverage includes the venue.** A job covers a request with the same
@@ -45,6 +59,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   actually created.
 - `submit` resolves the submitter email before checking for an existing job,
   so it now needs a configured email even when it only reports one.
+
+- `approve`, `cancel`, `retry`, `submit`, `run` and `complete --paper-id`
+  call the shared operations. Arguments, events and exit codes are
+  unchanged except:
+  - `retry` refuses a PENDING_APPROVAL job (approve it instead) rather than
+    queueing it without approval.
+  - `retry` refuses a job whose registered config now declares another
+    `project_id`. Before, a plain retry went ahead with that config and a
+    forced one reset the job before failing in the worker.
+  - `approve`, `cancel`, `complete` and `retry` with `--paper-id` outside a
+    project fail with the project-config error instead of searching jobs
+    that have no project.
+  - `submit`, `run`, `approve`, `retry` and `cancel` log one more INFO line
+    (to stdout under the default logging config).
 
 ### Fixed
 
