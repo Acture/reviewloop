@@ -64,3 +64,5 @@ rfd = { version = "0.17", optional = true }
 [dev-dependencies]
 axum = "0.8"
 tempfile = "3.14"
+# Paused clock for timeout tests (`#[tokio::test(start_paused = true)]`).
+tokio = { version = "1.46", features = ["test-util"] }

@@ -2115,7 +2115,7 @@ async fn cmd_import_token(
         println!("Attached token to existing job {}", job.id);
         // Immediately poll rather than waiting for the next 30-second daemon tick.
         if let Some(fresh) = db.get_job(&job.id)? {
-            reviewloop::worker::poll_job(config, db, &fresh).await?;
+            reviewloop::worker::poll_job(config, db, &fresh.id).await?;
         }
         if let Some(after_poll) = db.get_job(&job.id)? {
             let is_failed = matches!(
@@ -2190,7 +2190,7 @@ async fn cmd_import_token(
 
     // Immediately poll rather than waiting for the next 30-second daemon tick.
     if let Some(fresh) = db.get_job(&job.id)? {
-        reviewloop::worker::poll_job(config, db, &fresh).await?;
+        reviewloop::worker::poll_job(config, db, &fresh.id).await?;
     }
     if let Some(after_poll) = db.get_job(&job.id)? {
         let is_failed = matches!(
@@ -2251,7 +2251,7 @@ async fn cmd_check(
 
     for job in targets {
         maybe_record_manual_poll_override(config, db, &job)?;
-        reviewloop::worker::poll_job(config, db, &job).await?;
+        reviewloop::worker::poll_job(config, db, &job.id).await?;
         let Some(updated) = db.get_project_job(&config.project_id, &job.id)? else {
             continue;
         };
@@ -2452,7 +2452,7 @@ async fn cmd_retry(
             let due = db
                 .get_job(&job.id)?
                 .ok_or_else(|| anyhow!("job not found: {}", job.id))?;
-            reviewloop::worker::poll_job(job_config, db, &due).await?;
+            reviewloop::worker::poll_job(job_config, db, &due.id).await?;
             println!("Immediately polled job {} with rate-limit override", job.id);
         }
         RetryAction::SubmitNow => {

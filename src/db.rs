@@ -743,15 +743,6 @@ impl Db {
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
-    pub fn mark_fallback_used(&self, job_id: &str) -> Result<()> {
-        let conn = self.connect()?;
-        conn.execute(
-            "UPDATE jobs SET fallback_used = 1, updated_at = ?2 WHERE id = ?1",
-            params![job_id, to_rfc3339(Utc::now())],
-        )?;
-        Ok(())
-    }
-
     /// Atomically take the job's lease for `kind` when it is claimable: QUEUED for submit,
     /// PROCESSING for poll, no live lease, and — with [`ClaimTiming::WhenDue`] — past its
     /// `next_poll_at`. Returns `None` otherwise. A submit claim marks the row CLAIMED:
