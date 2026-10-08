@@ -99,6 +99,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     that have no project.
   - `submit`, `run`, `approve`, `retry` and `cancel` log one more INFO line
     (to stdout under the default logging config).
+- **Job ownership (OSS-337)** — the worker now takes a time-limited lease on a
+  job before submitting or polling it (daemon tick and every CLI entry point),
+  so concurrent processes can no longer submit the same QUEUED job twice. State
+  checks, the change and its event share one SQLite `IMMEDIATE` transaction;
+  results from an expired or revoked lease are rejected.
+- **Uncertain submissions are never resent** — the submit stage
+  (`CLAIMED` → `DISPATCHED`) is persisted before anything is sent. A crash,
+  timeout, or ambiguous `confirm-upload` response (5xx, unreadable or
+  token-less 2xx) parks the job as `SUBMITTED` / `UNCERTAIN` with a diagnostic
+  instead of retrying or switching to the Playwright fallback. Previously a
+  `confirm-upload` 5xx went straight to the fallback. `reviewloop run` stops
+  on such a job with exit code 2 and prints how to reconcile it; with email
+  token ingestion enabled it first waits up to 30 minutes for the token email.
+- **Cancel** is atomic with respect to a finishing worker, never revives a
+  job, and states that it does not withdraw a submission the provider already
+  received. Late receipts are kept on the job and in the events table.
+- **`retry` refuses a job whose submission is in flight** (`DISPATCHED` with a
+  live lease); wait for its outcome or cancel it.
+- **Fallback script contract** — failures report `"submitted": <bool>`; only
+  `false` (or a script that never started) is a definitive rejection. Custom
+  scripts that omit `submitted` have every failure treated as an unknown
+  outcome.
+- **`import-token --job-id`** attaches a token to a named job; the reconcile
+  hint for an uncertain submission uses it.
+
+### Upgrade notes
+
+- Schema version 4 adds `jobs.lease_owner`, `jobs.lease_expires_at` and
+  `jobs.submit_stage` (migrated automatically from v1, v2 or v3).
+- Jobs left `SUBMITTED` by earlier versions are marked `UNCERTAIN` on the
+  first tick and wait for reconciliation (token email, `import-token`,
+  `retry --force`, or `cancel`).
+- New event types: `submit_dispatched`, `submit_outcome_unknown`,
+  `submit_claim_expired`, `submit_claim_taken_over`,
+  `submit_receipt_after_lease_lost`, `stale_result_rejected`.
 
 ### Fixed
 

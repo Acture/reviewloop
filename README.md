@@ -52,7 +52,7 @@ reviewloop run paper/main.pdf
 `reviewloop run` registers the paper if it isn't already in the project config, submits
 it immediately with force, then drives a live polling loop until the review lands.
 
-Exit codes: `0` = review complete, `2` = terminal failure, `130` = Ctrl+C.
+Exit codes: `0` = review complete, `2` = terminal failure or a submission that needs manual reconciliation, `130` = Ctrl+C.
 
 > **A submitter email is required.** Set `providers.stanford.email` in
 > `~/.config/reviewloop/config.toml` (step 2.5 above) or run
@@ -228,7 +228,7 @@ reviewloop daemon uninstall
 reviewloop daemon status
 reviewloop submit --paper-id main [--force] [--request-key <key>]
 reviewloop approve --job-id <job-id>
-reviewloop import-token --paper-id main --token <token> [--source email]
+reviewloop import-token (--paper-id main | --job-id <job-id>) --token <token> [--source email]
 reviewloop check [--job-id <job-id> | --paper-id <paper-id>] [--all-processing]
 reviewloop status [--paper-id main] [--json] [--show-token] [--active]
 reviewloop retry --job-id <job-id> [--force]  # (was --override-rate-limit, deprecated since vNext)
@@ -260,7 +260,7 @@ new review round.
 
 ## Exit Codes
 
-- `reviewloop run`: 0 = Completed, 2 = terminal failure, 130 = Ctrl+C
+- `reviewloop run`: 0 = Completed, 2 = terminal failure or submission outcome unknown (needs reconciliation), 130 = Ctrl+C
 - `reviewloop import-token`: 0 = token attached + poll success, 2 = poll resolved to failure
 - All other commands: 0 = success, 1 = error
 
@@ -272,8 +272,38 @@ Each tick performs:
 1. Trigger scan (`git tags`, PDF hash changes)
 2. Optional Gmail OAuth + IMAP token ingestion
 3. Timeout marking
-4. Submission processing (`QUEUED -> SUBMITTED/PROCESSING`)
-5. Poll processing (`PROCESSING -> COMPLETED/FAILED/...`)
+4. Lease recovery (claims left behind by a crashed or killed worker)
+5. Submission processing (`QUEUED -> SUBMITTED -> PROCESSING`)
+6. Poll processing (`PROCESSING -> COMPLETED/FAILED/...`)
+
+### Job ownership and uncertain submissions
+
+Every worker path — daemon tick, `submit`, `run`, `retry`, `check`,
+`import-token` — first takes a time-limited lease on the job in one SQLite
+transaction, so two processes never submit or poll the same job at once.
+State changes are written only while the lease is still held, together
+with their event; a result that arrives after the lease expired or was
+revoked (cancel, `retry`, `complete`, an imported token) is rejected.
+
+The submit stage is persisted before anything is sent:
+
+- `QUEUED` + `CLAIMED`: a worker owns the job, nothing has been sent. If
+  the worker dies here, the claim expires and the job is picked up again.
+- `SUBMITTED` + `DISPATCHED`: the request may be on the wire.
+- `SUBMITTED` + `UNCERTAIN`: the provider may have accepted the paper, but
+  no receipt was saved (crash or timeout after sending, an unreadable or
+  5xx `confirm-upload` response). ReviewLoop does **not** resubmit these
+  or switch to the fallback, because the provider gives no idempotency
+  guarantee. `reviewloop status` shows the reason; settle it by letting
+  email ingestion attach the token, running
+  `reviewloop import-token --job-id <id> --token <token>`, resubmitting
+  explicitly with `reviewloop retry --job-id <id> --force`, or
+  `reviewloop cancel --job-id <id>`.
+
+Cancelling is local: it stops further processing and marks the job
+`FAILED`, but does not withdraw a submission the provider already
+received. A receipt that arrives after the cancel is kept on the job
+(and in the `submit_receipt_after_lease_lost` event) for recovery.
 
 Manual immediate poll:
 - `reviewloop check --job-id <id>` forces one check now for that processing job (ignores `next_poll_at`)
@@ -405,7 +435,9 @@ middleware (∼90 lines) that does:
   request is retried against the next proxy in the rotation. HTTP
   responses (any 4xx / 5xx that completes a round-trip) are returned as
   the upstream service answered — the proxy is healthy, the upstream said
-  no.
+  no. Multipart uploads (the PDF upload and `confirm-upload`, which creates
+  the submission) are streamed and sent exactly once through one proxy;
+  they are never re-sent on failover.
 
 > **Note on library choice**: [`reqwest-proxy-pool`](https://crates.io/crates/reqwest-proxy-pool)
 > 0.4 was evaluated and found unsuitable: it supports only SOCKS5/SOCKS5H
@@ -555,10 +587,20 @@ Optional repo variables:
 
 ## Fallback Requirements
 
-When API submit fails and fallback is enabled:
+The fallback runs only when the API submit failed in a way that proves the
+provider did not accept the paper (an error before `confirm-upload`, or an
+explicit rejection). An ambiguous failure marks the job `UNCERTAIN`
+instead (see [Job ownership and uncertain submissions](#job-ownership-and-uncertain-submissions)).
+
+When the fallback runs:
 - Node.js must be available
 - Playwright runtime dependencies must be installed
 - script path defaults to `tools/paperreview_fallback.mjs`
+
+A custom `fallback_script` prints one JSON line: `{"success": true, "token": "..."}`
+on stdout, or on failure `{"success": false, "submitted": <bool>, "error": "..."}`
+on stderr with a non-zero exit. Report `"submitted": false` only when the form
+was never submitted; any other failure is treated as an unknown outcome.
 
 ## Responsible Use
 
