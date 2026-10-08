@@ -1,5 +1,5 @@
 use super::{ops::CANCELLED_BY_USER, redact::redact_text};
-use crate::model::{ExistingReason, Job, JobStatus, NewJob};
+use crate::model::{ExistingReason, Job, JobStatus, NewJob, SubmitStage};
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Serializer};
 use serde_json::Value;
@@ -8,6 +8,13 @@ use serde_json::Value;
 /// not the variant name its derive would emit.
 fn status_str<S: Serializer>(status: &JobStatus, serializer: S) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(status.as_str())
+}
+
+fn stage_str<S: Serializer>(stage: &Option<SubmitStage>, serializer: S) -> Result<S::Ok, S::Error> {
+    match stage {
+        Some(stage) => serializer.serialize_str(stage.as_str()),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// Where a job stands, folded from its status for callers that only need to
@@ -86,6 +93,11 @@ pub struct JobView {
     pub git_tag: Option<String>,
     pub git_commit: Option<String>,
     pub fallback_used: bool,
+    /// Stage of the current submit attempt: CLAIMED (a worker owns it, nothing sent),
+    /// DISPATCHED (the request may be in flight) or UNCERTAIN (the provider may have
+    /// it but no receipt was saved; never resubmitted automatically). Null otherwise.
+    #[serde(serialize_with = "stage_str")]
+    pub submit_stage: Option<SubmitStage>,
     /// The last failure, with the job's token replaced by `[redacted]`.
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -122,6 +134,7 @@ impl JobView {
             git_tag: job.git_tag.clone(),
             git_commit: job.git_commit.clone(),
             fallback_used: job.fallback_used,
+            submit_stage: job.submit_stage,
             last_error: job
                 .last_error
                 .as_deref()

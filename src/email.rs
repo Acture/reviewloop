@@ -592,6 +592,22 @@ mod gmail_impl {
     }
 }
 
+/// Whether a tick can attach review tokens from email: the same guards the Gmail and
+/// IMAP pollers apply before they do any work.
+pub fn token_ingestion_active(config: &Config) -> Result<bool> {
+    let gmail = match &config.gmail_oauth {
+        Some(gmail) if gmail.enabled => {
+            crate::oauth::google::GoogleOauthProvider::from_config(config)?.is_some()
+        }
+        _ => false,
+    };
+    let imap = cfg!(feature = "imap")
+        && config.imap.as_ref().is_some_and(|imap| {
+            imap.enabled && !imap.username.trim().is_empty() && !imap.password.trim().is_empty()
+        });
+    Ok(gmail || imap)
+}
+
 pub async fn poll_imap_if_enabled(config: &Config, db: &Db) -> Result<Vec<Job>> {
     let span = tracing::info_span!("poll_imap_if_enabled", project_id = %config.project_id);
     async move {
