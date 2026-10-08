@@ -87,6 +87,70 @@ impl JobStatus {
     }
 }
 
+/// Persisted stage of a job's current submit attempt (`jobs.submit_stage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubmitStage {
+    /// A worker holds the job's lease; nothing has been sent to the provider.
+    Claimed,
+    /// The request may have reached the provider; the lease owner awaits the receipt.
+    Dispatched,
+    /// The provider may have accepted the request but no receipt was saved. Never
+    /// resubmitted automatically; awaits reconciliation (token email, `import-token`,
+    /// explicit `retry`, or `cancel`).
+    Uncertain,
+}
+
+impl SubmitStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubmitStage::Claimed => "CLAIMED",
+            SubmitStage::Dispatched => "DISPATCHED",
+            SubmitStage::Uncertain => "UNCERTAIN",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "CLAIMED" => Some(SubmitStage::Claimed),
+            "DISPATCHED" => Some(SubmitStage::Dispatched),
+            "UNCERTAIN" => Some(SubmitStage::Uncertain),
+            _ => None,
+        }
+    }
+}
+
+/// The work a job lease grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkKind {
+    Submit,
+    Poll,
+}
+
+impl WorkKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkKind::Submit => "submit",
+            WorkKind::Poll => "poll",
+        }
+    }
+}
+
+/// Route a submit attempt is dispatched through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitChannel {
+    Primary,
+    Fallback,
+}
+
+impl SubmitChannel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubmitChannel::Primary => "primary",
+            SubmitChannel::Fallback => "fallback",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::JobStatus;
@@ -196,8 +260,28 @@ pub struct Job {
     pub next_poll_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub fallback_used: bool,
+    /// Owner of the job's current work lease; ownership lapses at `lease_expires_at`.
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub submit_stage: Option<SubmitStage>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl Job {
+    /// How an operator settles a submission whose outcome is unknown.
+    pub fn reconcile_hint(&self) -> String {
+        if self.token.is_some() {
+            return format!(
+                "a receipt token is saved; run `reviewloop retry --job-id {}` to resume polling",
+                self.id
+            );
+        }
+        format!(
+            "not resubmitted automatically; once the review email arrives run `reviewloop import-token --job-id {} --token <token>`, or `reviewloop retry --job-id {} --force` to resubmit anyway (may duplicate), or `reviewloop cancel --job-id {}`",
+            self.id, self.id, self.id
+        )
+    }
 }
 
 #[derive(Debug, Clone)]

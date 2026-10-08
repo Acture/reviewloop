@@ -54,7 +54,7 @@ every operation against a temporary config and database.
 | `get_review` | `ReviewOps::get_review` | yes | `ReviewQuery` | `ReviewView` | none |
 | `approve_job` | `ReviewOps::approve_job` | no | job reference (needs a project) | `TransitionOutcome` | PENDING_APPROVAL → QUEUED; `approved` event `{}`. |
 | `retry_job` | `ReviewOps::retry_job` | no | `RetryRequest` | `RetryOutcome` | Re-queues the job (see Retry semantics); `retried` event `{}`, or `manual_rate_limit_override` when forced. |
-| `cancel_job` | `ReviewOps::cancel_job` | no | `CancelRequest` | `TransitionOutcome` | Non-terminal → FAILED with `last_error` `"cancelled by user"` or `"cancelled by user: <reason>"`; `cancelled` event `{reason, previous_status}`. The provider is not contacted. |
+| `cancel_job` | `ReviewOps::cancel_job` | no | `CancelRequest` | `TransitionOutcome` | Non-terminal → FAILED with `last_error` `"cancelled by user"` or `"cancelled by user: <reason>"`; `cancelled` event `{reason, previous_status, previous_submit_stage, lease_was_active}`. Check, write and event share one transaction that revokes any worker lease, so a worker finishing at the same time either lands first (the cancel fails as terminal) or has its result rejected. The provider is not contacted. |
 
 `ReviewOps::find_job(job_ref, eligibility)` is the shared resolver behind the
 job references above. It is a Rust helper, not a tool.
@@ -87,7 +87,7 @@ job references above. It is a Rust helper, not a tool.
 | `PENDING_APPROVAL` | `awaiting_approval` | Stored; waits for `approve_job`. Not sent while pending. | `null` |
 | `QUEUED` | `queued` | Stored locally and **not** accepted by the provider. A worker submits it. | Earliest submission attempt (set after a rate limit); `null` means the next worker tick. |
 | `PROCESSING` | `submitted` | The provider accepted the PDF and returned a token (`has_token`). The worker polls for the review. | Next provider poll. |
-| `SUBMITTED` | `submitted` | Legacy status that current workers never write (they move QUEUED straight to PROCESSING) and never resume; such a job usually has no token. `retry_job` re-queues it. | As stored. |
+| `SUBMITTED` | `submitted` | The submission may have reached the provider. While a worker holds its lease (`submit_stage` DISPATCHED) the request is in flight; otherwise (`UNCERTAIN`) the outcome is unknown and the job is never resubmitted automatically: a token email, `import-token --job-id`, an explicit `retry_job` or `cancel_job` settles it. `retry_job` refuses a job whose dispatch is in flight, and polls instead of resubmitting once a receipt token is saved. | As stored. |
 | `COMPLETED` | `completed` | The review is stored; `get_review` returns it. | `null` |
 | `FAILED`, `FAILED_NEEDS_MANUAL`, `TIMEOUT` | `failed` | The attempt ended. `last_error` explains it; `retry_job` can re-queue it. | `null` |
 | `FAILED` with a `cancelled by user` error | `cancelled` | Cancelled locally. A submission the provider already accepted (`has_token`) is not revoked; its result is no longer collected. | `null` |
@@ -109,7 +109,11 @@ that is `null`; callers SHOULD NOT check an active job more often than that.
 | yes | yes | PROCESSING | PROCESSING, `next_poll_at` = now (unchanged with `caller_executes`); `attempt` and `last_error` kept | `poll_now` |
 | yes | no | QUEUED, SUBMITTED, FAILED, FAILED_NEEDS_MANUAL, TIMEOUT | QUEUED, `attempt` 0, `next_poll_at` `null`, `last_error` cleared | `submit_now` |
 
-A PENDING_APPROVAL job is `invalid_state`: it needs `approve_job`. Terminal
+A PENDING_APPROVAL job is `invalid_state`: it needs `approve_job`. Re-queuing a
+tokenless job is checked again inside the write, and is also `invalid_state`
+when a worker is sending its submission right now (`submit_stage` DISPATCHED
+under a live lease: wait for the outcome or cancel it) or when a receipt token
+landed meanwhile (call `retry_job` again, which then polls it). Terminal
 jobs, cancelled ones included, may be retried; retrying is an explicit re-run,
 so a job cancelled while pending and then retried is queued without a separate
 approval. The schedule comes from the
@@ -146,6 +150,7 @@ caller leaves it to the worker's next tick.
 | `git_tag` | string | nullable | Tag that triggered the job, if any. |
 | `git_commit` | string | nullable | Commit of that tag, if any. |
 | `fallback_used` | boolean | required | The browser fallback submitted the job. |
+| `submit_stage` | string | nullable | Current submit attempt: `CLAIMED` (a worker owns it, nothing sent), `DISPATCHED` (the request may be in flight) or `UNCERTAIN` (the provider may hold it but no receipt was saved; never resubmitted automatically, see `last_error`). |
 | `last_error` | string | nullable | Last failure, token-redacted. |
 | `created_at` | RFC3339 UTC timestamp string | required | Creation time. |
 | `updated_at` | RFC3339 UTC timestamp string | required | Last state change. |
@@ -278,6 +283,7 @@ job ends FAILED, FAILED_NEEDS_MANUAL or TIMEOUT and 130 on Ctrl-C, and
     "git_tag": null,
     "git_commit": null,
     "fallback_used": false,
+    "submit_stage": null,
     "last_error": null,
     "created_at": "2026-10-07T12:00:00.123456Z",
     "updated_at": "2026-10-07T12:00:00.123456Z",
@@ -333,9 +339,6 @@ These are deliberately outside this contract and owned by follow-up issues:
 
 - **Venue at submission.** A job stored without a venue is sent with the
   venue configured at submission time, which `JobView.venue` does not show.
-- **Worker claims and uncertain submissions (OSS-337).** A QUEUED job may be
-  picked by more than one process, and there is no "outcome unknown" phase
-  for a submission that may have reached the provider.
 - **Multi-project daemon (OSS-338).** No operation reports whether a worker is
   running. A queued job waits until the project's daemon (or a CLI command)
   processes it.

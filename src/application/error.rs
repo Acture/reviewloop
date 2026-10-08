@@ -211,6 +211,9 @@ impl OpError {
                 Operation::RetryJob if *status == JobStatus::PendingApproval => {
                     "approve the job with approve_job".to_string()
                 }
+                Operation::RetryJob if *status == JobStatus::Submitted => {
+                    "the submission is in flight or already has a receipt: check submit_stage with get_job, then wait, retry_job again to poll a saved receipt, or cancel_job".to_string()
+                }
                 Operation::RetryJob => "retry without force, or check the job's status with get_job".to_string(),
                 _ => "check the job's status with get_job".to_string(),
             },

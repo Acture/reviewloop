@@ -1024,7 +1024,12 @@ fn cancel_marks_the_job_cancelled_locally() -> Result<()> {
     );
     assert_eq!(
         fx.events("cancelled")?,
-        vec![json!({ "reason": "wrong draft", "previous_status": "PROCESSING" })]
+        vec![json!({
+            "reason": "wrong draft",
+            "previous_status": "PROCESSING",
+            "previous_submit_stage": null,
+            "lease_was_active": false,
+        })]
     );
 
     let again = fx

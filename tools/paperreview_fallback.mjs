@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
-import { chromium } from 'playwright';
+// Flips just before the submit click. From then on the provider may hold the paper, so
+// reviewloop treats any failure as "outcome unknown" instead of retrying.
+let submitted = false;
 
 function getArg(name, required = false) {
   const idx = process.argv.indexOf(name);
@@ -19,10 +21,12 @@ async function main() {
   const email = getArg('--email', true);
   const venue = getArg('--venue', false);
 
+  // Imported here so a missing playwright install is reported as a clean pre-submit failure.
+  const { chromium } = await import('playwright');
   const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
 
   try {
+    const page = await browser.newPage();
     await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
     await page.setInputFiles('#pdf', pdfPath);
@@ -47,6 +51,7 @@ async function main() {
       }
     }
 
+    submitted = true;
     await page.click('#submitBtn');
     await page.waitForSelector('#tokenDisplay', { timeout: 120000 });
 
@@ -56,15 +61,12 @@ async function main() {
     }
 
     console.log(JSON.stringify({ success: true, token }));
-    await browser.close();
-  } catch (error) {
-    console.error(JSON.stringify({ success: false, error: String(error) }));
-    await browser.close();
-    process.exit(1);
+  } finally {
+    await browser.close().catch(() => {});
   }
 }
 
 main().catch((error) => {
-  console.error(JSON.stringify({ success: false, error: String(error) }));
+  console.error(JSON.stringify({ success: false, submitted, error: String(error) }));
   process.exit(1);
 });

@@ -469,7 +469,7 @@ async fn integration_poll_transitions_from_202_to_200_and_writes_artifacts() -> 
     let ctx = TestContext::new(server.base_url.clone())?;
     let job = ctx.create_processing_job("tok-202-200")?;
 
-    worker::poll_job(&ctx.config, &ctx.db, &job).await?;
+    worker::poll_job(&ctx.config, &ctx.db, &job.id).await?;
     let first = ctx
         .db
         .get_job(&job.id)?
@@ -477,7 +477,7 @@ async fn integration_poll_transitions_from_202_to_200_and_writes_artifacts() -> 
     assert_eq!(first.status, JobStatus::Processing);
     assert_eq!(first.attempt, 1);
 
-    worker::poll_job(&ctx.config, &ctx.db, &first).await?;
+    worker::poll_job(&ctx.config, &ctx.db, &first.id).await?;
     let done = ctx
         .db
         .get_job(&job.id)?
@@ -510,7 +510,7 @@ async fn integration_poll_404_marks_job_failed_invalid_token() -> Result<()> {
     let ctx = TestContext::new(server.base_url.clone())?;
     let job = ctx.create_processing_job("tok-invalid")?;
 
-    worker::poll_job(&ctx.config, &ctx.db, &job).await?;
+    worker::poll_job(&ctx.config, &ctx.db, &job.id).await?;
 
     let failed = ctx.db.get_job(&job.id)?.context("job not found")?;
     assert_eq!(failed.status, JobStatus::Failed);
@@ -569,7 +569,7 @@ async fn integration_rate_limit_honors_retry_after_header() -> Result<()> {
     let poll_job = ctx.create_processing_job("tok-rl-header")?;
     let before2 = Utc::now();
 
-    worker::poll_job(&ctx.config, &ctx.db, &poll_job).await?;
+    worker::poll_job(&ctx.config, &ctx.db, &poll_job.id).await?;
 
     let retrying = ctx.db.get_job(&poll_job.id)?.context("poll job missing")?;
     assert_eq!(retrying.status, JobStatus::Processing);
@@ -624,7 +624,7 @@ async fn integration_server_error_uses_polling_schedule() -> Result<()> {
     let ctx = TestContext::new(server.base_url.clone())?;
     let poll_job = ctx.create_processing_job("tok-500-sched")?;
 
-    worker::poll_job(&ctx.config, &ctx.db, &poll_job).await?;
+    worker::poll_job(&ctx.config, &ctx.db, &poll_job.id).await?;
 
     let retrying = ctx.db.get_job(&poll_job.id)?.context("poll job missing")?;
     assert_eq!(retrying.status, JobStatus::Processing);
@@ -663,7 +663,7 @@ async fn integration_poll_terminal_generation_error_marks_failed_needs_manual() 
     let ctx = TestContext::new(server.base_url.clone())?;
     let poll_job = ctx.create_processing_job("tok-terminal")?;
 
-    worker::poll_job(&ctx.config, &ctx.db, &poll_job).await?;
+    worker::poll_job(&ctx.config, &ctx.db, &poll_job.id).await?;
 
     let failed = ctx.db.get_job(&poll_job.id)?.context("poll job missing")?;
     assert_eq!(failed.status, JobStatus::FailedNeedsManual);
@@ -1071,7 +1071,7 @@ async fn pinned_snapshot_is_uploaded_and_archived_after_source_and_config_change
     let submitted = ctx.db.get_job(&job.id)?.context("job not found")?;
     assert_eq!(submitted.status, JobStatus::Processing);
 
-    worker::poll_job(&ctx.config, &ctx.db, &submitted).await?;
+    worker::poll_job(&ctx.config, &ctx.db, &submitted.id).await?;
     let done = ctx.db.get_job(&job.id)?.context("job not found")?;
     assert_eq!(done.status, JobStatus::Completed);
 

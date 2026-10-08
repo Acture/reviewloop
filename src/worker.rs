@@ -1,12 +1,14 @@
 use crate::{
     artifact::write_review_artifacts,
-    backend::{BackendError, ReviewFetchResult, SubmitRequest, build_backend},
+    backend::{
+        BackendError, ReviewBackend, ReviewFetchResult, SubmitReceipt, SubmitRequest, build_backend,
+    },
     config::{Config, NotificationsConfig},
-    db::Db,
+    db::{ClaimTiming, Db, JobChange, Lease, LeaseWrite, NewReview, ReceiptWrite},
     email::poll_imap_if_enabled,
     email_account::resolve_submission_email,
     fallback::submit_with_node_playwright,
-    model::{Job, JobStatus},
+    model::{Job, JobStatus, SubmitChannel, SubmitStage, WorkKind},
     notifier::{self, NotificationKind},
     panel::render_tick_panel,
     submission_input::{
@@ -18,12 +20,23 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
+    future::Future,
     path::{Path, PathBuf},
     time::Duration as StdDuration,
 };
 use tracing::{error, info, warn};
+
+/// Submit lease length, renewed at every dispatch. It outlives `SUBMIT_CALL_TIMEOUT`, so a
+/// running owner records its own outcome first. The lease is wall-clock while the timeout
+/// pauses during system sleep, so a suspended owner can still lose its lease mid-call:
+/// its late result is then rejected but kept for recovery.
+const SUBMIT_LEASE_TTL: Duration = Duration::minutes(30);
+/// Upper bound on one dispatch (primary call or fallback script).
+const SUBMIT_CALL_TIMEOUT: StdDuration = StdDuration::from_secs(20 * 60);
+const POLL_LEASE_TTL: Duration = Duration::minutes(10);
+const POLL_CALL_TIMEOUT: StdDuration = StdDuration::from_secs(5 * 60);
 
 /// Offload a notification call onto a blocking thread so a slow or absent
 /// OS notification daemon (NSUserNotificationCenter, D-Bus) cannot stall the
@@ -157,16 +170,18 @@ async fn run_tick_internal(config: &Config, db: &Db, tick: Option<u64>) -> Resul
     let email_polled_jobs = poll_imap_if_enabled(config, db).await?;
 
     mark_timeouts(config, db)?;
+    recover_stale_leases(config, db)?;
     process_submissions(config, db).await?;
     process_polls(config, db).await?;
 
     // Immediately poll any jobs that just received a token via email ingestion,
     // rather than waiting for the next 30-second tick.
     for job in email_polled_jobs {
-        if let Some(fresh) = db.get_job(&job.id)? {
-            if fresh.status == crate::model::JobStatus::Processing && fresh.token.is_some() {
-                poll_job(config, db, &fresh).await?;
-            }
+        if let Some(fresh) = db.get_job(&job.id)?
+            && fresh.status == JobStatus::Processing
+            && fresh.token.is_some()
+        {
+            poll_job(config, db, &fresh.id).await?;
         }
     }
 
@@ -181,14 +196,70 @@ async fn run_tick_internal(config: &Config, db: &Db, tick: Option<u64>) -> Resul
     Ok(())
 }
 
+/// Outcome of a by-id worker entry point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attempt {
+    /// This call held the job's lease and ran the work.
+    Ran,
+    /// The job was not claimable: another worker holds it, or its status changed.
+    NotClaimed,
+}
+
+/// Settle submit attempts whose worker vanished; see [`Db::recover_expired_leases`].
+pub fn recover_stale_leases(config: &Config, db: &Db) -> Result<()> {
+    let report = db.recover_expired_leases(&config.project_id, Utc::now())?;
+    if report.released_claims > 0 {
+        info!(
+            released = report.released_claims,
+            "released expired submit claims that never dispatched"
+        );
+    }
+    if report.uncertain_submits > 0 {
+        warn!(
+            uncertain = report.uncertain_submits,
+            "submissions with unknown outcome need reconciliation"
+        );
+        fire_notification(
+            &config.notifications,
+            NotificationKind::FailedNeedsManual,
+            None,
+            None,
+            Some(&format!(
+                "{} submission(s) may have reached the provider without a saved receipt; see `reviewloop status`",
+                report.uncertain_submits
+            )),
+        );
+    }
+    Ok(())
+}
+
 pub async fn process_submissions(config: &Config, db: &Db) -> Result<()> {
     let per_tick_budget = usize::min(
         config.core.max_concurrency,
         config.core.max_submissions_per_tick,
     );
-    let jobs = db.list_ready_queued(&config.project_id, per_tick_budget, Utc::now())?;
-    for job in jobs {
-        submit_job(config, db, &job.id).await?;
+    for job in db.list_ready_queued(&config.project_id, per_tick_budget, Utc::now())? {
+        // Another process may have claimed or rescheduled it since the listing.
+        let Some(lease) = db.claim_job(
+            &job.id,
+            WorkKind::Submit,
+            ClaimTiming::WhenDue,
+            Utc::now(),
+            SUBMIT_LEASE_TTL,
+        )?
+        else {
+            continue;
+        };
+        let backend = match build_backend(
+            config,
+            &lease.job.backend,
+            Some(db),
+            Some(&config.project_id),
+        ) {
+            Ok(backend) => backend,
+            Err(err) => return Err(abandon_claim(db, &lease, err)),
+        };
+        submit_leased(config, db, lease, backend.as_ref()).await?;
     }
 
     Ok(())
@@ -198,136 +269,121 @@ pub async fn process_polls(config: &Config, db: &Db) -> Result<()> {
     let jobs =
         db.list_due_processing(&config.project_id, config.core.max_concurrency, Utc::now())?;
     for job in jobs {
-        poll_job(config, db, &job).await?;
+        let Some(lease) = db.claim_job(
+            &job.id,
+            WorkKind::Poll,
+            ClaimTiming::WhenDue,
+            Utc::now(),
+            POLL_LEASE_TTL,
+        )?
+        else {
+            continue;
+        };
+        let backend = match build_backend(
+            config,
+            &lease.job.backend,
+            Some(db),
+            Some(&config.project_id),
+        ) {
+            Ok(backend) => backend,
+            Err(err) => return Err(abandon_claim(db, &lease, err)),
+        };
+        poll_leased(config, db, lease, backend.as_ref()).await?;
     }
     Ok(())
 }
 
-pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<()> {
-    let Some(job) = db.get_job(job_id)? else {
-        anyhow::bail!("job not found: {job_id}");
-    };
-    if job.project_id != config.project_id {
-        anyhow::bail!(
-            "job {} belongs to project {} not current project {}",
-            job.id,
-            job.project_id,
-            config.project_id
-        );
-    }
-
-    // NOTE: span is entered here; context is carried through sync code but
-    // not propagated across .await points (pragmatic trade-off over a full
-    // async body rewrite — still provides structured context on function entry).
-    let _span = tracing::info_span!(
-        "submit_job",
-        job_id = %job.id,
-        paper_id = %job.paper_id,
-        backend = %job.backend,
-        attempt = job.attempt
-    )
-    .entered();
-
-    let Some(snapshot_path) = pinned_input(config, db, &job)? else {
-        return Ok(());
-    };
-
+/// Submit one QUEUED job now, ignoring its cooldown (explicit CLI action).
+pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<Attempt> {
+    let job = project_job(config, db, job_id)?;
     let backend = build_backend(config, &job.backend, Some(db), Some(&config.project_id))?;
+    submit_job_with_backend(config, db, job_id, backend.as_ref()).await
+}
 
-    let email = resolve_submission_email(config, &job.backend, Some(&job.email))?;
-    // The paper may have been removed from config since enqueue; the job's
-    // snapshot is self-contained, so the config is only a venue fallback.
-    let venue = match job.backend.as_str() {
-        "stanford" => job
-            .venue
-            .clone()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .or_else(|| {
-                config
-                    .find_paper(&job.paper_id)
-                    .and_then(|p| config.venue_for(p))
-            }),
-        _ => job.venue.clone(),
+/// [`submit_job`] against a caller-supplied primary backend.
+pub async fn submit_job_with_backend(
+    config: &Config,
+    db: &Db,
+    job_id: &str,
+    backend: &dyn ReviewBackend,
+) -> Result<Attempt> {
+    project_job(config, db, job_id)?;
+    let Some(lease) = db.claim_job(
+        job_id,
+        WorkKind::Submit,
+        ClaimTiming::Now,
+        Utc::now(),
+        SUBMIT_LEASE_TTL,
+    )?
+    else {
+        info!(
+            job_id,
+            "submit skipped: job is not QUEUED or another worker holds it"
+        );
+        return Ok(Attempt::NotClaimed);
     };
+    submit_leased(config, db, lease, backend).await?;
+    Ok(Attempt::Ran)
+}
 
-    // Intentionally do NOT pre-write JobStatus::Submitted here. The previous
-    // intermediate write existed to mark the job as "in flight", but if the
-    // process crashed (launchd restart, SIGKILL, panic) between this write
-    // and backend.submit() returning, the job was orphaned in SUBMITTED
-    // state with no token, and no worker path (list_ready_queued,
-    // list_due_processing, mark_timeouts) ever picked it back up. By keeping
-    // the job as QUEUED through the await, a crash leaves the job in a
-    // recoverable state: the next tick will re-attempt the submission.
-    // Successful submissions transition QUEUED -> PROCESSING in
-    // mark_submitted_with_token. The transient SUBMITTED status is now
-    // unused by the worker (still a valid value for future use).
+/// Everything a submit attempt needs, resolved before anything is sent: after dispatch
+/// a local error would strand the job mid-flight, where it reads as an unknown outcome.
+struct SubmitPlan {
+    request: SubmitRequest,
+    fallback: Option<FallbackPlan>,
+}
 
-    let submit_req = SubmitRequest {
-        pdf_path: snapshot_path.clone(),
-        email,
-        venue,
-    };
+struct FallbackPlan {
+    script: PathBuf,
+    base_url: String,
+    pdf_path: PathBuf,
+    email: String,
+    venue: Option<String>,
+}
 
-    match backend.submit(submit_req).await {
-        Ok(receipt) => {
-            let _ = &receipt.backend_submission_ref;
-            let next_poll = compute_next_poll_at(
-                Utc::now(),
-                &config.polling.schedule_minutes,
-                0,
-                config.polling.jitter_percent,
-            );
-            db.mark_submitted_with_token(&job.id, &receipt.token, next_poll)?;
-            db.add_event(
-                None,
-                Some(&job.id),
-                "submitted",
-                json!({
-                    "backend": backend.name(),
-                    "token": receipt.token,
-                    "pdf_hash": job.pdf_hash,
-                    "snapshot_path": snapshot_path,
+impl SubmitPlan {
+    /// `None` when the job's pinned PDF cannot be found; [`pinned_input`] has then
+    /// moved it to FAILED_NEEDS_MANUAL, which also revokes the claim.
+    fn prepare(config: &Config, db: &Db, job: &Job) -> Result<Option<Self>> {
+        let Some(snapshot_path) = pinned_input(config, db, job)? else {
+            return Ok(None);
+        };
+        let email = resolve_submission_email(config, &job.backend, Some(&job.email))?;
+        // Prefer the venue stored on the job. The paper may have been removed from
+        // config since enqueue; the snapshot is self-contained, so the config is
+        // only a venue fallback.
+        let venue = match job.backend.as_str() {
+            "stanford" => job
+                .venue
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    config
+                        .find_paper(&job.paper_id)
+                        .and_then(|p| config.venue_for(p))
                 }),
-            )?;
-            info!(job_id = %job.id, backend = %backend.name(), "job submitted");
-            Ok(())
-        }
-        Err(BackendError::RateLimited {
-            message,
-            retry_after,
-        }) => {
-            let next = match retry_after {
-                Some(d) => Utc::now() + d,
-                None => compute_next_poll_at(
-                    Utc::now(),
-                    &config.polling.schedule_minutes,
-                    job.attempt + 1,
-                    config.polling.jitter_percent,
-                ),
-            };
-            let retry_after_source = if retry_after.is_some() {
-                "server"
-            } else {
-                "schedule"
-            };
-            db.update_job_state(
-                &job.id,
-                JobStatus::Queued,
-                Some(job.attempt + 1),
-                Some(Some(next)),
-                Some(Some(message.clone())),
-            )?;
-            db.add_event(
-                None,
-                Some(&job.id),
-                "submit_rate_limited",
-                json!({ "message": message, "next_poll_at": next.to_rfc3339(), "retry_after_source": retry_after_source }),
-            )?;
-            warn!(job_id = %job.id, retry_after_source, "submit rate limited; next attempt scheduled");
-            Ok(())
-        }
-        Err(err) => handle_submit_error_with_fallback(config, db, &job, &snapshot_path, err).await,
+            _ => job.venue.clone(),
+        };
+        let fallback = (job.backend == "stanford"
+            && !job.fallback_used
+            && config.providers.stanford.fallback_mode == "node_playwright")
+            .then(|| FallbackPlan {
+                script: PathBuf::from(&config.providers.stanford.fallback_script),
+                base_url: config.providers.stanford.base_url.clone(),
+                pdf_path: snapshot_path.clone(),
+                email: email.clone(),
+                venue: venue.clone(),
+            });
+        Ok(Some(Self {
+            request: SubmitRequest {
+                pdf_path: snapshot_path,
+                email,
+                venue,
+            },
+            fallback,
+        }))
     }
 }
 
@@ -398,120 +454,341 @@ fn pinned_input(config: &Config, db: &Db, job: &Job) -> Result<Option<PathBuf>> 
     }
 }
 
-async fn handle_submit_error_with_fallback(
+async fn submit_leased(
     config: &Config,
     db: &Db,
-    job: &Job,
-    snapshot_path: &Path,
-    err: BackendError,
+    mut lease: Lease,
+    backend: &dyn ReviewBackend,
 ) -> Result<()> {
-    let can_fallback = job.backend == "stanford"
-        && !job.fallback_used
-        && config.providers.stanford.fallback_mode == "node_playwright";
+    // NOTE: span is entered here; context is carried through sync code but
+    // not propagated across .await points (pragmatic trade-off over a full
+    // async body rewrite — still provides structured context on function entry).
+    let _span = tracing::info_span!(
+        "submit_job",
+        job_id = %lease.job.id,
+        paper_id = %lease.job.paper_id,
+        backend = %lease.job.backend,
+        attempt = lease.job.attempt
+    )
+    .entered();
 
-    if can_fallback {
-        let email = resolve_submission_email(config, &job.backend, Some(&job.email))?;
-        let fallback_venue = job
-            .venue
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                // Re-derive from the current paper config in case the user
-                // updated the venue between submit attempts.
-                config
-                    .find_paper(&job.paper_id)
-                    .and_then(|p| config.venue_for(p))
-            });
+    let plan = match SubmitPlan::prepare(config, db, &lease.job) {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return Ok(()),
+        Err(err) => return Err(abandon_claim(db, &lease, err)),
+    };
 
-        match submit_with_node_playwright(
-            Path::new(&config.providers.stanford.fallback_script),
-            &config.providers.stanford.base_url,
-            snapshot_path,
-            &email,
-            fallback_venue.as_deref(),
-        )
-        .await
-        {
-            Ok(receipt) => {
-                let next_poll = compute_next_poll_at(
-                    Utc::now(),
-                    &config.polling.schedule_minutes,
-                    0,
-                    config.polling.jitter_percent,
+    if !db.begin_submit_dispatch(
+        &mut lease,
+        SubmitChannel::Primary,
+        Utc::now(),
+        SUBMIT_LEASE_TTL,
+    )? {
+        warn!(job_id = %lease.job.id, "submit lease lost before dispatch; nothing sent");
+        return Ok(());
+    }
+
+    match bounded_submit(backend.submit(plan.request)).await {
+        Ok(receipt) => accept_receipt(config, db, &lease, &receipt, SubmitChannel::Primary),
+        Err(BackendError::OutcomeUnknown(detail)) => {
+            mark_uncertain(config, db, &lease, SubmitChannel::Primary, &detail)
+        }
+        Err(BackendError::RateLimited {
+            message,
+            retry_after,
+        }) => schedule_submit_retry(config, db, &lease, message, retry_after),
+        // The provider provably rejected the request, so another route cannot duplicate it.
+        Err(err) => match plan.fallback {
+            Some(fallback) => submit_via_fallback(config, db, lease, fallback, err).await,
+            None => fail_submit(db, &lease, err),
+        },
+    }
+}
+
+async fn submit_via_fallback(
+    config: &Config,
+    db: &Db,
+    mut lease: Lease,
+    fallback: FallbackPlan,
+    primary_err: BackendError,
+) -> Result<()> {
+    if !db.begin_submit_dispatch(
+        &mut lease,
+        SubmitChannel::Fallback,
+        Utc::now(),
+        SUBMIT_LEASE_TTL,
+    )? {
+        warn!(job_id = %lease.job.id, error = %primary_err, "submit lease lost after primary failure; fallback not started");
+        let current = db.get_job(&lease.job.id)?.map(|job| job.status);
+        applied(db, &lease, LeaseWrite::Lost(current), "submit_failed")?;
+        return Ok(());
+    }
+
+    let result = bounded_submit(submit_with_node_playwright(
+        &fallback.script,
+        &fallback.base_url,
+        &fallback.pdf_path,
+        &fallback.email,
+        fallback.venue.as_deref(),
+    ))
+    .await;
+    match result {
+        Ok(receipt) => accept_receipt(config, db, &lease, &receipt, SubmitChannel::Fallback),
+        Err(BackendError::OutcomeUnknown(detail)) => mark_uncertain(
+            config,
+            db,
+            &lease,
+            SubmitChannel::Fallback,
+            &format!("primary submit error: {primary_err}; fallback: {detail}"),
+        ),
+        Err(fallback_err) => {
+            let reason =
+                format!("primary submit error: {primary_err}; fallback error: {fallback_err}");
+            let change = JobChange {
+                status: JobStatus::FailedNeedsManual,
+                attempt: Some(lease.job.attempt + 1),
+                next_poll_at: Some(None),
+                last_error: Some(Some(reason.clone())),
+                submit_stage: None,
+                // The fallback provably never reached the provider; a later retry may use it.
+                fallback_used: Some(false),
+            };
+            if finish(
+                db,
+                &lease,
+                &change,
+                "submit_failed_needs_manual",
+                json!({ "reason": reason }),
+            )? {
+                fire_notification(
+                    &config.notifications,
+                    NotificationKind::FailedNeedsManual,
+                    Some(&lease.job.paper_id),
+                    Some(&lease.job.id),
+                    Some(&reason),
                 );
-                db.mark_fallback_used(&job.id)?;
-                db.mark_submitted_with_token(&job.id, &receipt.token, next_poll)?;
-                db.add_event(
-                    None,
-                    Some(&job.id),
-                    "submitted_via_fallback",
-                    json!({
-                        "token": receipt.token,
-                        "pdf_hash": job.pdf_hash,
-                        "snapshot_path": snapshot_path,
-                    }),
-                )?;
-                warn!(job_id = %job.id, "job submitted via fallback script");
-                return Ok(());
+                error!(job_id = %lease.job.id, "submit failed and fallback failed; manual intervention required");
             }
-            Err(fallback_err) => {
-                let reason = format!("primary submit error: {err}; fallback error: {fallback_err}");
-                db.update_job_state(
-                    &job.id,
-                    JobStatus::FailedNeedsManual,
-                    Some(job.attempt + 1),
-                    Some(None),
-                    Some(Some(reason.clone())),
-                )?;
-                db.add_event(
-                    None,
-                    Some(&job.id),
-                    "submit_failed_needs_manual",
-                    json!({ "reason": reason }),
-                )?;
+            Ok(())
+        }
+    }
+}
+
+/// Bound one dispatch. Giving up after the request may have been sent leaves its
+/// outcome unknown.
+async fn bounded_submit(
+    call: impl Future<Output = Result<SubmitReceipt, BackendError>>,
+) -> Result<SubmitReceipt, BackendError> {
+    tokio::time::timeout(SUBMIT_CALL_TIMEOUT, call)
+        .await
+        .unwrap_or_else(|_| {
+            Err(BackendError::OutcomeUnknown(format!(
+                "no response within {}s",
+                SUBMIT_CALL_TIMEOUT.as_secs()
+            )))
+        })
+}
+
+fn accept_receipt(
+    config: &Config,
+    db: &Db,
+    lease: &Lease,
+    receipt: &SubmitReceipt,
+    channel: SubmitChannel,
+) -> Result<()> {
+    let next_poll = compute_next_poll_at(
+        Utc::now(),
+        &config.polling.schedule_minutes,
+        0,
+        config.polling.jitter_percent,
+    );
+    let job_id = &lease.job.id;
+    // Name the token in the error so a failed save still leaves it in the daemon log.
+    let write = db
+        .record_submit_receipt(lease, Utc::now(), &receipt.token, next_poll, channel)
+        .with_context(|| {
+            format!(
+                "failed to save submit receipt token {} for job {job_id}",
+                receipt.token
+            )
+        })?;
+    match write {
+        ReceiptWrite::Accepted => match channel {
+            SubmitChannel::Primary => info!(job_id = %job_id, "job submitted"),
+            SubmitChannel::Fallback => warn!(job_id = %job_id, "job submitted via fallback script"),
+        },
+        ReceiptWrite::StoredForRecovery => {
+            warn!(
+                job_id = %job_id,
+                "submit receipt arrived after the lease was lost; token stored for recovery, status unchanged"
+            );
+            // A parked submission now has a usable token: tell the operator how to resume.
+            if let Some(job) = db.get_job(job_id)?
+                && job.status == JobStatus::Submitted
+            {
                 fire_notification(
                     &config.notifications,
                     NotificationKind::FailedNeedsManual,
                     Some(&job.paper_id),
                     Some(&job.id),
-                    Some(&reason),
+                    job.last_error.as_deref(),
                 );
-                error!(job_id = %job.id, "submit failed and fallback failed; manual intervention required");
-                return Ok(());
             }
         }
+        ReceiptWrite::Logged => warn!(
+            job_id = %job_id,
+            "submit receipt arrived after the lease was lost; recorded as an event only"
+        ),
     }
-
-    let reason = err.to_string();
-    db.update_job_state(
-        &job.id,
-        JobStatus::Failed,
-        Some(job.attempt + 1),
-        Some(None),
-        Some(Some(reason.clone())),
-    )?;
-    db.add_event(
-        None,
-        Some(&job.id),
-        "submit_failed",
-        json!({ "reason": reason }),
-    )?;
-    error!(job_id = %job.id, "submit failed");
     Ok(())
 }
 
-pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
-    if job.project_id != config.project_id {
-        anyhow::bail!(
-            "job {} belongs to project {} not current project {}",
-            job.id,
-            job.project_id,
-            config.project_id
+/// The provider may hold the submission: park the job as SUBMITTED/UNCERTAIN. It is
+/// never resubmitted or handed to the fallback automatically.
+fn mark_uncertain(
+    config: &Config,
+    db: &Db,
+    lease: &Lease,
+    channel: SubmitChannel,
+    detail: &str,
+) -> Result<()> {
+    let reason = format!(
+        "submission outcome unknown ({} channel): {detail}; {}",
+        channel.as_str(),
+        lease.job.reconcile_hint()
+    );
+    let change = JobChange {
+        status: JobStatus::Submitted,
+        attempt: Some(lease.job.attempt + 1),
+        next_poll_at: Some(None),
+        last_error: Some(Some(reason.clone())),
+        submit_stage: Some(SubmitStage::Uncertain),
+        fallback_used: None,
+    };
+    if finish(
+        db,
+        lease,
+        &change,
+        "submit_outcome_unknown",
+        json!({ "source": "dispatch_error", "channel": channel.as_str(), "error": detail }),
+    )? {
+        fire_notification(
+            &config.notifications,
+            NotificationKind::FailedNeedsManual,
+            Some(&lease.job.paper_id),
+            Some(&lease.job.id),
+            Some(&reason),
         );
+        error!(job_id = %lease.job.id, channel = channel.as_str(), "submission outcome unknown; awaiting reconciliation");
     }
+    Ok(())
+}
 
+fn schedule_submit_retry(
+    config: &Config,
+    db: &Db,
+    lease: &Lease,
+    message: String,
+    retry_after: Option<Duration>,
+) -> Result<()> {
+    let attempt = lease.job.attempt + 1;
+    let next = match retry_after {
+        Some(d) => Utc::now() + d,
+        None => compute_next_poll_at(
+            Utc::now(),
+            &config.polling.schedule_minutes,
+            attempt,
+            config.polling.jitter_percent,
+        ),
+    };
+    let retry_after_source = if retry_after.is_some() {
+        "server"
+    } else {
+        "schedule"
+    };
+    let change = JobChange {
+        status: JobStatus::Queued,
+        attempt: Some(attempt),
+        next_poll_at: Some(Some(next)),
+        last_error: Some(Some(message.clone())),
+        submit_stage: None,
+        fallback_used: None,
+    };
+    if finish(
+        db,
+        lease,
+        &change,
+        "submit_rate_limited",
+        json!({ "message": message, "next_poll_at": next.to_rfc3339(), "retry_after_source": retry_after_source }),
+    )? {
+        warn!(job_id = %lease.job.id, retry_after_source, "submit rate limited; next attempt scheduled");
+    }
+    Ok(())
+}
+
+fn fail_submit(db: &Db, lease: &Lease, err: BackendError) -> Result<()> {
+    let reason = err.to_string();
+    let change = JobChange {
+        status: JobStatus::Failed,
+        attempt: Some(lease.job.attempt + 1),
+        next_poll_at: Some(None),
+        last_error: Some(Some(reason.clone())),
+        submit_stage: None,
+        fallback_used: None,
+    };
+    if finish(
+        db,
+        lease,
+        &change,
+        "submit_failed",
+        json!({ "reason": reason }),
+    )? {
+        error!(job_id = %lease.job.id, "submit failed");
+    }
+    Ok(())
+}
+
+/// Poll one PROCESSING job now, ignoring its schedule (explicit CLI action, or a token
+/// that just arrived).
+pub async fn poll_job(config: &Config, db: &Db, job_id: &str) -> Result<Attempt> {
+    let job = project_job(config, db, job_id)?;
+    let backend = build_backend(config, &job.backend, Some(db), Some(&config.project_id))?;
+    poll_job_with_backend(config, db, job_id, backend.as_ref()).await
+}
+
+/// [`poll_job`] against a caller-supplied backend.
+pub async fn poll_job_with_backend(
+    config: &Config,
+    db: &Db,
+    job_id: &str,
+    backend: &dyn ReviewBackend,
+) -> Result<Attempt> {
+    project_job(config, db, job_id)?;
+    let Some(lease) = db.claim_job(
+        job_id,
+        WorkKind::Poll,
+        ClaimTiming::Now,
+        Utc::now(),
+        POLL_LEASE_TTL,
+    )?
+    else {
+        info!(
+            job_id,
+            "poll skipped: job is not PROCESSING or another worker holds it"
+        );
+        return Ok(Attempt::NotClaimed);
+    };
+    poll_leased(config, db, lease, backend).await?;
+    Ok(Attempt::Ran)
+}
+
+async fn poll_leased(
+    config: &Config,
+    db: &Db,
+    lease: Lease,
+    backend: &dyn ReviewBackend,
+) -> Result<()> {
+    let job = &lease.job;
     // NOTE: span is entered here; context is carried through sync code but
     // not propagated across .await points (pragmatic trade-off over a full
     // async body rewrite — still provides structured context on function entry).
@@ -523,76 +800,107 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
     )
     .entered();
 
-    let token = job
-        .token
-        .as_deref()
-        .with_context(|| format!("job {} has no token", job.id))?;
+    let Some(token) = job.token.clone() else {
+        let err = anyhow::anyhow!("job {} has no token", job.id);
+        return Err(abandon_claim(db, &lease, err));
+    };
 
-    let backend = build_backend(config, &job.backend, Some(db), Some(&config.project_id))?;
+    let fetched = tokio::time::timeout(POLL_CALL_TIMEOUT, backend.fetch_review(&token))
+        .await
+        .unwrap_or_else(|_| {
+            Err(BackendError::Network(format!(
+                "no response within {}s",
+                POLL_CALL_TIMEOUT.as_secs()
+            )))
+        });
+    let attempt = job.attempt + 1;
+    let retry_at = || {
+        compute_next_poll_at(
+            Utc::now(),
+            &config.polling.schedule_minutes,
+            attempt,
+            config.polling.jitter_percent,
+        )
+    };
+    let still_processing = |next: chrono::DateTime<Utc>, last_error: Option<String>| JobChange {
+        status: JobStatus::Processing,
+        attempt: Some(attempt),
+        next_poll_at: Some(Some(next)),
+        last_error: Some(last_error),
+        submit_stage: None,
+        fallback_used: None,
+    };
 
-    match backend.fetch_review(token).await {
+    match fetched {
         Ok(ReviewFetchResult::Processing) => {
-            let next = compute_next_poll_at(
-                Utc::now(),
-                &config.polling.schedule_minutes,
-                job.attempt + 1,
-                config.polling.jitter_percent,
-            );
-            db.update_job_state(
-                &job.id,
-                JobStatus::Processing,
-                Some(job.attempt + 1),
-                Some(Some(next)),
-                Some(None),
-            )?;
-            db.add_event(
-                None,
-                Some(&job.id),
+            let next = retry_at();
+            finish(
+                db,
+                &lease,
+                &still_processing(next, None),
                 "poll_processing",
-                json!({ "attempt": job.attempt + 1, "next_poll_at": next.to_rfc3339() }),
+                json!({ "attempt": attempt, "next_poll_at": next.to_rfc3339() }),
             )?;
         }
         Ok(ReviewFetchResult::Ready { raw_json }) => {
-            let (_, summary_md, _) =
-                write_review_artifacts(&config.state_dir(), job, token, &raw_json)?;
-            db.upsert_review(&job.id, token, &raw_json.to_string(), &summary_md)?;
-            db.update_job_state(
-                &job.id,
-                JobStatus::Completed,
-                Some(job.attempt + 1),
-                Some(None),
-                Some(None),
-            )?;
-            db.add_event(
-                None,
-                Some(&job.id),
+            // Writing artifacts before the ownership check is harmless: a poll lease
+            // guards nothing the provider holds, so a lost lease only leaves files for
+            // a job that ended another way.
+            let summary_md =
+                match write_review_artifacts(&config.state_dir(), job, &token, &raw_json) {
+                    Ok((_, summary_md, _)) => summary_md,
+                    Err(err) => return Err(abandon_claim(db, &lease, err)),
+                };
+            let raw_json = raw_json.to_string();
+            let change = JobChange {
+                status: JobStatus::Completed,
+                attempt: Some(attempt),
+                next_poll_at: Some(None),
+                last_error: Some(None),
+                submit_stage: None,
+                fallback_used: None,
+            };
+            let write = db.finish_lease_with_review(
+                &lease,
+                Utc::now(),
+                NewReview {
+                    token: &token,
+                    raw_json: &raw_json,
+                    summary_md: &summary_md,
+                },
+                &change,
                 "review_completed",
                 json!({ "token": token }),
             )?;
-            fire_notification(
-                &config.notifications,
-                NotificationKind::Completed,
-                Some(&job.paper_id),
-                Some(&job.id),
-                Some("ready"),
-            );
-            info!(job_id = %job.id, "review completed and artifacts written");
+            if applied(db, &lease, write, "review_completed")? {
+                fire_notification(
+                    &config.notifications,
+                    NotificationKind::Completed,
+                    Some(&job.paper_id),
+                    Some(&job.id),
+                    Some("ready"),
+                );
+                info!(job_id = %job.id, "review completed and artifacts written");
+            }
         }
         Ok(ReviewFetchResult::InvalidToken) => {
-            db.update_job_state(
-                &job.id,
-                JobStatus::Failed,
-                Some(job.attempt + 1),
-                Some(None),
-                Some(Some("invalid token".to_string())),
-            )?;
-            db.add_event(
-                None,
-                Some(&job.id),
+            let change = JobChange {
+                status: JobStatus::Failed,
+                attempt: Some(attempt),
+                next_poll_at: Some(None),
+                last_error: Some(Some("invalid token".to_string())),
+                submit_stage: None,
+                fallback_used: None,
+            };
+            if finish(
+                db,
+                &lease,
+                &change,
                 "invalid_token",
                 json!({ "token": token }),
-            )?;
-            warn!(job_id = %job.id, "invalid token reported by backend");
+            )? {
+                warn!(job_id = %job.id, "invalid token reported by backend");
+            }
         }
         Err(BackendError::RateLimited {
             message,
@@ -600,49 +908,42 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
         }) => {
             let next = match retry_after {
                 Some(d) => Utc::now() + d,
-                None => compute_next_poll_at(
-                    Utc::now(),
-                    &config.polling.schedule_minutes,
-                    job.attempt + 1,
-                    config.polling.jitter_percent,
-                ),
+                None => retry_at(),
             };
             let retry_after_source = if retry_after.is_some() {
                 "server"
             } else {
                 "schedule"
             };
-            db.update_job_state(
-                &job.id,
-                JobStatus::Processing,
-                Some(job.attempt + 1),
-                Some(Some(next)),
-                Some(Some(message.clone())),
-            )?;
-            db.add_event(
-                None,
-                Some(&job.id),
+            if finish(
+                db,
+                &lease,
+                &still_processing(next, Some(message.clone())),
                 "poll_rate_limited",
                 json!({ "message": message, "next_poll_at": next.to_rfc3339(), "retry_after_source": retry_after_source }),
-            )?;
-            warn!(job_id = %job.id, retry_after_source, "poll rate limited; next attempt scheduled");
+            )? {
+                warn!(job_id = %job.id, retry_after_source, "poll rate limited; next attempt scheduled");
+            }
         }
-        Err(BackendError::Server { status, body }) => {
-            if is_terminal_review_generation_failure(&body) {
-                let reason = format!("terminal backend error ({status}): {body}");
-                db.update_job_state(
-                    &job.id,
-                    JobStatus::FailedNeedsManual,
-                    Some(job.attempt + 1),
-                    Some(None),
-                    Some(Some(reason.clone())),
-                )?;
-                db.add_event(
-                    None,
-                    Some(&job.id),
-                    "poll_terminal_error",
-                    json!({ "status": status, "message": body }),
-                )?;
+        Err(BackendError::Server { status, body })
+            if is_terminal_review_generation_failure(&body) =>
+        {
+            let reason = format!("terminal backend error ({status}): {body}");
+            let change = JobChange {
+                status: JobStatus::FailedNeedsManual,
+                attempt: Some(attempt),
+                next_poll_at: Some(None),
+                last_error: Some(Some(reason.clone())),
+                submit_stage: None,
+                fallback_used: None,
+            };
+            if finish(
+                db,
+                &lease,
+                &change,
+                "poll_terminal_error",
+                json!({ "status": status, "message": body }),
+            )? {
                 fire_notification(
                     &config.notifications,
                     NotificationKind::FailedNeedsManual,
@@ -655,54 +956,102 @@ pub async fn poll_job(config: &Config, db: &Db, job: &Job) -> Result<()> {
                     status,
                     "poll returned terminal review-generation failure; marked failed-needs-manual"
                 );
-            } else {
-                let next = compute_next_poll_at(
-                    Utc::now(),
-                    &config.polling.schedule_minutes,
-                    job.attempt + 1,
-                    config.polling.jitter_percent,
-                );
-                db.update_job_state(
-                    &job.id,
-                    JobStatus::Processing,
-                    Some(job.attempt + 1),
-                    Some(Some(next)),
-                    Some(Some(body.clone())),
-                )?;
-                db.add_event(
-                    None,
-                    Some(&job.id),
-                    "poll_server_error",
-                    json!({ "status": status, "message": body, "next_poll_at": next.to_rfc3339(), "retry_after_source": "schedule" }),
-                )?;
+            }
+        }
+        Err(BackendError::Server { status, body }) => {
+            let next = retry_at();
+            if finish(
+                db,
+                &lease,
+                &still_processing(next, Some(body.clone())),
+                "poll_server_error",
+                json!({ "status": status, "message": body, "next_poll_at": next.to_rfc3339(), "retry_after_source": "schedule" }),
+            )? {
                 warn!(job_id = %job.id, "poll server error; scheduled retry via polling cadence");
             }
         }
         Err(err) => {
-            let next = compute_next_poll_at(
-                Utc::now(),
-                &config.polling.schedule_minutes,
-                job.attempt + 1,
-                config.polling.jitter_percent,
-            );
-            db.update_job_state(
-                &job.id,
-                JobStatus::Processing,
-                Some(job.attempt + 1),
-                Some(Some(next)),
-                Some(Some(err.to_string())),
-            )?;
-            db.add_event(
-                None,
-                Some(&job.id),
+            let next = retry_at();
+            if finish(
+                db,
+                &lease,
+                &still_processing(next, Some(err.to_string())),
                 "poll_error",
                 json!({ "error": err.to_string(), "next_poll_at": next.to_rfc3339() }),
-            )?;
-            warn!(job_id = %job.id, "poll failed; scheduled retry");
+            )? {
+                warn!(job_id = %job.id, "poll failed; scheduled retry");
+            }
         }
     }
 
     Ok(())
+}
+
+fn project_job(config: &Config, db: &Db, job_id: &str) -> Result<Job> {
+    let job = db
+        .get_job(job_id)?
+        .with_context(|| format!("job not found: {job_id}"))?;
+    if job.project_id != config.project_id {
+        anyhow::bail!(
+            "job {} belongs to project {} not current project {}",
+            job.id,
+            job.project_id,
+            config.project_id
+        );
+    }
+    Ok(job)
+}
+
+/// Apply a lease owner's result. Returns `false` when the lease was lost — the job was
+/// cancelled, overridden, or taken over — in which case nothing was written.
+fn finish(
+    db: &Db,
+    lease: &Lease,
+    change: &JobChange,
+    event_type: &str,
+    payload: Value,
+) -> Result<bool> {
+    let write = db.finish_lease(lease, Utc::now(), change, event_type, payload)?;
+    applied(db, lease, write, event_type)
+}
+
+fn applied(db: &Db, lease: &Lease, write: LeaseWrite, outcome: &str) -> Result<bool> {
+    let LeaseWrite::Lost(current) = write else {
+        return Ok(true);
+    };
+    let current = current.map(JobStatus::as_str);
+    warn!(
+        job_id = %lease.job.id,
+        kind = lease.kind.as_str(),
+        outcome,
+        current_status = ?current,
+        "lease lost; stale worker result rejected"
+    );
+    db.add_event(
+        None,
+        Some(&lease.job.id),
+        "stale_result_rejected",
+        json!({
+            "kind": lease.kind.as_str(),
+            "owner": lease.owner,
+            "outcome": outcome,
+            "current_status": current,
+        }),
+    )?;
+    Ok(false)
+}
+
+/// Release a claim after a local error, before anything was sent, and hand back the
+/// error. If the release itself fails the claim simply expires and is recovered.
+fn abandon_claim(db: &Db, lease: &Lease, err: anyhow::Error) -> anyhow::Error {
+    if let Err(release_err) = db.release_lease(lease) {
+        warn!(
+            job_id = %lease.job.id,
+            error = %release_err,
+            "failed to release claim after local error; it will be recovered when the lease expires"
+        );
+    }
+    err
 }
 
 pub fn mark_timeouts(config: &Config, db: &Db) -> Result<()> {
@@ -711,15 +1060,30 @@ pub fn mark_timeouts(config: &Config, db: &Db) -> Result<()> {
     for job in db.list_processing_jobs(&config.project_id)? {
         let timeout = timeout_for_job(config, &job);
         let reference_start = job.started_at.unwrap_or(job.created_at);
-        if now - reference_start >= timeout {
-            db.update_job_state(
-                &job.id,
-                JobStatus::Timeout,
-                Some(job.attempt),
-                Some(None),
-                Some(Some("review timed out".to_string())),
-            )?;
-            db.add_event(None, Some(&job.id), "timeout", json!({}))?;
+        if now - reference_start < timeout {
+            continue;
+        }
+        // Claiming first lets a poll in flight finish; if the job is still PROCESSING
+        // afterwards, the next tick times it out.
+        let Some(lease) = db.claim_job(
+            &job.id,
+            WorkKind::Poll,
+            ClaimTiming::Now,
+            now,
+            POLL_LEASE_TTL,
+        )?
+        else {
+            continue;
+        };
+        let change = JobChange {
+            status: JobStatus::Timeout,
+            attempt: Some(job.attempt),
+            next_poll_at: Some(None),
+            last_error: Some(Some("review timed out".to_string())),
+            submit_stage: None,
+            fallback_used: None,
+        };
+        if finish(db, &lease, &change, "timeout", json!({}))? {
             fire_notification(
                 &config.notifications,
                 NotificationKind::Timeout,

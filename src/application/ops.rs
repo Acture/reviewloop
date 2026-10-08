@@ -15,7 +15,7 @@ use super::{
 use crate::{
     artifact::render_summary_markdown,
     config::Config,
-    db::Db,
+    db::{CancelOutcome, Db, Requeue},
     email_account::resolve_submission_email,
     model::{
         EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, Job, JobPdf, JobStatus,
@@ -390,13 +390,7 @@ impl<'a> ReviewOps<'a> {
                     ));
                 }
                 // user override: reset terminal job back to Queued for re-submission.
-                self.db.update_job_state_unchecked(
-                    &job.id,
-                    JobStatus::Queued,
-                    Some(0),
-                    Some(None),
-                    Some(None),
-                )?;
+                self.requeue(&job)?;
                 self.db.add_event(
                     Some(&job.project_id),
                     Some(&job.id),
@@ -424,13 +418,7 @@ impl<'a> ReviewOps<'a> {
                     RetryAction::PollScheduled
                 } else {
                     // user override: explicit retry may cross state-machine boundaries.
-                    self.db.update_job_state_unchecked(
-                        &job.id,
-                        JobStatus::Queued,
-                        Some(0),
-                        Some(None),
-                        Some(None),
-                    )?;
+                    self.requeue(&job)?;
                     RetryAction::SubmissionQueued
                 };
                 self.db
@@ -451,45 +439,56 @@ impl<'a> ReviewOps<'a> {
     /// Mark a non-terminal job FAILED with a cancellation reason. The provider
     /// is not contacted, so an already accepted submission keeps running
     /// remotely; its result is no longer collected.
+    ///
+    /// The status check, the write and the `cancelled` event share one transaction that
+    /// also revokes any worker lease, so a worker finishing concurrently either lands
+    /// first (the cancel is refused as terminal) or has its result rejected.
     pub fn cancel_job(&self, request: &CancelRequest) -> Result<TransitionOutcome, OpError> {
         let job = self.find_job(&request.job, Eligibility::CANCEL)?;
-        if job.status.is_terminal() {
-            return Err(OpError::InvalidState {
-                message: format!(
-                    "job {} is already in terminal status {}; cannot cancel",
-                    job.id,
-                    job.status.as_str()
-                ),
-                job_id: job.id,
-                status: job.status,
-                operation: Operation::CancelJob,
-            });
-        }
-
-        let last_error = match request.reason.as_deref() {
-            Some(reason) => format!("{CANCELLED_BY_USER}: {reason}"),
-            None => CANCELLED_BY_USER.to_string(),
+        let status = match self
+            .db
+            .cancel_job(&job.id, request.reason.as_deref(), Utc::now())?
+        {
+            CancelOutcome::Cancelled {
+                previous_status, ..
+            } => previous_status,
+            CancelOutcome::AlreadyTerminal(status) => {
+                return Err(OpError::InvalidState {
+                    message: format!(
+                        "job {} is already in terminal status {}; cannot cancel",
+                        job.id,
+                        status.as_str()
+                    ),
+                    job_id: job.id,
+                    status,
+                    operation: Operation::CancelJob,
+                });
+            }
         };
-        // user override: PendingApproval -> Failed is not in the state machine but
-        // cancellation is a legitimate user action on any non-terminal job.
-        self.db.update_job_state_unchecked(
-            &job.id,
-            JobStatus::Failed,
-            None,
-            Some(None),
-            Some(Some(last_error)),
-        )?;
-        self.db.add_event(
-            None,
-            Some(&job.id),
-            "cancelled",
-            json!({
-                "reason": request.reason,
-                "previous_status": job.status.as_str(),
-            }),
-        )?;
         info!(job_id = %job.id, paper_id = %job.paper_id, "job cancelled");
-        self.transitioned(&job)
+        self.transitioned(&Job { status, ..job })
+    }
+
+    /// [`Db::requeue`] with its refusals as typed retry errors.
+    fn requeue(&self, job: &Job) -> Result<(), OpError> {
+        match self.db.requeue(&job.id, Utc::now())? {
+            Requeue::Requeued => Ok(()),
+            Requeue::InFlight { owner, expires_at } => Err(invalid_retry(
+                job,
+                &format!(
+                    "job {} is being submitted right now (worker {owner} holds it until {}); wait for the outcome or cancel it",
+                    job.id,
+                    expires_at.to_rfc3339()
+                ),
+            )),
+            Requeue::HasReceipt => Err(invalid_retry(
+                job,
+                &format!(
+                    "job {} already has a submission receipt; run `reviewloop retry --job-id {}` again to poll it",
+                    job.id, job.id
+                ),
+            )),
+        }
     }
 
     fn job_by_id(&self, job_id: &str) -> Result<Job, OpError> {
@@ -596,8 +595,7 @@ impl<'a> ReviewOps<'a> {
             .db
             .list_active_jobs_for_paper(&created.project_id, &created.paper_id)?;
         for sibling in siblings.into_iter().filter(|job| job.id != created.id) {
-            self.db
-                .update_job_state(&sibling.id, sibling.status, Some(0), Some(None), None)?;
+            self.db.reschedule(&sibling.id, Some(0), Some(None))?;
             self.db.add_event(
                 Some(&created.project_id),
                 Some(&sibling.id),

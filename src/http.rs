@@ -45,10 +45,9 @@ use tracing::warn;
 /// errors that complete a round-trip do not.
 ///
 /// Bodies that cannot be cloned (streamed bodies) fall back to a
-/// single-attempt path against the first selected proxy — documented
-/// limitation that does not affect the current PDF-upload path (which
-/// reads the whole file into memory before constructing the multipart
-/// request body).
+/// single-attempt path against the first selected proxy. Multipart forms are
+/// streamed, so the S3 upload and `confirm-upload` — the request that creates a
+/// submission — are always sent exactly once and never re-sent on failover.
 struct RoundRobinProxyMiddleware {
     /// One client per proxy URL, built at construction time.
     clients: Vec<reqwest::Client>,
@@ -73,11 +72,9 @@ impl reqwest_middleware::Middleware for RoundRobinProxyMiddleware {
 
         let start = self.counter.fetch_add(1, Ordering::Relaxed) % n;
 
-        // Streamed bodies (e.g. tokio File) can't be re-tried because
+        // Streamed bodies (multipart forms, files) can't be re-tried because
         // try_clone returns None. Fall back to single-attempt, no failover.
-        // The current PDF upload path constructs the body from a Vec<u8>
-        // (whole file pre-loaded), so try_clone returns Some -- failover
-        // works for that flow.
+        // This is what keeps `confirm-upload` from ever being sent twice.
         if req.try_clone().is_none() {
             return self.clients[start]
                 .execute(req)
@@ -251,6 +248,21 @@ pub fn build_reqwest_client(config: &Config) -> Result<reqwest::Client> {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    /// The failover loop only re-sends cloneable requests. `confirm-upload` creates a
+    /// submission, so it must stay a streamed multipart body that is sent exactly once.
+    #[test]
+    fn multipart_requests_are_never_resent_on_failover() {
+        let form = reqwest::multipart::Form::new()
+            .text("s3_key", "key")
+            .text("email", "a@example.com");
+        let request = reqwest::Client::new()
+            .post("http://127.0.0.1:1/api/confirm-upload")
+            .multipart(form)
+            .build()
+            .expect("build multipart request");
+        assert!(request.try_clone().is_none());
+    }
 
     #[test]
     fn build_client_no_proxies_succeeds() {

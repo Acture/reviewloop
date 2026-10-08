@@ -45,6 +45,11 @@ pub enum BackendError {
     Network(String),
     #[error("command error: {0}")]
     Command(String),
+    /// A submit request may have been accepted by the provider, but no usable receipt
+    /// came back. Never retried or redirected to the fallback automatically: the
+    /// provider gives no idempotency guarantee, so a resend could duplicate the review.
+    #[error("outcome unknown: {0}")]
+    OutcomeUnknown(String),
 }
 
 #[async_trait]

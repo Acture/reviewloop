@@ -12,10 +12,12 @@ use reviewloop::config::{
 use reviewloop::db::Db;
 use reviewloop::email_account;
 use reviewloop::model::{
-    EnqueueMode, EnqueueRequest, EventRecord, ExistingReason, JobPdf, JobStatus, NewJob, StatusView,
+    EnqueueMode, EnqueueRequest, EventRecord, ExistingReason, JobPdf, JobStatus, NewJob,
+    StatusView, SubmitStage,
 };
 use reviewloop::oauth::{self, google::GoogleOauthProvider};
 use reviewloop::util::sha256_file;
+use reviewloop::worker::Attempt;
 use serde_json::{Value, json};
 use std::{
     env, fs,
@@ -87,8 +89,12 @@ enum Command {
     /// "manual"). Useful when a token arrives out-of-band; see README
     /// 'Exit Codes' section.
     ImportToken {
+        /// Attach to the newest open job of this paper, or create one.
+        #[arg(long, required_unless_present = "job_id", conflicts_with = "job_id")]
+        paper_id: Option<String>,
+        /// Attach to this job (e.g. one whose submission outcome is unknown).
         #[arg(long)]
-        paper_id: String,
+        job_id: Option<String>,
         #[arg(long)]
         token: String,
         #[arg(long, default_value = "manual")]
@@ -500,11 +506,20 @@ async fn run() -> Result<()> {
         }
         Command::ImportToken {
             paper_id,
+            job_id,
             token,
             source,
         } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
-            cmd_import_token(&config, &db, &paper_id, &token, &source).await
+            cmd_import_token(
+                &config,
+                &db,
+                paper_id.as_deref(),
+                job_id.as_deref(),
+                &token,
+                &source,
+            )
+            .await
         }
         Command::Check { target } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
@@ -1848,26 +1863,10 @@ fn print_guardrail_warnings(config: &Config) {
 /// The CLI's immediate execution of a job `request_review` just enqueued:
 /// submit it now and pull its first poll forward to ~60s so the user gets
 /// fast feedback.
-async fn submit_now(config: &Config, db: &Db, job_id: &str) -> Result<()> {
-    reviewloop::worker::submit_job(config, db, job_id).await?;
-    if let Some(submitted) = db.get_job(job_id)?
-        && submitted.token.is_some()
-    {
-        let fast_first = Utc::now() + chrono::Duration::seconds(60);
-        let current = submitted
-            .next_poll_at
-            .unwrap_or(fast_first + chrono::Duration::seconds(1));
-        if fast_first < current {
-            db.update_job_state(
-                &submitted.id,
-                submitted.status,
-                None,
-                Some(Some(fast_first)),
-                None,
-            )?;
-        }
-    }
-    Ok(())
+async fn submit_now(config: &Config, db: &Db, job_id: &str) -> Result<Attempt> {
+    let attempt = reviewloop::worker::submit_job(config, db, job_id).await?;
+    db.pull_poll_forward(job_id, Utc::now() + chrono::Duration::seconds(60))?;
+    Ok(attempt)
 }
 
 async fn cmd_submit(
@@ -1907,10 +1906,32 @@ async fn cmd_submit(
         return Ok(());
     }
 
-    submit_now(config, db, &job.job_id).await?;
-    println!("Submitted job {} for paper_id={paper_id}", job.job_id);
+    if submit_now(config, db, &job.job_id).await? == Attempt::NotClaimed {
+        println!(
+            "Queued job {} for paper_id={paper_id}; another reviewloop worker is submitting it",
+            job.job_id
+        );
+        return Ok(());
+    }
+    let submitted = db
+        .get_job(&job.job_id)?
+        .with_context(|| format!("job not found: {}", job.job_id))?;
+    if submitted.status == JobStatus::Processing {
+        println!("Submitted job {} for paper_id={paper_id}", job.job_id);
+    } else {
+        println!(
+            "Job {} for paper_id={paper_id} is {}: {}",
+            job.job_id,
+            submitted.status.as_str(),
+            submitted.last_error.as_deref().unwrap_or("(no details)")
+        );
+    }
     Ok(())
 }
+
+/// How long `run` keeps waiting for a token email to settle a submission whose
+/// outcome is unknown before it exits with the reconcile hint.
+const UNCERTAIN_EMAIL_GRACE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
     let write_path = resolve_mutable_project_config_path(config_override)?;
@@ -1966,12 +1987,29 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
         .map_err(|err| with_email_hint(err, "run"))?;
     let job_id = requested.job.job_id;
 
-    // Submit immediately (equivalent to cmd_submit with force=true).
-    submit_now(&config, &db, &job_id).await?;
+    // Submit immediately (equivalent to cmd_submit with force=true). If another worker
+    // got there first, the loop below still follows the job to completion.
+    let submit_attempt = submit_now(&config, &db, &job_id).await?;
 
     if !args.quiet {
-        println!("Submitted job {} for paper_id={paper_id}", job_id);
+        match submit_attempt {
+            Attempt::Ran => println!("Submitted job {} for paper_id={paper_id}", job_id),
+            Attempt::NotClaimed => println!(
+                "Job {} for paper_id={paper_id} is being submitted by another reviewloop worker",
+                job_id
+            ),
+        }
     }
+
+    // Email ingestion can still attach the token of a submission whose outcome is
+    // unknown; without it nothing advances such a job, so `run` stops on it.
+    // A broken email setup only costs the wait: ticks report it themselves.
+    let waits_for_token_email =
+        reviewloop::email::token_ingestion_active(&config).unwrap_or_else(|err| {
+            warn!(error = %err, "email token ingestion unavailable; not waiting for a token email");
+            false
+        });
+    let mut uncertain_since: Option<std::time::Instant> = None;
 
     // Foreground polling loop.
     let start = std::time::Instant::now();
@@ -2009,15 +2047,20 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
             }
         }
 
-        let is_terminal = matches!(
-            updated.status,
-            JobStatus::Completed
-                | JobStatus::Failed
-                | JobStatus::FailedNeedsManual
-                | JobStatus::Timeout
-        );
+        let mut needs_reconciliation = updated.status == JobStatus::Submitted
+            && updated.submit_stage == Some(SubmitStage::Uncertain);
+        if needs_reconciliation && waits_for_token_email {
+            let since = *uncertain_since.get_or_insert_with(|| {
+                eprintln!(
+                    "\nnote: job {job_id}'s submission outcome is unknown; waiting up to {} min for the review email to attach its token",
+                    UNCERTAIN_EMAIL_GRACE.as_secs() / 60
+                );
+                std::time::Instant::now()
+            });
+            needs_reconciliation = since.elapsed() >= UNCERTAIN_EMAIL_GRACE;
+        }
 
-        if is_terminal {
+        if updated.status.is_terminal() || needs_reconciliation {
             if !args.quiet && is_tty {
                 println!();
             }
@@ -2035,12 +2078,12 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
                 }
                 _ => {
                     let reason = updated.last_error.as_deref().unwrap_or("(no details)");
-                    eprintln!(
-                        "✗ Job {} reached {}: {}",
-                        job_id,
-                        updated.status.as_str(),
-                        reason
-                    );
+                    let state = if needs_reconciliation {
+                        "needs reconciliation".to_string()
+                    } else {
+                        format!("reached {}", updated.status.as_str())
+                    };
+                    eprintln!("✗ Job {} {}: {}", job_id, state, reason);
                     std::process::exit(2);
                 }
             }
@@ -2091,20 +2134,43 @@ fn cmd_cancel(config: &Config, db: &Db, job_ref: &JobRef, reason: Option<&str>) 
         outcome.job.job_id,
         outcome.previous_status.as_str()
     );
+    if let Some(note) = cancel_note(outcome.previous_status) {
+        println!("{note}");
+    }
     Ok(())
+}
+
+/// What cancelling cannot undo: once the provider may hold the submission (SUBMITTED or
+/// PROCESSING), the cancel is local only.
+fn cancel_note(previous_status: JobStatus) -> Option<&'static str> {
+    matches!(
+        previous_status,
+        JobStatus::Submitted | JobStatus::Processing
+    )
+    .then_some(
+        "note: cancellation is local only; a submission the provider already received is not withdrawn",
+    )
 }
 
 async fn cmd_import_token(
     config: &Config,
     db: &Db,
-    paper_id: &str,
+    paper_id: Option<&str>,
+    job_id: Option<&str>,
     token: &str,
     source: &str,
 ) -> Result<()> {
     require_project(config)?;
     db.record_email_token(token, source, None)?;
 
-    if let Some(job) = db.find_latest_open_job_for_paper(&config.project_id, paper_id)? {
+    let existing = match (job_id, paper_id) {
+        (Some(job_id), _) => Some(ensure_project_job(config, db, job_id)?),
+        (None, Some(paper_id)) => {
+            db.find_latest_open_job_for_paper(&config.project_id, paper_id)?
+        }
+        (None, None) => anyhow::bail!("import-token needs --job-id or --paper-id"),
+    };
+    if let Some(job) = existing {
         db.attach_token_to_job(&job.id, token, Utc::now())?;
         db.add_event(
             None,
@@ -2113,28 +2179,10 @@ async fn cmd_import_token(
             json!({ "source": source, "token": token }),
         )?;
         println!("Attached token to existing job {}", job.id);
-        // Immediately poll rather than waiting for the next 30-second daemon tick.
-        if let Some(fresh) = db.get_job(&job.id)? {
-            reviewloop::worker::poll_job(config, db, &fresh).await?;
-        }
-        if let Some(after_poll) = db.get_job(&job.id)? {
-            let is_failed = matches!(
-                after_poll.status,
-                JobStatus::Failed | JobStatus::FailedNeedsManual | JobStatus::Timeout
-            );
-            if is_failed {
-                let detail = after_poll.last_error.as_deref().unwrap_or("(no details)");
-                eprintln!(
-                    "warning: token attached but immediate poll returned {}: {}",
-                    after_poll.status.as_str(),
-                    detail
-                );
-                std::process::exit(2);
-            }
-        }
-        return Ok(());
+        return poll_imported_token(config, db, &job.id).await;
     }
 
+    let paper_id = paper_id.context("import-token needs --paper-id to create a job")?;
     let paper = config
         .find_paper(paper_id)
         .ok_or_else(|| OpError::paper_not_found(paper_id, config))?;
@@ -2187,25 +2235,29 @@ async fn cmd_import_token(
     )?;
 
     println!("Created job {} and attached imported token", job.id);
+    poll_imported_token(config, db, &job.id).await
+}
 
-    // Immediately poll rather than waiting for the next 30-second daemon tick.
-    if let Some(fresh) = db.get_job(&job.id)? {
-        reviewloop::worker::poll_job(config, db, &fresh).await?;
+/// Poll right away rather than waiting for the next 30-second daemon tick; exit 2 when
+/// the token turns out to be unusable.
+async fn poll_imported_token(config: &Config, db: &Db, job_id: &str) -> Result<()> {
+    if reviewloop::worker::poll_job(config, db, job_id).await? == Attempt::NotClaimed {
+        println!("Job {job_id} is being polled by another reviewloop worker");
+        return Ok(());
     }
-    if let Some(after_poll) = db.get_job(&job.id)? {
-        let is_failed = matches!(
+    if let Some(after_poll) = db.get_job(job_id)?
+        && matches!(
             after_poll.status,
             JobStatus::Failed | JobStatus::FailedNeedsManual | JobStatus::Timeout
+        )
+    {
+        let detail = after_poll.last_error.as_deref().unwrap_or("(no details)");
+        eprintln!(
+            "warning: token attached but immediate poll returned {}: {}",
+            after_poll.status.as_str(),
+            detail
         );
-        if is_failed {
-            let detail = after_poll.last_error.as_deref().unwrap_or("(no details)");
-            eprintln!(
-                "warning: token attached but immediate poll returned {}: {}",
-                after_poll.status.as_str(),
-                detail
-            );
-            std::process::exit(2);
-        }
+        std::process::exit(2);
     }
     Ok(())
 }
@@ -2222,6 +2274,18 @@ async fn cmd_check(
     let mut targets = Vec::new();
     if let Some(job_id) = job_id {
         let job = ensure_project_job(config, db, job_id)?;
+        match job.status {
+            JobStatus::Processing => {}
+            // A submission whose outcome is unknown, possibly with a recovered receipt.
+            JobStatus::Submitted => anyhow::bail!(
+                "job {job_id} is SUBMITTED, not PROCESSING; {}",
+                job.reconcile_hint()
+            ),
+            other => anyhow::bail!(
+                "job {job_id} is {}; nothing to poll (see `reviewloop status`)",
+                other.as_str()
+            ),
+        }
         if job.token.is_none() {
             anyhow::bail!("job {job_id} has no token; cannot poll");
         }
@@ -2251,7 +2315,13 @@ async fn cmd_check(
 
     for job in targets {
         maybe_record_manual_poll_override(config, db, &job)?;
-        reviewloop::worker::poll_job(config, db, &job).await?;
+        if reviewloop::worker::poll_job(config, db, &job.id).await? == Attempt::NotClaimed {
+            println!(
+                "Job {} is being polled by another reviewloop worker",
+                job.id
+            );
+            continue;
+        }
         let Some(updated) = db.get_project_job(&config.project_id, &job.id)? else {
             continue;
         };
@@ -2447,20 +2517,40 @@ async fn cmd_retry(
         include_failed,
         caller_executes: force,
     })?;
+    if outcome.previous_status == JobStatus::Submitted
+        && matches!(
+            outcome.action,
+            RetryAction::SubmitNow | RetryAction::SubmissionQueued
+        )
+    {
+        eprintln!(
+            "warning: job {} may already have reached the provider; resubmitting can create a duplicate review request",
+            job.id
+        );
+    }
     match outcome.action {
         RetryAction::PollNow => {
-            let due = db
-                .get_job(&job.id)?
-                .ok_or_else(|| anyhow!("job not found: {}", job.id))?;
-            reviewloop::worker::poll_job(job_config, db, &due).await?;
-            println!("Immediately polled job {} with rate-limit override", job.id);
+            match reviewloop::worker::poll_job(job_config, db, &job.id).await? {
+                Attempt::Ran => {
+                    println!("Immediately polled job {} with rate-limit override", job.id)
+                }
+                Attempt::NotClaimed => println!(
+                    "Job {} is being polled by another reviewloop worker",
+                    job.id
+                ),
+            }
         }
         RetryAction::SubmitNow => {
-            reviewloop::worker::submit_job(job_config, db, &job.id).await?;
-            println!(
-                "Immediately retried job {} with rate-limit override",
-                job.id
-            );
+            match reviewloop::worker::submit_job(job_config, db, &job.id).await? {
+                Attempt::Ran => println!(
+                    "Immediately retried job {} with rate-limit override",
+                    job.id
+                ),
+                Attempt::NotClaimed => println!(
+                    "Job {} is being submitted by another reviewloop worker",
+                    job.id
+                ),
+            }
         }
         RetryAction::PollScheduled | RetryAction::SubmissionQueued => {
             println!("Retry scheduled for job {}", job.id);
@@ -4293,6 +4383,536 @@ mod tests {
             assert_eq!(tick_health(300), "stuck");
             assert_eq!(tick_health(600), "stuck");
             assert_eq!(tick_health(3600), "stuck");
+        }
+    }
+
+    mod oss337_cli {
+        use super::super::{cancel_note, cmd_check, cmd_import_token, cmd_retry};
+        use crate::{Cli, Command};
+        use chrono::{DateTime, Duration, Utc};
+        use clap::{Parser, error::ErrorKind};
+        use reviewloop::application::JobRef;
+        use reviewloop::config::Config;
+        use reviewloop::db::{ClaimTiming, Db, Lease, ReceiptWrite};
+        use reviewloop::model::{
+            EventRecord, Job, JobPdf, JobStatus, NewJob, SubmitChannel, SubmitStage, WorkKind,
+        };
+        use serde_json::json;
+        use tempfile::TempDir;
+
+        const PROJECT_ID: &str = "oss337-cli";
+        const PAPER_ID: &str = "main";
+
+        fn submit_ttl() -> Duration {
+            Duration::minutes(30)
+        }
+
+        /// One project on its own file database; the backend is unreachable, so any
+        /// poll a command makes ends in `poll_error`.
+        struct Ctx {
+            _tmp: TempDir,
+            config: Config,
+            db: Db,
+        }
+
+        impl Ctx {
+            fn new() -> Self {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let state_dir = tmp.path().join("state");
+                std::fs::create_dir_all(&state_dir).expect("mkdir state");
+                let mut config = Config {
+                    project_id: PROJECT_ID.to_string(),
+                    ..Config::default()
+                };
+                config.core.state_dir = state_dir.to_string_lossy().to_string();
+                config.polling.schedule_minutes = vec![10, 20, 40, 60];
+                config.polling.jitter_percent = 0;
+                config.providers.stanford.base_url = "http://127.0.0.1:9".to_string();
+                config.providers.stanford.fallback_mode = "disabled".to_string();
+                let db = Db::new_file(state_dir.join("reviewloop.db"));
+                db.ensure_schema().expect("ensure schema");
+                Self {
+                    _tmp: tmp,
+                    config,
+                    db,
+                }
+            }
+
+            fn create_job(&self, status: JobStatus, pdf_hash: &str) -> Job {
+                self.db
+                    .create_job(&NewJob {
+                        project_id: PROJECT_ID.to_string(),
+                        paper_id: PAPER_ID.to_string(),
+                        backend: "stanford".to_string(),
+                        pdf: JobPdf::Unpinned {
+                            pdf_path: "/test/paper.pdf".to_string(),
+                            pdf_hash: pdf_hash.to_string(),
+                        },
+                        status,
+                        email: "test@example.com".to_string(),
+                        venue: None,
+                        git_tag: None,
+                        git_commit: None,
+                        next_poll_at: None,
+                    })
+                    .expect("create job")
+            }
+
+            fn job(&self, job_id: &str) -> Job {
+                self.db
+                    .get_job(job_id)
+                    .expect("get_job")
+                    .expect("job present")
+            }
+
+            fn events_for(&self, job_id: &str) -> Vec<EventRecord> {
+                self.db
+                    .list_timeline_events(PROJECT_ID, PAPER_ID)
+                    .expect("list_timeline_events")
+                    .into_iter()
+                    .filter(|event| event.job_id.as_deref() == Some(job_id))
+                    .collect()
+            }
+
+            fn event_types_for(&self, job_id: &str) -> Vec<String> {
+                self.events_for(job_id)
+                    .into_iter()
+                    .map(|event| event.event_type)
+                    .collect()
+            }
+
+            /// A QUEUED job claimed and dispatched at `at`: SUBMITTED/DISPATCHED under a
+            /// submit lease that lives until `at + 30min`.
+            fn dispatched_job(&self, pdf_hash: &str, at: DateTime<Utc>) -> Lease {
+                let job = self.create_job(JobStatus::Queued, pdf_hash);
+                let mut lease = self
+                    .db
+                    .claim_job(
+                        &job.id,
+                        WorkKind::Submit,
+                        ClaimTiming::Now,
+                        at,
+                        submit_ttl(),
+                    )
+                    .expect("claim_job")
+                    .expect("QUEUED job is claimable");
+                assert!(
+                    self.db
+                        .begin_submit_dispatch(&mut lease, SubmitChannel::Primary, at, submit_ttl())
+                        .expect("begin_submit_dispatch"),
+                    "the claim owner can dispatch"
+                );
+                assert_eq!(lease.job.status, JobStatus::Submitted);
+                assert_eq!(lease.job.submit_stage, Some(SubmitStage::Dispatched));
+                lease
+            }
+
+            /// A submission dispatched two hours ago whose worker died: crash recovery
+            /// leaves it SUBMITTED/UNCERTAIN with no token and no lease.
+            fn uncertain_tokenless_job(&self, pdf_hash: &str) -> Job {
+                let lease = self.dispatched_job(pdf_hash, Utc::now() - Duration::hours(2));
+                let recovery = self
+                    .db
+                    .recover_expired_leases(PROJECT_ID, Utc::now())
+                    .expect("recover_expired_leases");
+                assert_eq!(recovery.uncertain_submits, 1);
+                assert_eq!(recovery.released_claims, 0);
+                let job = self.job(&lease.job.id);
+                assert_eq!(job.status, JobStatus::Submitted);
+                assert_eq!(job.submit_stage, Some(SubmitStage::Uncertain));
+                assert_eq!(job.token, None);
+                assert_eq!(job.lease_owner, None);
+                assert_eq!(job.lease_expires_at, None);
+                job
+            }
+        }
+
+        fn parse(args: &[&str]) -> Result<Command, clap::Error> {
+            Cli::try_parse_from(std::iter::once("reviewloop").chain(args.iter().copied()))
+                .map(|cli| cli.command)
+        }
+
+        #[test]
+        fn import_token_parses_job_id() {
+            match parse(&["import-token", "--job-id", "J", "--token", "T"]).expect("parses") {
+                Command::ImportToken {
+                    paper_id,
+                    job_id,
+                    token,
+                    source,
+                } => {
+                    assert_eq!(paper_id, None);
+                    assert_eq!(job_id.as_deref(), Some("J"));
+                    assert_eq!(token, "T");
+                    assert_eq!(source, "manual");
+                }
+                other => panic!("expected ImportToken, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn import_token_parses_paper_id() {
+            match parse(&["import-token", "--paper-id", "P", "--token", "T"]).expect("parses") {
+                Command::ImportToken {
+                    paper_id,
+                    job_id,
+                    token,
+                    source,
+                } => {
+                    assert_eq!(paper_id.as_deref(), Some("P"));
+                    assert_eq!(job_id, None);
+                    assert_eq!(token, "T");
+                    assert_eq!(source, "manual");
+                }
+                other => panic!("expected ImportToken, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn import_token_rejects_job_id_with_paper_id() {
+            let err = parse(&[
+                "import-token",
+                "--job-id",
+                "J",
+                "--paper-id",
+                "P",
+                "--token",
+                "T",
+            ])
+            .expect_err("--job-id and --paper-id are exclusive");
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{err}");
+        }
+
+        #[test]
+        fn import_token_requires_job_id_or_paper_id() {
+            let err = parse(&["import-token", "--token", "T"]).expect_err("a target is required");
+            assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{err}");
+            assert!(err.to_string().contains("--paper-id"), "{err}");
+        }
+
+        #[test]
+        fn import_token_requires_token() {
+            let err = parse(&["import-token", "--job-id", "J"]).expect_err("--token is required");
+            assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{err}");
+            assert!(err.to_string().contains("--token"), "{err}");
+        }
+
+        /// `--job-id` binds the token to the named submission, not to the newest open job
+        /// of the paper that `--paper-id` would pick.
+        #[tokio::test]
+        async fn import_token_job_id_binds_named_job_not_newer_sibling() {
+            let ctx = Ctx::new();
+            let named = ctx.uncertain_tokenless_job("hash-v1");
+            assert_eq!(named.started_at, None);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let newer = ctx.create_job(JobStatus::Queued, "hash-v2");
+            let latest = ctx
+                .db
+                .find_latest_open_job_for_paper(PROJECT_ID, PAPER_ID)
+                .expect("find_latest_open_job_for_paper")
+                .expect("an open job");
+            assert_eq!(
+                latest.id, newer.id,
+                "--paper-id would have picked the newer job"
+            );
+            let newer_before = format!("{:?}", ctx.job(&newer.id));
+            let named_events_before = ctx.event_types_for(&named.id);
+
+            let before = Utc::now();
+            cmd_import_token(
+                &ctx.config,
+                &ctx.db,
+                None,
+                Some(&named.id),
+                "tok-named",
+                "manual",
+            )
+            .await
+            .expect("import-token --job-id");
+            let after = Utc::now();
+
+            let job = ctx.job(&named.id);
+            assert_eq!(job.status, JobStatus::Processing);
+            assert_eq!(job.token.as_deref(), Some("tok-named"));
+            assert_eq!(job.submit_stage, None);
+            assert_eq!(job.lease_owner, None);
+            assert_eq!(job.lease_expires_at, None);
+            assert!(!job.fallback_used);
+            let started_at = job
+                .started_at
+                .expect("a token always comes with started_at");
+            assert!(
+                before <= started_at && started_at <= after,
+                "started_at={started_at} outside [{before}, {after}]"
+            );
+            // The receipt resets attempt to 0; the failed immediate poll counts one.
+            assert_eq!(job.attempt, 1);
+            let next_poll_at = job.next_poll_at.expect("poll_error schedules a retry");
+            assert!(next_poll_at > after, "next_poll_at={next_poll_at}");
+            let last_error = job
+                .last_error
+                .clone()
+                .expect("poll_error records the error");
+            assert!(!last_error.is_empty());
+
+            let events = ctx.events_for(&named.id);
+            let new_events = &events[named_events_before.len()..];
+            let new_types: Vec<&str> = new_events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect();
+            assert_eq!(new_types, ["token_imported", "poll_error"]);
+            assert_eq!(
+                new_events[0].payload,
+                json!({ "source": "manual", "token": "tok-named" })
+            );
+            assert_eq!(
+                new_events[1].payload,
+                json!({ "error": last_error, "next_poll_at": next_poll_at.to_rfc3339() })
+            );
+
+            assert_eq!(
+                format!("{:?}", ctx.job(&newer.id)),
+                newer_before,
+                "the newer open job must stay untouched"
+            );
+            assert!(ctx.events_for(&newer.id).is_empty());
+        }
+
+        /// `check --job-id` refuses a SUBMITTED job even when a late receipt stored its
+        /// token, and names the retry that resumes polling.
+        #[tokio::test]
+        async fn check_job_id_refuses_submitted_job_with_stored_token() {
+            let ctx = Ctx::new();
+            let dispatched_at = Utc::now() - Duration::hours(2);
+            let lease = ctx.dispatched_job("hash-late", dispatched_at);
+            let received_at = Utc::now();
+            assert_eq!(
+                ctx.db
+                    .record_submit_receipt(
+                        &lease,
+                        received_at,
+                        "tok-late",
+                        received_at + Duration::minutes(10),
+                        SubmitChannel::Primary,
+                    )
+                    .expect("record_submit_receipt"),
+                ReceiptWrite::StoredForRecovery
+            );
+            let job_id = lease.job.id.clone();
+            let stored = ctx.job(&job_id);
+            assert_eq!(stored.status, JobStatus::Submitted);
+            assert_eq!(stored.submit_stage, Some(SubmitStage::Uncertain));
+            assert_eq!(stored.token.as_deref(), Some("tok-late"));
+            assert_eq!(stored.lease_owner, None);
+            assert_eq!(stored.lease_expires_at, None);
+            assert!(stored.started_at.is_some());
+            let before = format!("{stored:?}");
+            let events_before = ctx.event_types_for(&job_id);
+
+            let err = cmd_check(&ctx.config, &ctx.db, Some(&job_id), None, false)
+                .await
+                .expect_err("check refuses a non-PROCESSING job");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("job {job_id} is SUBMITTED, not PROCESSING")),
+                "{msg}"
+            );
+            assert!(
+                msg.contains(&format!("`reviewloop retry --job-id {job_id}`")),
+                "{msg}"
+            );
+
+            assert_eq!(format!("{:?}", ctx.job(&job_id)), before);
+            assert_eq!(ctx.event_types_for(&job_id), events_before);
+        }
+
+        /// The usual unknown outcome has no receipt at all; `check --job-id` should still
+        /// say how to reconcile it.
+        #[tokio::test]
+        async fn check_job_id_on_tokenless_uncertain_job_names_reconcile_hint() {
+            let ctx = Ctx::new();
+            let job = ctx.uncertain_tokenless_job("hash-unknown");
+            let before = format!("{job:?}");
+
+            let err = cmd_check(&ctx.config, &ctx.db, Some(&job.id), None, false)
+                .await
+                .expect_err("check refuses a non-PROCESSING job");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("import-token --job-id {}", job.id)),
+                "{msg}"
+            );
+            assert_eq!(format!("{:?}", ctx.job(&job.id)), before);
+        }
+
+        /// `retry` (with or without `--force`, or the deprecated alias) never requeues a
+        /// submission whose dispatch is in flight under a live lease.
+        async fn assert_retry_refuses_in_flight_submission(force: bool, override_rate_limit: bool) {
+            let ctx = Ctx::new();
+            let lease = ctx.dispatched_job("hash-in-flight", Utc::now());
+            let job_id = lease.job.id.clone();
+            let before = ctx.job(&job_id);
+            let before_debug = format!("{before:?}");
+            let events_before = ctx.event_types_for(&job_id);
+            assert_eq!(events_before, ["submit_dispatched"]);
+
+            let job_ref = JobRef::Id(job_id.clone());
+            let err = cmd_retry(
+                &ctx.config,
+                &ctx.db,
+                &job_ref,
+                force,
+                override_rate_limit,
+                false,
+            )
+            .await
+            .expect_err("retry must not requeue an in-flight submission");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("job {job_id} is being submitted right now")),
+                "{msg}"
+            );
+            assert!(msg.contains(&lease.owner), "{msg}");
+
+            let after = ctx.job(&job_id);
+            assert_eq!(after.status, JobStatus::Submitted);
+            assert_eq!(after.submit_stage, Some(SubmitStage::Dispatched));
+            assert_eq!(after.lease_owner.as_deref(), Some(lease.owner.as_str()));
+            assert_eq!(after.lease_expires_at, lease.job.lease_expires_at);
+            assert_eq!(after.attempt, before.attempt);
+            assert_eq!(after.token, None);
+            assert_eq!(format!("{after:?}"), before_debug);
+            assert_eq!(ctx.event_types_for(&job_id), events_before);
+        }
+
+        #[tokio::test]
+        async fn retry_refuses_in_flight_submission() {
+            assert_retry_refuses_in_flight_submission(false, false).await;
+        }
+
+        #[tokio::test]
+        async fn retry_force_refuses_in_flight_submission() {
+            assert_retry_refuses_in_flight_submission(true, false).await;
+        }
+
+        #[tokio::test]
+        async fn retry_override_rate_limit_refuses_in_flight_submission() {
+            assert_retry_refuses_in_flight_submission(false, true).await;
+        }
+
+        /// Once the dispatching worker's lease has lapsed, `retry` is the user's explicit
+        /// choice to resubmit and requeues the job from scratch.
+        #[tokio::test]
+        async fn retry_requeues_dispatched_job_whose_lease_expired() {
+            let ctx = Ctx::new();
+            let lease = ctx.dispatched_job("hash-stalled", Utc::now() - Duration::hours(2));
+            let job_id = lease.job.id.clone();
+
+            cmd_retry(
+                &ctx.config,
+                &ctx.db,
+                &JobRef::Id(job_id.clone()),
+                false,
+                false,
+                false,
+            )
+            .await
+            .expect("retry after the lease expired");
+
+            let job = ctx.job(&job_id);
+            assert_eq!(job.status, JobStatus::Queued);
+            assert_eq!(job.attempt, 0);
+            assert_eq!(job.submit_stage, None);
+            assert_eq!(job.lease_owner, None);
+            assert_eq!(job.lease_expires_at, None);
+            assert_eq!(job.next_poll_at, None);
+            assert_eq!(job.last_error, None);
+            assert_eq!(job.token, None);
+            let events = ctx.events_for(&job_id);
+            let last = events.last().expect("retried event");
+            assert_eq!(last.event_type, "retried");
+            assert_eq!(last.payload, json!({}));
+        }
+
+        #[test]
+        fn reconcile_hint_for_tokenless_job_names_import_token_job_id() {
+            let ctx = Ctx::new();
+            let job = ctx.uncertain_tokenless_job("hash-hint");
+            let id = &job.id;
+            let hint = job.reconcile_hint();
+            assert!(
+                hint.contains(&format!(
+                    "`reviewloop import-token --job-id {id} --token <token>`"
+                )),
+                "{hint}"
+            );
+            assert!(
+                hint.contains(&format!("`reviewloop retry --job-id {id} --force`")),
+                "{hint}"
+            );
+            assert!(
+                hint.contains(&format!("`reviewloop cancel --job-id {id}`")),
+                "{hint}"
+            );
+            assert!(!hint.contains("--paper-id"), "{hint}");
+            // Recovery records the same hint as the job's last_error.
+            let last_error = job.last_error.as_deref().expect("recovery reason");
+            assert!(last_error.ends_with(&hint), "{last_error}");
+        }
+
+        #[test]
+        fn reconcile_hint_for_job_with_token_names_retry() {
+            let ctx = Ctx::new();
+            let queued = ctx.create_job(JobStatus::Queued, "hash-token");
+            ctx.db
+                .attach_token_to_job(&queued.id, "tok", Utc::now())
+                .expect("attach_token_to_job");
+            let job = ctx.job(&queued.id);
+            assert_eq!(
+                job.reconcile_hint(),
+                format!(
+                    "a receipt token is saved; run `reviewloop retry --job-id {}` to resume polling",
+                    job.id
+                )
+            );
+            assert!(!job.reconcile_hint().contains("import-token"));
+        }
+
+        /// Cancel never claims to withdraw what the provider may already hold.
+        #[test]
+        fn cancel_note_says_remote_submission_is_not_withdrawn() {
+            for status in [JobStatus::Submitted, JobStatus::Processing] {
+                let note =
+                    cancel_note(status).expect("note for a submission the provider may hold");
+                assert!(note.contains("local only") && note.contains("not withdrawn"));
+            }
+            for status in [JobStatus::PendingApproval, JobStatus::Queued] {
+                assert_eq!(
+                    cancel_note(status),
+                    None,
+                    "{status:?} never reached the provider"
+                );
+            }
+        }
+
+        /// A completed job is not "resumable": check must not suggest retrying it.
+        #[tokio::test]
+        async fn check_job_id_on_completed_job_does_not_suggest_resuming() {
+            let ctx = Ctx::new();
+            let job = ctx.create_job(JobStatus::Queued, "hash-done");
+            ctx.db
+                .attach_token_to_job(&job.id, "tok-done", Utc::now())
+                .expect("attach_token_to_job");
+            ctx.db
+                .update_job_state(&job.id, JobStatus::Completed, None, Some(None), None)
+                .expect("complete");
+            let err = cmd_check(&ctx.config, &ctx.db, Some(&job.id), None, false)
+                .await
+                .expect_err("nothing to poll");
+            let msg = err.to_string();
+            assert!(msg.contains("is COMPLETED; nothing to poll"), "{msg}");
+            assert!(!msg.contains("resume polling"), "{msg}");
         }
     }
 }
