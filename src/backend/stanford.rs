@@ -178,17 +178,34 @@ impl ReviewBackend for StanfordBackend {
             .text("venue", req.venue.unwrap_or_default())
             .text("email", req.email);
 
+        // confirm-upload is the step that creates the submission. Everything before it is
+        // safe to retry; from here on, any failure that does not prove rejection is
+        // reported as `OutcomeUnknown` so the worker never resends blindly.
         let confirm_resp = self
             .client
             .post(self.endpoint("/api/confirm-upload"))
             .multipart(confirm_form)
             .send()
             .await
-            .map_err(|e| BackendError::Network(e.to_string()))?;
+            .map_err(|e| {
+                if e.is_connect() {
+                    BackendError::Network(e.to_string())
+                } else {
+                    BackendError::OutcomeUnknown(format!("confirm-upload got no response: {e}"))
+                }
+            })?;
 
         let status = confirm_resp.status();
         let retry_after = parse_retry_after(confirm_resp.headers());
-        let body_text = confirm_resp.text().await.unwrap_or_else(|_| "".to_string());
+        let body_text = match confirm_resp.text().await {
+            Ok(text) => text,
+            Err(e) if status.is_success() => {
+                return Err(BackendError::OutcomeUnknown(format!(
+                    "confirm-upload returned {status} but its body was unreadable: {e}"
+                )));
+            }
+            Err(_) => String::new(),
+        };
 
         if status == StatusCode::TOO_MANY_REQUESTS {
             return Err(BackendError::RateLimited {
@@ -197,10 +214,9 @@ impl ReviewBackend for StanfordBackend {
             });
         }
         if status.is_server_error() {
-            return Err(BackendError::Server {
-                status: status.as_u16(),
-                body: body_text,
-            });
+            return Err(BackendError::OutcomeUnknown(format!(
+                "confirm-upload returned {status}: {body_text}"
+            )));
         }
         if !status.is_success() {
             return Err(BackendError::Schema(format!(
@@ -208,8 +224,9 @@ impl ReviewBackend for StanfordBackend {
             )));
         }
 
-        let parsed: ConfirmResponse = serde_json::from_str(&body_text)
-            .map_err(|e| BackendError::Schema(format!("invalid confirm payload: {e}")))?;
+        let parsed: ConfirmResponse = serde_json::from_str(&body_text).map_err(|e| {
+            BackendError::OutcomeUnknown(format!("invalid confirm-upload receipt: {e}"))
+        })?;
 
         if !parsed.success {
             return Err(BackendError::Schema(
@@ -220,9 +237,9 @@ impl ReviewBackend for StanfordBackend {
             ));
         }
 
-        let token = parsed
-            .token
-            .ok_or_else(|| BackendError::Schema("confirm-upload missing token".to_string()))?;
+        let token = parsed.token.ok_or_else(|| {
+            BackendError::OutcomeUnknown("confirm-upload succeeded without a token".to_string())
+        })?;
 
         Ok(SubmitReceipt {
             token,
