@@ -3,13 +3,15 @@ use crate::{
     model::{
         EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, EventRecord, ExistingReason,
         Job, JobStatus, NewJob, RegisteredProject, ReviewIdentity, ReviewRecord, StatusView,
+        SubmitChannel, SubmitStage, WorkKind,
     },
     util::{parse_rfc3339, to_rfc3339},
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, TransactionBehavior, params, params_from_iter,
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    params_from_iter,
 };
 use serde_json::{Value, json};
 use std::{
@@ -19,7 +21,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PruneReport {
@@ -42,6 +44,100 @@ pub struct PurgePaperReport {
     pub jobs: usize,
     pub events: usize,
     pub reviews: usize,
+}
+
+/// Exclusive, time-bounded right to act on one job, obtained from [`Db::claim_job`].
+/// Writes made on its behalf are rejected once `expires_at` passes or the lease is
+/// revoked (cancel, user override, external token attach).
+#[derive(Debug, Clone)]
+pub struct Lease {
+    /// The job as of the latest write made under this lease.
+    pub job: Job,
+    pub kind: WorkKind,
+    pub owner: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Whether a claim honours the job's `next_poll_at` cooldown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimTiming {
+    /// Daemon scheduling: claim only once `next_poll_at` has passed.
+    WhenDue,
+    /// Explicit CLI action: claim regardless of cooldown.
+    Now,
+}
+
+/// Outcome of a write guarded by lease ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseWrite {
+    Applied,
+    /// The lease expired or was revoked, so nothing was written. Carries the job's
+    /// current status (`None` when the row is gone).
+    Lost(Option<JobStatus>),
+}
+
+/// State a lease owner leaves the job in; finishing always releases the lease.
+#[derive(Debug, Clone)]
+pub struct JobChange {
+    pub status: JobStatus,
+    pub attempt: Option<u32>,
+    pub next_poll_at: Option<Option<DateTime<Utc>>>,
+    pub last_error: Option<Option<String>>,
+    /// Stage left on the row; `None` clears it.
+    pub submit_stage: Option<SubmitStage>,
+    /// New `fallback_used` flag; `None` keeps it.
+    pub fallback_used: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewReview<'a> {
+    pub token: &'a str,
+    pub raw_json: &'a str,
+    pub summary_md: &'a str,
+}
+
+/// What became of a submit receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptWrite {
+    /// Recorded by the lease owner; the job is PROCESSING.
+    Accepted,
+    /// The lease was lost, but the job had no token and no live owner, so the token
+    /// was stored for recovery without changing the job's status.
+    StoredForRecovery,
+    /// The lease was lost and the job could not take the token; only an event records it.
+    Logged,
+}
+
+/// Outcome of [`Db::requeue`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Requeue {
+    Requeued,
+    /// A worker is sending this job's submission right now.
+    InFlight {
+        owner: String,
+        expires_at: DateTime<Utc>,
+    },
+    /// The job already has a receipt token; polling it, not resubmitting, is the retry.
+    HasReceipt,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseRecovery {
+    /// Expired pre-dispatch submit claims returned to the queue.
+    pub released_claims: usize,
+    /// SUBMITTED jobs without a live owner, now marked pending reconciliation.
+    pub uncertain_submits: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    Cancelled {
+        previous_status: JobStatus,
+        previous_stage: Option<SubmitStage>,
+        /// A worker held a live lease, so a request may still be in flight.
+        lease_was_active: bool,
+    },
+    AlreadyTerminal(JobStatus),
 }
 
 pub struct Db {
@@ -155,23 +251,24 @@ impl Db {
     }
 
     pub fn ensure_schema(&self) -> Result<()> {
-        let conn = self.connect()?;
+        let mut conn = self.connect()?;
         enable_wal_mode(&conn).context("enabling WAL mode")?;
-
-        let current_version: i64 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .context("reading schema version")?;
-        let current_version = u32::try_from(current_version).unwrap_or(0);
-        if current_version >= SCHEMA_VERSION {
+        if schema_version(&conn)? >= SCHEMA_VERSION {
             return Ok(());
         }
 
-        create_tables_if_missing(&conn).context("creating tables")?;
-        migrate_columns(&conn).context("migrating columns")?;
-        create_indexes(&conn).context("creating indexes")?;
-
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION as i64)
+        // A daemon and a CLI call can start together; the write lock serializes their
+        // migrations and the re-check makes the loser a no-op.
+        let tx = begin_immediate(&mut conn)?;
+        if schema_version(&tx)? >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        create_tables_if_missing(&tx).context("creating tables")?;
+        migrate_columns(&tx).context("migrating columns")?;
+        create_indexes(&tx).context("creating indexes")?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION as i64)
             .context("recording schema version")?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -219,14 +316,7 @@ impl Db {
     }
 
     pub fn get_job(&self, job_id: &str) -> Result<Option<Job>> {
-        let conn = self.connect()?;
-        conn.query_row(
-            "SELECT * FROM jobs WHERE id = ?1",
-            params![job_id],
-            map_job_row,
-        )
-        .optional()
-        .map_err(Into::into)
+        load_job(&self.connect()?, job_id)
     }
 
     pub fn get_project_job(&self, project_id: &str, job_id: &str) -> Result<Option<Job>> {
@@ -399,6 +489,7 @@ impl Db {
             WHERE project_id = ?1
               AND status = ?2
               AND (next_poll_at IS NULL OR next_poll_at <= ?3)
+              AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?3)
             ORDER BY created_at ASC
             LIMIT ?4
             "#,
@@ -430,6 +521,7 @@ impl Db {
               AND status = ?2
               AND token IS NOT NULL
               AND (next_poll_at IS NULL OR next_poll_at <= ?3)
+              AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?3)
             ORDER BY COALESCE(next_poll_at, created_at) ASC
             LIMIT ?4
             "#,
@@ -446,10 +538,11 @@ impl Db {
         collect_rows(rows)
     }
 
-    /// Update job state, enforcing `JobStatus::can_transition` as a guard.
-    /// Returns an error on invalid transitions. Use [`update_job_state_unchecked`]
-    /// for deliberate user overrides (retry --force, complete, cancel) that
-    /// legitimately move out of terminal states.
+    /// Update job state, enforcing `JobStatus::can_transition` as a guard. Validation and
+    /// write share one transaction. A status change revokes any work lease (the owner's
+    /// premise no longer holds); a same-status bookkeeping update leaves it in place.
+    /// Use [`update_job_state_unchecked`] for deliberate user overrides (retry --force,
+    /// complete) that legitimately move out of terminal states.
     pub fn update_job_state(
         &self,
         job_id: &str,
@@ -458,17 +551,9 @@ impl Db {
         next_poll_at: Option<Option<DateTime<Utc>>>,
         last_error: Option<Option<String>>,
     ) -> Result<()> {
-        // Fetch current state to validate the transition before mutating.
-        let current = {
-            let conn = self.connect()?;
-            conn.query_row(
-                "SELECT * FROM jobs WHERE id = ?1",
-                params![job_id],
-                map_job_row,
-            )
-            .optional()?
-            .ok_or_else(|| anyhow!("job not found: {job_id}"))?
-        };
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        let current = require_job(&tx, job_id)?;
         if !current.status.can_transition(status) {
             anyhow::bail!(
                 "invalid status transition for job {}: {} -> {}",
@@ -477,12 +562,30 @@ impl Db {
                 status.as_str()
             );
         }
-        self.update_job_state_unchecked(job_id, status, attempt, next_poll_at, last_error)
+        let (lease, submit_stage) = if status == current.status {
+            (LeaseColumns::Keep, None)
+        } else {
+            (LeaseColumns::Clear, Some(None))
+        };
+        write_row(
+            &tx,
+            &current,
+            RowWrite {
+                attempt,
+                next_poll_at,
+                last_error,
+                submit_stage,
+                ..RowWrite::new(status, lease)
+            },
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
-    /// Update job state without enforcing the state-machine guard.
-    /// Use at CLI override sites (cmd_retry --force, cmd_complete, cmd_cancel)
-    /// that deliberately move jobs out of terminal or otherwise-restricted states.
+    /// Update job state without enforcing the state-machine guard, revoking any work
+    /// lease so an in-flight worker's result is rejected.
+    /// Use at CLI override sites (cmd_retry --force, cmd_complete) that deliberately move
+    /// jobs out of terminal or otherwise-restricted states.
     pub fn update_job_state_unchecked(
         &self,
         job_id: &str,
@@ -492,44 +595,107 @@ impl Db {
         last_error: Option<Option<String>>,
     ) -> Result<()> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-
-        let current = tx
-            .query_row(
-                "SELECT * FROM jobs WHERE id = ?1",
-                params![job_id],
-                map_job_row,
-            )
-            .optional()?
-            .ok_or_else(|| anyhow!("job not found: {job_id}"))?;
-
-        let attempt_val = attempt.unwrap_or(current.attempt);
-        let next_poll_val = next_poll_at.unwrap_or(current.next_poll_at).map(to_rfc3339);
-        let last_error_val = last_error.unwrap_or(current.last_error);
-
-        tx.execute(
-            r#"
-            UPDATE jobs
-            SET status = ?2,
-                attempt = ?3,
-                next_poll_at = ?4,
-                last_error = ?5,
-                updated_at = ?6
-            WHERE id = ?1
-            "#,
-            params![
-                job_id,
-                status.as_str(),
-                attempt_val as i64,
-                next_poll_val,
-                last_error_val,
-                to_rfc3339(Utc::now()),
-            ],
+        let tx = begin_immediate(&mut conn)?;
+        let current = require_job(&tx, job_id)?;
+        write_row(
+            &tx,
+            &current,
+            RowWrite {
+                attempt,
+                next_poll_at,
+                last_error,
+                submit_stage: Some(None),
+                ..RowWrite::new(status, LeaseColumns::Clear)
+            },
         )?;
         tx.commit()?;
         Ok(())
     }
 
+    /// Reset a job's retry bookkeeping. Status, lease and submit stage are read and kept
+    /// inside the transaction, so a caller's stale view can never become a transition.
+    /// `None` fields keep the current value.
+    pub fn reschedule(
+        &self,
+        job_id: &str,
+        attempt: Option<u32>,
+        next_poll_at: Option<Option<DateTime<Utc>>>,
+    ) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        let current = require_job(&tx, job_id)?;
+        write_row(
+            &tx,
+            &current,
+            RowWrite {
+                attempt,
+                next_poll_at,
+                ..RowWrite::new(current.status, LeaseColumns::Keep)
+            },
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Bring a PROCESSING job's next poll forward to `at` unless it is already due
+    /// sooner. Returns `false` when nothing changed.
+    pub fn pull_poll_forward(&self, job_id: &str, at: DateTime<Utc>) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        let current = require_job(&tx, job_id)?;
+        // A NULL next_poll_at is already due.
+        if current.status != JobStatus::Processing
+            || current.next_poll_at.is_none_or(|next| next <= at)
+        {
+            return Ok(false);
+        }
+        write_row(
+            &tx,
+            &current,
+            RowWrite {
+                next_poll_at: Some(Some(at)),
+                ..RowWrite::new(current.status, LeaseColumns::Keep)
+            },
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Put a job back to QUEUED for another submit attempt (user `retry`): attempt 0, no
+    /// cooldown or error, lease revoked. Both refusals are re-checked inside the
+    /// transaction, so a caller's stale view cannot turn into a duplicate submission:
+    /// a submission in flight (DISPATCHED with a live lease) or one whose receipt has
+    /// landed meanwhile (the job holds a token) is left alone.
+    pub fn requeue(&self, job_id: &str, now: DateTime<Utc>) -> Result<Requeue> {
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        let current = require_job(&tx, job_id)?;
+        if current.token.is_some() {
+            return Ok(Requeue::HasReceipt);
+        }
+        if current.submit_stage == Some(SubmitStage::Dispatched) && lease_is_live(&current, now) {
+            return Ok(Requeue::InFlight {
+                owner: current.lease_owner.clone().unwrap_or_default(),
+                expires_at: current.lease_expires_at.unwrap_or(now),
+            });
+        }
+        write_row(
+            &tx,
+            &current,
+            RowWrite {
+                attempt: Some(0),
+                next_poll_at: Some(None),
+                last_error: Some(None),
+                submit_stage: Some(None),
+                ..RowWrite::new(JobStatus::Queued, LeaseColumns::Clear)
+            },
+        )?;
+        tx.commit()?;
+        Ok(Requeue::Requeued)
+    }
+
+    /// Attach a token obtained outside the worker (email ingestion, `import-token`) and
+    /// move the job to PROCESSING. The token is authoritative, so any work lease is revoked.
     pub fn mark_submitted_with_token(
         &self,
         job_id: &str,
@@ -537,17 +703,8 @@ impl Db {
         next_poll_at: DateTime<Utc>,
     ) -> Result<()> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-
-        let current = tx
-            .query_row(
-                "SELECT * FROM jobs WHERE id = ?1",
-                params![job_id],
-                map_job_row,
-            )
-            .optional()?
-            .ok_or_else(|| anyhow!("job not found: {job_id}"))?;
-
+        let tx = begin_immediate(&mut conn)?;
+        let current = require_job(&tx, job_id)?;
         if !current.status.can_transition(JobStatus::Processing) {
             anyhow::bail!(
                 "invalid status transition for job {}: {} -> {}",
@@ -556,29 +713,7 @@ impl Db {
                 JobStatus::Processing.as_str()
             );
         }
-
-        let now = to_rfc3339(Utc::now());
-        tx.execute(
-            r#"
-            UPDATE jobs
-            SET status = ?2,
-                token = ?3,
-                started_at = COALESCE(started_at, ?5),
-                next_poll_at = ?4,
-                last_error = NULL,
-                attempt = 0,
-                updated_at = ?6
-            WHERE id = ?1
-            "#,
-            params![
-                job_id,
-                JobStatus::Processing.as_str(),
-                token,
-                to_rfc3339(next_poll_at),
-                now,
-                now,
-            ],
-        )?;
+        write_receipt(&tx, &current, token, next_poll_at)?;
         tx.commit()?;
         Ok(())
     }
@@ -617,6 +752,486 @@ impl Db {
         Ok(())
     }
 
+    /// Atomically take the job's lease for `kind` when it is claimable: QUEUED for submit,
+    /// PROCESSING for poll, no live lease, and — with [`ClaimTiming::WhenDue`] — past its
+    /// `next_poll_at`. Returns `None` otherwise. A submit claim marks the row CLAIMED:
+    /// nothing has been sent yet, so an expired claim is safe to take over.
+    pub fn claim_job(
+        &self,
+        job_id: &str,
+        kind: WorkKind,
+        timing: ClaimTiming,
+        now: DateTime<Utc>,
+        ttl: ChronoDuration,
+    ) -> Result<Option<Lease>> {
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        let job = require_job(&tx, job_id)?;
+        let claimable_status = match kind {
+            WorkKind::Submit => JobStatus::Queued,
+            WorkKind::Poll => JobStatus::Processing,
+        };
+        let due = match timing {
+            ClaimTiming::Now => true,
+            ClaimTiming::WhenDue => job.next_poll_at.is_none_or(|at| at <= now),
+        };
+        if job.status != claimable_status || !due || lease_is_live(&job, now) {
+            return Ok(None);
+        }
+
+        let owner = format!("{}-{}", std::process::id(), Uuid::new_v4());
+        let expires_at = now + ttl;
+        let submit_stage = match kind {
+            WorkKind::Submit => Some(Some(SubmitStage::Claimed)),
+            WorkKind::Poll => None,
+        };
+        write_row(
+            &tx,
+            &job,
+            RowWrite {
+                submit_stage,
+                ..RowWrite::new(
+                    job.status,
+                    LeaseColumns::Set {
+                        owner: &owner,
+                        expires_at,
+                    },
+                )
+            },
+        )?;
+        if kind == WorkKind::Submit
+            && let Some(previous_owner) = job.lease_owner.as_deref()
+        {
+            insert_job_event(
+                &tx,
+                &job,
+                "submit_claim_taken_over",
+                &json!({ "previous_owner": previous_owner, "owner": owner }),
+            )?;
+        }
+        let job = require_job(&tx, job_id)?;
+        tx.commit()?;
+        Ok(Some(Lease {
+            job,
+            kind,
+            owner,
+            expires_at,
+        }))
+    }
+
+    /// Record that the lease owner is about to send the submission through `channel`:
+    /// SUBMITTED/DISPATCHED, lease renewed to `now + ttl`, and a `submit_dispatched` event,
+    /// in one transaction. Returns `false` — and the caller must not send — when the
+    /// lease is no longer held.
+    pub fn begin_submit_dispatch(
+        &self,
+        lease: &mut Lease,
+        channel: SubmitChannel,
+        now: DateTime<Utc>,
+        ttl: ChronoDuration,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            lease.kind == WorkKind::Submit,
+            "begin_submit_dispatch needs a submit lease"
+        );
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        let Some(job) = load_job(&tx, &lease.job.id)? else {
+            return Ok(false);
+        };
+        if !held_by(&job, &lease.owner, now) || !job.status.can_transition(JobStatus::Submitted) {
+            return Ok(false);
+        }
+
+        let expires_at = now + ttl;
+        write_row(
+            &tx,
+            &job,
+            RowWrite {
+                submit_stage: Some(Some(SubmitStage::Dispatched)),
+                // Set before the script runs so a crash mid-fallback cannot rerun it;
+                // cleared again if the fallback provably never reached the provider.
+                fallback_used: (channel == SubmitChannel::Fallback).then_some(true),
+                ..RowWrite::new(
+                    JobStatus::Submitted,
+                    LeaseColumns::Set {
+                        owner: &lease.owner,
+                        expires_at,
+                    },
+                )
+            },
+        )?;
+        insert_job_event(
+            &tx,
+            &job,
+            "submit_dispatched",
+            &json!({ "channel": channel.as_str(), "owner": lease.owner }),
+        )?;
+        let job = require_job(&tx, &job.id)?;
+        tx.commit()?;
+        lease.job = job;
+        lease.expires_at = expires_at;
+        Ok(true)
+    }
+
+    /// Give the lease back without changing the job's status, e.g. after a local error
+    /// before anything was sent. A submit lease is only released while still CLAIMED: once
+    /// dispatched, its outcome must be recorded instead. Returns `false` when this owner
+    /// no longer holds the row.
+    pub fn release_lease(&self, lease: &Lease) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        let Some(job) = load_job(&tx, &lease.job.id)? else {
+            return Ok(false);
+        };
+        let releasable = match lease.kind {
+            WorkKind::Submit => job.submit_stage == Some(SubmitStage::Claimed),
+            WorkKind::Poll => true,
+        };
+        if job.lease_owner.as_deref() != Some(lease.owner.as_str()) || !releasable {
+            return Ok(false);
+        }
+        let submit_stage = match lease.kind {
+            WorkKind::Submit => Some(None),
+            WorkKind::Poll => None,
+        };
+        write_row(
+            &tx,
+            &job,
+            RowWrite {
+                submit_stage,
+                ..RowWrite::new(job.status, LeaseColumns::Clear)
+            },
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Apply `change` and record the event in one transaction, releasing the lease — but
+    /// only while `lease` is still held at `now`. A lost lease writes nothing.
+    pub fn finish_lease(
+        &self,
+        lease: &Lease,
+        now: DateTime<Utc>,
+        change: &JobChange,
+        event_type: &str,
+        payload: Value,
+    ) -> Result<LeaseWrite> {
+        self.finish(lease, now, change, None, event_type, payload)
+    }
+
+    /// [`finish_lease`](Self::finish_lease) that also stores the fetched review.
+    pub fn finish_lease_with_review(
+        &self,
+        lease: &Lease,
+        now: DateTime<Utc>,
+        review: NewReview<'_>,
+        change: &JobChange,
+        event_type: &str,
+        payload: Value,
+    ) -> Result<LeaseWrite> {
+        self.finish(lease, now, change, Some(review), event_type, payload)
+    }
+
+    fn finish(
+        &self,
+        lease: &Lease,
+        now: DateTime<Utc>,
+        change: &JobChange,
+        review: Option<NewReview<'_>>,
+        event_type: &str,
+        payload: Value,
+    ) -> Result<LeaseWrite> {
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        let Some(job) = load_job(&tx, &lease.job.id)? else {
+            return Ok(LeaseWrite::Lost(None));
+        };
+        if !held_by(&job, &lease.owner, now) {
+            return Ok(LeaseWrite::Lost(Some(job.status)));
+        }
+        anyhow::ensure!(
+            job.status.can_transition(change.status),
+            "invalid status transition for job {}: {} -> {}",
+            job.id,
+            job.status.as_str(),
+            change.status.as_str()
+        );
+        if let Some(review) = review {
+            upsert_review_row(&tx, &job.id, review)?;
+        }
+        write_row(
+            &tx,
+            &job,
+            RowWrite {
+                attempt: change.attempt,
+                next_poll_at: change.next_poll_at,
+                last_error: change.last_error.clone(),
+                submit_stage: Some(change.submit_stage),
+                fallback_used: change.fallback_used,
+                ..RowWrite::new(change.status, LeaseColumns::Clear)
+            },
+        )?;
+        insert_job_event(&tx, &job, event_type, &payload)?;
+        tx.commit()?;
+        Ok(LeaseWrite::Applied)
+    }
+
+    /// Record the provider's receipt for a dispatched submission.
+    ///
+    /// While the lease is held the job moves to PROCESSING with the token. A receipt
+    /// arriving after the lease was lost never changes the job's status, but it is not
+    /// discarded: an event always records it, and the token is stored when the job has
+    /// none and no live owner (pending reconciliation, cancelled, failed) — so it can be
+    /// recovered and email ingestion cannot bind it to a different job.
+    pub fn record_submit_receipt(
+        &self,
+        lease: &Lease,
+        now: DateTime<Utc>,
+        token: &str,
+        next_poll_at: DateTime<Utc>,
+        channel: SubmitChannel,
+    ) -> Result<ReceiptWrite> {
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        let Some(job) = load_job(&tx, &lease.job.id)? else {
+            insert_job_event(
+                &tx,
+                &lease.job,
+                "submit_receipt_after_lease_lost",
+                &json!({ "channel": channel.as_str(), "token": token, "owner": lease.owner, "status": null, "stored": false }),
+            )?;
+            tx.commit()?;
+            return Ok(ReceiptWrite::Logged);
+        };
+
+        if held_by(&job, &lease.owner, now) && job.status.can_transition(JobStatus::Processing) {
+            write_receipt(&tx, &job, token, next_poll_at)?;
+            let event_type = match channel {
+                SubmitChannel::Primary => "submitted",
+                SubmitChannel::Fallback => "submitted_via_fallback",
+            };
+            insert_job_event(
+                &tx,
+                &job,
+                event_type,
+                &json!({
+                    "backend": job.backend,
+                    "channel": channel.as_str(),
+                    "token": token,
+                    "pdf_hash": job.pdf_hash,
+                    "snapshot_path": job.snapshot_path,
+                }),
+            )?;
+            tx.commit()?;
+            return Ok(ReceiptWrite::Accepted);
+        }
+
+        let store = job.token.is_none()
+            && !lease_is_live(&job, now)
+            && matches!(
+                job.status,
+                JobStatus::Submitted
+                    | JobStatus::Failed
+                    | JobStatus::FailedNeedsManual
+                    | JobStatus::Timeout
+            );
+        if store {
+            // A token always comes with started_at, which the review timeout counts from.
+            tx.execute(
+                "UPDATE jobs SET token = ?2, started_at = COALESCE(started_at, ?3) WHERE id = ?1",
+                params![job.id, token, to_rfc3339(now)],
+            )?;
+            let mut write = RowWrite::new(job.status, LeaseColumns::Clear);
+            if job.status == JobStatus::Submitted {
+                let with_token = Job {
+                    token: Some(token.to_string()),
+                    ..job.clone()
+                };
+                write.submit_stage = Some(Some(SubmitStage::Uncertain));
+                write.last_error = Some(Some(format!(
+                    "submission receipt arrived after the worker lost its lease; {}",
+                    with_token.reconcile_hint()
+                )));
+            }
+            write_row(&tx, &job, write)?;
+        }
+        insert_job_event(
+            &tx,
+            &job,
+            "submit_receipt_after_lease_lost",
+            &json!({
+                "channel": channel.as_str(),
+                "token": token,
+                "owner": lease.owner,
+                "status": job.status.as_str(),
+                "existing_token": job.token,
+                "stored": store,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(if store {
+            ReceiptWrite::StoredForRecovery
+        } else {
+            ReceiptWrite::Logged
+        })
+    }
+
+    /// Settle submit attempts whose owner is gone (crash, kill, stall):
+    /// - QUEUED with an expired claim: nothing was sent, so the claim is released and
+    ///   the job is claimable again with its cooldown unchanged.
+    /// - SUBMITTED with no live owner and not yet UNCERTAIN: the provider may have
+    ///   accepted it, so the job is marked UNCERTAIN with a diagnostic and is never
+    ///   resubmitted automatically.
+    pub fn recover_expired_leases(
+        &self,
+        project_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<LeaseRecovery> {
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        let now_text = to_rfc3339(now);
+        let mut report = LeaseRecovery::default();
+
+        let stale_claims = query_jobs(
+            &tx,
+            r#"
+            SELECT * FROM jobs
+            WHERE project_id = ?1
+              AND status = ?2
+              AND lease_owner IS NOT NULL
+              AND (lease_expires_at IS NULL OR lease_expires_at <= ?3)
+            "#,
+            params![project_id, JobStatus::Queued.as_str(), now_text],
+        )?;
+        for job in stale_claims {
+            write_row(
+                &tx,
+                &job,
+                RowWrite {
+                    submit_stage: Some(None),
+                    ..RowWrite::new(JobStatus::Queued, LeaseColumns::Clear)
+                },
+            )?;
+            insert_job_event(
+                &tx,
+                &job,
+                "submit_claim_expired",
+                &json!({
+                    "previous_owner": job.lease_owner,
+                    "lease_expires_at": job.lease_expires_at.map(to_rfc3339),
+                }),
+            )?;
+            report.released_claims += 1;
+        }
+
+        let orphaned = query_jobs(
+            &tx,
+            r#"
+            SELECT * FROM jobs
+            WHERE project_id = ?1
+              AND status = ?2
+              AND COALESCE(submit_stage, '') <> ?3
+              AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?4)
+            "#,
+            params![
+                project_id,
+                JobStatus::Submitted.as_str(),
+                SubmitStage::Uncertain.as_str(),
+                now_text
+            ],
+        )?;
+        for job in orphaned {
+            let (source, cause) = match job.lease_owner.as_deref() {
+                Some(owner) => (
+                    "lease_expired",
+                    format!(
+                        "worker {owner} lost its lease after dispatching to the provider (crash, kill, or stall)"
+                    ),
+                ),
+                None => (
+                    "legacy_submitted",
+                    "the job was left SUBMITTED without a receipt by an earlier reviewloop version"
+                        .to_string(),
+                ),
+            };
+            let reason = format!(
+                "submission outcome unknown: {cause}, so the provider may have accepted it; {}",
+                job.reconcile_hint()
+            );
+            write_row(
+                &tx,
+                &job,
+                RowWrite {
+                    last_error: Some(Some(reason.clone())),
+                    submit_stage: Some(Some(SubmitStage::Uncertain)),
+                    ..RowWrite::new(JobStatus::Submitted, LeaseColumns::Clear)
+                },
+            )?;
+            insert_job_event(
+                &tx,
+                &job,
+                "submit_outcome_unknown",
+                &json!({ "source": source, "previous_owner": job.lease_owner, "reason": reason }),
+            )?;
+            report.uncertain_submits += 1;
+        }
+
+        tx.commit()?;
+        Ok(report)
+    }
+
+    /// Cancel a non-terminal job: FAILED with a "cancelled by user" reason, lease revoked,
+    /// and a `cancelled` event, in one transaction — so a worker finishing concurrently
+    /// either lands first (`AlreadyTerminal`) or loses its lease (its result is rejected).
+    /// Cancelling never withdraws a request the provider may already hold.
+    pub fn cancel_job(
+        &self,
+        job_id: &str,
+        reason: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<CancelOutcome> {
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        let job = require_job(&tx, job_id)?;
+        if job.status.is_terminal() {
+            return Ok(CancelOutcome::AlreadyTerminal(job.status));
+        }
+
+        let last_error = match reason {
+            Some(reason) => format!("cancelled by user: {reason}"),
+            None => "cancelled by user".to_string(),
+        };
+        let lease_was_active = lease_is_live(&job, now);
+        write_row(
+            &tx,
+            &job,
+            RowWrite {
+                next_poll_at: Some(None),
+                last_error: Some(Some(last_error)),
+                submit_stage: Some(None),
+                ..RowWrite::new(JobStatus::Failed, LeaseColumns::Clear)
+            },
+        )?;
+        insert_job_event(
+            &tx,
+            &job,
+            "cancelled",
+            &json!({
+                "reason": reason,
+                "previous_status": job.status.as_str(),
+                "previous_submit_stage": job.submit_stage.map(SubmitStage::as_str),
+                "lease_was_active": lease_was_active,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(CancelOutcome::Cancelled {
+            previous_status: job.status,
+            previous_stage: job.submit_stage,
+            lease_was_active,
+        })
+    }
+
     pub fn upsert_review(
         &self,
         job_id: &str,
@@ -624,20 +1239,15 @@ impl Db {
         raw_json: &str,
         summary_md: &str,
     ) -> Result<()> {
-        let conn = self.connect()?;
-        conn.execute(
-            r#"
-            INSERT INTO reviews(job_id, token, raw_json, summary_md, completed_at)
-            VALUES(?1, ?2, ?3, ?4, ?5)
-            ON CONFLICT(job_id) DO UPDATE SET
-                token = excluded.token,
-                raw_json = excluded.raw_json,
-                summary_md = excluded.summary_md,
-                completed_at = excluded.completed_at
-            "#,
-            params![job_id, token, raw_json, summary_md, to_rfc3339(Utc::now())],
-        )?;
-        Ok(())
+        upsert_review_row(
+            &self.connect()?,
+            job_id,
+            NewReview {
+                token,
+                raw_json,
+                summary_md,
+            },
+        )
     }
 
     /// Read a job's stored review.
@@ -1106,7 +1716,8 @@ impl Db {
             SELECT id, paper_id, backend, pdf_path, pdf_hash, snapshot_path, status, token, email,
                    venue, git_tag, git_commit, attempt, started_at, next_poll_at,
                    last_error, fallback_used, created_at, updated_at,
-                   project_id, version_no, round_no, version_source, version_key
+                   project_id, version_no, round_no, version_source, version_key,
+                   lease_owner, lease_expires_at, submit_stage
             FROM (
                 SELECT *,
                        ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY updated_at DESC) AS rn
@@ -1333,6 +1944,176 @@ impl Db {
     }
 }
 
+/// Begin a transaction that takes the write lock up front. A deferred read-then-write
+/// transaction in WAL mode fails with SQLITE_BUSY — without a busy-handler retry — when
+/// another connection commits in between, so every read-validate-write uses this.
+fn begin_immediate(conn: &mut Connection) -> Result<Transaction<'_>> {
+    Ok(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
+}
+
+fn schema_version(conn: &Connection) -> Result<u32> {
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("reading schema version")?;
+    Ok(u32::try_from(version).unwrap_or(0))
+}
+
+fn require_job(conn: &Connection, job_id: &str) -> Result<Job> {
+    load_job(conn, job_id)?.ok_or_else(|| anyhow!("job not found: {job_id}"))
+}
+
+fn query_jobs(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Job>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params, map_job_row)?;
+    collect_rows(rows)
+}
+
+fn lease_is_live(job: &Job, now: DateTime<Utc>) -> bool {
+    job.lease_owner.is_some() && job.lease_expires_at.is_some_and(|at| at > now)
+}
+
+fn held_by(job: &Job, owner: &str, now: DateTime<Utc>) -> bool {
+    job.lease_owner.as_deref() == Some(owner) && lease_is_live(job, now)
+}
+
+enum LeaseColumns<'a> {
+    Keep,
+    Clear,
+    Set {
+        owner: &'a str,
+        expires_at: DateTime<Utc>,
+    },
+}
+
+/// A change to a job's execution state. `None` fields keep the current value.
+struct RowWrite<'a> {
+    status: JobStatus,
+    attempt: Option<u32>,
+    next_poll_at: Option<Option<DateTime<Utc>>>,
+    last_error: Option<Option<String>>,
+    lease: LeaseColumns<'a>,
+    submit_stage: Option<Option<SubmitStage>>,
+    fallback_used: Option<bool>,
+}
+
+impl<'a> RowWrite<'a> {
+    fn new(status: JobStatus, lease: LeaseColumns<'a>) -> Self {
+        Self {
+            status,
+            attempt: None,
+            next_poll_at: None,
+            last_error: None,
+            lease,
+            submit_stage: None,
+            fallback_used: None,
+        }
+    }
+}
+
+/// The single writer of a job's execution-state columns — status, attempt, schedule,
+/// last_error, lease, submit stage and fallback flag — so every state change keeps them
+/// consistent.
+fn write_row(conn: &Connection, current: &Job, write: RowWrite<'_>) -> Result<()> {
+    let (lease_owner, lease_expires_at) = match write.lease {
+        LeaseColumns::Keep => (current.lease_owner.clone(), current.lease_expires_at),
+        LeaseColumns::Clear => (None, None),
+        LeaseColumns::Set { owner, expires_at } => (Some(owner.to_string()), Some(expires_at)),
+    };
+    conn.execute(
+        r#"
+        UPDATE jobs
+        SET status = ?2,
+            attempt = ?3,
+            next_poll_at = ?4,
+            last_error = ?5,
+            lease_owner = ?6,
+            lease_expires_at = ?7,
+            submit_stage = ?8,
+            fallback_used = ?9,
+            updated_at = ?10
+        WHERE id = ?1
+        "#,
+        params![
+            current.id,
+            write.status.as_str(),
+            write.attempt.unwrap_or(current.attempt) as i64,
+            write
+                .next_poll_at
+                .unwrap_or(current.next_poll_at)
+                .map(to_rfc3339),
+            write
+                .last_error
+                .unwrap_or_else(|| current.last_error.clone()),
+            lease_owner,
+            lease_expires_at.map(to_rfc3339),
+            write
+                .submit_stage
+                .unwrap_or(current.submit_stage)
+                .map(SubmitStage::as_str),
+            write.fallback_used.unwrap_or(current.fallback_used),
+            to_rfc3339(Utc::now()),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Move a job to PROCESSING with its receipt token, releasing any lease.
+fn write_receipt(
+    conn: &Connection,
+    current: &Job,
+    token: &str,
+    next_poll_at: DateTime<Utc>,
+) -> Result<()> {
+    write_row(
+        conn,
+        current,
+        RowWrite {
+            attempt: Some(0),
+            next_poll_at: Some(Some(next_poll_at)),
+            last_error: Some(None),
+            submit_stage: Some(None),
+            ..RowWrite::new(JobStatus::Processing, LeaseColumns::Clear)
+        },
+    )?;
+    conn.execute(
+        "UPDATE jobs SET token = ?2, started_at = COALESCE(started_at, ?3) WHERE id = ?1",
+        params![current.id, token, to_rfc3339(Utc::now())],
+    )?;
+    Ok(())
+}
+
+fn insert_job_event(conn: &Connection, job: &Job, event_type: &str, payload: &Value) -> Result<()> {
+    insert_event(
+        conn,
+        Some(&job.project_id),
+        Some(&job.id),
+        event_type,
+        payload,
+    )
+}
+
+fn upsert_review_row(conn: &Connection, job_id: &str, review: NewReview<'_>) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO reviews(job_id, token, raw_json, summary_md, completed_at)
+        VALUES(?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(job_id) DO UPDATE SET
+            token = excluded.token,
+            raw_json = excluded.raw_json,
+            summary_md = excluded.summary_md,
+            completed_at = excluded.completed_at
+        "#,
+        params![
+            job_id,
+            review.token,
+            review.raw_json,
+            review.summary_md,
+            to_rfc3339(Utc::now())
+        ],
+    )?;
+    Ok(())
+}
+
 fn enable_wal_mode(conn: &Connection) -> Result<()> {
     // Enable WAL journal mode for file-based databases. WAL allows concurrent
     // readers + one writer without blocking each other, so a write transaction
@@ -1384,6 +2165,9 @@ fn create_tables_if_missing(conn: &Connection) -> Result<()> {
             next_poll_at TEXT,
             last_error TEXT,
             fallback_used INTEGER NOT NULL DEFAULT 0,
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            submit_stage TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -1457,6 +2241,9 @@ fn migrate_columns(conn: &Connection) -> Result<()> {
     )?;
     ensure_column_exists(conn, "jobs", "version_key", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column_exists(conn, "events", "project_id", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column_exists(conn, "jobs", "lease_owner", "TEXT")?;
+    ensure_column_exists(conn, "jobs", "lease_expires_at", "TEXT")?;
+    ensure_column_exists(conn, "jobs", "submit_stage", "TEXT")?;
     ensure_column_exists(conn, "jobs", "snapshot_path", "TEXT")?;
 
     if column_exists(conn, "jobs", "version_no")? {
@@ -1874,11 +2661,23 @@ fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
     let status: String = row.get("status")?;
     let started_at: Option<String> = row.get("started_at")?;
     let next_poll_at: Option<String> = row.get("next_poll_at")?;
+    let lease_expires_at: Option<String> = row.get("lease_expires_at")?;
+    let submit_stage: Option<String> = row.get("submit_stage")?;
     let created_at: String = row.get("created_at")?;
     let updated_at: String = row.get("updated_at")?;
 
     let status = JobStatus::from_db(&status)
         .ok_or_else(|| conversion_error(format!("invalid status: {status}")))?;
+    let submit_stage = submit_stage
+        .map(|value| {
+            SubmitStage::from_db(&value)
+                .ok_or_else(|| conversion_error(format!("invalid submit_stage: {value}")))
+        })
+        .transpose()?;
+    let lease_expires_at = lease_expires_at
+        .map(|v| parse_rfc3339(&v))
+        .transpose()
+        .map_err(|e| conversion_error(e.to_string()))?;
 
     let next_poll_at = next_poll_at
         .map(|v| parse_rfc3339(&v))
@@ -1916,6 +2715,9 @@ fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         next_poll_at,
         last_error: row.get("last_error")?,
         fallback_used: row.get::<_, i64>("fallback_used")? == 1,
+        lease_owner: row.get("lease_owner")?,
+        lease_expires_at,
+        submit_stage,
         created_at,
         updated_at,
     })

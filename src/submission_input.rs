@@ -329,6 +329,9 @@ mod tests {
             next_poll_at: None,
             last_error: None,
             fallback_used: false,
+            lease_owner: None,
+            lease_expires_at: None,
+            submit_stage: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
