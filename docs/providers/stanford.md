@@ -88,12 +88,14 @@ and again on the pinned snapshot before every dispatch:
 |---|---|
 | larger than 10 MiB | rejected: `input_rejected` at enqueue; at submit `FAILED_NEEDS_MANUAL` with event `submit_input_rejected`, nothing sent, fallback not run |
 | no `%PDF-` header in the first 1 KiB | rejected the same way |
-| more than 15 pages (estimated) | accepted with a notice: `ManuscriptInput.notices` at enqueue, event `submit_input_notice` before dispatch, and a log warning |
+| more than 15 pages | accepted with a notice: `ManuscriptInput.notices` at enqueue, event `submit_input_notice` before dispatch, and a log warning |
 | file name without `.pdf` | uploaded as `<name>.pdf` by both routes |
 
-The page count is a heuristic (`/Type /Page` objects). It reads 0 for PDFs that keep
-their page objects in compressed object streams, in which case no notice is given.
-Language and field are not checked.
+Enqueue checks the pinned snapshot, the bytes every submission of the job uploads. The
+page count is an estimate: it counts `/Type /Page` objects, including those in
+Flate-compressed object streams, where pdfTeX, XeTeX and LuaTeX put them by default.
+A PDF whose pages cannot be found that way (encrypted, other filters) counts 0 pages
+and gets no notice. Language and field are not checked.
 
 ## Email, venue and score
 
@@ -107,7 +109,8 @@ Language and field are not checked.
   ACL, EMNLP, OSDI, SOSP, VLDB and SIGMOD, and sends any other venue as typed under
   "Other". The API accepts any string; an empty venue is allowed. Resolution:
   `papers[].venue` → project `providers.stanford.venue` → global
-  `providers.stanford.venue`. The job records the venue requested; a job stored
+  `providers.stanford.venue`, whose built-in default is `ICLR`; set `venue = ""` to
+  send none. The job records the venue requested; a job stored
   without one is sent the venue configured at submission time.
 - **Score**: `numerical_score` is fitted to ICLR 2025 reviews and, per the tech
   overview, shown only when the venue is ICLR. `review.md` prints it as
@@ -121,7 +124,7 @@ Language and field are not checked.
 | `providers.stanford.fallback_mode` | global | `node_playwright`; `disabled` turns the fallback off |
 | `providers.stanford.fallback_script` | global, project override | `tools/paperreview_fallback.mjs` |
 | `providers.stanford.email` | global, project override | active email account |
-| `providers.stanford.venue` | project (global fallback); `papers[].venue` per paper | none |
+| `providers.stanford.venue` | project (global fallback); `papers[].venue` per paper | `ICLR` |
 
 The backend identifier stays `stanford` everywhere: config sections, the job's
 `backend`, tag triggers (`review-stanford/<paper-id>/*`) and the email token
@@ -157,7 +160,7 @@ Markdown) and `has_feedback`. ReviewLoop writes `<state_dir>/artifacts/<job_id>/
 |---|---|
 | `review.json` | the reply, verbatim |
 | `review.md` | summary: title, venue, submission date, score, then the sections (or `content`) |
-| `meta.json` | `job_id`, `paper_id`, `backend`, `token`, `generated_at`, `pdf_path`, `pdf_hash` and `snapshot_path` (the uploaded bytes), `provider` (`backend`, `name`, `base_url`) and `submission` (`channel`, `venue`, `version_no`, `round_no`, `submitted_at`, `provider_submission_date`) |
+| `meta.json` | `job_id`, `paper_id`, `backend`, `token`, `generated_at`, `pdf_path`, `pdf_hash` and `snapshot_path` (the uploaded bytes), `provider` (`backend`, `name`, `base_url`) and `submission`: `channel` (the route that produced the receipt), `venue` (recorded on the job; `null` when the configured venue was sent), `version_no`, `round_no`, `submitted_at`, and the provider's own `provider_submission_date` and `provider_venue` |
 
 The review is stored against the job's pinned snapshot, so `meta.json.pdf_hash`
 is the SHA-256 of the bytes the provider received, even if the source PDF changed
@@ -177,15 +180,21 @@ review, and the events that record it) and in `meta.json`. It is kept out of:
 
 If the database cannot save a receipt, the token is written to
 `<state_dir>/recovery/receipt-<job_id>-<time>.json` (mode `0600`) and the error
-names that file, not the token. Only if that write fails too does the error carry
-the token, as the last place left to keep it.
+names that file, not the token. Only if that write fails too is the token logged, in a
+single daemon log line; the error, which also reaches notifications, `daemon status`
+and the widget, never carries it. `daemon status --json` and `status` also hide request
+URLs recorded by earlier versions.
 
 ## Fallback
 
 With `fallback_mode = "node_playwright"`, a definitive primary failure hands the
 attempt to `tools/paperreview_fallback.mjs`. It submits the same pinned PDF under the
 same file name, email and venue through the provider's own upload form, and
-watches the page's requests to report in the primary's terms:
+watches the page's requests to report in the primary's terms. The upload step is the
+page's cross-origin multipart POST, so the analytics beacons the live page sends never
+count as a step; steps only move forward and stop at `confirm`; and the token is read
+from confirm-upload's reply, not from the page, which renders a missing one as
+"undefined".
 
 ```json
 {"success": false, "stage": "confirm", "status": 422, "submitted": true, "error": "email: Field required"}
@@ -195,13 +204,16 @@ watches the page's requests to report in the primary's terms:
 |---|---|
 | `success: true` with `token` | accepted (`submitted_via_fallback`) |
 | `rate_limited: true` (`retry_after_secs`) | rate limited → `QUEUED`; the fallback stays available |
-| `submitted: false`, or a 4xx `status` | definitive → `FAILED_NEEDS_MANUAL`; the fallback stays available |
+| `submitted: false`; or, for `confirm`, a 4xx `status` or `rejected: true` (2xx with `success: false`) | definitive → `FAILED_NEEDS_MANUAL`; the fallback stays available |
 | anything else, or no report | outcome unknown → `SUBMITTED` / `UNCERTAIN` |
 
-`submitted` turns true when the page sends `confirm-upload`. The fallback needs Node.js
-and Playwright (`npm i playwright && npx playwright install chromium`). Its network
-classification is covered by `shipped_fallback_script_classifies_outcomes_like_the_primary`.
-The browser run itself is only exercised against the live page.
+`submitted` turns true when the page sends `confirm-upload`; after that, an answer
+reported for any other step never settles the outcome. The fallback needs Node.js
+and Playwright (`npm i playwright && npx playwright install chromium`). Its tracking and
+classification are tested by replaying page traffic, analytics beacons included, through
+the shipped functions (`shipped_fallback_script_classifies_outcomes_like_the_primary`);
+the browser run itself was checked with Playwright against a mock of the page and is not
+part of CI.
 
 ## Tests
 
@@ -211,10 +223,12 @@ The browser run itself is only exercised against the live page.
 | confirm without a valid receipt, lost response, timeouts | `confirm_200_…`, `confirm_response_lost_…`, `hung_upload_init_…`, `hung_confirm_…` |
 | rate limits | `upload_init_rate_limit_…`, `confirm_429_…`, `integration_rate_limit_…`, `fallback_rate_limit_…` |
 | processing, complete, invalid token, terminal failure | `tests/integration_mock_server.rs` (`integration_poll_…`) |
-| preflight | `oversized_pdf_…`, `non_pdf_input_…`, `long_paper_…`, `request_review_rejects_…`, `request_review_reports_…` |
+| preflight, page count of LaTeX PDFs | `oversized_pdf_…`, `non_pdf_input_…`, `long_paper_…`, `request_review_rejects_…`, `request_review_reports_…`, `estimate_pdf_page_count_reads_pages_in_compressed_object_streams` |
+| confirm without a usable receipt, upload rate limit | `confirm_200_success_with_blank_token_…`, `upload_rate_limit_requeues_…` |
 | restart resumes the same receipt; archive matches the uploaded snapshot | `restart_resumes_the_same_receipt_and_archives_the_uploaded_snapshot` |
-| token stays out of errors and status | `poll_network_error_never_records_the_token`, `status_output_redacts_tokens_unless_shown`, `unsaved_receipt_goes_to_a_private_recovery_file_not_the_log` |
-| primary and fallback send the same input | `primary_and_fallback_send_the_same_manuscript_email_and_venue` |
+| token stays out of errors and status | `poll_network_error_never_records_the_token`, `status_output_redacts_tokens_unless_shown`, `status_output_redacts_tokens_of_jobs_outside_the_rows`, `unsaved_receipt_goes_to_a_private_recovery_file_not_the_log`, `receipt_that_cannot_be_kept_anywhere_still_stays_out_of_the_error` |
+| primary and fallback send the same input and agree on outcomes | `primary_and_fallback_send_the_same_manuscript_email_and_venue`, `fallback_confirm_success_false_…`, `fallback_client_error_attributed_to_an_earlier_step_…` |
+| archive names the receipt's route | `archive_names_the_route_of_the_receipt_not_an_earlier_fallback_attempt` |
 
 ## Real-service acceptance
 

@@ -1,6 +1,10 @@
 # Stanford Agentic Reviewer fixtures
 
-Sanitized provider replies used by the adapter's unit tests and the mock providers.
+Sanitized provider replies. The adapter's unit tests (`src/backend/stanford.rs`) parse
+every one of them through the types and helpers the live path uses, so a re-captured
+fixture whose shape changed fails there. The mock providers in `tests/` build their
+replies inline in the same shapes.
+
 Checked against `https://paperreview.ai` on 2026-10-09; see
 `docs/providers/stanford.md` for the full contract.
 

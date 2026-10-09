@@ -192,7 +192,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   sent.
 - **A receipt the database cannot save** is written to
   `<state_dir>/recovery/receipt-<job_id>-<time>.json` (mode `0600`); the error
-  names the file instead of carrying the token.
+  names the file instead of carrying the token. If that write fails too, the
+  token goes to one daemon log line, never into the error.
+- **PDF page counts include pages in compressed object streams**, which pdfTeX,
+  XeTeX and LuaTeX write by default. Those PDFs used to count 0 pages, so they
+  now get the coverage notice, and the Stanford review timeout now scales with
+  their page count as documented instead of always using the full timeout.
+- **The fallback reads the receipt from confirm-upload's reply**, ignores
+  analytics beacons, and reports a 2xx confirm with `success: false` as
+  `rejected`; a fallback answer for any step but `confirm`, once confirm was
+  sent, never settles the outcome.
+- **`meta.json` names the route that produced the receipt** (a primary receipt
+  after an earlier fallback attempt is `primary`) and adds `provider_venue`.
 
 - **Request identity includes review options** — coverage and request keys
   compare the new `review_options` (CSPaper's `desk_rejection_enabled`)
@@ -271,6 +282,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   stay token-free; `reviewloop status` redacts tokens in event payloads and
   errors unless `--show-token`.
 - `reviewloop status` no longer panics truncating a non-ASCII error.
+- A presigned upload answering 429 is rate limited (requeued after `Retry-After`)
+  instead of a definitive failure that started the fallback.
+- A confirm-upload reply with a blank token is no receipt: the outcome is
+  unknown instead of a job that fails on its first poll.
+- `status --active` hides the tokens of the jobs it leaves out; `daemon status
+  --json` hides request URLs in older `proxy_failover` payloads.
 - Git commands for a project repository ignore `GIT_DIR` / `GIT_INDEX_FILE`
   inherited from the environment. Run from a git hook (the pre-commit quality
   gate), the git trigger and its tests used to act on the repository being

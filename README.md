@@ -783,10 +783,11 @@ The fallback receives `--base-url`, `--pdf`, `--filename`, `--email` and optiona
 
 A custom `fallback_script` prints one JSON line: `{"success": true, "token": "..."}`
 on stdout, or on failure `{"success": false, "submitted": <bool>, "stage": "...",
-"status": <http status>, "rate_limited": <bool>, "retry_after_secs": <n>, "error": "..."}`
-on stderr with a non-zero exit. `rate_limited: true` requeues the job; `"submitted":
-false` (confirm-upload never sent) or a 4xx `status` is a definitive failure; any
-other failure is treated as an unknown outcome. The full contract is in
+"status": <http status>, "rate_limited": <bool>, "retry_after_secs": <n>, "rejected": <bool>,
+"error": "..."}` on stderr with a non-zero exit. `rate_limited: true` requeues the job;
+`"submitted": false` (confirm-upload never sent), or a 4xx `status` or `rejected: true`
+reported for the `confirm` stage, is a definitive failure; any other failure is treated
+as an unknown outcome. The full contract is in
 [docs/providers/stanford.md](docs/providers/stanford.md#fallback).
 
 ## Responsible Use
