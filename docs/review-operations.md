@@ -131,7 +131,7 @@ caller leaves it to the worker's next tick.
 | `job_id` | string | required | Job UUID. |
 | `project_id` | string | required | Owning project. Empty only for legacy jobs. |
 | `paper_id` | string | required | Paper the job reviews. |
-| `backend` | string | required | Review provider, e.g. `"stanford"`. |
+| `backend` | string | required | Review provider: `"stanford"` or `"cspaper"`. |
 | `status` | string | required | One of `"PENDING_APPROVAL"`, `"QUEUED"`, `"SUBMITTED"`, `"PROCESSING"`, `"COMPLETED"`, `"FAILED"`, `"FAILED_NEEDS_MANUAL"`, `"TIMEOUT"`. |
 | `phase` | string | required | One of `"awaiting_approval"`, `"queued"`, `"submitted"`, `"completed"`, `"failed"`, `"cancelled"` (see the lifecycle table). |
 | `terminal` | boolean | required | `true` for COMPLETED, FAILED, FAILED_NEEDS_MANUAL and TIMEOUT. |
@@ -142,7 +142,8 @@ caller leaves it to the worker's next tick.
 | `pdf_path` | string | required | The paper's PDF the job was enqueued from. It may have changed or disappeared since. |
 | `snapshot_path` | string | nullable | The immutable copy every submission of the job uploads. `null` only for jobs created before snapshots existed (the worker backfills it while the source still matches `pdf_hash`) and for jobs created by `import-token`. |
 | `pdf_hash` | string | required | SHA-256 of the snapshot bytes. |
-| `venue` | string | nullable | Venue recorded at request time. When it is null, a stanford worker sends the paper's configured venue at submission time, which this field does not show. |
+| `venue` | string | nullable | Venue recorded at request time; for `cspaper` the review template (`agent_id`, e.g. `"ICLR_main_2026_1"`). When it is null, a stanford worker sends the paper's configured venue at submission time, which this field does not show. |
+| `review_options` | object | required | Provider options recorded at request time, string values keyed by option name, and part of the review identity: `{"desk_rejection_enabled": "true"}` or `"false"` for `cspaper`, `{}` for `stanford`. |
 | `version_no` | integer | required | Manuscript version number within the paper. |
 | `round_no` | integer | required | Review round within the version. |
 | `version_source` | string | required | `"pdf_hash"` or `"git_commit"`. |
@@ -164,7 +165,7 @@ caller leaves it to the worker's next tick.
 | `ReviewRequestOutcome.disposition` | string | required | `"created"`: a new job was stored. `"existing"`: an earlier job answers the request and is returned; no job was stored. |
 | `ReviewRequestOutcome.reason` | string | nullable | For `existing`: `"request_replay"` (the request key was already bound to this job) or `"covered"` (a pending, in-flight or completed job has the same review identity). `null` for `created`. |
 | `ReviewRequestOutcome.job` | `JobView` | required | The created or existing job. |
-| `ReviewRequestOutcome.input` | `ManuscriptInput` | required | What this request asked to review: `paper_id`, `pdf_path` (the source), `snapshot_path` (the copy taken for this request), `pdf_hash` (of the snapshot), `backend`, `venue` (trimmed, `null` when unset), `version_source`, `version_key`. On `existing` the returned job keeps its own snapshot; compare `pdf_hash` to confirm it reviews the same bytes. |
+| `ReviewRequestOutcome.input` | `ManuscriptInput` | required | What this request asked to review: `paper_id`, `pdf_path` (the source), `snapshot_path` (the copy taken for this request), `pdf_hash` (of the snapshot), `backend`, `venue` (trimmed, `null` when unset), `review_options`, `version_source`, `version_key`. On `existing` the returned job keeps its own snapshot; compare `pdf_hash` to confirm it reviews the same bytes. |
 | `JobList.jobs` | `JobView[]` | required | Newest first. |
 | `JobList.truncated` | boolean | required | More jobs matched than `limit`. |
 | `TransitionOutcome.job` | `JobView` | required | The job after the change. |
@@ -172,7 +173,7 @@ caller leaves it to the worker's next tick.
 | `RetryOutcome.job`, `.previous_status` | as above | required | As for `TransitionOutcome`. |
 | `RetryOutcome.action` | string | required | One of `"poll_scheduled"`, `"submission_queued"`, `"poll_now"`, `"submit_now"` (see Retry semantics). |
 | `ProjectView` | object | — | `project_id`, `config_path`, `config_present` (the file still exists), `last_seen_at`, `current` (the project these operations act for). Ordered by `project_id`. |
-| `PaperView` | object | — | `paper_id`, `backend`, `venue` (what a new request would send), `pdf_path`, `pdf_present`, `watched`, `tag_trigger` (nullable). Config order. |
+| `PaperView` | object | — | `paper_id`, `backend`, `venue` and `review_options` (what a new request would send), `pdf_path`, `pdf_present`, `watched`, `tag_trigger` (nullable). Config order. |
 | `ReviewView.job` | `JobView` | required | The reviewed job, for checking `pdf_hash` and `version_no`. |
 | `ReviewView.completed_at` | RFC3339 UTC timestamp string | required | When the review was stored. |
 | `ReviewView.score` | string | nullable | The review's `numerical_score` as text. |

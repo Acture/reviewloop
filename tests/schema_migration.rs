@@ -1,7 +1,7 @@
-//! Schema migration to v4 (OSS-337): the lease columns land on v1-v3 databases
-//! without disturbing existing rows, legacy SUBMITTED rows are settled as UNCERTAIN
-//! instead of being resubmitted, concurrent migrations do not collide, and the lease
-//! primitives work on a freshly created database.
+//! Schema migrations up to the current version: the lease columns (v4, OSS-337) and
+//! review options (v5, OSS-353) land on older databases without disturbing existing rows,
+//! legacy SUBMITTED rows are settled as UNCERTAIN instead of being resubmitted, concurrent
+//! migrations do not collide, and the lease primitives work on a freshly created database.
 
 mod common;
 
@@ -24,7 +24,7 @@ const PROJECT: &str = "project-legacy";
 const OTHER_PROJECT: &str = "project-other";
 const LEASE_COLUMNS: [&str; 3] = ["lease_owner", "lease_expires_at", "submit_stage"];
 /// Schema version written by this build (`SCHEMA_VERSION` in src/db.rs).
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 /// `create_tables_if_missing` + `create_indexes` as of schema v1 (commit 4aeff29),
 /// verbatim: `jobs` has no lease columns.
@@ -491,6 +491,7 @@ fn fresh_new_job(paper_id: &str) -> NewJob {
         status: JobStatus::Queued,
         email: "fresh@example.edu".to_string(),
         venue: None,
+        review_options: Default::default(),
         git_tag: None,
         git_commit: None,
         next_poll_at: None,

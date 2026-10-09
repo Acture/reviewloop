@@ -140,6 +140,7 @@ pub fn run_pdf_trigger(config: &Config, db: &Db) -> Result<()> {
             &paper.backend,
             &hash,
             provider_venue(config, paper).as_deref(),
+            &config.review_options_for(paper),
             None,
         );
         if let Some(existing) = db.find_duplicate_covering_job(&config.project_id, &identity)? {
@@ -372,6 +373,7 @@ fn new_trigger_job(
         status,
         email: provider_email(config, &paper.backend)?,
         venue: provider_venue(config, paper),
+        review_options: config.review_options_for(paper),
         git_tag,
         git_commit,
         next_poll_at: None,

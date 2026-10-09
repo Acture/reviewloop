@@ -78,6 +78,7 @@ fn new_job(hash: &str, venue: Option<&str>) -> NewJob {
         status: JobStatus::Queued,
         email: "author@example.edu".to_string(),
         venue: venue.map(str::to_string),
+        review_options: Default::default(),
         git_tag: None,
         git_commit: None,
         next_poll_at: None,

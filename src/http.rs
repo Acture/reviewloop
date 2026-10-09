@@ -46,8 +46,9 @@ use tracing::warn;
 ///
 /// Bodies that cannot be cloned (streamed bodies) fall back to a
 /// single-attempt path against the first selected proxy. Multipart forms are
-/// streamed, so the S3 upload and `confirm-upload` — the request that creates a
-/// submission — are always sent exactly once and never re-sent on failover.
+/// streamed, so every request that creates a provider submission (Stanford's
+/// `confirm-upload`, CSPaper's review POST) and the S3 upload are always sent
+/// exactly once and never re-sent on failover.
 struct RoundRobinProxyMiddleware {
     /// One client per proxy URL, built at construction time.
     clients: Vec<reqwest::Client>,
@@ -177,6 +178,27 @@ fn is_transient_proxy_error(err: &reqwest::Error) -> bool {
 /// `ClientWithMiddleware` with no middleware — behaviour identical to a bare
 /// `reqwest::Client::new()`.
 ///
+/// Whether a client follows HTTP redirects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Redirects {
+    /// reqwest's default policy: follow up to 10 hops.
+    Follow,
+    /// Return 3xx responses to the caller. Required for requests that carry a
+    /// credential in a custom header: reqwest strips only the standard
+    /// authorization headers on a cross-host redirect, so it would forward
+    /// such a header to the redirect target.
+    Refuse,
+}
+
+impl Redirects {
+    fn apply(self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        match self {
+            Redirects::Follow => builder,
+            Redirects::Refuse => builder.redirect(reqwest::redirect::Policy::none()),
+        }
+    }
+}
+
 /// When proxies are configured, installs [`RoundRobinProxyMiddleware`] so
 /// every request cycles through the proxy list.  Only the count is logged;
 /// individual proxy URLs are never emitted to avoid leaking embedded
@@ -184,13 +206,23 @@ fn is_transient_proxy_error(err: &reqwest::Error) -> bool {
 ///
 /// Pass `db` and `project_id` to enable `proxy_failover` event recording.
 /// When either is `None`, failovers are warn-logged only (legacy behaviour).
+///
+/// `redirects` applies to the per-proxy clients too, since in proxy mode they
+/// are the ones that execute the request.
 pub fn build_client(
     config: &Config,
     db: Option<&Db>,
     project_id: Option<&str>,
+    redirects: Redirects,
 ) -> Result<ClientWithMiddleware> {
+    let plain = || {
+        redirects
+            .apply(reqwest::Client::builder())
+            .build()
+            .context("failed to build HTTP client")
+    };
     if config.core.proxies.is_empty() {
-        return Ok(ClientBuilder::new(reqwest::Client::new()).build());
+        return Ok(ClientBuilder::new(plain()?).build());
     }
 
     tracing::info!(
@@ -206,7 +238,8 @@ pub fn build_client(
         .map(|(i, url)| {
             let proxy = reqwest::Proxy::all(url)
                 .with_context(|| format!("invalid proxy URL at index {i}"))?;
-            reqwest::Client::builder()
+            redirects
+                .apply(reqwest::Client::builder())
                 .proxy(proxy)
                 .build()
                 .with_context(|| format!("failed to build client for proxy at index {i}"))
@@ -224,9 +257,7 @@ pub fn build_client(
         event_target,
     };
 
-    Ok(ClientBuilder::new(reqwest::Client::new())
-        .with(middleware)
-        .build())
+    Ok(ClientBuilder::new(plain()?).with(middleware).build())
 }
 
 /// Build a plain `reqwest::Client` with the first configured proxy applied.
@@ -268,7 +299,8 @@ mod tests {
     fn build_client_no_proxies_succeeds() {
         let config = Config::default();
         assert!(config.core.proxies.is_empty());
-        let client = build_client(&config, None, None).expect("build_client with no proxies");
+        let client = build_client(&config, None, None, Redirects::Follow)
+            .expect("build_client with no proxies");
         // Verify it is usable: just assert the type compiles and builds.
         drop(client);
     }
@@ -288,7 +320,8 @@ mod tests {
             "socks5://proxy2.example.com:1080".to_string(),
         ];
         // Build should succeed; actual connectivity is not tested in unit tests.
-        let client = build_client(&config, None, None).expect("build_client with valid proxy URLs");
+        let client = build_client(&config, None, None, Redirects::Follow)
+            .expect("build_client with valid proxy URLs");
         drop(client);
     }
 
@@ -349,7 +382,8 @@ mod tests {
             "http://198.51.100.2:2".to_string(),
             format!("http://{live_addr}"),
         ];
-        let client = build_client(&config, None, None).expect("build client with mixed proxies");
+        let client = build_client(&config, None, None, Redirects::Follow)
+            .expect("build client with mixed proxies");
 
         // Request at the live "proxy" itself so the first two genuinely fail
         // at the connect step rather than getting an HTTP error from a
@@ -397,8 +431,8 @@ mod tests {
             format!("http://{live_addr}"),
         ];
         let project_id = "test-proj-failover";
-        let client =
-            build_client(&config, Some(&db), Some(project_id)).expect("build client for test");
+        let client = build_client(&config, Some(&db), Some(project_id), Redirects::Follow)
+            .expect("build client for test");
 
         let resp = client
             .get(format!("http://{live_addr}/"))

@@ -119,6 +119,7 @@ impl Ctx {
             status: JobStatus::Queued,
             email: EMAIL.to_string(),
             venue: self.config.providers.stanford.venue.clone(),
+            review_options: Default::default(),
             git_tag: None,
             git_commit: None,
             next_poll_at: None,
@@ -442,7 +443,6 @@ pub fn in_order<T: Send + 'static>(
 pub fn receipt(token: &str) -> SubmitReceipt {
     SubmitReceipt {
         token: token.to_string(),
-        backend_submission_ref: None,
     }
 }
 

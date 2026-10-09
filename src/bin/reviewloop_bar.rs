@@ -900,6 +900,7 @@ mod tests {
             token: None,
             email: "a@b.c".to_string(),
             venue: None,
+            review_options: Default::default(),
             git_tag: None,
             git_commit: None,
             attempt,

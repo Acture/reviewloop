@@ -125,6 +125,11 @@ fn bind_matches(
             continue;
         }
 
+        // A backend without email tokens never gets one bound from mail, even
+        // if a pattern is configured under its name.
+        if !crate::backend::tokens_arrive_by_email(&matched.backend) {
+            continue;
+        }
         if let Some(job) = db.find_latest_open_job_without_token(project_id, &matched.backend)? {
             let next_poll = Utc::now();
             db.attach_token_to_job(&job.id, &matched.token, next_poll)?;
@@ -900,6 +905,7 @@ mod tests {
             status: JobStatus::Queued,
             email: "user@example.com".to_string(),
             venue: None,
+            review_options: Default::default(),
             git_tag: None,
             git_commit: None,
             next_poll_at: None,
@@ -942,6 +948,7 @@ mod tests {
             status: JobStatus::Queued,
             email: "user@example.com".to_string(),
             venue: None,
+            review_options: Default::default(),
             git_tag: None,
             git_commit: None,
             next_poll_at: None,

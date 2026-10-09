@@ -20,8 +20,19 @@ pub fn write_review_artifacts(
         "job_id": job.id,
         "paper_id": job.paper_id,
         "backend": job.backend,
+        // The provider's reference for the review (CSPaper: its job id).
         "token": token,
         "generated_at": Utc::now().to_rfc3339(),
+        // What was asked for: the template / venue and provider options.
+        "venue": job.venue,
+        "review_options": job.review_options,
+        // Which manuscript version was reviewed.
+        "version_no": job.version_no,
+        "round_no": job.round_no,
+        "version_source": job.version_source,
+        "version_key": job.version_key,
+        "git_tag": job.git_tag,
+        "git_commit": job.git_commit,
         "pdf_path": job.pdf_path,
         "pdf_hash": job.pdf_hash,
         // The bytes actually uploaded; null for a job submitted before

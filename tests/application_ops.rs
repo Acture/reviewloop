@@ -96,6 +96,7 @@ impl Fixture {
             status,
             email: "test@example.edu".to_string(),
             venue: None,
+            review_options: Default::default(),
             git_tag: None,
             git_commit: None,
             next_poll_at: None,

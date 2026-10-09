@@ -99,8 +99,5 @@ pub async fn submit_with_node_playwright(
         BackendError::OutcomeUnknown("fallback reported success without a token".to_string())
     })?;
 
-    Ok(SubmitReceipt {
-        token,
-        backend_submission_ref: None,
-    })
+    Ok(SubmitReceipt { token })
 }

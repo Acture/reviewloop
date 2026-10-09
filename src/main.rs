@@ -291,8 +291,9 @@ enum PaperCommand {
         #[arg(long, default_value_t = false)]
         no_submit_prompt: bool,
         /// Override the venue for this paper. When omitted, the project-level
-        /// `venue` from `reviewloop.toml` is used.
-        #[arg(long)]
+        /// `venue` from `reviewloop.toml` is used. For backend cspaper this is
+        /// the review template (`agent_id`, e.g. ICLR_main_2026_1).
+        #[arg(long, visible_alias = "agent-id")]
         venue: Option<String>,
     },
     /// Enable or disable PDF-change watching for an already-registered paper.
@@ -1986,6 +1987,7 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
         })
         .map_err(|err| with_email_hint(err, "run"))?;
     let job_id = requested.job.job_id;
+    let backend = requested.job.backend;
 
     // Submit immediately (equivalent to cmd_submit with force=true). If another worker
     // got there first, the loop below still follows the job to completion.
@@ -2004,8 +2006,8 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
     // Email ingestion can still attach the token of a submission whose outcome is
     // unknown; without it nothing advances such a job, so `run` stops on it.
     // A broken email setup only costs the wait: ticks report it themselves.
-    let waits_for_token_email =
-        reviewloop::email::token_ingestion_active(&config).unwrap_or_else(|err| {
+    let waits_for_token_email = reviewloop::backend::tokens_arrive_by_email(&backend)
+        && reviewloop::email::token_ingestion_active(&config).unwrap_or_else(|err| {
             warn!(error = %err, "email token ingestion unavailable; not waiting for a token email");
             false
         });
@@ -2161,7 +2163,6 @@ async fn cmd_import_token(
     source: &str,
 ) -> Result<()> {
     require_project(config)?;
-    db.record_email_token(token, source, None)?;
 
     let existing = match (job_id, paper_id) {
         (Some(job_id), _) => Some(ensure_project_job(config, db, job_id)?),
@@ -2171,6 +2172,7 @@ async fn cmd_import_token(
         (None, None) => anyhow::bail!("import-token needs --job-id or --paper-id"),
     };
     if let Some(job) = existing {
+        record_imported_token(db, &job.backend, token, source)?;
         db.attach_token_to_job(&job.id, token, Utc::now())?;
         db.add_event(
             None,
@@ -2186,6 +2188,7 @@ async fn cmd_import_token(
     let paper = config
         .find_paper(paper_id)
         .ok_or_else(|| OpError::paper_not_found(paper_id, config))?;
+    record_imported_token(db, &paper.backend, token, source)?;
 
     let pdf_hash = if Path::new(&paper.pdf_path).exists() {
         sha256_file(Path::new(&paper.pdf_path))?
@@ -2216,6 +2219,7 @@ async fn cmd_import_token(
                 status: JobStatus::Processing,
                 email,
                 venue,
+                review_options: config.review_options_for(paper),
                 git_tag: None,
                 git_commit: None,
                 next_poll_at: Some(Utc::now()),
@@ -2236,6 +2240,15 @@ async fn cmd_import_token(
 
     println!("Created job {} and attached imported token", job.id);
     poll_imported_token(config, db, &job.id).await
+}
+
+/// Imported tokens join the email-token ledger only for backends whose tokens
+/// arrive by email, where ingestion must recognise them as already seen.
+fn record_imported_token(db: &Db, backend: &str, token: &str, source: &str) -> Result<()> {
+    if reviewloop::backend::tokens_arrive_by_email(backend) {
+        db.record_email_token(token, source, None)?;
+    }
+    Ok(())
 }
 
 /// Poll right away rather than waiting for the next 30-second daemon tick; exit 2 when
@@ -2712,6 +2725,10 @@ fn with_email_hint(err: OpError, command: &str) -> anyhow::Error {
         OpError::SubmitterEmailUnavailable { .. } => anyhow::Error::new(err).context(format!(
             "reviewloop {command} requires a submitter email. set providers.stanford.email in ~/.config/reviewloop/config.toml or run 'reviewloop email login --provider google' to use OAuth (see README 'Email Token Ingestion' section)."
         )),
+        OpError::ProviderNotConfigured { .. } => {
+            let hint = err.recovery().unwrap_or_default();
+            anyhow::Error::new(err).context(format!("reviewloop {command}: {hint}"))
+        }
         other => other.into(),
     }
 }
@@ -3413,6 +3430,7 @@ mod tests {
             status: JobStatus::Queued,
             email: "test@example.com".to_string(),
             venue: None,
+            review_options: Default::default(),
             git_tag: None,
             git_commit: None,
             next_poll_at: None,
@@ -3559,6 +3577,7 @@ mod tests {
                 status,
                 email: "test@example.com".to_string(),
                 venue: None,
+                review_options: Default::default(),
                 git_tag: None,
                 git_commit: None,
                 next_poll_at: None,
@@ -3859,6 +3878,7 @@ mod tests {
                     status: JobStatus::Queued,
                     email: "test@example.com".to_string(),
                     venue: None,
+                    review_options: Default::default(),
                     git_tag: None,
                     git_commit: None,
                     next_poll_at: None,
@@ -4128,6 +4148,7 @@ mod tests {
                     status: JobStatus::Processing,
                     email: "test@example.com".to_string(),
                     venue: None,
+                    review_options: Default::default(),
                     git_tag: None,
                     git_commit: None,
                     next_poll_at: None,
@@ -4254,6 +4275,7 @@ mod tests {
                         status: JobStatus::Queued,
                         email: "test@example.com".to_string(),
                         venue: None,
+                        review_options: Default::default(),
                         git_tag: None,
                         git_commit: None,
                         next_poll_at: None,
@@ -4321,6 +4343,7 @@ mod tests {
                     status,
                     email: "test@example.com".to_string(),
                     venue: None,
+                    review_options: Default::default(),
                     git_tag: None,
                     git_commit: None,
                     next_poll_at: None,
@@ -4451,6 +4474,7 @@ mod tests {
                         status,
                         email: "test@example.com".to_string(),
                         venue: None,
+                        review_options: Default::default(),
                         git_tag: None,
                         git_commit: None,
                         next_poll_at: None,

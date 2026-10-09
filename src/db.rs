@@ -2,8 +2,8 @@ use crate::{
     config::Config,
     model::{
         EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, EventRecord, ExistingReason,
-        Job, JobStatus, NewJob, RegisteredProject, ReviewIdentity, ReviewRecord, StatusView,
-        SubmitChannel, SubmitStage, WorkKind,
+        Job, JobStatus, NewJob, RegisteredProject, ReviewIdentity, ReviewOptions, ReviewRecord,
+        StatusView, SubmitChannel, SubmitStage, WorkKind,
     },
     util::{parse_rfc3339, to_rfc3339},
 };
@@ -21,7 +21,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PruneReport {
@@ -1705,7 +1705,7 @@ impl Db {
         let mut stmt = conn.prepare(
             r#"
             SELECT id, paper_id, backend, pdf_path, pdf_hash, snapshot_path, status, token, email,
-                   venue, git_tag, git_commit, attempt, started_at, next_poll_at,
+                   venue, review_options, git_tag, git_commit, attempt, started_at, next_poll_at,
                    last_error, fallback_used, created_at, updated_at,
                    project_id, version_no, round_no, version_source, version_key,
                    lease_owner, lease_expires_at, submit_stage
@@ -2145,6 +2145,7 @@ fn create_tables_if_missing(conn: &Connection) -> Result<()> {
             token TEXT,
             email TEXT NOT NULL,
             venue TEXT,
+            review_options TEXT,
             git_tag TEXT,
             git_commit TEXT,
             version_no INTEGER NOT NULL DEFAULT 1,
@@ -2236,6 +2237,7 @@ fn migrate_columns(conn: &Connection) -> Result<()> {
     ensure_column_exists(conn, "jobs", "lease_expires_at", "TEXT")?;
     ensure_column_exists(conn, "jobs", "submit_stage", "TEXT")?;
     ensure_column_exists(conn, "jobs", "snapshot_path", "TEXT")?;
+    ensure_column_exists(conn, "jobs", "review_options", "TEXT")?;
 
     if column_exists(conn, "jobs", "version_no")? {
         conn.execute(
@@ -2391,6 +2393,7 @@ fn enqueue_in_tx(conn: &Connection, request: &EnqueueRequest) -> Result<EnqueueO
             "backend": job.backend,
             "pdf_hash": job.pdf_hash,
             "venue": job.venue,
+            "review_options": job.review_options,
             "version_no": job.version_no,
             "round_no": job.round_no,
             "version_source": job.version_source,
@@ -2419,6 +2422,7 @@ fn insert_duplicate_skipped(
             "backend": identity.backend,
             "pdf_hash": identity.pdf_hash,
             "venue": identity.venue,
+            "review_options": identity.review_options,
             "version_no": existing.version_no,
             "round_no": existing.round_no,
             "version_source": identity.version_source.as_str(),
@@ -2462,6 +2466,8 @@ fn find_covering_job(
     identity: &ReviewIdentity,
 ) -> Result<Option<Job>> {
     // Rows written before venues were normalized may hold blanks or padding.
+    // Rows written before review options existed hold NULL, which matches the
+    // empty options of a backend that has none.
     let [s1, s2, s3, s4, s5] = COVERING_STATUSES.map(JobStatus::as_str);
     conn.query_row(
         r#"
@@ -2473,6 +2479,7 @@ fn find_covering_job(
           AND pdf_hash = ?4
           AND version_key = ?5
           AND COALESCE(TRIM(venue), '') = ?6
+          AND COALESCE(review_options, '') = ?12
           AND status IN (?7, ?8, ?9, ?10, ?11)
         ORDER BY created_at DESC, id DESC
         LIMIT 1
@@ -2489,6 +2496,7 @@ fn find_covering_job(
             s3,
             s4,
             s5,
+            identity.review_options.canonical().unwrap_or_default(),
         ],
         map_job_row,
     )
@@ -2510,9 +2518,10 @@ fn insert_job(conn: &Connection, new_job: &NewJob, identity: &ReviewIdentity) ->
         r#"
         INSERT INTO jobs (
             id, project_id, paper_id, backend, pdf_path, pdf_hash, snapshot_path, status, token,
-            email, venue, git_tag, git_commit, version_no, round_no, version_source, version_key,
-            attempt, started_at, next_poll_at, last_error, fallback_used, created_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 0, NULL, ?17, NULL, 0, ?18, ?18)
+            email, venue, review_options, git_tag, git_commit, version_no, round_no,
+            version_source, version_key, attempt, started_at, next_poll_at, last_error,
+            fallback_used, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?19, ?11, ?12, ?13, ?14, ?15, ?16, 0, NULL, ?17, NULL, 0, ?18, ?18)
         "#,
         params![
             id,
@@ -2533,6 +2542,7 @@ fn insert_job(conn: &Connection, new_job: &NewJob, identity: &ReviewIdentity) ->
             identity.version_key,
             new_job.next_poll_at.map(to_rfc3339),
             to_rfc3339(now),
+            identity.review_options.canonical(),
         ],
     )?;
 
@@ -2654,6 +2664,7 @@ fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
     let next_poll_at: Option<String> = row.get("next_poll_at")?;
     let lease_expires_at: Option<String> = row.get("lease_expires_at")?;
     let submit_stage: Option<String> = row.get("submit_stage")?;
+    let review_options: Option<String> = row.get("review_options")?;
     let created_at: String = row.get("created_at")?;
     let updated_at: String = row.get("updated_at")?;
 
@@ -2665,6 +2676,8 @@ fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
                 .ok_or_else(|| conversion_error(format!("invalid submit_stage: {value}")))
         })
         .transpose()?;
+    let review_options = ReviewOptions::from_canonical(review_options.as_deref())
+        .map_err(|e| conversion_error(format!("invalid review_options: {e}")))?;
     let lease_expires_at = lease_expires_at
         .map(|v| parse_rfc3339(&v))
         .transpose()
@@ -2695,6 +2708,7 @@ fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         token: row.get("token")?,
         email: row.get("email")?,
         venue: row.get("venue")?,
+        review_options,
         git_tag: row.get("git_tag")?,
         git_commit: row.get("git_commit")?,
         version_no: row.get::<_, i64>("version_no")? as u32,
@@ -2838,6 +2852,7 @@ mod tests {
             status: JobStatus::Queued,
             email: "test@example.com".to_string(),
             venue: None,
+            review_options: Default::default(),
             git_tag: None,
             git_commit: None,
             next_poll_at: None,

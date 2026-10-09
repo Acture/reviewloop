@@ -1,3 +1,4 @@
+use crate::{backend::cspaper, model::ReviewOptions};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -116,7 +117,7 @@ impl Config {
                 "using legacy project settings from {}. migrate them into {PROJECT_CONFIG_FILE} with `reviewloop config migrate-project --project-id <id>`",
                 path.display()
             ));
-            let config = Self::from_parts(global, project, None);
+            let config = Self::from_parts(global, project, None).with_env_secrets();
             config.validate_runtime(require_project)?;
             return Ok(LoadedConfig {
                 config,
@@ -135,7 +136,7 @@ impl Config {
             .as_deref()
             .and_then(Path::parent)
             .map(Path::to_path_buf);
-        let config = Self::from_parts(global, project, project_root);
+        let config = Self::from_parts(global, project, project_root).with_env_secrets();
         config.validate_runtime(require_project)?;
         Ok(LoadedConfig {
             config,
@@ -281,8 +282,9 @@ impl Config {
     /// `self.providers.stanford.venue`, so this only needs to combine the
     /// per-paper override with the merged project/global default.
     ///
-    /// For non-stanford backends, only the per-paper override is consulted;
-    /// returns `None` if not set.
+    /// For cspaper the venue is the review template (`agent_id`): the per-paper
+    /// override, then `providers.cspaper.agent_id` (project over global). Other
+    /// backends consult only the per-paper override and return `None` if unset.
     pub fn venue_for(&self, paper: &PaperConfig) -> Option<String> {
         let per_paper = paper
             .venue
@@ -302,8 +304,34 @@ impl Config {
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
+            cspaper::BACKEND => self.providers.cspaper.agent_id.clone(),
             _ => None,
         }
+    }
+
+    /// Provider options beyond the venue that a new review of `paper` is
+    /// requested with. Part of the request identity, so every enqueue path
+    /// resolves them here. CSPaper always records the desk-rejection setting
+    /// explicitly, so an unset value and the provider default compare equal.
+    pub fn review_options_for(&self, paper: &PaperConfig) -> ReviewOptions {
+        match paper.backend.as_str() {
+            cspaper::BACKEND => ReviewOptions::default().with(
+                cspaper::DESK_REJECTION_ENABLED,
+                self.providers.cspaper.desk_rejection_enabled.to_string(),
+            ),
+            _ => ReviewOptions::default(),
+        }
+    }
+
+    /// Fills machine-level secrets that the global config leaves unset from
+    /// the environment. Only the runtime loader calls this, so configs built
+    /// in code never pick up the caller's environment.
+    fn with_env_secrets(mut self) -> Self {
+        self.providers.cspaper.api_key = secret_or_env(
+            self.providers.cspaper.api_key.take(),
+            env::var(CSPAPER_API_KEY_ENV).ok(),
+        );
+        self
     }
 
     #[cfg(test)]
@@ -435,6 +463,17 @@ impl Config {
                         .venue
                         .or(global.providers.stanford.venue),
                 },
+                cspaper: CspaperProviderConfig {
+                    base_url: global.providers.cspaper.base_url,
+                    api_key: secret_or_env(global.providers.cspaper.api_key, None),
+                    agent_id: non_blank(project.providers.cspaper.agent_id)
+                        .or_else(|| non_blank(global.providers.cspaper.agent_id)),
+                    desk_rejection_enabled: project
+                        .providers
+                        .cspaper
+                        .desk_rejection_enabled
+                        .unwrap_or(global.providers.cspaper.desk_rejection_enabled),
+                },
             },
             papers,
             paper_watch: project.paper_watch,
@@ -464,6 +503,49 @@ fn merge_optional_string(project: Option<String>, global: String) -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or(global)
+}
+
+fn non_blank(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Environment variable holding the CSPaper organisation API key when
+/// `providers.cspaper.api_key` is unset in the global config.
+pub const CSPAPER_API_KEY_ENV: &str = "REVIEWLOOP_CSPAPER_API_KEY";
+
+/// A configured secret wins; the environment fills it only when the config
+/// leaves it blank (the same precedence as the Gmail client credentials).
+fn secret_or_env(
+    configured: Option<Redacted<String>>,
+    env: Option<String>,
+) -> Option<Redacted<String>> {
+    let non_blank = |value: String| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(Redacted(value))
+    };
+    configured
+        .and_then(|secret| non_blank(secret.0))
+        .or_else(|| env.and_then(non_blank))
+}
+
+/// Provider base URLs receive credentials or manuscripts, so they must be
+/// `https://`; plain `http://` is accepted only for a loopback host (local
+/// tests and mocks).
+fn validate_provider_base_url(field: &str, raw: &str) -> Result<()> {
+    let invalid = || {
+        anyhow!(
+            "{field} must be https:// (or http://localhost / http://127.0.0.1 for local testing); got {raw}"
+        )
+    };
+    let url = reqwest::Url::parse(raw).map_err(|_| invalid())?;
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    match url.scheme() {
+        "https" if url.host_str().is_some() => Ok(()),
+        "http" if loopback => Ok(()),
+        _ => Err(invalid()),
+    }
 }
 
 impl Config {
@@ -507,21 +589,17 @@ impl Config {
         Ok(())
     }
 
-    /// O9: `providers.stanford.base_url` must be `https://`, with
-    /// `http://localhost` and `http://127.0.0.1` whitelisted for local tests.
+    /// O9: provider base URLs must be `https://`, with `http://localhost` and
+    /// `http://127.0.0.1` whitelisted for local tests.
     fn validate_base_url(&self) -> Result<()> {
-        let url = &self.providers.stanford.base_url;
-        let allowed = url.starts_with("https://")
-            || url.starts_with("http://localhost")
-            || url.starts_with("http://127.0.0.1");
-        if !allowed {
-            return Err(anyhow!(
-                "providers.stanford.base_url must be https:// (or http://localhost / \
-                 http://127.0.0.1 for local testing); got {}",
-                url
-            ));
-        }
-        Ok(())
+        validate_provider_base_url(
+            "providers.stanford.base_url",
+            &self.providers.stanford.base_url,
+        )?;
+        validate_provider_base_url(
+            "providers.cspaper.base_url",
+            &self.providers.cspaper.base_url,
+        )
     }
 
     /// O8: Validate that `providers.stanford.fallback_script` does not escape
@@ -840,6 +918,7 @@ impl LegacyConfig {
                     // (now migrated to project_config below) carries the value.
                     venue: None,
                 },
+                cspaper: GlobalCspaperProviderConfig::default(),
             },
             imap: self.imap.clone(),
             gmail_oauth: self.gmail_oauth.clone(),
@@ -878,6 +957,7 @@ impl LegacyConfig {
                     fallback_script: None,
                     venue: self.providers.stanford.venue.clone(),
                 },
+                cspaper: ProjectCspaperProviderConfig::default(),
             },
             papers: self.papers.clone(),
             paper_watch: self.paper_watch.clone(),
@@ -1319,6 +1399,35 @@ impl Default for ProjectPdfTriggerConfig {
 #[serde(default)]
 pub struct ProvidersConfig {
     pub stanford: StanfordProviderConfig,
+    pub cspaper: CspaperProviderConfig,
+}
+
+/// Runtime CSPaper settings, merged from the global and project files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CspaperProviderConfig {
+    pub base_url: String,
+    /// Organisation API key from the global config or
+    /// [`CSPAPER_API_KEY_ENV`]. Never serialized: no file written from a
+    /// runtime config may carry it.
+    #[serde(skip)]
+    pub api_key: Option<Redacted<String>>,
+    /// Default review template (CSPaper `agent_id`), project value over
+    /// global. A paper's `venue` overrides it; see [`Config::venue_for`].
+    pub agent_id: Option<String>,
+    pub desk_rejection_enabled: bool,
+}
+
+impl Default for CspaperProviderConfig {
+    fn default() -> Self {
+        let global = GlobalCspaperProviderConfig::default();
+        Self {
+            base_url: global.base_url,
+            api_key: None,
+            agent_id: None,
+            desk_rejection_enabled: global.desk_rejection_enabled,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1347,6 +1456,39 @@ impl Default for StanfordProviderConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct GlobalProvidersConfig {
     pub stanford: GlobalStanfordProviderConfig,
+    pub cspaper: GlobalCspaperProviderConfig,
+}
+
+/// Machine-level CSPaper settings. The API key and base URL live only here:
+/// the project file has no field for them, so `deny_unknown_fields` rejects
+/// a key (or a base URL that would redirect it) placed in `reviewloop.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GlobalCspaperProviderConfig {
+    pub base_url: String,
+    /// Organisation API key (`csp_live_...`). When unset,
+    /// [`CSPAPER_API_KEY_ENV`] is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<Redacted<String>>,
+    /// Default review template (`agent_id`, e.g. `ICLR_main_2026_1`). No
+    /// built-in default: the template decides what the review means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// CSPaper's desk-rejection screening (topic fit, minimum quality,
+    /// prompt injection) before the review. The provider default is `true`;
+    /// `false` always yields a full, scored review.
+    pub desk_rejection_enabled: bool,
+}
+
+impl Default for GlobalCspaperProviderConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://cspaper.org".to_string(),
+            api_key: None,
+            agent_id: None,
+            desk_rejection_enabled: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1381,6 +1523,27 @@ impl Default for GlobalStanfordProviderConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectProvidersConfig {
     pub stanford: ProjectStanfordProviderConfig,
+    #[serde(skip_serializing_if = "ProjectCspaperProviderConfig::is_empty")]
+    pub cspaper: ProjectCspaperProviderConfig,
+}
+
+/// Per-project CSPaper review choices. Deliberately no `api_key` or
+/// `base_url`: see [`GlobalCspaperProviderConfig`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectCspaperProviderConfig {
+    /// Overrides `global.providers.cspaper.agent_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Overrides `global.providers.cspaper.desk_rejection_enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk_rejection_enabled: Option<bool>,
+}
+
+impl ProjectCspaperProviderConfig {
+    fn is_empty(&self) -> bool {
+        self.agent_id.is_none() && self.desk_rejection_enabled.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
