@@ -781,6 +781,14 @@ fn describe_mismatches(mismatches: &[FieldMismatch]) -> String {
         .join("; ")
 }
 
+/// What this machine has sent a provider: submissions it accepted (a stored
+/// receipt) and tokenless ones whose outcome is unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ProviderUsage {
+    pub accepted: u64,
+    pub uncertain: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusView {
     pub id: String,

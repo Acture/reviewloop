@@ -2,8 +2,8 @@ use crate::{
     config::Config,
     model::{
         EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, EventRecord, ExistingReason,
-        Job, JobStatus, NewJob, RegisteredProject, ReviewIdentity, ReviewOptions, ReviewRecord,
-        StatusView, SubmitChannel, SubmitStage, WorkKind,
+        Job, JobStatus, NewJob, ProviderUsage, RegisteredProject, ReviewIdentity, ReviewOptions,
+        ReviewRecord, StatusView, SubmitChannel, SubmitStage, WorkKind,
     },
     util::{parse_rfc3339, to_rfc3339},
 };
@@ -1701,6 +1701,30 @@ impl Db {
             map_job_row,
         )?;
         collect_rows(rows)
+    }
+
+    /// Submissions `backend` has accepted or may have accepted, over every
+    /// project in this database: provider credentials are machine-level, so
+    /// usage is too. A job holding a token counts as accepted, wherever the
+    /// token came from; a tokenless job left UNCERTAIN may have been.
+    pub fn provider_usage(&self, backend: &str) -> Result<ProviderUsage> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT COALESCE(SUM(token IS NOT NULL), 0),
+                   COALESCE(SUM(token IS NULL AND submit_stage = ?2), 0)
+            FROM jobs
+            WHERE backend = ?1
+            "#,
+            params![backend, SubmitStage::Uncertain.as_str()],
+            |row| {
+                Ok(ProviderUsage {
+                    accepted: row.get::<_, i64>(0)? as u64,
+                    uncertain: row.get::<_, i64>(1)? as u64,
+                })
+            },
+        )
+        .map_err(Into::into)
     }
 
     /// Fleet-wide: recent failures across all projects, capped per project.

@@ -4,7 +4,7 @@ use reviewloop::{
     backend::cspaper,
     config::{Config, PaperConfig},
     db::Db,
-    model::{Job, JobPdf, JobStatus, NewJob, ReviewIdentity, ReviewOptions},
+    model::{Job, JobPdf, JobStatus, NewJob, ProviderUsage, ReviewIdentity, ReviewOptions},
     util::sha256_file,
     worker,
 };
@@ -993,5 +993,43 @@ fn failed_job_lists_keep_cspaper_review_options() -> Result<()> {
         );
         assert!(find(&stanford.id)?.review_options.is_empty(), "{query}");
     }
+    Ok(())
+}
+
+#[test]
+fn provider_usage_counts_cspaper_receipts_and_uncertain_submissions_across_projects() -> Result<()>
+{
+    let ctx = DbTestContext::new()?;
+    let options = || desk_rejection(true);
+    let accepted = ctx.create_cspaper_job("proj-a", JobStatus::Queued, "hash-u1", options())?;
+    ctx.db
+        .attach_token_to_job(&accepted.id, "856f388c-0001", Utc::now())?;
+    // The key is machine-level, so another project's submissions count too.
+    let other_project =
+        ctx.create_cspaper_job("proj-b", JobStatus::Queued, "hash-u2", options())?;
+    ctx.db
+        .attach_token_to_job(&other_project.id, "856f388c-0002", Utc::now())?;
+    let uncertain = ctx.create_cspaper_job("proj-a", JobStatus::Submitted, "hash-u3", options())?;
+    let conn = rusqlite::Connection::open(&ctx.db.path)?;
+    conn.execute(
+        "UPDATE jobs SET submit_stage = 'UNCERTAIN' WHERE id = ?1",
+        params![uncertain.id],
+    )?;
+    // Never sent: queued, or refused before a receipt.
+    ctx.create_cspaper_job("proj-a", JobStatus::Queued, "hash-u4", options())?;
+    ctx.create_cspaper_job("proj-a", JobStatus::Failed, "hash-u5", options())?;
+    // Other backends never count.
+    let stanford = ctx.create_job_with_project_and_hash("proj-a", JobStatus::Queued, "hash-u6")?;
+    ctx.db
+        .attach_token_to_job(&stanford.id, "stanford-token-0001", Utc::now())?;
+
+    assert_eq!(
+        ctx.db.provider_usage(cspaper::BACKEND)?,
+        ProviderUsage {
+            accepted: 2,
+            uncertain: 1,
+        }
+    );
+    assert_eq!(ctx.db.provider_usage("unknown")?, ProviderUsage::default());
     Ok(())
 }
