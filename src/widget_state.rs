@@ -354,6 +354,7 @@ mod tests {
             status: JobStatus::Queued,
             email: "t@example.com".to_string(),
             venue: None,
+            review_options: Default::default(),
             git_tag: None,
             git_commit: None,
             next_poll_at: None,

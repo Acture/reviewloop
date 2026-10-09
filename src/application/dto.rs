@@ -1,5 +1,5 @@
 use super::{ops::CANCELLED_BY_USER, redact::redact_text};
-use crate::model::{ExistingReason, Job, JobStatus, NewJob, SubmitStage};
+use crate::model::{ExistingReason, Job, JobStatus, NewJob, ReviewOptions, SubmitStage};
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Serializer};
 use serde_json::Value;
@@ -85,7 +85,11 @@ pub struct JobView {
     pub snapshot_path: Option<String>,
     /// SHA-256 of the snapshot bytes.
     pub pdf_hash: String,
+    /// The venue the job is reviewed against; for cspaper the review template
+    /// (`agent_id`).
     pub venue: Option<String>,
+    /// Provider options recorded on the job (`{}` when the backend has none).
+    pub review_options: ReviewOptions,
     pub version_no: u32,
     pub round_no: u32,
     pub version_source: String,
@@ -127,6 +131,7 @@ impl JobView {
             snapshot_path: job.snapshot_path.clone(),
             pdf_hash: job.pdf_hash.clone(),
             venue: job.venue.clone(),
+            review_options: job.review_options.clone(),
             version_no: job.version_no,
             round_no: job.round_no,
             version_source: job.version_source.clone(),
@@ -182,6 +187,8 @@ pub struct PaperView {
     pub backend: String,
     /// The venue a new request would use (paper, then provider default).
     pub venue: Option<String>,
+    /// The provider options a new request would use.
+    pub review_options: ReviewOptions,
     pub pdf_path: String,
     pub pdf_present: bool,
     pub watched: bool,
@@ -202,6 +209,7 @@ pub struct ManuscriptInput {
     pub pdf_hash: String,
     pub backend: String,
     pub venue: Option<String>,
+    pub review_options: ReviewOptions,
     pub version_source: String,
     pub version_key: String,
 }
@@ -216,6 +224,7 @@ impl ManuscriptInput {
             pdf_hash: identity.pdf_hash,
             backend: identity.backend,
             venue: identity.venue,
+            review_options: identity.review_options,
             version_source: identity.version_source.as_str().to_string(),
             version_key: identity.version_key,
         }

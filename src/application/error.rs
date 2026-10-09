@@ -46,6 +46,15 @@ pub enum OpError {
     #[error("{detail}")]
     SubmitterEmailUnavailable { backend: String, detail: String },
 
+    /// A setting the paper's provider needs (its API key, or the review
+    /// template) is not configured.
+    #[error("{message}")]
+    ProviderNotConfigured {
+        backend: String,
+        setting: &'static str,
+        message: String,
+    },
+
     #[error("job not found: {job_id}")]
     JobNotFound { job_id: String },
 
@@ -159,6 +168,7 @@ impl OpError {
             OpError::PaperNotFound { .. } => "paper_not_found",
             OpError::PdfNotFound { .. } => "pdf_not_found",
             OpError::SubmitterEmailUnavailable { .. } => "submitter_email_unavailable",
+            OpError::ProviderNotConfigured { .. } => "provider_not_configured",
             OpError::JobNotFound { .. } => "job_not_found",
             OpError::NoEligibleJob { .. } => "no_eligible_job",
             OpError::AmbiguousJob { .. } => "ambiguous_job",
@@ -193,6 +203,13 @@ impl OpError {
             ),
             OpError::SubmitterEmailUnavailable { .. } => {
                 "set providers.stanford.email in ~/.config/reviewloop/config.toml or run `reviewloop email login --provider google`".to_string()
+            }
+            OpError::ProviderNotConfigured { setting: "api_key", .. } => format!(
+                "set providers.cspaper.api_key in ~/.config/reviewloop/config.toml or export {}; the key never goes in reviewloop.toml",
+                crate::config::CSPAPER_API_KEY_ENV
+            ),
+            OpError::ProviderNotConfigured { .. } => {
+                "set providers.cspaper.agent_id in reviewloop.toml or ~/.config/reviewloop/config.toml, or the paper's venue (`reviewloop paper add --agent-id`), to a CSPaper agent_id such as ICLR_main_2026_1 (https://cspaper.org/platform/review lists them)".to_string()
             }
             OpError::JobNotFound { .. } => {
                 "check the job_id; list_jobs shows this project's jobs".to_string()
@@ -259,6 +276,9 @@ impl OpError {
                 json!({ "paper_id": paper_id, "path": path })
             }
             OpError::SubmitterEmailUnavailable { backend, .. } => json!({ "backend": backend }),
+            OpError::ProviderNotConfigured {
+                backend, setting, ..
+            } => json!({ "backend": backend, "setting": setting }),
             OpError::JobNotFound { job_id } => json!({ "job_id": job_id }),
             OpError::NoEligibleJob {
                 paper_id,

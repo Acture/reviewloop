@@ -98,6 +98,49 @@ pub fn run_git_tag_trigger(config: &Config, db: &Db) -> Result<()> {
 // set.
 static PDF_MISSING_WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
+// Per-process set of `(paper, setting)` pairs already reported as missing a
+// provider setting, so a misconfigured paper is reported once instead of on
+// every tick (same trade-off as `PDF_MISSING_WARNED`).
+static PROVIDER_UNCONFIGURED_WARNED: OnceLock<Mutex<HashSet<(String, &'static str)>>> =
+    OnceLock::new();
+
+/// Whether `paper` cannot be reviewed yet because its provider lacks a
+/// setting. A trigger skips such a paper instead of enqueueing a job that
+/// could only fail, and enqueues it on a later tick once the setting exists.
+fn provider_unconfigured(
+    config: &Config,
+    db: &Db,
+    paper: &PaperConfig,
+    source: &str,
+) -> Result<bool> {
+    let Some((setting, message)) = config.missing_provider_setting(paper) else {
+        return Ok(false);
+    };
+    let guard = PROVIDER_UNCONFIGURED_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut seen = guard.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.insert((paper.id.clone(), setting)) {
+        warn!(
+            paper_id = %paper.id,
+            backend = %paper.backend,
+            setting,
+            source,
+            "{message}; trigger skips the paper until it is configured"
+        );
+        db.add_event(
+            Some(&config.project_id),
+            None,
+            "provider_not_configured",
+            json!({
+                "paper_id": paper.id,
+                "backend": paper.backend,
+                "setting": setting,
+                "source": source,
+            }),
+        )?;
+    }
+    Ok(true)
+}
+
 pub fn run_pdf_trigger(config: &Config, db: &Db) -> Result<()> {
     if !config.trigger.pdf.enabled {
         return Ok(());
@@ -140,6 +183,7 @@ pub fn run_pdf_trigger(config: &Config, db: &Db) -> Result<()> {
             &paper.backend,
             &hash,
             provider_venue(config, paper).as_deref(),
+            &config.review_options_for(paper),
             None,
         );
         if let Some(existing) = db.find_duplicate_covering_job(&config.project_id, &identity)? {
@@ -158,6 +202,9 @@ pub fn run_pdf_trigger(config: &Config, db: &Db) -> Result<()> {
         let latest_hash =
             db.latest_hash_for_paper(&config.project_id, &paper.id, &paper.backend)?;
         if latest_hash.as_deref() == Some(hash.as_str()) {
+            continue;
+        }
+        if provider_unconfigured(config, db, paper, "pdf_change_trigger")? {
             continue;
         }
 
@@ -229,6 +276,10 @@ fn process_tag_entry(config: &Config, db: &Db, tag: &str, commit: &str) -> Resul
     }
 
     if let Some(paper) = select_paper_for_tag(config, tag) {
+        // Left unseen, so the tag enqueues once the provider is configured.
+        if provider_unconfigured(config, db, paper, "git_tag_trigger")? {
+            return Ok(false);
+        }
         // The tag is the request: if marking it seen below is lost (crash,
         // retention pruning), replaying it returns the job it already made,
         // as long as that job has not been pruned itself.
@@ -372,6 +423,7 @@ fn new_trigger_job(
         status,
         email: provider_email(config, &paper.backend)?,
         venue: provider_venue(config, paper),
+        review_options: config.review_options_for(paper),
         git_tag,
         git_commit,
         next_poll_at: None,

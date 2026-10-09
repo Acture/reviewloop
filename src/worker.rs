@@ -381,6 +381,7 @@ impl SubmitPlan {
                 pdf_path: snapshot_path,
                 email,
                 venue,
+                review_options: job.review_options.clone(),
             },
             fallback,
         }))
@@ -497,6 +498,9 @@ async fn submit_leased(
             message,
             retry_after,
         }) => schedule_submit_retry(config, db, &lease, message, retry_after),
+        // Nothing was created, but no other job of this backend can succeed until
+        // someone fixes the credentials: say so instead of failing quietly.
+        Err(err @ BackendError::Auth(_)) => park_submit_needs_manual(config, db, &lease, err),
         // The provider provably rejected the request, so another route cannot duplicate it.
         Err(err) => match plan.fallback {
             Some(fallback) => submit_via_fallback(config, db, lease, fallback, err).await,
@@ -726,6 +730,42 @@ fn schedule_submit_retry(
     Ok(())
 }
 
+/// The provider provably refused the submission for a reason an operator must
+/// fix first. The job keeps no receipt, so `retry` resubmits it afterwards.
+fn park_submit_needs_manual(
+    config: &Config,
+    db: &Db,
+    lease: &Lease,
+    err: BackendError,
+) -> Result<()> {
+    let reason = err.to_string();
+    let change = JobChange {
+        status: JobStatus::FailedNeedsManual,
+        attempt: Some(lease.job.attempt + 1),
+        next_poll_at: Some(None),
+        last_error: Some(Some(reason.clone())),
+        submit_stage: None,
+        fallback_used: None,
+    };
+    if finish(
+        db,
+        lease,
+        &change,
+        "submit_failed_needs_manual",
+        json!({ "reason": reason }),
+    )? {
+        fire_notification(
+            &config.notifications,
+            NotificationKind::FailedNeedsManual,
+            Some(&lease.job.paper_id),
+            Some(&lease.job.id),
+            Some(&reason),
+        );
+        error!(job_id = %lease.job.id, "submit refused; manual intervention required");
+    }
+    Ok(())
+}
+
 fn fail_submit(db: &Db, lease: &Lease, err: BackendError) -> Result<()> {
     let reason = err.to_string();
     let change = JobChange {
@@ -881,6 +921,36 @@ async fn poll_leased(
                     Some("ready"),
                 );
                 info!(job_id = %job.id, "review completed and artifacts written");
+            }
+        }
+        Ok(ReviewFetchResult::Failed { reason }) => {
+            let detail = format!(
+                "provider reported the review failed: {reason}; request a new review with `reviewloop submit --paper-id {} --force`",
+                job.paper_id
+            );
+            let change = JobChange {
+                status: JobStatus::FailedNeedsManual,
+                attempt: Some(attempt),
+                next_poll_at: Some(None),
+                last_error: Some(Some(detail.clone())),
+                submit_stage: None,
+                fallback_used: None,
+            };
+            if finish(
+                db,
+                &lease,
+                &change,
+                "poll_provider_failed",
+                json!({ "reason": reason }),
+            )? {
+                fire_notification(
+                    &config.notifications,
+                    NotificationKind::FailedNeedsManual,
+                    Some(&job.paper_id),
+                    Some(&job.id),
+                    Some(&detail),
+                );
+                warn!(job_id = %job.id, "provider reported the review failed; marked failed-needs-manual");
             }
         }
         Ok(ReviewFetchResult::InvalidToken) => {

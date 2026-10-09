@@ -26,7 +26,14 @@ pub fn render_tick_panel(
     println!("time: {}", Utc::now().to_rfc3339());
     println!("tick: {tick}");
     println!("project_id: {}", config.project_id);
-    println!("backend: stanford (paperreview.ai)");
+    let mut backends: Vec<&str> = config.papers.iter().map(|p| p.backend.as_str()).collect();
+    backends.sort_unstable();
+    backends.dedup();
+    if backends.is_empty() {
+        println!("backends: none configured");
+    } else {
+        println!("backends: {}", backends.join(", "));
+    }
     println!();
     println!("Jobs");
     println!("- pending approval : {pending}");

@@ -5,13 +5,15 @@
 use anyhow::Result;
 use chrono::Utc;
 use reviewloop::{
+    backend::cspaper,
     db::Db,
     model::{
         EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, ExistingReason, Job, JobPdf,
-        JobStatus, NewJob,
+        JobStatus, NewJob, ReviewOptions,
     },
 };
 use rusqlite::{Connection, params};
+use serde_json::{Value, json};
 use std::{
     path::PathBuf,
     sync::{Arc, Barrier},
@@ -64,6 +66,16 @@ impl Ctx {
             |row| row.get(0),
         )?)
     }
+
+    /// Payloads of every `event_type` event, oldest first.
+    fn payloads(&self, event_type: &str) -> Result<Vec<Value>> {
+        let conn = self.sql()?;
+        let mut stmt =
+            conn.prepare("SELECT payload_json FROM events WHERE event_type = ?1 ORDER BY id")?;
+        let rows = stmt.query_map(params![event_type], |row| row.get::<_, String>(0))?;
+        rows.map(|raw| -> Result<Value> { Ok(serde_json::from_str(&raw?)?) })
+            .collect()
+    }
 }
 
 fn new_job(hash: &str, venue: Option<&str>) -> NewJob {
@@ -78,10 +90,27 @@ fn new_job(hash: &str, venue: Option<&str>) -> NewJob {
         status: JobStatus::Queued,
         email: "author@example.edu".to_string(),
         venue: venue.map(str::to_string),
+        review_options: Default::default(),
         git_tag: None,
         git_commit: None,
         next_poll_at: None,
     }
+}
+
+/// A CSPaper request: the template (`agent_id`) rides in `venue`, the
+/// desk-rejection setting in the review options, and there is no submitter email.
+fn cspaper_job(hash: &str, agent_id: &str, desk_rejection: bool) -> NewJob {
+    NewJob {
+        backend: cspaper::BACKEND.to_string(),
+        email: String::new(),
+        venue: Some(agent_id.to_string()),
+        review_options: desk_rejection_options(desk_rejection),
+        ..new_job(hash, None)
+    }
+}
+
+fn desk_rejection_options(enabled: bool) -> ReviewOptions {
+    ReviewOptions::default().with(cspaper::DESK_REJECTION_ENABLED, enabled.to_string())
 }
 
 fn request(job: NewJob, key: Option<&str>, mode: EnqueueMode) -> EnqueueRequest {
@@ -454,6 +483,276 @@ fn blank_venue_matches_legacy_rows_without_venue() -> Result<()> {
         ExistingReason::Covered,
     );
     assert_eq!(covered.id, legacy.id);
+    Ok(())
+}
+
+const ICLR_TEMPLATE: &str = "ICLR_main_2026_1";
+const NEURIPS_TEMPLATE: &str = "NeurIPS_main_2026_1";
+
+#[test]
+fn cspaper_template_is_part_of_coverage_and_request_identity() -> Result<()> {
+    let ctx = Ctx::new()?;
+    let iclr = created(ctx.db.enqueue(&request(
+        cspaper_job("h1", ICLR_TEMPLATE, true),
+        Some("iclr"),
+        EnqueueMode::Deduplicate,
+    ))?);
+    assert_eq!(iclr.backend, cspaper::BACKEND);
+    assert_eq!(iclr.venue.as_deref(), Some(ICLR_TEMPLATE));
+    assert_eq!(iclr.review_options, desk_rejection_options(true));
+
+    let neurips = created(ctx.db.enqueue(&request(
+        cspaper_job("h1", NEURIPS_TEMPLATE, true),
+        None,
+        EnqueueMode::Deduplicate,
+    ))?);
+    assert_ne!(
+        neurips.id, iclr.id,
+        "same manuscript, other template: new review"
+    );
+    assert_eq!((neurips.version_no, neurips.round_no), (1, 2));
+
+    let same_template = existing(
+        ctx.db.enqueue(&request(
+            cspaper_job("h1", NEURIPS_TEMPLATE, true),
+            None,
+            EnqueueMode::Deduplicate,
+        ))?,
+        ExistingReason::Covered,
+    );
+    assert_eq!(same_template.id, neurips.id);
+
+    let err = conflict(ctx.db.enqueue(&request(
+        cspaper_job("h1", NEURIPS_TEMPLATE, true),
+        Some("iclr"),
+        EnqueueMode::Deduplicate,
+    )));
+    assert_eq!(err.existing_job_id, iclr.id);
+    let fields: Vec<_> = err.mismatches.iter().map(|m| m.field).collect();
+    assert_eq!(fields, ["venue"]);
+    assert_eq!(err.mismatches[0].recorded.as_deref(), Some(ICLR_TEMPLATE));
+    assert_eq!(
+        err.mismatches[0].requested.as_deref(),
+        Some(NEURIPS_TEMPLATE)
+    );
+    assert_eq!(ctx.jobs()?, 2);
+    Ok(())
+}
+
+#[test]
+fn cspaper_desk_rejection_setting_is_part_of_coverage_and_request_identity() -> Result<()> {
+    let ctx = Ctx::new()?;
+    let screened_req = request(
+        cspaper_job("h1", ICLR_TEMPLATE, true),
+        Some("screened"),
+        EnqueueMode::Deduplicate,
+    );
+    let screened = created(ctx.db.enqueue(&screened_req)?);
+    let events_before = ctx.count("SELECT COUNT(*) FROM events")?;
+
+    let err = conflict(ctx.db.enqueue(&request(
+        cspaper_job("h1", ICLR_TEMPLATE, false),
+        Some("screened"),
+        EnqueueMode::Deduplicate,
+    )));
+    assert_eq!(err.existing_job_id, screened.id);
+    let fields: Vec<_> = err.mismatches.iter().map(|m| m.field).collect();
+    assert_eq!(fields, ["review_options"]);
+    assert_eq!(
+        err.mismatches[0].recorded.as_deref(),
+        Some(r#"{"desk_rejection_enabled":"true"}"#)
+    );
+    assert_eq!(
+        err.mismatches[0].requested.as_deref(),
+        Some(r#"{"desk_rejection_enabled":"false"}"#)
+    );
+    assert_eq!(ctx.jobs()?, 1, "a conflict enqueues nothing");
+    assert_eq!(ctx.count("SELECT COUNT(*) FROM events")?, events_before);
+
+    let unscreened = created(ctx.db.enqueue(&request(
+        cspaper_job("h1", ICLR_TEMPLATE, false),
+        None,
+        EnqueueMode::Deduplicate,
+    ))?);
+    assert_ne!(
+        unscreened.id, screened.id,
+        "same manuscript and template, other desk-rejection setting: new review"
+    );
+    assert_eq!((unscreened.version_no, unscreened.round_no), (1, 2));
+    assert_eq!(unscreened.review_options, desk_rejection_options(false));
+
+    let replay = existing(
+        ctx.db.enqueue(&screened_req)?,
+        ExistingReason::RequestReplay,
+    );
+    assert_eq!(replay.id, screened.id);
+    assert_eq!(replay.review_options, desk_rejection_options(true));
+
+    let covered = existing(
+        ctx.db.enqueue(&request(
+            cspaper_job("h1", ICLR_TEMPLATE, false),
+            None,
+            EnqueueMode::Deduplicate,
+        ))?,
+        ExistingReason::Covered,
+    );
+    assert_eq!(covered.id, unscreened.id);
+    assert_eq!(ctx.jobs()?, 2);
+
+    // Both event kinds record the options the request was made with.
+    let enqueued: Vec<Value> = ctx
+        .payloads("job_enqueued")?
+        .into_iter()
+        .map(|payload| payload["review_options"].clone())
+        .collect();
+    assert_eq!(
+        enqueued,
+        [
+            json!({ "desk_rejection_enabled": "true" }),
+            json!({ "desk_rejection_enabled": "false" }),
+        ]
+    );
+    let skipped = ctx.payloads("duplicate_skipped")?;
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(
+        skipped[0]["review_options"],
+        json!({ "desk_rejection_enabled": "false" })
+    );
+    assert_eq!(skipped[0]["existing_job_id"], json!(unscreened.id));
+    Ok(())
+}
+
+#[test]
+fn stanford_and_cspaper_reviews_of_the_same_pdf_are_distinct() -> Result<()> {
+    let ctx = Ctx::new()?;
+    let stanford = created(ctx.db.enqueue(&request(
+        new_job("h1", Some("ICLR")),
+        Some("k"),
+        EnqueueMode::Deduplicate,
+    ))?);
+    assert!(stanford.review_options.is_empty());
+
+    let err = conflict(ctx.db.enqueue(&request(
+        cspaper_job("h1", "ICLR", true),
+        Some("k"),
+        EnqueueMode::Deduplicate,
+    )));
+    let fields: Vec<_> = err.mismatches.iter().map(|m| m.field).collect();
+    assert_eq!(fields, ["backend", "review_options"]);
+    assert_eq!(err.mismatches[1].recorded, None, "stanford has no options");
+
+    let cspaper = created(ctx.db.enqueue(&request(
+        cspaper_job("h1", "ICLR", true),
+        None,
+        EnqueueMode::Deduplicate,
+    ))?);
+    assert_ne!(cspaper.id, stanford.id);
+    assert_eq!(cspaper.backend, cspaper::BACKEND);
+
+    // Each backend's repeat request is covered by its own job only.
+    let again_stanford = existing(
+        ctx.db.enqueue(&request(
+            new_job("h1", Some("ICLR")),
+            None,
+            EnqueueMode::Deduplicate,
+        ))?,
+        ExistingReason::Covered,
+    );
+    assert_eq!(again_stanford.id, stanford.id);
+    let again_cspaper = existing(
+        ctx.db.enqueue(&request(
+            cspaper_job("h1", "ICLR", true),
+            None,
+            EnqueueMode::Deduplicate,
+        ))?,
+        ExistingReason::Covered,
+    );
+    assert_eq!(again_cspaper.id, cspaper.id);
+    assert_eq!(ctx.jobs()?, 2);
+    Ok(())
+}
+
+/// Request keys bound before review options existed carry identities without a
+/// `review_options` field; they must still replay rather than fail as corrupt.
+#[test]
+fn legacy_identity_without_review_options_still_replays() -> Result<()> {
+    let ctx = Ctx::new()?;
+    let job = ctx.db.create_job(&new_job("h1", Some("ICLR")))?;
+    // ReviewIdentity as serialized by builds before OSS-353, field order included.
+    let legacy_identity = r#"{"paper_id":"main","backend":"stanford","pdf_hash":"h1","venue":"ICLR","version_source":"pdf_hash","version_key":"h1"}"#;
+    ctx.sql()?.execute(
+        "INSERT INTO enqueue_requests(project_id, request_key, identity_json, job_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            PROJECT,
+            "legacy-key",
+            legacy_identity,
+            job.id,
+            "2026-01-02T03:04:05+00:00"
+        ],
+    )?;
+
+    let replay = existing(
+        ctx.db.enqueue(&request(
+            new_job("h1", Some("ICLR")),
+            Some("legacy-key"),
+            EnqueueMode::Deduplicate,
+        ))?,
+        ExistingReason::RequestReplay,
+    );
+    assert_eq!(replay.id, job.id);
+
+    // The legacy identity still guards its key against other content.
+    let err = conflict(ctx.db.enqueue(&request(
+        cspaper_job("h1", "ICLR", true),
+        Some("legacy-key"),
+        EnqueueMode::Deduplicate,
+    )));
+    let fields: Vec<_> = err.mismatches.iter().map(|m| m.field).collect();
+    assert_eq!(fields, ["backend", "review_options"]);
+    assert_eq!(ctx.jobs()?, 1);
+    Ok(())
+}
+
+/// Identities without review options serialize exactly as before OSS-353, so
+/// keys bound by this build stay readable by older builds sharing the database.
+#[test]
+fn stanford_identity_is_recorded_without_review_options() -> Result<()> {
+    let ctx = Ctx::new()?;
+    created(ctx.db.enqueue(&request(
+        new_job("h1", Some("ICLR")),
+        Some("stanford"),
+        EnqueueMode::Deduplicate,
+    ))?);
+    created(ctx.db.enqueue(&request(
+        cspaper_job("h1", ICLR_TEMPLATE, false),
+        Some("cspaper"),
+        EnqueueMode::Deduplicate,
+    ))?);
+
+    let identity = |key: &str| -> Result<Value> {
+        let raw: String = ctx.sql()?.query_row(
+            "SELECT identity_json FROM enqueue_requests WHERE request_key = ?1",
+            params![key],
+            |row| row.get(0),
+        )?;
+        Ok(serde_json::from_str(&raw)?)
+    };
+    assert_eq!(
+        identity("stanford")?,
+        json!({
+            "paper_id": "main",
+            "backend": "stanford",
+            "pdf_hash": "h1",
+            "venue": "ICLR",
+            "version_source": "pdf_hash",
+            "version_key": "h1",
+        })
+    );
+    assert_eq!(
+        identity("cspaper")?["review_options"],
+        json!({ "desk_rejection_enabled": "false" })
+    );
     Ok(())
 }
 

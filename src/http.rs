@@ -46,8 +46,9 @@ use tracing::warn;
 ///
 /// Bodies that cannot be cloned (streamed bodies) fall back to a
 /// single-attempt path against the first selected proxy. Multipart forms are
-/// streamed, so the S3 upload and `confirm-upload` — the request that creates a
-/// submission — are always sent exactly once and never re-sent on failover.
+/// streamed, so every request that creates a provider submission (Stanford's
+/// `confirm-upload`, CSPaper's review POST) and the S3 upload are always sent
+/// exactly once and never re-sent on failover.
 struct RoundRobinProxyMiddleware {
     /// One client per proxy URL, built at construction time.
     clients: Vec<reqwest::Client>,
@@ -170,12 +171,46 @@ fn is_transient_proxy_error(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout() || err.status().is_none()
 }
 
+/// Whether a client follows HTTP redirects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Redirects {
+    /// reqwest's default policy: follow up to 10 hops.
+    Follow,
+    /// Return 3xx responses to the caller. Required for requests that carry a
+    /// credential in a custom header: reqwest strips only the standard
+    /// authorization headers on a cross-host redirect, so it would forward
+    /// such a header to the redirect target.
+    Refuse,
+}
+
+impl Redirects {
+    fn apply(self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        match self {
+            Redirects::Follow => builder,
+            Redirects::Refuse => builder.redirect(reqwest::redirect::Policy::none()),
+        }
+    }
+}
+
+/// Bounds connecting: TCP, a proxy's CONNECT tunnel and the TLS handshake.
+/// Backends map connect errors to "nothing was sent", so a stalled handshake
+/// must surface as one instead of running into the worker's dispatch bound,
+/// which reads as "the provider may hold the submission". Nothing bounds the
+/// request once sent: an expiry then would hide whether it arrived.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn client_builder(redirects: Redirects) -> reqwest::ClientBuilder {
+    redirects
+        .apply(reqwest::Client::builder())
+        .connect_timeout(CONNECT_TIMEOUT)
+}
+
 /// Build an outbound HTTP client with proxy pool middleware when proxies are
 /// configured.
 ///
 /// When `config.core.proxies` is empty, returns a plain
 /// `ClientWithMiddleware` with no middleware — behaviour identical to a bare
-/// `reqwest::Client::new()`.
+/// `reqwest::Client` with the chosen redirect policy.
 ///
 /// When proxies are configured, installs [`RoundRobinProxyMiddleware`] so
 /// every request cycles through the proxy list.  Only the count is logged;
@@ -184,13 +219,22 @@ fn is_transient_proxy_error(err: &reqwest::Error) -> bool {
 ///
 /// Pass `db` and `project_id` to enable `proxy_failover` event recording.
 /// When either is `None`, failovers are warn-logged only (legacy behaviour).
+///
+/// `redirects` applies to the per-proxy clients too, since in proxy mode they
+/// are the ones that execute the request.
 pub fn build_client(
     config: &Config,
     db: Option<&Db>,
     project_id: Option<&str>,
+    redirects: Redirects,
 ) -> Result<ClientWithMiddleware> {
+    let plain = || {
+        client_builder(redirects)
+            .build()
+            .context("failed to build HTTP client")
+    };
     if config.core.proxies.is_empty() {
-        return Ok(ClientBuilder::new(reqwest::Client::new()).build());
+        return Ok(ClientBuilder::new(plain()?).build());
     }
 
     tracing::info!(
@@ -206,7 +250,7 @@ pub fn build_client(
         .map(|(i, url)| {
             let proxy = reqwest::Proxy::all(url)
                 .with_context(|| format!("invalid proxy URL at index {i}"))?;
-            reqwest::Client::builder()
+            client_builder(redirects)
                 .proxy(proxy)
                 .build()
                 .with_context(|| format!("failed to build client for proxy at index {i}"))
@@ -224,9 +268,7 @@ pub fn build_client(
         event_target,
     };
 
-    Ok(ClientBuilder::new(reqwest::Client::new())
-        .with(middleware)
-        .build())
+    Ok(ClientBuilder::new(plain()?).with(middleware).build())
 }
 
 /// Build a plain `reqwest::Client` with the first configured proxy applied.
@@ -268,7 +310,8 @@ mod tests {
     fn build_client_no_proxies_succeeds() {
         let config = Config::default();
         assert!(config.core.proxies.is_empty());
-        let client = build_client(&config, None, None).expect("build_client with no proxies");
+        let client = build_client(&config, None, None, Redirects::Follow)
+            .expect("build_client with no proxies");
         // Verify it is usable: just assert the type compiles and builds.
         drop(client);
     }
@@ -288,7 +331,8 @@ mod tests {
             "socks5://proxy2.example.com:1080".to_string(),
         ];
         // Build should succeed; actual connectivity is not tested in unit tests.
-        let client = build_client(&config, None, None).expect("build_client with valid proxy URLs");
+        let client = build_client(&config, None, None, Redirects::Follow)
+            .expect("build_client with valid proxy URLs");
         drop(client);
     }
 
@@ -349,7 +393,8 @@ mod tests {
             "http://198.51.100.2:2".to_string(),
             format!("http://{live_addr}"),
         ];
-        let client = build_client(&config, None, None).expect("build client with mixed proxies");
+        let client = build_client(&config, None, None, Redirects::Follow)
+            .expect("build client with mixed proxies");
 
         // Request at the live "proxy" itself so the first two genuinely fail
         // at the connect step rather than getting an HTTP error from a
@@ -397,8 +442,8 @@ mod tests {
             format!("http://{live_addr}"),
         ];
         let project_id = "test-proj-failover";
-        let client =
-            build_client(&config, Some(&db), Some(project_id)).expect("build client for test");
+        let client = build_client(&config, Some(&db), Some(project_id), Redirects::Follow)
+            .expect("build client for test");
 
         let resp = client
             .get(format!("http://{live_addr}/"))
@@ -417,5 +462,50 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    /// A peer that accepts the TCP connection and then says nothing.
+    async fn silent_listener() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent listener");
+        let addr = listener.local_addr().expect("listener address");
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        (addr, task)
+    }
+
+    /// A stalled TLS handshake or proxy tunnel must end as a connect error,
+    /// which backends read as "nothing was sent", and not hang until the
+    /// worker's dispatch bound reads it as an unknown outcome.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_handshakes_end_as_connect_errors() {
+        let (addr, task) = silent_listener().await;
+
+        let mut direct = Config::default();
+        direct.core.proxies.clear();
+        let mut proxied = Config::default();
+        proxied.core.proxies = vec![format!("http://{addr}")];
+
+        for (case, config, url) in [
+            ("TLS handshake", direct, format!("https://{addr}/api")),
+            (
+                "proxy CONNECT",
+                proxied,
+                "https://cspaper.invalid/api".to_string(),
+            ),
+        ] {
+            let client = build_client(&config, None, None, Redirects::Refuse).expect("client");
+            let result = tokio::time::timeout(CONNECT_TIMEOUT * 2, client.get(&url).send())
+                .await
+                .unwrap_or_else(|_| panic!("{case}: no connect timeout fired"));
+            let err = result.expect_err("a silent peer cannot answer");
+            assert!(err.is_connect(), "{case}: {err}");
+        }
+        task.abort();
     }
 }

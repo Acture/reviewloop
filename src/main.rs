@@ -7,7 +7,8 @@ use reviewloop::application::{
 };
 use reviewloop::artifact::write_review_artifacts;
 use reviewloop::config::{
-    Config, LegacyConfig, PaperConfigFile, ProjectConfigFile, default_project_config_path,
+    Config, GlobalConfigFile, LegacyConfig, PaperConfigFile, ProjectConfigFile,
+    default_project_config_path,
 };
 use reviewloop::db::Db;
 use reviewloop::email_account;
@@ -291,8 +292,9 @@ enum PaperCommand {
         #[arg(long, default_value_t = false)]
         no_submit_prompt: bool,
         /// Override the venue for this paper. When omitted, the project-level
-        /// `venue` from `reviewloop.toml` is used.
-        #[arg(long)]
+        /// `venue` from `reviewloop.toml` is used. For backend cspaper this is
+        /// the review template (`agent_id`, e.g. ICLR_main_2026_1).
+        #[arg(long, visible_alias = "agent-id")]
         venue: Option<String>,
     },
     /// Enable or disable PDF-change watching for an already-registered paper.
@@ -977,7 +979,11 @@ fn cmd_config_migrate_project(
 
     let global_path = Config::ensure_global_config_file()?
         .ok_or_else(|| anyhow!("failed to determine global config path"))?;
-    legacy.global_config().save(&global_path)?;
+    // Legacy files predate CSPaper; keep a CSPaper section (and its API key)
+    // already saved in the global config instead of resetting it.
+    let mut global = legacy.global_config();
+    global.providers.cspaper = GlobalConfigFile::load(&global_path)?.providers.cspaper;
+    global.save(&global_path)?;
 
     let backup_path = legacy_path.with_file_name("reviewloop.legacy.bak.toml");
     if backup_path.exists() {
@@ -1160,6 +1166,9 @@ fn cmd_daemon_install(config_override: Option<&Path>, start: bool) -> Result<()>
             println!("- project config: {}", path.display());
         } else {
             println!("- mode: global-only daemon (no project config bound)");
+        }
+        if let Some(warning) = daemon_cspaper_key_warning(&config, &global_path)? {
+            println!("{warning}");
         }
 
         if start {
@@ -1986,6 +1995,7 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
         })
         .map_err(|err| with_email_hint(err, "run"))?;
     let job_id = requested.job.job_id;
+    let backend = requested.job.backend;
 
     // Submit immediately (equivalent to cmd_submit with force=true). If another worker
     // got there first, the loop below still follows the job to completion.
@@ -2004,8 +2014,8 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
     // Email ingestion can still attach the token of a submission whose outcome is
     // unknown; without it nothing advances such a job, so `run` stops on it.
     // A broken email setup only costs the wait: ticks report it themselves.
-    let waits_for_token_email =
-        reviewloop::email::token_ingestion_active(&config).unwrap_or_else(|err| {
+    let waits_for_token_email = reviewloop::backend::tokens_arrive_by_email(&backend)
+        && reviewloop::email::token_ingestion_active(&config).unwrap_or_else(|err| {
             warn!(error = %err, "email token ingestion unavailable; not waiting for a token email");
             false
         });
@@ -2161,7 +2171,6 @@ async fn cmd_import_token(
     source: &str,
 ) -> Result<()> {
     require_project(config)?;
-    db.record_email_token(token, source, None)?;
 
     let existing = match (job_id, paper_id) {
         (Some(job_id), _) => Some(ensure_project_job(config, db, job_id)?),
@@ -2171,6 +2180,7 @@ async fn cmd_import_token(
         (None, None) => anyhow::bail!("import-token needs --job-id or --paper-id"),
     };
     if let Some(job) = existing {
+        record_imported_token(db, &job.backend, token, source)?;
         db.attach_token_to_job(&job.id, token, Utc::now())?;
         db.add_event(
             None,
@@ -2186,6 +2196,7 @@ async fn cmd_import_token(
     let paper = config
         .find_paper(paper_id)
         .ok_or_else(|| OpError::paper_not_found(paper_id, config))?;
+    record_imported_token(db, &paper.backend, token, source)?;
 
     let pdf_hash = if Path::new(&paper.pdf_path).exists() {
         sha256_file(Path::new(&paper.pdf_path))?
@@ -2216,6 +2227,7 @@ async fn cmd_import_token(
                 status: JobStatus::Processing,
                 email,
                 venue,
+                review_options: config.review_options_for(paper),
                 git_tag: None,
                 git_commit: None,
                 next_poll_at: Some(Utc::now()),
@@ -2236,6 +2248,39 @@ async fn cmd_import_token(
 
     println!("Created job {} and attached imported token", job.id);
     poll_imported_token(config, db, &job.id).await
+}
+
+/// launchd starts the daemon without the installing shell's environment, so a
+/// CSPaper key that only comes from the environment never reaches it.
+#[cfg(target_os = "macos")]
+fn daemon_cspaper_key_warning(config: &Config, global_path: &Path) -> Result<Option<String>> {
+    let uses_cspaper = config
+        .papers
+        .iter()
+        .any(|paper| paper.backend == reviewloop::backend::cspaper::BACKEND);
+    let key_in_file = GlobalConfigFile::load(global_path)?
+        .providers
+        .cspaper
+        .api_key
+        .is_some_and(|key| !key.trim().is_empty());
+    Ok((uses_cspaper && !key_in_file).then(|| {
+        format!(
+            "warning: this project uses backend=cspaper but {} has no providers.cspaper.api_key; \
+             the daemon does not inherit {} from this shell, so its CSPaper submissions would \
+             fail. Set the key in the global config.",
+            global_path.display(),
+            reviewloop::config::CSPAPER_API_KEY_ENV
+        )
+    }))
+}
+
+/// Imported tokens join the email-token ledger only for backends whose tokens
+/// arrive by email, where ingestion must recognise them as already seen.
+fn record_imported_token(db: &Db, backend: &str, token: &str, source: &str) -> Result<()> {
+    if reviewloop::backend::tokens_arrive_by_email(backend) {
+        db.record_email_token(token, source, None)?;
+    }
+    Ok(())
 }
 
 /// Poll right away rather than waiting for the next 30-second daemon tick; exit 2 when
@@ -2712,6 +2757,10 @@ fn with_email_hint(err: OpError, command: &str) -> anyhow::Error {
         OpError::SubmitterEmailUnavailable { .. } => anyhow::Error::new(err).context(format!(
             "reviewloop {command} requires a submitter email. set providers.stanford.email in ~/.config/reviewloop/config.toml or run 'reviewloop email login --provider google' to use OAuth (see README 'Email Token Ingestion' section)."
         )),
+        OpError::ProviderNotConfigured { .. } => {
+            let hint = err.recovery().unwrap_or_default();
+            anyhow::Error::new(err).context(format!("reviewloop {command}: {hint}"))
+        }
         other => other.into(),
     }
 }
@@ -3413,6 +3462,7 @@ mod tests {
             status: JobStatus::Queued,
             email: "test@example.com".to_string(),
             venue: None,
+            review_options: Default::default(),
             git_tag: None,
             git_commit: None,
             next_poll_at: None,
@@ -3559,6 +3609,7 @@ mod tests {
                 status,
                 email: "test@example.com".to_string(),
                 venue: None,
+                review_options: Default::default(),
                 git_tag: None,
                 git_commit: None,
                 next_poll_at: None,
@@ -3859,6 +3910,7 @@ mod tests {
                     status: JobStatus::Queued,
                     email: "test@example.com".to_string(),
                     venue: None,
+                    review_options: Default::default(),
                     git_tag: None,
                     git_commit: None,
                     next_poll_at: None,
@@ -4014,6 +4066,54 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    mod daemon_cspaper_key {
+        use crate::daemon_cspaper_key_warning;
+        use reviewloop::config::{Config, GlobalConfigFile, PaperConfig, Redacted};
+
+        fn config_with(backend: &str) -> Config {
+            let mut config = Config {
+                papers: vec![PaperConfig {
+                    id: "main".to_string(),
+                    pdf_path: "main.pdf".to_string(),
+                    backend: backend.to_string(),
+                    venue: None,
+                }],
+                ..Config::default()
+            };
+            // Present at runtime, as if it came from the environment.
+            config.providers.cspaper.api_key = Some(Redacted("csp_live_env".to_string()));
+            config
+        }
+
+        #[test]
+        fn warns_only_when_a_cspaper_project_has_no_key_in_the_global_file() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("config.toml");
+            GlobalConfigFile::default().save(&path).expect("save");
+
+            let warning = daemon_cspaper_key_warning(&config_with("cspaper"), &path)
+                .expect("check")
+                .expect("a CSPaper project without a key on file is warned about");
+            assert!(warning.contains("REVIEWLOOP_CSPAPER_API_KEY"), "{warning}");
+            assert!(!warning.contains("csp_live_env"), "{warning}");
+            assert!(
+                daemon_cspaper_key_warning(&config_with("stanford"), &path)
+                    .expect("check")
+                    .is_none()
+            );
+
+            let mut global = GlobalConfigFile::default();
+            global.providers.cspaper.api_key = Some(Redacted("csp_live_file".to_string()));
+            global.save(&path).expect("save");
+            assert!(
+                daemon_cspaper_key_warning(&config_with("cspaper"), &path)
+                    .expect("check")
+                    .is_none()
+            );
+        }
+    }
+
     mod paper_add_venue {
         use crate::{Cli, Command, PaperCommand};
         use clap::Parser;
@@ -4041,6 +4141,35 @@ mod tests {
                 } => {
                     assert_eq!(venue.as_deref(), Some("ICLR"), "venue should be ICLR");
                     assert_eq!(paper_id, "main");
+                }
+                _ => panic!("expected Paper Add command"),
+            }
+        }
+
+        /// For cspaper the venue is the review template, so `--agent-id` is
+        /// the same flag under the provider's name.
+        #[test]
+        fn paper_add_agent_id_alias_sets_venue() {
+            let args = Cli::try_parse_from([
+                "reviewloop",
+                "paper",
+                "add",
+                "--paper-id",
+                "main",
+                "--pdf-path",
+                "paper/main.pdf",
+                "--backend",
+                "cspaper",
+                "--agent-id",
+                "ICLR_main_2026_1",
+            ])
+            .expect("paper add --agent-id should parse");
+            match args.command {
+                Command::Paper {
+                    command: PaperCommand::Add { venue, backend, .. },
+                } => {
+                    assert_eq!(venue.as_deref(), Some("ICLR_main_2026_1"));
+                    assert_eq!(backend.as_deref(), Some("cspaper"));
                 }
                 _ => panic!("expected Paper Add command"),
             }
@@ -4128,6 +4257,7 @@ mod tests {
                     status: JobStatus::Processing,
                     email: "test@example.com".to_string(),
                     venue: None,
+                    review_options: Default::default(),
                     git_tag: None,
                     git_commit: None,
                     next_poll_at: None,
@@ -4254,6 +4384,7 @@ mod tests {
                         status: JobStatus::Queued,
                         email: "test@example.com".to_string(),
                         venue: None,
+                        review_options: Default::default(),
                         git_tag: None,
                         git_commit: None,
                         next_poll_at: None,
@@ -4321,6 +4452,7 @@ mod tests {
                     status,
                     email: "test@example.com".to_string(),
                     venue: None,
+                    review_options: Default::default(),
                     git_tag: None,
                     git_commit: None,
                     next_poll_at: None,
@@ -4451,6 +4583,7 @@ mod tests {
                         status,
                         email: "test@example.com".to_string(),
                         venue: None,
+                        review_options: Default::default(),
                         git_tag: None,
                         git_commit: None,
                         next_poll_at: None,

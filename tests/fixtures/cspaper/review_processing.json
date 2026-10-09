@@ -1,0 +1,14 @@
+{
+  "status": 200,
+  "data": {
+    "id": "856f388c-d5cd-4409-b3bf-3e0c8279dc49",
+    "status": "PROCESSING",
+    "agent_id": "ICLR_main_2026_1",
+    "result": null,
+    "result_summary": null,
+    "failed_reason": null,
+    "created": "2026-10-09T12:00:00Z",
+    "finished_at": null,
+    "paper_meta": {"filename": "main.pdf", "title": "A Study of Agentic Peer Review", "authors": ["Author One"]}
+  }
+}

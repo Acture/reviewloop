@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     artifact::render_summary_markdown,
-    config::Config,
+    config::{Config, PaperConfig},
     db::{CancelOutcome, Db, Requeue},
     email_account::resolve_submission_email,
     model::{
@@ -28,6 +28,20 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use std::path::Path;
 use tracing::info;
+
+/// Settings the paper's provider needs before a request can be submitted.
+/// Checked at enqueue, like the Stanford submitter email, so a job that could
+/// only fail is never queued.
+fn check_provider_settings(config: &Config, paper: &PaperConfig) -> Result<(), OpError> {
+    match config.missing_provider_setting(paper) {
+        Some((setting, message)) => Err(OpError::ProviderNotConfigured {
+            backend: paper.backend.clone(),
+            setting,
+            message,
+        }),
+        None => Ok(()),
+    }
+}
 
 /// `last_error` prefix of a cancelled job. The widget and the failure lists
 /// in [`Db`] filter on it.
@@ -95,6 +109,7 @@ impl<'a> ReviewOps<'a> {
                 paper_id: paper.id.clone(),
                 backend: paper.backend.clone(),
                 venue: self.config.venue_for(paper),
+                review_options: self.config.review_options_for(paper),
                 pdf_path: paper.pdf_path.clone(),
                 pdf_present: Path::new(&paper.pdf_path).exists(),
                 watched: self.config.is_paper_watched(&paper.id),
@@ -134,6 +149,7 @@ impl<'a> ReviewOps<'a> {
             });
         }
 
+        check_provider_settings(self.config, paper)?;
         let email = if paper.backend == "stanford" {
             resolve_submission_email(self.config, "stanford", None).map_err(|err| {
                 OpError::SubmitterEmailUnavailable {
@@ -157,6 +173,7 @@ impl<'a> ReviewOps<'a> {
             },
             email,
             venue: self.config.venue_for(paper),
+            review_options: self.config.review_options_for(paper),
             git_tag: None,
             git_commit: None,
             next_poll_at: None,

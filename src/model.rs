@@ -2,6 +2,7 @@ use crate::submission_input::PreparedInput;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobStatus {
@@ -153,7 +154,8 @@ impl SubmitChannel {
 
 #[cfg(test)]
 mod tests {
-    use super::JobStatus;
+    use super::{Job, JobStatus, ReviewIdentity, ReviewOptions};
+    use chrono::Utc;
 
     #[test]
     fn terminal_states_are_absorbing() {
@@ -228,6 +230,182 @@ mod tests {
         assert!(!PendingApproval.can_transition(Completed));
         assert!(!PendingApproval.can_transition(Failed));
     }
+
+    const DESK_ON: &str = r#"{"desk_rejection_enabled":"true"}"#;
+    const DESK_OFF: &str = r#"{"desk_rejection_enabled":"false"}"#;
+
+    fn desk(enabled: bool) -> ReviewOptions {
+        ReviewOptions::default().with("desk_rejection_enabled", enabled.to_string())
+    }
+
+    fn identity(
+        backend: &str,
+        venue: Option<&str>,
+        options: &ReviewOptions,
+        git_commit: Option<&str>,
+    ) -> ReviewIdentity {
+        ReviewIdentity::new("paper-a", backend, "hash-a", venue, options, git_commit)
+    }
+
+    #[test]
+    fn review_options_canonical_sorts_keys_and_is_none_when_empty() {
+        assert_eq!(ReviewOptions::default().canonical(), None);
+        let options = ReviewOptions::default()
+            .with("zeta", "2")
+            .with("alpha", "1");
+        assert_eq!(
+            options.canonical().as_deref(),
+            Some(r#"{"alpha":"1","zeta":"2"}"#)
+        );
+        // Insertion order never changes the stored form.
+        let reordered = ReviewOptions::default()
+            .with("alpha", "1")
+            .with("zeta", "2");
+        assert_eq!(reordered.canonical(), options.canonical());
+        assert_eq!(desk(true).canonical().as_deref(), Some(DESK_ON));
+    }
+
+    #[test]
+    fn review_options_from_canonical_round_trips() {
+        assert_eq!(
+            ReviewOptions::from_canonical(None).expect("NULL column"),
+            ReviewOptions::default()
+        );
+        assert_eq!(
+            ReviewOptions::from_canonical(Some("")).expect("empty column"),
+            ReviewOptions::default()
+        );
+        assert_eq!(
+            ReviewOptions::from_canonical(Some("  ")).expect("blank column"),
+            ReviewOptions::default()
+        );
+        for options in [desk(true), desk(false), desk(true).with("other", "x")] {
+            let canonical = options.canonical().expect("non-empty options");
+            assert_eq!(
+                ReviewOptions::from_canonical(Some(&canonical)).expect("canonical JSON"),
+                options
+            );
+        }
+        assert!(ReviewOptions::from_canonical(Some("not json")).is_err());
+    }
+
+    #[test]
+    fn identity_without_options_serializes_like_pre_oss_353_identity() {
+        let stanford = identity("stanford", Some(" ICLR "), &ReviewOptions::default(), None);
+        assert_eq!(
+            serde_json::to_string(&stanford).expect("serialize"),
+            r#"{"paper_id":"paper-a","backend":"stanford","pdf_hash":"hash-a","venue":"ICLR","version_source":"pdf_hash","version_key":"hash-a"}"#
+        );
+
+        let cspaper = identity("cspaper", Some("T"), &desk(false), Some("abc123"));
+        assert_eq!(
+            serde_json::to_string(&cspaper).expect("serialize"),
+            r#"{"paper_id":"paper-a","backend":"cspaper","pdf_hash":"hash-a","venue":"T","review_options":{"desk_rejection_enabled":"false"},"version_source":"git_commit","version_key":"abc123"}"#
+        );
+    }
+
+    #[test]
+    fn identity_json_without_options_reads_back_with_empty_options() {
+        let legacy = r#"{"paper_id":"paper-a","backend":"stanford","pdf_hash":"hash-a","venue":"ICLR","version_source":"pdf_hash","version_key":"hash-a"}"#;
+        let read: ReviewIdentity = serde_json::from_str(legacy).expect("legacy identity_json");
+        assert!(read.review_options.is_empty());
+        let current = identity("stanford", Some("ICLR"), &ReviewOptions::default(), None);
+        assert_eq!(read, current);
+        assert!(read.mismatches(&current).is_empty());
+
+        let with_options = identity("cspaper", Some("T"), &desk(true), None);
+        let json = serde_json::to_string(&with_options).expect("serialize");
+        let back: ReviewIdentity = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, with_options);
+    }
+
+    #[test]
+    fn mismatches_report_review_options_after_venue_as_canonical_text() {
+        let recorded = identity("cspaper", Some("T1"), &desk(true), Some("abc123"));
+        let requested = identity("cspaper", Some("T2"), &desk(false), None);
+        let mismatches = recorded.mismatches(&requested);
+        let fields: Vec<&str> = mismatches.iter().map(|m| m.field).collect();
+        assert_eq!(
+            fields,
+            ["venue", "review_options", "version_source", "version_key"]
+        );
+        assert_eq!(mismatches[1].recorded.as_deref(), Some(DESK_ON));
+        assert_eq!(mismatches[1].requested.as_deref(), Some(DESK_OFF));
+
+        // Options recorded before they existed compare as unset.
+        let legacy = identity("cspaper", Some("T1"), &ReviewOptions::default(), None);
+        let current = identity("cspaper", Some("T1"), &desk(true), None);
+        let mismatches = legacy.mismatches(&current);
+        assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+        assert_eq!(mismatches[0].field, "review_options");
+        assert_eq!(mismatches[0].recorded, None);
+        assert_eq!(mismatches[0].requested.as_deref(), Some(DESK_ON));
+
+        assert!(current.mismatches(&current.clone()).is_empty());
+    }
+
+    fn tokenless_job(backend: &str) -> Job {
+        let now = Utc::now();
+        Job {
+            id: "job-1".to_string(),
+            project_id: "project".to_string(),
+            paper_id: "paper-a".to_string(),
+            backend: backend.to_string(),
+            pdf_path: "paper.pdf".to_string(),
+            pdf_hash: "hash-a".to_string(),
+            snapshot_path: None,
+            status: JobStatus::Submitted,
+            token: None,
+            email: String::new(),
+            venue: None,
+            review_options: ReviewOptions::default(),
+            git_tag: None,
+            git_commit: None,
+            version_no: 1,
+            round_no: 1,
+            version_source: "pdf_hash".to_string(),
+            version_key: "hash-a".to_string(),
+            attempt: 1,
+            started_at: None,
+            next_poll_at: None,
+            last_error: None,
+            fallback_used: false,
+            lease_owner: None,
+            lease_expires_at: None,
+            submit_stage: Some(super::SubmitStage::Uncertain),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn reconcile_hint_for_tokenless_cspaper_job_never_waits_for_email() {
+        let hint = tokenless_job("cspaper").reconcile_hint();
+        for expected in [
+            "CSPaper sends no email",
+            "`reviewloop import-token --job-id job-1 --token <cspaper job_id>`",
+            "`reviewloop retry --job-id job-1 --force`",
+            "`reviewloop cancel --job-id job-1`",
+        ] {
+            assert!(hint.contains(expected), "missing {expected:?}: {hint}");
+        }
+        assert!(!hint.contains("review email"), "{hint}");
+
+        // The email wording stays Stanford's.
+        assert!(
+            tokenless_job("stanford")
+                .reconcile_hint()
+                .contains("once the review email arrives")
+        );
+
+        // A saved receipt resumes polling the same way for every backend.
+        let mut with_token = tokenless_job("cspaper");
+        with_token.token = Some("job_abc".to_string());
+        assert_eq!(
+            with_token.reconcile_hint(),
+            "a receipt token is saved; run `reviewloop retry --job-id job-1` to resume polling"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +427,7 @@ pub struct Job {
     pub token: Option<String>,
     pub email: String,
     pub venue: Option<String>,
+    pub review_options: ReviewOptions,
     pub git_tag: Option<String>,
     pub git_commit: Option<String>,
     pub version_no: u32,
@@ -277,6 +456,12 @@ impl Job {
                 self.id
             );
         }
+        if self.backend == crate::backend::cspaper::BACKEND {
+            return format!(
+                "not resubmitted automatically; CSPaper sends no email, so look for this paper in the CSPaper review list (https://cspaper.org/platform/review) and run `reviewloop import-token --job-id {} --token <cspaper job_id>`, or `reviewloop retry --job-id {} --force` to resubmit anyway (may duplicate), or `reviewloop cancel --job-id {}`",
+                self.id, self.id, self.id
+            );
+        }
         format!(
             "not resubmitted automatically; once the review email arrives run `reviewloop import-token --job-id {} --token <token>`, or `reviewloop retry --job-id {} --force` to resubmit anyway (may duplicate), or `reviewloop cancel --job-id {}`",
             self.id, self.id, self.id
@@ -293,6 +478,7 @@ pub struct NewJob {
     pub status: JobStatus,
     pub email: String,
     pub venue: Option<String>,
+    pub review_options: ReviewOptions,
     pub git_tag: Option<String>,
     pub git_commit: Option<String>,
     pub next_poll_at: Option<DateTime<Utc>>,
@@ -306,6 +492,7 @@ impl NewJob {
             &self.backend,
             self.pdf.pdf_hash(),
             self.venue.as_deref(),
+            &self.review_options,
             self.git_commit.as_deref(),
         )
     }
@@ -362,6 +549,43 @@ impl VersionSource {
     }
 }
 
+/// Provider settings beyond the venue that change what a review means, such as
+/// CSPaper's desk-rejection screening. Keys are the provider's option names.
+/// Empty for providers without such settings, which keeps their identity and
+/// stored rows unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ReviewOptions(BTreeMap<String, String>);
+
+impl ReviewOptions {
+    pub fn with(mut self, key: &str, value: impl Into<String>) -> Self {
+        self.0.insert(key.to_string(), value.into());
+        self
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Sorted-key JSON, or `None` when empty: the form stored in
+    /// `jobs.review_options` and compared by coverage and request keys.
+    pub fn canonical(&self) -> Option<String> {
+        (!self.is_empty())
+            .then(|| serde_json::to_string(&self.0).expect("a string map always serializes"))
+    }
+
+    pub fn from_canonical(raw: Option<&str>) -> serde_json::Result<Self> {
+        match raw.map(str::trim).filter(|raw| !raw.is_empty()) {
+            Some(raw) => serde_json::from_str(raw).map(Self),
+            None => Ok(Self::default()),
+        }
+    }
+}
+
 /// Normalized content of a review request within one project: the manuscript
 /// bytes, where and how it is reviewed, and which manuscript version it is.
 ///
@@ -373,8 +597,13 @@ pub struct ReviewIdentity {
     pub paper_id: String,
     pub backend: String,
     pub pdf_hash: String,
-    /// Trimmed; `None` when unset or blank.
+    /// Trimmed; `None` when unset or blank. For CSPaper this is the review
+    /// template (`agent_id`).
     pub venue: Option<String>,
+    /// Omitted when empty, so identities recorded before options existed
+    /// still read back and compare equal.
+    #[serde(default, skip_serializing_if = "ReviewOptions::is_empty")]
+    pub review_options: ReviewOptions,
     pub version_source: VersionSource,
     /// The git commit when known, otherwise the manuscript hash.
     pub version_key: String,
@@ -386,6 +615,7 @@ impl ReviewIdentity {
         backend: &str,
         pdf_hash: &str,
         venue: Option<&str>,
+        review_options: &ReviewOptions,
         git_commit: Option<&str>,
     ) -> Self {
         let commit = git_commit.map(str::trim).filter(|value| !value.is_empty());
@@ -401,6 +631,7 @@ impl ReviewIdentity {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
+            review_options: review_options.clone(),
             version_source,
             version_key,
         }
@@ -409,11 +640,18 @@ impl ReviewIdentity {
     /// Fields whose values differ between `self` (the recorded request) and
     /// `requested`, in declaration order.
     pub fn mismatches(&self, requested: &Self) -> Vec<FieldMismatch> {
-        let fields: [(&'static str, Option<&str>, Option<&str>); 6] = [
+        let recorded_options = self.review_options.canonical();
+        let requested_options = requested.review_options.canonical();
+        let fields: [(&'static str, Option<&str>, Option<&str>); 7] = [
             ("paper_id", Some(&self.paper_id), Some(&requested.paper_id)),
             ("backend", Some(&self.backend), Some(&requested.backend)),
             ("pdf_hash", Some(&self.pdf_hash), Some(&requested.pdf_hash)),
             ("venue", self.venue.as_deref(), requested.venue.as_deref()),
+            (
+                "review_options",
+                recorded_options.as_deref(),
+                requested_options.as_deref(),
+            ),
             (
                 "version_source",
                 Some(self.version_source.as_str()),

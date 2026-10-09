@@ -10,7 +10,8 @@ use reviewloop::{
         ReviewQuery, ReviewRequest, ReviewRequestOutcome,
     },
     artifact::write_review_artifacts,
-    config::{Config, PaperConfig},
+    backend::cspaper,
+    config::{CSPAPER_API_KEY_ENV, Config, PaperConfig, Redacted},
     db::Db,
     model::{EnqueueConflict, ExistingReason, Job, JobPdf, JobStatus, NewJob},
     util::sha256_file,
@@ -20,6 +21,11 @@ use serde_json::{Value, json};
 use std::{collections::BTreeSet, fs, path::Path};
 
 const TOKEN: &str = "tok-0123456789abcdef";
+/// CSPaper organisation key; must never reach a DTO, error view or event.
+const CSPAPER_KEY: &str = "csp-org-key-5f0e1d2c3b4a";
+const CSPAPER_PAPER: &str = "cs";
+const AGENT_ID: &str = "ICLR_main_2026_1";
+const OTHER_AGENT_ID: &str = "NeurIPS_main_2026_1";
 
 struct Fixture {
     tmp: tempfile::TempDir,
@@ -84,6 +90,45 @@ impl Fixture {
         })
     }
 
+    /// Add paper [`CSPAPER_PAPER`] on the cspaper backend, with its own PDF and no
+    /// per-paper template; the provider settings stay unconfigured.
+    fn add_cspaper_paper(&mut self) -> Result<()> {
+        let pdf_path = self.tmp.path().join("cspaper.pdf");
+        fs::write(&pdf_path, b"%PDF-1.4\n% cspaper draft\n%%EOF\n")?;
+        self.config.papers.push(PaperConfig {
+            id: CSPAPER_PAPER.to_string(),
+            pdf_path: pdf_path.to_string_lossy().to_string(),
+            backend: cspaper::BACKEND.to_string(),
+            venue: None,
+        });
+        Ok(())
+    }
+
+    /// The API key and default template a cspaper request needs.
+    fn configure_cspaper(&mut self) {
+        self.config.providers.cspaper.api_key = Some(Redacted(CSPAPER_KEY.to_string()));
+        self.config.providers.cspaper.agent_id = Some(AGENT_ID.to_string());
+    }
+
+    fn cspaper_request(&self, request_key: Option<&str>) -> Result<ReviewRequestOutcome, OpError> {
+        self.ops().request_review(&ReviewRequest {
+            paper_id: CSPAPER_PAPER.to_string(),
+            request_key: request_key.map(str::to_string),
+            force: false,
+            approval: Approval::Granted,
+            origin: RequestOrigin::Submit,
+        })
+    }
+
+    fn cspaper_events(&self) -> Result<Vec<Value>> {
+        Ok(self
+            .db
+            .list_timeline_events(&self.config.project_id, CSPAPER_PAPER)?
+            .into_iter()
+            .map(|event| event.payload)
+            .collect())
+    }
+
     fn insert_job(&self, project_id: &str, status: JobStatus, hash: &str) -> Result<Job> {
         self.db.create_job(&NewJob {
             project_id: project_id.to_string(),
@@ -96,6 +141,7 @@ impl Fixture {
             status,
             email: "test@example.edu".to_string(),
             venue: None,
+            review_options: Default::default(),
             git_tag: None,
             git_commit: None,
             next_poll_at: None,
@@ -160,6 +206,19 @@ fn assert_token_free<T: Serialize>(value: &T) {
     let json = serde_json::to_value(value).expect("serializable");
     walk(&json);
     assert!(!json.to_string().contains(TOKEN), "token leaked: {json}");
+}
+
+/// Serialize `value` and fail if the CSPaper API key appears anywhere.
+fn assert_key_free<T: Serialize>(value: &T) {
+    let json = serde_json::to_string(value).expect("serializable");
+    assert!(
+        !json.contains(CSPAPER_KEY),
+        "CSPaper API key leaked: {json}"
+    );
+}
+
+fn desk_rejection(enabled: bool) -> Value {
+    json!({ "desk_rejection_enabled": enabled.to_string() })
 }
 
 fn review_json() -> Value {
@@ -507,6 +566,208 @@ fn paper_not_found_without_papers_suggests_adding_one() {
         message.contains("reviewloop paper add --paper-id myid"),
         "{message}"
     );
+}
+
+// ---- cspaper ----
+
+#[test]
+fn cspaper_request_without_provider_settings_is_refused_before_enqueue() -> Result<()> {
+    let mut fx = Fixture::new()?;
+    fx.add_cspaper_paper()?;
+
+    // The key is checked first, whether or not a template is configured.
+    for agent_id in [None, Some(AGENT_ID)] {
+        fx.config.providers.cspaper.agent_id = agent_id.map(str::to_string);
+        let err = fx.cspaper_request(Some("cs-1")).unwrap_err();
+        assert_eq!(err.code(), "provider_not_configured");
+        assert!(matches!(
+            &err,
+            OpError::ProviderNotConfigured {
+                setting: "api_key",
+                ..
+            }
+        ));
+        let view = err.view();
+        assert_eq!(
+            view.details,
+            json!({ "backend": "cspaper", "setting": "api_key" })
+        );
+        assert!(
+            view.recovery
+                .as_deref()
+                .is_some_and(|hint| hint.contains(CSPAPER_API_KEY_ENV)),
+            "{view:?}"
+        );
+    }
+
+    fx.config.providers.cspaper.api_key = Some(Redacted(CSPAPER_KEY.to_string()));
+    fx.config.providers.cspaper.agent_id = None;
+    let err = fx.cspaper_request(Some("cs-1")).unwrap_err();
+    assert_eq!(err.code(), "provider_not_configured");
+    let view = err.view();
+    assert_eq!(
+        view.details,
+        json!({ "backend": "cspaper", "setting": "agent_id" })
+    );
+    assert!(view.message.contains(CSPAPER_PAPER), "{view:?}");
+    assert!(
+        view.recovery
+            .as_deref()
+            .is_some_and(|hint| hint.contains("agent_id")),
+        "{view:?}"
+    );
+    assert_key_free(&view);
+    assert!(!format!("{err:?}").contains(CSPAPER_KEY), "{err:?}");
+
+    // Refused requests enqueue nothing and leave their request key unbound.
+    assert!(
+        fx.ops()
+            .list_jobs(&JobListQuery::default())?
+            .jobs
+            .is_empty()
+    );
+    assert!(fx.cspaper_events()?.is_empty());
+
+    // A per-paper venue is a template too.
+    fx.config.papers[1].venue = Some(OTHER_AGENT_ID.to_string());
+    let outcome = fx.cspaper_request(Some("cs-1"))?;
+    assert_eq!(outcome.disposition, RequestDisposition::Created);
+    assert_eq!(outcome.job.venue.as_deref(), Some(OTHER_AGENT_ID));
+    assert_key_free(&outcome);
+    Ok(())
+}
+
+#[test]
+fn cspaper_request_records_template_and_desk_rejection_option() -> Result<()> {
+    let mut fx = Fixture::new()?;
+    fx.add_cspaper_paper()?;
+    fx.configure_cspaper();
+
+    let outcome = fx.cspaper_request(None)?;
+    assert_eq!(outcome.disposition, RequestDisposition::Created);
+    let job = &outcome.job;
+    assert_eq!(job.backend, cspaper::BACKEND);
+    assert_eq!(job.status, JobStatus::Queued);
+    assert_eq!(job.venue.as_deref(), Some(AGENT_ID));
+    let job_json = serde_json::to_value(job)?;
+    assert_eq!(job_json["review_options"], desk_rejection(true));
+    let input = serde_json::to_value(&outcome.input)?;
+    assert_eq!(input["backend"], json!(cspaper::BACKEND));
+    assert_eq!(input["venue"], json!(AGENT_ID));
+    assert_eq!(input["review_options"], desk_rejection(true));
+
+    // CSPaper authenticates by key, so the job carries no submitter email.
+    let stored = fx.db.get_job(&job.job_id)?.expect("job");
+    assert_eq!(stored.email, "");
+    assert_eq!(
+        stored.review_options.get(cspaper::DESK_REJECTION_ENABLED),
+        Some("true")
+    );
+
+    let events = fx.cspaper_events()?;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["backend"], json!(cspaper::BACKEND));
+    assert_eq!(events[0]["venue"], json!(AGENT_ID));
+    assert_eq!(events[0]["review_options"], desk_rejection(true));
+
+    // Without desk-rejection screening it is another review of the same manuscript.
+    fx.config.providers.cspaper.desk_rejection_enabled = false;
+    let unscreened = fx.cspaper_request(None)?;
+    assert_eq!(unscreened.disposition, RequestDisposition::Created);
+    assert_ne!(unscreened.job.job_id, job.job_id);
+    assert_eq!(unscreened.job.round_no, 2);
+    assert_eq!(
+        serde_json::to_value(&unscreened.job)?["review_options"],
+        desk_rejection(false)
+    );
+
+    assert_key_free(&outcome);
+    assert_key_free(&unscreened);
+    assert_key_free(&fx.ops().get_job(&job.job_id)?);
+    assert_key_free(&fx.ops().list_jobs(&JobListQuery::default())?);
+    assert_key_free(&fx.cspaper_events()?);
+    Ok(())
+}
+
+#[test]
+fn list_papers_reports_cspaper_template_and_options() -> Result<()> {
+    let mut fx = Fixture::new()?;
+    fx.add_cspaper_paper()?;
+    fx.configure_cspaper();
+    fx.config.providers.cspaper.desk_rejection_enabled = false;
+
+    let papers = fx.ops().list_papers()?;
+    let json = serde_json::to_value(&papers)?;
+    assert_eq!(json[0]["paper_id"], json!("main"));
+    assert_eq!(json[0]["review_options"], json!({}));
+    assert_eq!(json[1]["paper_id"], json!(CSPAPER_PAPER));
+    assert_eq!(json[1]["backend"], json!(cspaper::BACKEND));
+    assert_eq!(json[1]["venue"], json!(AGENT_ID));
+    assert_eq!(json[1]["review_options"], desk_rejection(false));
+    assert_key_free(&papers);
+
+    // A Stanford request records no options anywhere.
+    let stanford = serde_json::to_value(fx.request(false, Approval::Granted)?)?;
+    assert_eq!(stanford["job"]["review_options"], json!({}));
+    assert_eq!(stanford["input"]["review_options"], json!({}));
+    let job_id = stanford["job"]["job_id"].as_str().expect("job_id");
+    assert_eq!(
+        serde_json::to_value(fx.ops().get_job(job_id)?)?["review_options"],
+        json!({})
+    );
+    Ok(())
+}
+
+#[test]
+fn cspaper_request_key_replays_until_the_template_or_options_change() -> Result<()> {
+    let mut fx = Fixture::new()?;
+    fx.add_cspaper_paper()?;
+    fx.configure_cspaper();
+
+    let first = fx.cspaper_request(Some("cs-req"))?;
+    assert_eq!(first.disposition, RequestDisposition::Created);
+    let replay = fx.cspaper_request(Some("cs-req"))?;
+    assert_eq!(replay.disposition, RequestDisposition::Existing);
+    assert_eq!(replay.reason, Some(ExistingReason::RequestReplay));
+    assert_eq!(replay.job.job_id, first.job.job_id);
+
+    fx.config.providers.cspaper.agent_id = Some(OTHER_AGENT_ID.to_string());
+    let switched = fx.cspaper_request(Some("cs-req")).unwrap_err();
+    assert_eq!(switched.code(), "request_conflict");
+    let view = switched.view();
+    assert_eq!(view.details["existing_job_id"], json!(first.job.job_id));
+    assert_eq!(
+        view.details["mismatches"],
+        json!([{ "field": "venue", "recorded": AGENT_ID, "requested": OTHER_AGENT_ID }])
+    );
+    assert_key_free(&view);
+
+    // The other template under a new key is a new review.
+    let other = fx.cspaper_request(Some("cs-req-neurips"))?;
+    assert_eq!(other.disposition, RequestDisposition::Created);
+    assert_ne!(other.job.job_id, first.job.job_id);
+    assert_eq!(other.job.venue.as_deref(), Some(OTHER_AGENT_ID));
+
+    fx.config.providers.cspaper.agent_id = Some(AGENT_ID.to_string());
+    fx.config.providers.cspaper.desk_rejection_enabled = false;
+    let flipped = fx.cspaper_request(Some("cs-req")).unwrap_err();
+    assert_eq!(flipped.code(), "request_conflict");
+    let view = flipped.view();
+    assert_eq!(
+        view.details["mismatches"],
+        json!([{
+            "field": "review_options",
+            "recorded": r#"{"desk_rejection_enabled":"true"}"#,
+            "requested": r#"{"desk_rejection_enabled":"false"}"#,
+        }])
+    );
+    assert_key_free(&view);
+
+    assert_eq!(fx.ops().list_jobs(&JobListQuery::default())?.jobs.len(), 2);
+    assert_key_free(&first);
+    assert_key_free(&replay);
+    assert_key_free(&other);
+    Ok(())
 }
 
 // ---- job references ----
@@ -1148,6 +1409,11 @@ fn every_error_code_is_documented_with_a_view() -> Result<()> {
         OpError::SubmitterEmailUnavailable {
             backend: "stanford".into(),
             detail: "none".into(),
+        },
+        OpError::ProviderNotConfigured {
+            backend: "cspaper".into(),
+            setting: "api_key",
+            message: "none".into(),
         },
         OpError::JobNotFound { job_id: "j".into() },
         OpError::NoEligibleJob {
