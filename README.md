@@ -647,6 +647,22 @@ the flat `core.review_timeout_hours`. `reviewloop run` does not wait for a
 token email on an uncertain CSPaper submission; it stops at once with exit
 code 2.
 
+### Local usage
+
+CSPaper bills reviews in credits (1 per review on its own site; how platform
+API keys are billed is not published). After a CSPaper submission, `submit`
+and `run` print what this machine has used so far, and `reviewloop status`
+repeats it for a project with CSPaper papers:
+
+```text
+CSPaper usage from this machine: 3 accepted review(s), est. 3 credit(s) at 1 per review; 1 uncertain submission(s) may also have been charged
+```
+
+The count is local: every CSPaper job in the state database that holds a
+CSPaper job id (including imported ones), across all projects, since the key
+is machine-level. Uncertain submissions are listed separately. It is an
+estimate, not CSPaper's balance.
+
 ### Errors and outcomes
 
 Submitting:

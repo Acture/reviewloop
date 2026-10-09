@@ -6,6 +6,7 @@ use reviewloop::application::{
     RetryRequest, ReviewOps, ReviewRequest, require_project,
 };
 use reviewloop::artifact::write_review_artifacts;
+use reviewloop::backend::cspaper;
 use reviewloop::config::{
     Config, GlobalConfigFile, LegacyConfig, PaperConfigFile, ProjectConfigFile,
     default_project_config_path,
@@ -1935,6 +1936,15 @@ async fn cmd_submit(
             submitted.last_error.as_deref().unwrap_or("(no details)")
         );
     }
+    print_provider_usage(db, &job.backend)
+}
+
+/// After a submission to a provider that bills per review, say what this
+/// machine has used so far. Local and estimated; see `cspaper::usage_note`.
+fn print_provider_usage(db: &Db, backend: &str) -> Result<()> {
+    if backend == cspaper::BACKEND {
+        println!("{}", cspaper::usage_note(db.provider_usage(backend)?));
+    }
     Ok(())
 }
 
@@ -2003,7 +2013,10 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
 
     if !args.quiet {
         match submit_attempt {
-            Attempt::Ran => println!("Submitted job {} for paper_id={paper_id}", job_id),
+            Attempt::Ran => {
+                println!("Submitted job {} for paper_id={paper_id}", job_id);
+                print_provider_usage(&db, &backend)?;
+            }
             Attempt::NotClaimed => println!(
                 "Job {} for paper_id={paper_id} is being submitted by another reviewloop worker",
                 job_id
@@ -2257,7 +2270,7 @@ fn daemon_cspaper_key_warning(config: &Config, global_path: &Path) -> Result<Opt
     let uses_cspaper = config
         .papers
         .iter()
-        .any(|paper| paper.backend == reviewloop::backend::cspaper::BACKEND);
+        .any(|paper| paper.backend == cspaper::BACKEND);
     let key_in_file = GlobalConfigFile::load(global_path)?
         .providers
         .cspaper
@@ -2500,6 +2513,15 @@ fn cmd_status(
         }
     }
 
+    let uses_cspaper = config
+        .papers
+        .iter()
+        .any(|paper| paper.backend == cspaper::BACKEND)
+        || rows.iter().any(|row| row.backend == cspaper::BACKEND);
+    if uses_cspaper {
+        println!();
+        print_provider_usage(db, cspaper::BACKEND)?;
+    }
     Ok(())
 }
 

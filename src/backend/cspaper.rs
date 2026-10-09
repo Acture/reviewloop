@@ -26,7 +26,7 @@ use super::{
     BackendError, ReviewBackend, ReviewFetchResult, SubmitReceipt, SubmitRequest, parse_retry_after,
 };
 use crate::config::{CSPAPER_API_KEY_ENV, CspaperProviderConfig, Redacted};
-use crate::model::ReviewOptions;
+use crate::model::{ProviderUsage, ReviewOptions};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, LOCATION};
 use reqwest::{Response, StatusCode, multipart};
@@ -43,6 +43,10 @@ const REVIEWS_PATH: &str = "/api/platform/reviews";
 const API_KEY_HEADER: &str = "X-API-Key";
 /// Provider text quoted into job errors and events is cut to this many chars.
 const MAX_QUOTED_CHARS: usize = 512;
+/// What one review costs on CSPaper's own site (June 2026). How platform API
+/// keys are billed is not published, so usage notes call this an estimate.
+pub const ESTIMATED_CREDITS_PER_REVIEW: u64 = 1;
+
 /// Retrying a job resends what it recorded at request time, so a corrected
 /// template needs a new request.
 const NEW_REVIEW_HINT: &str = "request a new review with `reviewloop submit --paper-id <paper>` (retrying this job resends what it recorded)";
@@ -284,6 +288,22 @@ impl ReviewBackend for CspaperBackend {
             .map_err(|e| BackendError::Schema(format!("invalid CSPaper job payload: {e}")))?;
         interpret_job(token, payload)
     }
+}
+
+/// One-line local usage summary for the CLI.
+pub fn usage_note(usage: ProviderUsage) -> String {
+    let mut note = format!(
+        "CSPaper usage from this machine: {} accepted review(s), est. {} credit(s) at {ESTIMATED_CREDITS_PER_REVIEW} per review",
+        usage.accepted,
+        usage.accepted * ESTIMATED_CREDITS_PER_REVIEW,
+    );
+    if usage.uncertain > 0 {
+        note.push_str(&format!(
+            "; {} uncertain submission(s) may also have been charged",
+            usage.uncertain
+        ));
+    }
+    note
 }
 
 fn response_meta(headers: &HeaderMap) -> (Option<chrono::Duration>, Option<String>) {
@@ -585,6 +605,27 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    #[test]
+    fn usage_note_estimates_credits_and_flags_uncertain_submissions() {
+        let quiet = usage_note(ProviderUsage {
+            accepted: 3,
+            uncertain: 0,
+        });
+        assert!(
+            quiet.contains("3 accepted review(s), est. 3 credit(s)"),
+            "{quiet}"
+        );
+        assert!(!quiet.contains("uncertain"), "{quiet}");
+        let uncertain = usage_note(ProviderUsage {
+            accepted: 0,
+            uncertain: 2,
+        });
+        assert!(
+            uncertain.contains("2 uncertain submission(s)"),
+            "{uncertain}"
+        );
     }
 
     #[test]

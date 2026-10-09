@@ -86,6 +86,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   template before anything is enqueued. Git tag and PDF change triggers skip
   such a paper with a `provider_not_configured` event (once per paper and
   setting per process) and leave the tag unprocessed until it is configured.
+- **Local CSPaper usage** — after a CSPaper submission, `submit` and `run`
+  print how many reviews this machine has had accepted (est. 1 credit each)
+  and how many are uncertain; `status` repeats it for CSPaper projects. The
+  count comes from the local database, across projects (`Db::provider_usage`).
 - **`daemon install` key check** — warns when a CSPaper project's key is not
   in the global config: launchd does not pass the shell's
   `REVIEWLOOP_CSPAPER_API_KEY` to the daemon.
