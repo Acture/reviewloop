@@ -10,7 +10,10 @@ use chrono::{DateTime, Duration, Utc};
 use common::{PAPER, SUBMIT_TTL, event_types, events_for, load_job};
 use reviewloop::{
     db::{ClaimTiming, Db, JobChange, LeaseRecovery, LeaseWrite},
-    model::{Job, JobPdf, JobStatus, NewJob, SubmitStage, WorkKind},
+    model::{
+        EnqueueMode, EnqueueOutcome, EnqueueRequest, ExistingReason, Job, JobPdf, JobStatus,
+        NewJob, SubmitStage, WorkKind,
+    },
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -23,6 +26,8 @@ use std::{
 const PROJECT: &str = "project-legacy";
 const OTHER_PROJECT: &str = "project-other";
 const LEASE_COLUMNS: [&str; 3] = ["lease_owner", "lease_expires_at", "submit_stage"];
+/// Added by schema v5 (OSS-353).
+const REVIEW_OPTIONS_COLUMN: &str = "review_options";
 /// Schema version written by this build (`SCHEMA_VERSION` in src/db.rs).
 const CURRENT_SCHEMA_VERSION: i64 = 5;
 
@@ -337,10 +342,21 @@ fn raw_lease_columns(
     )?)
 }
 
-/// Each lease column exists exactly once, as a nullable TEXT column with no default.
-fn assert_lease_columns(path: &Path) -> Result<()> {
+/// Raw `jobs.review_options` as stored, bypassing the crate's row mapping.
+fn raw_review_options(path: &Path, job_id: &str) -> Result<Option<String>> {
+    let conn = Connection::open(path)?;
+    Ok(conn.query_row(
+        "SELECT review_options FROM jobs WHERE id = ?1",
+        params![job_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Each column added after v1 that the current schema needs (the lease columns and
+/// review options) exists exactly once, as a nullable TEXT column with no default.
+fn assert_current_columns(path: &Path) -> Result<()> {
     let columns = jobs_columns(path)?;
-    for column in LEASE_COLUMNS {
+    for column in LEASE_COLUMNS.into_iter().chain([REVIEW_OPTIONS_COLUMN]) {
         let matches: Vec<&ColumnInfo> = columns.iter().filter(|c| c.name == column).collect();
         assert_eq!(matches.len(), 1, "jobs.{column} must exist exactly once");
         let info = matches[0];
@@ -351,7 +367,8 @@ fn assert_lease_columns(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Every v1 column survives the migration and the lease fields start empty.
+/// Every v1 column survives the migration and the lease fields and review options
+/// start empty.
 fn assert_legacy_row_intact(job: &Job, row: &LegacyRow) -> Result<()> {
     let id = row.id;
     assert_eq!(job.id, id);
@@ -399,6 +416,11 @@ fn assert_legacy_row_intact(job: &Job, row: &LegacyRow) -> Result<()> {
     assert_eq!(job.lease_owner, None, "{id}: lease_owner");
     assert_eq!(job.lease_expires_at, None, "{id}: lease_expires_at");
     assert_eq!(job.submit_stage, None, "{id}: submit_stage");
+    assert!(
+        job.review_options.is_empty(),
+        "{id}: review_options {:?}",
+        job.review_options
+    );
     Ok(())
 }
 
@@ -464,7 +486,7 @@ fn assert_v1_file_migrates_concurrently(journal_mode: &str, rounds: usize) -> Re
             CURRENT_SCHEMA_VERSION,
             "{journal_mode} round {round}: user_version"
         );
-        assert_lease_columns(&path)?;
+        assert_current_columns(&path)?;
 
         let db = Db::new_file(path.clone());
         for row in LEGACY_ROWS {
@@ -503,7 +525,7 @@ fn v1_database_migrates_to_current_and_keeps_every_legacy_row_intact() -> Result
     let MigratedV1 { path, db, _tmp } = migrated_v1()?;
 
     assert_eq!(user_version(&path)?, CURRENT_SCHEMA_VERSION);
-    assert_lease_columns(&path)?;
+    assert_current_columns(&path)?;
     let indexes = index_names(&path)?;
     for index in V1_INDEXES {
         assert!(
@@ -520,6 +542,12 @@ fn v1_database_migrates_to_current_and_keeps_every_legacy_row_intact() -> Result
             "{}: raw lease columns must be NULL",
             row.id
         );
+        assert_eq!(
+            raw_review_options(&path, row.id)?,
+            None,
+            "{}: raw review_options must be NULL",
+            row.id
+        );
     }
 
     let events = events_for(&db, PROJECT, LEGACY_PROCESSING.id)?;
@@ -530,7 +558,7 @@ fn v1_database_migrates_to_current_and_keeps_every_legacy_row_intact() -> Result
     // Already current: a second call writes nothing.
     db.ensure_schema()?;
     assert_eq!(user_version(&path)?, CURRENT_SCHEMA_VERSION);
-    assert_lease_columns(&path)?;
+    assert_current_columns(&path)?;
     for row in LEGACY_ROWS {
         assert_legacy_row_intact(&load_job(&db, row.id)?, row)?;
     }
@@ -754,7 +782,7 @@ fn concurrent_ensure_schema_on_missing_file_creates_current_schema() -> Result<(
             CURRENT_SCHEMA_VERSION,
             "round {round}: user_version"
         );
-        assert_lease_columns(&path)?;
+        assert_current_columns(&path)?;
     }
     Ok(())
 }
@@ -767,7 +795,7 @@ fn fresh_database_has_lease_columns_and_supports_claim_and_finish() -> Result<()
     let db = Db::new_file(path.clone());
     db.ensure_schema()?;
     assert_eq!(user_version(&path)?, CURRENT_SCHEMA_VERSION);
-    assert_lease_columns(&path)?;
+    assert_current_columns(&path)?;
 
     let job = db.create_job(&fresh_new_job(PAPER))?;
     assert_eq!(job.status, JobStatus::Queued);
@@ -947,7 +975,7 @@ fn v2_database_gains_lease_columns_and_keeps_enqueue_requests() -> Result<()> {
     db.ensure_schema()?;
 
     assert_eq!(user_version(&path)?, CURRENT_SCHEMA_VERSION);
-    assert_lease_columns(&path)?;
+    assert_current_columns(&path)?;
     for row in LEGACY_ROWS {
         assert_legacy_row_intact(&load_job(&db, row.id)?, row)?;
     }
@@ -961,8 +989,9 @@ fn v2_database_gains_lease_columns_and_keeps_enqueue_requests() -> Result<()> {
 }
 
 /// Two schema-v3 lineages exist: master's (OSS-335 `snapshot_path`, no lease columns)
-/// and this branch's pre-merge one (lease columns, no `snapshot_path`). Both reach v4
-/// with every column, so neither build's v3 can hide the other's migration.
+/// and OSS-337's pre-merge one (lease columns, no `snapshot_path`). Both reach the
+/// current schema with every column, so neither build's v3 can hide the other's
+/// migration.
 fn v3_database_upgrades_with_every_column(add: &[&str]) -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let path = tmp.path().join("reviewloop.db");
@@ -980,7 +1009,7 @@ fn v3_database_upgrades_with_every_column(add: &[&str]) -> Result<()> {
     db.ensure_schema()?;
 
     assert_eq!(user_version(&path)?, CURRENT_SCHEMA_VERSION);
-    assert_lease_columns(&path)?;
+    assert_current_columns(&path)?;
     let columns = jobs_columns(&path)?;
     assert!(columns.iter().any(|info| info.name == "snapshot_path"));
     for row in LEGACY_ROWS {
@@ -997,4 +1026,128 @@ fn master_v3_database_gains_lease_columns() -> Result<()> {
 #[test]
 fn branch_v3_database_gains_snapshot_path() -> Result<()> {
     v3_database_upgrades_with_every_column(&LEASE_COLUMNS)
+}
+
+/// A schema-v4 database (OSS-337): the v1 rows plus `enqueue_requests`, `snapshot_path`
+/// and the lease columns, without `review_options`.
+fn build_v4_database(path: &Path) -> Result<()> {
+    build_v1_database(path, "wal")?;
+    let conn = Connection::open(path)?;
+    conn.execute_batch(V2_ENQUEUE_REQUESTS)?;
+    for column in ["snapshot_path"].into_iter().chain(LEASE_COLUMNS) {
+        conn.execute_batch(&format!("ALTER TABLE jobs ADD COLUMN {column} TEXT"))?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_enqueue_requests_job ON enqueue_requests(job_id);",
+    )?;
+    conn.pragma_update(None, "user_version", 4)?;
+    drop(conn);
+
+    assert_eq!(
+        user_version(path)?,
+        4,
+        "test setup: v4 file not at version 4"
+    );
+    assert!(
+        jobs_columns(path)?
+            .iter()
+            .all(|info| info.name != REVIEW_OPTIONS_COLUMN),
+        "test setup: v4 jobs table must not have {REVIEW_OPTIONS_COLUMN}"
+    );
+    Ok(())
+}
+
+/// `identity_json` for `row` exactly as builds before OSS-353 wrote it: no
+/// `review_options` field.
+fn pre_v5_identity_json(row: &LegacyRow) -> String {
+    format!(
+        r#"{{"paper_id":"{PAPER}","backend":"{LEGACY_BACKEND}","pdf_hash":"{}","venue":"{LEGACY_VENUE}","version_source":"{LEGACY_VERSION_SOURCE}","version_key":"{LEGACY_GIT_COMMIT}"}}"#,
+        row.pdf_hash()
+    )
+}
+
+/// The request that would have produced `row`: same manuscript, venue and commit.
+fn legacy_request(row: &LegacyRow, request_key: Option<&str>) -> EnqueueRequest {
+    EnqueueRequest {
+        job: NewJob {
+            project_id: row.project_id.to_string(),
+            paper_id: PAPER.to_string(),
+            backend: LEGACY_BACKEND.to_string(),
+            pdf: JobPdf::Unpinned {
+                pdf_path: LEGACY_PDF_PATH.to_string(),
+                pdf_hash: row.pdf_hash(),
+            },
+            status: JobStatus::Queued,
+            email: LEGACY_EMAIL.to_string(),
+            venue: Some(LEGACY_VENUE.to_string()),
+            review_options: Default::default(),
+            git_tag: Some(LEGACY_GIT_TAG.to_string()),
+            git_commit: Some(LEGACY_GIT_COMMIT.to_string()),
+            next_poll_at: None,
+        },
+        request_key: request_key.map(str::to_string),
+        mode: EnqueueMode::Deduplicate,
+        source: "test".to_string(),
+    }
+}
+
+#[test]
+fn v4_database_gains_review_options_and_replays_pre_upgrade_request_keys() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().join("reviewloop.db");
+    build_v4_database(&path)?;
+    Connection::open(&path)?.execute(
+        "INSERT INTO enqueue_requests VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            PROJECT,
+            "key-v4",
+            pre_v5_identity_json(&LEGACY_QUEUED),
+            LEGACY_QUEUED.id,
+            LEGACY_CREATED_AT
+        ],
+    )?;
+
+    let db = Db::new_file(path.clone());
+    db.ensure_schema()?;
+
+    assert_eq!(user_version(&path)?, CURRENT_SCHEMA_VERSION);
+    assert_current_columns(&path)?;
+    for row in LEGACY_ROWS {
+        assert_legacy_row_intact(&load_job(&db, row.id)?, row)?;
+        assert_eq!(
+            raw_review_options(&path, row.id)?,
+            None,
+            "{}: raw review_options must be NULL",
+            row.id
+        );
+    }
+    assert_eq!(
+        event_types(&db.list_timeline_events(PROJECT, PAPER)?),
+        vec![LEGACY_EVENT_TYPE],
+        "migration must not write events"
+    );
+
+    // The key bound before the upgrade replays to its job instead of failing as a
+    // corrupt identity or conflicting on the new field.
+    match db.enqueue(&legacy_request(&LEGACY_QUEUED, Some("key-v4")))? {
+        EnqueueOutcome::Existing {
+            job,
+            reason: ExistingReason::RequestReplay,
+        } => assert_legacy_row_intact(&job, &LEGACY_QUEUED)?,
+        other => panic!("expected a replay of {}, got {other:?}", LEGACY_QUEUED.id),
+    }
+
+    // A legacy row's NULL review options cover a request without options.
+    match db.enqueue(&legacy_request(&LEGACY_PROCESSING, None))? {
+        EnqueueOutcome::Existing {
+            job,
+            reason: ExistingReason::Covered,
+        } => assert_eq!(job.id, LEGACY_PROCESSING.id),
+        other => panic!("expected {} to cover, got {other:?}", LEGACY_PROCESSING.id),
+    }
+
+    let jobs: i64 =
+        Connection::open(&path)?.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))?;
+    assert_eq!(jobs, LEGACY_ROWS.len() as i64, "nothing new was enqueued");
+    Ok(())
 }

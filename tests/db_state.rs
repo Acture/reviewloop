@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use reviewloop::{
+    backend::cspaper,
     config::{Config, PaperConfig},
     db::Db,
-    model::{Job, JobPdf, JobStatus, NewJob, ReviewIdentity},
+    model::{Job, JobPdf, JobStatus, NewJob, ReviewIdentity, ReviewOptions},
     util::sha256_file,
     worker,
 };
@@ -114,6 +115,49 @@ impl DbTestContext {
             next_poll_at: None,
         })
     }
+
+    /// A CSPaper job in `project_id`: template in `venue`, options as given, no email.
+    fn create_cspaper_job(
+        &self,
+        project_id: &str,
+        status: JobStatus,
+        hash: &str,
+        review_options: ReviewOptions,
+    ) -> Result<Job> {
+        let paper = &self.config.papers[0];
+        self.db.create_job(&NewJob {
+            project_id: project_id.to_string(),
+            paper_id: paper.id.clone(),
+            backend: cspaper::BACKEND.to_string(),
+            pdf: JobPdf::Unpinned {
+                pdf_path: paper.pdf_path.clone(),
+                pdf_hash: hash.to_string(),
+            },
+            status,
+            email: String::new(),
+            venue: Some(CSPAPER_TEMPLATE.to_string()),
+            review_options,
+            git_tag: None,
+            git_commit: None,
+            next_poll_at: None,
+        })
+    }
+
+    /// Raw `jobs.review_options` as stored.
+    fn raw_review_options(&self, job_id: &str) -> Result<Option<String>> {
+        let conn = rusqlite::Connection::open(&self.db.path)?;
+        Ok(conn.query_row(
+            "SELECT review_options FROM jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )?)
+    }
+}
+
+const CSPAPER_TEMPLATE: &str = "ICLR_main_2026_1";
+
+fn desk_rejection(enabled: bool) -> ReviewOptions {
+    ReviewOptions::default().with(cspaper::DESK_REJECTION_ENABLED, enabled.to_string())
 }
 
 #[test]
@@ -838,5 +882,103 @@ fn list_failed_jobs_all_per_project_excludes_user_cancellations() -> Result<()> 
     assert!(!ids.contains(cancelled_with_reason.id.as_str()));
     assert!(ids.contains(real_failure.id.as_str()));
 
+    Ok(())
+}
+
+// ── OSS-353: review options ──────────────────────────────────────────────────
+
+#[test]
+fn review_options_round_trip_through_insert_and_load() -> Result<()> {
+    let ctx = DbTestContext::new()?;
+    let project = ctx.config.project_id.clone();
+
+    let screened = ctx.create_cspaper_job(
+        &project,
+        JobStatus::Queued,
+        "hash-rt-1",
+        desk_rejection(true),
+    )?;
+    assert_eq!(screened.review_options, desk_rejection(true));
+    assert_eq!(
+        ctx.raw_review_options(&screened.id)?.as_deref(),
+        Some(r#"{"desk_rejection_enabled":"true"}"#),
+        "stored as canonical JSON"
+    );
+    let loaded = ctx.db.get_job(&screened.id)?.context("cspaper job")?;
+    assert_eq!(loaded.review_options, desk_rejection(true));
+    assert_eq!(loaded.venue.as_deref(), Some(CSPAPER_TEMPLATE));
+    assert_eq!(loaded.backend, cspaper::BACKEND);
+    assert_eq!(loaded.email, "");
+
+    // Keys are stored sorted whatever order they were added in.
+    let several = ReviewOptions::default()
+        .with("z_extra", "1")
+        .with(cspaper::DESK_REJECTION_ENABLED, "false");
+    let job = ctx.create_cspaper_job(&project, JobStatus::Queued, "hash-rt-2", several.clone())?;
+    assert_eq!(
+        ctx.raw_review_options(&job.id)?.as_deref(),
+        Some(r#"{"desk_rejection_enabled":"false","z_extra":"1"}"#)
+    );
+    assert_eq!(
+        ctx.db.get_job(&job.id)?.context("job")?.review_options,
+        several
+    );
+
+    // A backend without options stores NULL, as rows written before options existed.
+    let stanford = ctx.create_job_with_hash(JobStatus::Queued, "hash-rt-3")?;
+    assert_eq!(ctx.raw_review_options(&stanford.id)?, None);
+    assert!(
+        ctx.db
+            .get_job(&stanford.id)?
+            .context("stanford job")?
+            .review_options
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_job_lists_keep_cspaper_review_options() -> Result<()> {
+    let ctx = DbTestContext::new()?;
+    let needs_manual = ctx.create_cspaper_job(
+        "proj-cs",
+        JobStatus::FailedNeedsManual,
+        "hash-cs-1",
+        desk_rejection(false),
+    )?;
+    let failed = ctx.create_cspaper_job(
+        "proj-cs",
+        JobStatus::Failed,
+        "hash-cs-2",
+        desk_rejection(true),
+    )?;
+    let stanford = ctx.create_job_with_project_and_hash("proj-cs", JobStatus::Failed, "hash-st")?;
+
+    // The fleet-wide query names its columns instead of `SELECT *`.
+    let fleet = ctx.db.list_failed_jobs_all_per_project(10)?;
+    let project = ctx.db.list_failed_jobs_for_project("proj-cs", 10)?;
+    for (query, results) in [
+        ("list_failed_jobs_all_per_project", &fleet),
+        ("list_failed_jobs_for_project", &project),
+    ] {
+        let find = |id: &str| -> Result<&Job> {
+            results
+                .iter()
+                .find(|job| job.id == id)
+                .with_context(|| format!("{query} lost job {id}"))
+        };
+        assert_eq!(results.len(), 3, "{query}");
+        let job = find(&needs_manual.id)?;
+        assert_eq!(job.status, JobStatus::FailedNeedsManual, "{query}");
+        assert_eq!(job.review_options, desk_rejection(false), "{query}");
+        assert_eq!(job.venue.as_deref(), Some(CSPAPER_TEMPLATE), "{query}");
+        assert_eq!(job.backend, cspaper::BACKEND, "{query}");
+        assert_eq!(
+            find(&failed.id)?.review_options,
+            desk_rejection(true),
+            "{query}"
+        );
+        assert!(find(&stanford.id)?.review_options.is_empty(), "{query}");
+    }
     Ok(())
 }
