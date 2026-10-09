@@ -43,8 +43,9 @@ const REVIEWS_PATH: &str = "/api/platform/reviews";
 const API_KEY_HEADER: &str = "X-API-Key";
 /// Provider text quoted into job errors and events is cut to this many chars.
 const MAX_QUOTED_CHARS: usize = 512;
-/// What one review costs on CSPaper's own site (June 2026). How platform API
-/// keys are billed is not published, so usage notes call this an estimate.
+/// What one review costs: 1 credit on CSPaper's own site (June 2026), assumed
+/// the same for platform API keys. Usage notes call the total an estimate
+/// because it is counted locally, not read from the CSPaper balance.
 pub const ESTIMATED_CREDITS_PER_REVIEW: u64 = 1;
 
 /// Retrying a job resends what it recorded at request time, so a corrected
@@ -290,13 +291,20 @@ impl ReviewBackend for CspaperBackend {
     }
 }
 
-/// One-line local usage summary for the CLI.
+/// One-line local usage summary for the CLI. Every accepted submission is
+/// counted, including those that ended without a review.
 pub fn usage_note(usage: ProviderUsage) -> String {
     let mut note = format!(
-        "CSPaper usage from this machine: {} accepted review(s), est. {} credit(s) at {ESTIMATED_CREDITS_PER_REVIEW} per review",
-        usage.accepted,
-        usage.accepted * ESTIMATED_CREDITS_PER_REVIEW,
+        "CSPaper usage from this machine: {} completed, {} in progress",
+        usage.completed, usage.in_progress
     );
+    if usage.ended > 0 {
+        note.push_str(&format!(", {} ended without a review", usage.ended));
+    }
+    note.push_str(&format!(
+        " (est. {} credit(s) at {ESTIMATED_CREDITS_PER_REVIEW} per review)",
+        usage.accepted() * ESTIMATED_CREDITS_PER_REVIEW
+    ));
     if usage.uncertain > 0 {
         note.push_str(&format!(
             "; {} uncertain submission(s) may also have been charged",
@@ -608,23 +616,25 @@ mod tests {
     }
 
     #[test]
-    fn usage_note_estimates_credits_and_flags_uncertain_submissions() {
+    fn usage_note_splits_reviews_by_stage_and_flags_uncertain_ones() {
         let quiet = usage_note(ProviderUsage {
-            accepted: 3,
-            uncertain: 0,
+            completed: 3,
+            in_progress: 1,
+            ..ProviderUsage::default()
         });
-        assert!(
-            quiet.contains("3 accepted review(s), est. 3 credit(s)"),
-            "{quiet}"
+        assert_eq!(
+            quiet,
+            "CSPaper usage from this machine: 3 completed, 1 in progress (est. 4 credit(s) at 1 per review)"
         );
-        assert!(!quiet.contains("uncertain"), "{quiet}");
-        let uncertain = usage_note(ProviderUsage {
-            accepted: 0,
-            uncertain: 2,
+        let busy = usage_note(ProviderUsage {
+            completed: 1,
+            in_progress: 0,
+            ended: 2,
+            uncertain: 1,
         });
-        assert!(
-            uncertain.contains("2 uncertain submission(s)"),
-            "{uncertain}"
+        assert_eq!(
+            busy,
+            "CSPaper usage from this machine: 1 completed, 0 in progress, 2 ended without a review (est. 3 credit(s) at 1 per review); 1 uncertain submission(s) may also have been charged"
         );
     }
 

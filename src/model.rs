@@ -781,12 +781,24 @@ fn describe_mismatches(mismatches: &[FieldMismatch]) -> String {
         .join("; ")
 }
 
-/// What this machine has sent a provider: submissions it accepted (a stored
-/// receipt) and tokenless ones whose outcome is unknown.
+/// What this machine has sent a provider. Accepted submissions (a stored
+/// receipt) are split by where the review stands; `uncertain` counts tokenless
+/// ones whose outcome is unknown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ProviderUsage {
-    pub accepted: u64,
+    pub completed: u64,
+    /// Accepted and still being reviewed.
+    pub in_progress: u64,
+    /// Accepted, then ended without a review: provider failure, timeout,
+    /// cancel, unknown job.
+    pub ended: u64,
     pub uncertain: u64,
+}
+
+impl ProviderUsage {
+    pub fn accepted(&self) -> u64 {
+        self.completed + self.in_progress + self.ended
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

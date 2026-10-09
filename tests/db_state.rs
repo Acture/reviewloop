@@ -984,39 +984,53 @@ fn failed_job_lists_keep_cspaper_review_options() -> Result<()> {
 }
 
 #[test]
-fn provider_usage_counts_cspaper_receipts_and_uncertain_submissions_across_projects() -> Result<()>
-{
+fn provider_usage_splits_cspaper_submissions_by_stage_across_projects() -> Result<()> {
     let ctx = DbTestContext::new()?;
     let options = || desk_rejection(true);
-    let accepted = ctx.create_cspaper_job("proj-a", JobStatus::Queued, "hash-u1", options())?;
-    ctx.db
-        .attach_token_to_job(&accepted.id, "856f388c-0001", Utc::now())?;
-    // The key is machine-level, so another project's submissions count too.
-    let other_project =
-        ctx.create_cspaper_job("proj-b", JobStatus::Queued, "hash-u2", options())?;
-    ctx.db
-        .attach_token_to_job(&other_project.id, "856f388c-0002", Utc::now())?;
-    let uncertain = ctx.create_cspaper_job("proj-a", JobStatus::Submitted, "hash-u3", options())?;
     let conn = rusqlite::Connection::open(&ctx.db.path)?;
-    conn.execute(
-        "UPDATE jobs SET submit_stage = 'UNCERTAIN' WHERE id = ?1",
-        params![uncertain.id],
-    )?;
+    let set = |id: &str, assignment: &str| -> Result<()> {
+        conn.execute(
+            &format!("UPDATE jobs SET {assignment} WHERE id = ?1"),
+            params![id],
+        )?;
+        Ok(())
+    };
+    let accepted = |project: &str, hash: &str, token: &str| -> Result<Job> {
+        let job = ctx.create_cspaper_job(project, JobStatus::Queued, hash, options())?;
+        ctx.db.attach_token_to_job(&job.id, token, Utc::now())?;
+        Ok(job)
+    };
+
+    // In progress: a receipt, still PROCESSING.
+    accepted("proj-a", "hash-u1", "856f388c-0001")?;
+    // Completed, in another project: the key is machine-level, so it counts.
+    let completed = accepted("proj-b", "hash-u2", "856f388c-0002")?;
+    set(&completed.id, "status = 'COMPLETED'")?;
+    // Accepted, then the provider reported the review failed.
+    let ended = accepted("proj-a", "hash-u3", "856f388c-0003")?;
+    set(&ended.id, "status = 'FAILED_NEEDS_MANUAL'")?;
+    // Outcome unknown: no receipt, parked UNCERTAIN.
+    let uncertain = ctx.create_cspaper_job("proj-a", JobStatus::Submitted, "hash-u4", options())?;
+    set(&uncertain.id, "submit_stage = 'UNCERTAIN'")?;
     // Never sent: queued, or refused before a receipt.
-    ctx.create_cspaper_job("proj-a", JobStatus::Queued, "hash-u4", options())?;
-    ctx.create_cspaper_job("proj-a", JobStatus::Failed, "hash-u5", options())?;
+    ctx.create_cspaper_job("proj-a", JobStatus::Queued, "hash-u5", options())?;
+    ctx.create_cspaper_job("proj-a", JobStatus::Failed, "hash-u6", options())?;
     // Other backends never count.
-    let stanford = ctx.create_job_with_project_and_hash("proj-a", JobStatus::Queued, "hash-u6")?;
+    let stanford = ctx.create_job_with_project_and_hash("proj-a", JobStatus::Queued, "hash-u7")?;
     ctx.db
         .attach_token_to_job(&stanford.id, "stanford-token-0001", Utc::now())?;
 
+    let usage = ctx.db.provider_usage(cspaper::BACKEND)?;
     assert_eq!(
-        ctx.db.provider_usage(cspaper::BACKEND)?,
+        usage,
         ProviderUsage {
-            accepted: 2,
+            completed: 1,
+            in_progress: 1,
+            ended: 1,
             uncertain: 1,
         }
     );
+    assert_eq!(usage.accepted(), 3);
     assert_eq!(ctx.db.provider_usage("unknown")?, ProviderUsage::default());
     Ok(())
 }

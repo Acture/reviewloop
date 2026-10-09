@@ -649,19 +649,21 @@ code 2.
 
 ### Local usage
 
-CSPaper bills reviews in credits (1 per review on its own site; how platform
-API keys are billed is not published). After a CSPaper submission, `submit`
-and `run` print what this machine has used so far, and `reviewloop status`
-repeats it for a project with CSPaper papers:
+CSPaper bills 1 credit per review; API submissions are assumed to cost the
+same as reviews on its site. After a CSPaper submission, `submit` and `run`
+print what this machine has used so far, and `reviewloop status` repeats it
+for a project with CSPaper papers:
 
 ```text
-CSPaper usage from this machine: 3 accepted review(s), est. 3 credit(s) at 1 per review; 1 uncertain submission(s) may also have been charged
+CSPaper usage from this machine: 3 completed, 1 in progress, 1 ended without a review (est. 5 credit(s) at 1 per review); 1 uncertain submission(s) may also have been charged
 ```
 
 The count is local: every CSPaper job in the state database that holds a
 CSPaper job id (including imported ones), across all projects, since the key
-is machine-level. Uncertain submissions are listed separately. It is an
-estimate, not CSPaper's balance.
+is machine-level, split into completed, in progress (accepted, still being
+reviewed) and ended without a review (provider failure, timeout, cancel).
+All three count toward the credit estimate; uncertain submissions are listed
+separately. It is an estimate, not CSPaper's balance.
 
 ### Errors and outcomes
 
