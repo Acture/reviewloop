@@ -839,8 +839,12 @@ pub struct ProjectCoreOverrides {
 }
 
 impl ProjectConfigFile {
+    /// A project file is meant to be committed, so an API key in it is
+    /// refused before parsing, naming its line but never quoting it.
     pub fn load(path: &Path) -> Result<Self> {
-        load_toml_file(path)
+        let raw = read_config_file(path)?;
+        refuse_project_api_key(path, &raw)?;
+        parse_toml(path, &raw)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -970,9 +974,64 @@ fn load_toml_file<T>(path: &Path) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read config: {}", path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("failed to parse TOML config: {}", path.display()))
+    parse_toml(path, &read_config_file(path)?)
+}
+
+fn read_config_file(path: &Path) -> Result<String> {
+    fs::read_to_string(path).with_context(|| format!("failed to read config: {}", path.display()))
+}
+
+/// The error names the line and column but never quotes the file: the toml
+/// crate's own report prints the offending source line, which may hold a
+/// secret (an API key, an IMAP password).
+fn parse_toml<T>(path: &Path, raw: &str) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    toml::from_str(raw).map_err(|err| {
+        let location = err
+            .span()
+            .and_then(|span| line_and_column(raw, span.start))
+            .map(|(line, column)| format!(" at line {line}, column {column}"))
+            .unwrap_or_default();
+        anyhow!(
+            "failed to parse TOML config: {}{location}: {}",
+            path.display(),
+            err.message()
+        )
+    })
+}
+
+/// 1-based line and column of byte `offset` in `raw`.
+fn line_and_column(raw: &str, offset: usize) -> Option<(usize, usize)> {
+    let before = raw.get(..offset)?;
+    let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+    Some((
+        before.matches('\n').count() + 1,
+        before[line_start..].chars().count() + 1,
+    ))
+}
+
+/// Refuses an `api_key` anywhere in a project file. Scans the raw text, so a
+/// line the TOML parser would reject (an unquoted or unterminated key) is
+/// refused here too instead of being quoted by the parse error.
+fn refuse_project_api_key(path: &Path, raw: &str) -> Result<()> {
+    let key_line =
+        regex::Regex::new(r#"(?m)^[^#\n]*\bapi_key["']?\s*="#).expect("valid api_key regex");
+    let Some(found) = key_line.find(raw) else {
+        return Ok(());
+    };
+    let line = raw[..found.start()].matches('\n').count() + 1;
+    let global = Config::global_config_path().map_or_else(
+        || format!("~/.config/reviewloop/{GLOBAL_CONFIG_FILE}"),
+        |path| path.display().to_string(),
+    );
+    Err(anyhow!(
+        "project config {} sets an api_key (line {line}); remove it: providers.cspaper.api_key \
+         belongs only in the global config {global} or the {CSPAPER_API_KEY_ENV} environment \
+         variable, never in a file that may be committed",
+        path.display()
+    ))
 }
 
 fn save_toml_file<T>(path: &Path, value: &T) -> Result<()>
@@ -1729,8 +1788,9 @@ pub struct ProjectNotificationsConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, GlobalConfigFile, LegacyConfig, PaperConfig, PaperConfigFile, ProjectConfigFile,
-        Redacted, default_project_config_path, find_git_root, home_dir_for_security,
+        CSPAPER_API_KEY_ENV, Config, GlobalConfigFile, LegacyConfig, PaperConfig, PaperConfigFile,
+        ProjectConfigFile, Redacted, default_project_config_path, find_git_root,
+        home_dir_for_security, secret_or_env,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -2362,5 +2422,410 @@ db_path = "db.sqlite"
         let s: Redacted<String> = Redacted::from("hello".to_string());
         assert_eq!(s.as_str(), "hello");
         assert!(!s.trim().is_empty());
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // OSS-353: CSPaper provider settings
+    // ──────────────────────────────────────────────────────────────────────
+
+    const CSPAPER_KEY: &str = "csp_live_X";
+
+    fn write_config(dir: &TempDir, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        fs::write(&path, body).expect("write config");
+        path
+    }
+
+    fn cspaper_paper(venue: Option<&str>) -> PaperConfigFile {
+        paper_file("main", Some("cspaper"), venue)
+    }
+
+    fn global_with_key(key: &str) -> GlobalConfigFile {
+        let mut global = GlobalConfigFile::default();
+        global.providers.cspaper.api_key = Some(Redacted(key.to_string()));
+        global
+    }
+
+    fn table_at<'a>(table: &'a toml::Table, path: &[&str]) -> &'a toml::Table {
+        path.iter().fold(table, |table, key| {
+            table
+                .get(*key)
+                .and_then(toml::Value::as_table)
+                .unwrap_or_else(|| panic!("missing table {key} in {path:?}"))
+        })
+    }
+
+    /// Asserts a config error neither quotes `secret` in its message nor in
+    /// its debug chain.
+    fn assert_no_echo(err: &anyhow::Error, secret: &str) {
+        let display = format!("{err:#}");
+        let debug = format!("{err:?}");
+        assert!(
+            !display.contains(secret),
+            "error echoes the secret: {display}"
+        );
+        assert!(
+            !debug.contains(secret),
+            "error chain echoes the secret: {debug}"
+        );
+    }
+
+    #[test]
+    fn global_default_writes_cspaper_table_without_api_key() {
+        let raw = toml::to_string_pretty(&GlobalConfigFile::default()).expect("serialize");
+        assert!(raw.contains("[providers.cspaper]"), "{raw}");
+        assert!(!raw.contains("api_key"), "{raw}");
+
+        let parsed: toml::Table = toml::from_str(&raw).expect("reparse");
+        let cspaper = table_at(&parsed, &["providers", "cspaper"]);
+        assert_eq!(
+            cspaper.get("base_url").and_then(toml::Value::as_str),
+            Some("https://cspaper.org")
+        );
+        assert_eq!(
+            cspaper
+                .get("desk_rejection_enabled")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        // No built-in template: the user must choose what the review means.
+        assert!(!cspaper.contains_key("agent_id"), "{raw}");
+    }
+
+    #[test]
+    fn global_api_key_round_trips_through_save_and_load() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = write_config(
+            &tmp,
+            "config.toml",
+            &format!(
+                "[providers.cspaper]\napi_key = \"{CSPAPER_KEY}\"\nagent_id = \"ICLR_main_2026_1\"\n"
+            ),
+        );
+        let loaded = GlobalConfigFile::load(&path).expect("load global");
+        let cspaper = &loaded.providers.cspaper;
+        assert_eq!(
+            cspaper.api_key.as_deref().map(String::as_str),
+            Some(CSPAPER_KEY)
+        );
+        assert_eq!(cspaper.agent_id.as_deref(), Some("ICLR_main_2026_1"));
+        assert_eq!(cspaper.base_url, "https://cspaper.org");
+        assert!(cspaper.desk_rejection_enabled);
+
+        // The global file is the key's home, so saving keeps it.
+        let saved = tmp.path().join("saved.toml");
+        loaded.save(&saved).expect("save global");
+        let raw = fs::read_to_string(&saved).expect("read saved");
+        assert!(
+            raw.contains(&format!("api_key = \"{CSPAPER_KEY}\"")),
+            "{raw}"
+        );
+        let reloaded = GlobalConfigFile::load(&saved).expect("reload global");
+        assert_eq!(
+            reloaded.providers.cspaper.api_key,
+            loaded.providers.cspaper.api_key
+        );
+        assert_eq!(
+            reloaded.providers.cspaper.agent_id,
+            loaded.providers.cspaper.agent_id
+        );
+
+        let cfg = Config::merge_for_tests(reloaded, project_with(vec![]));
+        assert_eq!(
+            cfg.providers.cspaper.api_key.as_deref().map(String::as_str),
+            Some(CSPAPER_KEY)
+        );
+    }
+
+    #[test]
+    fn project_config_refuses_api_key_without_echoing_it() {
+        let tmp = TempDir::new().expect("tempdir");
+        // Each places the key differently; the unquoted and unterminated
+        // forms are TOML syntax errors whose parser report would quote it.
+        let bodies = [
+            format!("project_id = \"p\"\n\n[providers.cspaper]\napi_key = \"{CSPAPER_KEY}\"\n"),
+            format!("project_id = \"p\"\n\n[providers.cspaper]\napi_key = {CSPAPER_KEY}\n"),
+            format!("project_id = \"p\"\n\n[providers.cspaper]\napi_key = \"{CSPAPER_KEY}\n"),
+            format!("project_id = \"p\"\nproviders.cspaper.api_key = \"{CSPAPER_KEY}\"\n"),
+            format!(
+                "project_id = \"p\"\n[providers]\ncspaper = {{ api_key = \"{CSPAPER_KEY}\" }}\n"
+            ),
+            format!("project_id = \"p\"\n[providers.cspaper]\n\"api_key\" = '{CSPAPER_KEY}'\n"),
+            format!("project_id = \"p\"\n[providers.stanford]\napi_key = \"{CSPAPER_KEY}\"\n"),
+            format!(
+                "project_id = \"p\"\n[[papers]]\nid = \"a\"\npdf_path = \"a.pdf\"\napi_key = \"{CSPAPER_KEY}\"\n"
+            ),
+        ];
+        for body in bodies {
+            let path = write_config(&tmp, "reviewloop.toml", &body);
+            let err = ProjectConfigFile::load(&path).expect_err("api_key in a project file");
+            assert_no_echo(&err, CSPAPER_KEY);
+            let msg = format!("{err:#}");
+            assert!(msg.contains("sets an api_key"), "{msg}");
+            assert!(msg.contains("providers.cspaper.api_key"), "{msg}");
+            assert!(msg.contains("global config"), "{msg}");
+            assert!(msg.contains(CSPAPER_API_KEY_ENV), "{msg}");
+            assert!(msg.contains(&path.display().to_string()), "{msg}");
+        }
+
+        // The error names the line holding the key.
+        let path = write_config(
+            &tmp,
+            "reviewloop.toml",
+            &format!("project_id = \"p\"\n\n[providers.cspaper]\napi_key = \"{CSPAPER_KEY}\"\n"),
+        );
+        let msg = format!("{:#}", ProjectConfigFile::load(&path).expect_err("refused"));
+        assert!(msg.contains("(line 4)"), "{msg}");
+    }
+
+    #[test]
+    fn project_config_allows_commented_api_key_and_agent_settings() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = write_config(
+            &tmp,
+            "reviewloop.toml",
+            "project_id = \"p\"\n\n[providers.cspaper]\n# api_key lives in the global config\n\
+             agent_id = \"ICLR_main_2026_1\"\ndesk_rejection_enabled = false\n",
+        );
+        let project = ProjectConfigFile::load(&path).expect("load project");
+        assert_eq!(
+            project.providers.cspaper.agent_id.as_deref(),
+            Some("ICLR_main_2026_1")
+        );
+        assert_eq!(
+            project.providers.cspaper.desk_rejection_enabled,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn project_config_refuses_cspaper_base_url() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = write_config(
+            &tmp,
+            "reviewloop.toml",
+            "project_id = \"p\"\n\n[providers.cspaper]\nbase_url = \"https://key-sink.example\"\n",
+        );
+        let err = ProjectConfigFile::load(&path).expect_err("base_url in a project file");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown field `base_url`"), "{msg}");
+        assert!(msg.contains("line 4, column 1"), "{msg}");
+        assert_no_echo(&err, "key-sink.example");
+    }
+
+    #[test]
+    fn config_parse_errors_never_quote_the_file() {
+        let tmp = TempDir::new().expect("tempdir");
+
+        // A misnamed key is an unknown field: the field is named, the line is not quoted.
+        let path = write_config(
+            &tmp,
+            "reviewloop.toml",
+            &format!("project_id = \"p\"\n[providers.cspaper]\napikey = \"{CSPAPER_KEY}\"\n"),
+        );
+        let err = ProjectConfigFile::load(&path).expect_err("unknown field");
+        assert_no_echo(&err, CSPAPER_KEY);
+        assert!(
+            format!("{err:#}").contains("unknown field `apikey`"),
+            "{err:#}"
+        );
+
+        // A syntax error in the global file, where secrets do belong.
+        let path = write_config(&tmp, "config.toml", "[imap]\npassword = hunter2\n");
+        let err = GlobalConfigFile::load(&path).expect_err("syntax error");
+        assert_no_echo(&err, "hunter2");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("failed to parse TOML config"), "{msg}");
+        assert!(msg.contains(&path.display().to_string()), "{msg}");
+        assert!(msg.contains("line 2, column 12"), "{msg}");
+    }
+
+    #[test]
+    fn debug_output_never_contains_cspaper_api_key() {
+        let global = global_with_key(CSPAPER_KEY);
+        assert!(!format!("{global:?}").contains(CSPAPER_KEY));
+        let cfg = Config::merge_for_tests(global, project_with(vec![cspaper_paper(None)]));
+        assert!(cfg.providers.cspaper.api_key.is_some());
+        assert!(!format!("{cfg:?}").contains(CSPAPER_KEY));
+        assert!(!format!("{cfg:#?}").contains(CSPAPER_KEY));
+    }
+
+    #[test]
+    fn runtime_providers_serialization_skips_api_key() {
+        let cfg = Config::merge_for_tests(global_with_key(CSPAPER_KEY), project_with(vec![]));
+        assert!(cfg.providers.cspaper.api_key.is_some());
+        let as_toml = toml::to_string_pretty(&cfg.providers).expect("toml");
+        let as_json = serde_json::to_string(&cfg.providers).expect("json");
+        for raw in [as_toml, as_json] {
+            assert!(!raw.contains(CSPAPER_KEY), "{raw}");
+            assert!(!raw.contains("api_key"), "{raw}");
+        }
+    }
+
+    #[test]
+    fn config_default_never_reads_cspaper_key_from_environment() {
+        // Only the runtime loader consults the environment.
+        assert!(Config::default().providers.cspaper.api_key.is_none());
+    }
+
+    #[test]
+    fn cspaper_agent_id_resolves_paper_then_project_then_global() {
+        assert_eq!(GlobalConfigFile::default().providers.cspaper.agent_id, None);
+        let cfg = Config::merge_for_tests(
+            GlobalConfigFile::default(),
+            project_with(vec![cspaper_paper(None)]),
+        );
+        assert_eq!(cfg.venue_for(&cfg.papers[0]), None);
+
+        let mut global = GlobalConfigFile::default();
+        global.providers.cspaper.agent_id = Some("GLOBAL_T".to_string());
+        let resolve = |project_agent: Option<&str>, paper_venue: Option<&str>| {
+            let mut project = project_with(vec![cspaper_paper(paper_venue)]);
+            project.providers.cspaper.agent_id = project_agent.map(str::to_string);
+            let cfg = Config::merge_for_tests(global.clone(), project);
+            cfg.venue_for(&cfg.papers[0])
+        };
+        assert_eq!(
+            resolve(Some("PROJECT_T"), Some("PAPER_T")).as_deref(),
+            Some("PAPER_T")
+        );
+        assert_eq!(
+            resolve(Some("PROJECT_T"), Some("   ")).as_deref(),
+            Some("PROJECT_T")
+        );
+        assert_eq!(
+            resolve(Some("PROJECT_T"), None).as_deref(),
+            Some("PROJECT_T")
+        );
+        assert_eq!(resolve(Some("   "), None).as_deref(), Some("GLOBAL_T"));
+        assert_eq!(resolve(None, None).as_deref(), Some("GLOBAL_T"));
+
+        // The stanford venue never leaks into a cspaper paper's template.
+        let mut project = project_with(vec![cspaper_paper(None)]);
+        project.providers.stanford.venue = Some("CVPR".to_string());
+        let cfg = Config::merge_for_tests(GlobalConfigFile::default(), project);
+        assert_eq!(cfg.venue_for(&cfg.papers[0]), None);
+    }
+
+    #[test]
+    fn cspaper_desk_rejection_project_override_beats_global() {
+        let resolve = |global_value: bool, project_value: Option<bool>| {
+            let mut global = GlobalConfigFile::default();
+            global.providers.cspaper.desk_rejection_enabled = global_value;
+            let mut project = project_with(vec![]);
+            project.providers.cspaper.desk_rejection_enabled = project_value;
+            Config::merge_for_tests(global, project)
+                .providers
+                .cspaper
+                .desk_rejection_enabled
+        };
+        assert!(resolve(true, None));
+        assert!(!resolve(false, None));
+        assert!(!resolve(true, Some(false)));
+        assert!(resolve(false, Some(true)));
+    }
+
+    #[test]
+    fn review_options_for_names_cspaper_desk_rejection_only() {
+        let mut project = project_with(vec![
+            paper_file("s", Some("stanford"), None),
+            cspaper_paper(None),
+        ]);
+        let cfg = Config::merge_for_tests(GlobalConfigFile::default(), project.clone());
+        let stanford = cfg.review_options_for(&cfg.papers[0]);
+        assert!(stanford.is_empty());
+        assert_eq!(stanford.canonical(), None);
+        assert_eq!(
+            cfg.review_options_for(&cfg.papers[1])
+                .canonical()
+                .as_deref(),
+            Some(r#"{"desk_rejection_enabled":"true"}"#)
+        );
+
+        project.providers.cspaper.desk_rejection_enabled = Some(false);
+        let cfg = Config::merge_for_tests(GlobalConfigFile::default(), project);
+        let cspaper = cfg.review_options_for(&cfg.papers[1]);
+        assert_eq!(cspaper.get("desk_rejection_enabled"), Some("false"));
+        assert_eq!(
+            cspaper.canonical().as_deref(),
+            Some(r#"{"desk_rejection_enabled":"false"}"#)
+        );
+        assert!(cfg.review_options_for(&cfg.papers[0]).is_empty());
+    }
+
+    #[test]
+    fn default_provider_base_urls_validate() {
+        assert!(Config::default().validate_base_url().is_ok());
+    }
+
+    #[test]
+    fn provider_base_urls_require_https_or_loopback_http() {
+        type SetBaseUrl = fn(&mut Config, &str);
+        let fields: [(&str, SetBaseUrl); 2] = [
+            ("providers.stanford.base_url", |cfg, url| {
+                cfg.providers.stanford.base_url = url.to_string();
+            }),
+            ("providers.cspaper.base_url", |cfg, url| {
+                cfg.providers.cspaper.base_url = url.to_string();
+            }),
+        ];
+        let accepted = [
+            "https://paperreview.ai",
+            "https://cspaper.org",
+            "http://localhost:8080",
+            "http://127.0.0.1:9",
+            "http://[::1]:8080",
+        ];
+        let rejected = [
+            "http://example.com",
+            "http://localhost.evil",
+            "http://127.0.0.1.evil.example",
+            "garbage",
+            "",
+            "ftp://cspaper.org",
+            "file:///etc/passwd",
+        ];
+        for (field, set) in fields {
+            for url in accepted {
+                let mut cfg = Config::default();
+                set(&mut cfg, url);
+                assert!(
+                    cfg.validate_base_url().is_ok(),
+                    "{field} = {url:?} must be accepted"
+                );
+            }
+            for url in rejected {
+                let mut cfg = Config::default();
+                set(&mut cfg, url);
+                let Err(err) = cfg.validate_base_url() else {
+                    panic!("{field} = {url:?} must be rejected");
+                };
+                assert!(err.to_string().contains(field), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn secret_or_env_prefers_non_blank_config_then_env() {
+        let secret = |value: &str| Some(Redacted(value.to_string()));
+        let resolve = |configured, env: Option<&str>| {
+            secret_or_env(configured, env.map(str::to_string)).map(|secret| secret.0)
+        };
+        assert_eq!(
+            resolve(secret("from-config"), Some("from-env")).as_deref(),
+            Some("from-config")
+        );
+        assert_eq!(
+            resolve(secret("  padded  "), None).as_deref(),
+            Some("padded")
+        );
+        assert_eq!(
+            resolve(secret("   "), Some("from-env")).as_deref(),
+            Some("from-env")
+        );
+        assert_eq!(resolve(None, Some("from-env")).as_deref(), Some("from-env"));
+        assert_eq!(resolve(secret(""), Some("   ")), None);
+        assert_eq!(resolve(None, Some("")), None);
+        assert_eq!(resolve(None, None), None);
     }
 }

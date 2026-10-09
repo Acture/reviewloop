@@ -983,6 +983,97 @@ mod tests {
         assert_eq!(updated.next_poll_at, Some(far_future));
     }
 
+    /// CSPaper hands its job_id back in the submit response and sends no
+    /// email, so a token mail matched under the cspaper name (a user-added
+    /// pattern) must never be bound to a tokenless cspaper job, even one whose
+    /// submit outcome is unknown. A stanford match in the same batch still binds.
+    #[test]
+    fn cspaper_email_token_is_never_bound_to_tokenless_cspaper_job() {
+        let db = Db::new_in_memory("email_cspaper_never_bound").expect("in-memory db");
+        db.ensure_schema().expect("ensure schema");
+        let new_job = |backend: &str, paper_id: &str| NewJob {
+            project_id: "project-email".to_string(),
+            paper_id: paper_id.to_string(),
+            backend: backend.to_string(),
+            pdf: JobPdf::Unpinned {
+                pdf_path: "paper.pdf".to_string(),
+                pdf_hash: format!("hash-{paper_id}"),
+            },
+            status: JobStatus::Queued,
+            email: "user@example.com".to_string(),
+            venue: None,
+            review_options: Default::default(),
+            git_tag: None,
+            git_commit: None,
+            next_poll_at: None,
+        };
+        let cspaper_job = db
+            .create_job(&new_job("cspaper", "paper-c"))
+            .expect("create cspaper job");
+        let stanford_job = db
+            .create_job(&new_job("stanford", "paper-s"))
+            .expect("create stanford job");
+
+        let mut cfg = ImapConfig::default();
+        cfg.backend_header_patterns.insert(
+            "cspaper".to_string(),
+            r"(?is)from:\s*.*cspaper\.org".to_string(),
+        );
+        cfg.backend_patterns.insert(
+            "cspaper".to_string(),
+            r"https?://cspaper\.org/platform/review/([A-Za-z0-9_-]+)".to_string(),
+        );
+        let header = "From: CSPaper <noreply@cspaper.org>\r\nSubject: review ready\r\n";
+        let backend = detect_backend_from_header(header, &cfg.backend_header_patterns);
+        assert_eq!(backend.as_deref(), Some("cspaper"));
+        let cspaper_match = super::extract_match(
+            "Your review: https://cspaper.org/platform/review/job_mail_123",
+            &cfg.backend_patterns,
+            backend.as_deref(),
+        )
+        .expect("configured cspaper pattern matches");
+        assert_eq!(cspaper_match.backend, "cspaper");
+        assert_eq!(cspaper_match.token, "job_mail_123");
+
+        let affected = super::bind_matches(
+            &db,
+            "project-email",
+            "gmail",
+            vec![
+                cspaper_match,
+                super::EmailMatch {
+                    backend: "stanford".to_string(),
+                    token: "tok_stanford_mail".to_string(),
+                },
+            ],
+        )
+        .expect("bind matches");
+
+        let affected_ids: Vec<&str> = affected.iter().map(|job| job.id.as_str()).collect();
+        assert_eq!(affected_ids, [stanford_job.id.as_str()]);
+        let cspaper_after = db
+            .get_job(&cspaper_job.id)
+            .expect("get job")
+            .expect("job exists");
+        assert_eq!(cspaper_after.token, None);
+        assert_eq!(cspaper_after.status, JobStatus::Queued);
+        assert_eq!(cspaper_after.next_poll_at, None);
+        let stanford_after = db
+            .get_job(&stanford_job.id)
+            .expect("get job")
+            .expect("job exists");
+        assert_eq!(stanford_after.token.as_deref(), Some("tok_stanford_mail"));
+
+        let attached = db
+            .list_recent_events_of_type("project-email", "gmail_token_attached", 10)
+            .expect("list events");
+        let attached_jobs: Vec<Option<&str>> = attached
+            .iter()
+            .map(|event| event.job_id.as_deref())
+            .collect();
+        assert_eq!(attached_jobs, [Some(stanford_job.id.as_str())]);
+    }
+
     /// U6 regression: when the Gmail OAuth token is absent (simulates a
     /// revoked / missing refresh token), `poll_gmail_if_enabled` must write a
     /// `gmail_oauth_refresh_failed` event so `daemon status` can surface it.

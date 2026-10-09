@@ -4066,6 +4066,35 @@ mod tests {
             }
         }
 
+        /// For cspaper the venue is the review template, so `--agent-id` is
+        /// the same flag under the provider's name.
+        #[test]
+        fn paper_add_agent_id_alias_sets_venue() {
+            let args = Cli::try_parse_from([
+                "reviewloop",
+                "paper",
+                "add",
+                "--paper-id",
+                "main",
+                "--pdf-path",
+                "paper/main.pdf",
+                "--backend",
+                "cspaper",
+                "--agent-id",
+                "ICLR_main_2026_1",
+            ])
+            .expect("paper add --agent-id should parse");
+            match args.command {
+                Command::Paper {
+                    command: PaperCommand::Add { venue, backend, .. },
+                } => {
+                    assert_eq!(venue.as_deref(), Some("ICLR_main_2026_1"));
+                    assert_eq!(backend.as_deref(), Some("cspaper"));
+                }
+                _ => panic!("expected Paper Add command"),
+            }
+        }
+
         #[test]
         fn paper_add_without_venue_is_none() {
             let args = Cli::try_parse_from([
