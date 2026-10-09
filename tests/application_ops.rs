@@ -1150,6 +1150,11 @@ fn every_error_code_is_documented_with_a_view() -> Result<()> {
             backend: "stanford".into(),
             detail: "none".into(),
         },
+        OpError::ProviderNotConfigured {
+            backend: "cspaper".into(),
+            setting: "api_key",
+            message: "none".into(),
+        },
         OpError::JobNotFound { job_id: "j".into() },
         OpError::NoEligibleJob {
             paper_id: "p".into(),
