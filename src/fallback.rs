@@ -21,13 +21,19 @@ struct FallbackOutput {
     status: Option<u16>,
     /// The provider answered 429.
     rate_limited: Option<bool>,
+    /// The provider answered 2xx with `success: false`: it refused the paper.
+    rejected: Option<bool>,
     /// The provider's `Retry-After`, in seconds.
     retry_after_secs: Option<i64>,
 }
 
 impl FallbackOutput {
     fn failure(&self, detail: String) -> BackendError {
-        if self.rate_limited == Some(true) {
+        // Once confirm-upload was sent, only its own answer settles the outcome; an
+        // answer reported for an earlier step says nothing about the submission.
+        let answer_counts =
+            self.submitted != Some(true) || self.stage.as_deref() == Some("confirm");
+        if answer_counts && self.rate_limited == Some(true) {
             return BackendError::RateLimited {
                 message: self.error.clone().unwrap_or(detail),
                 retry_after: self
@@ -35,11 +41,12 @@ impl FallbackOutput {
                     .and_then(|secs| chrono::Duration::try_seconds(secs.max(0))),
             };
         }
-        // A 4xx answer is a rejection: the provider created nothing.
-        let rejected = self
-            .status
-            .is_some_and(|status| (400..500).contains(&status));
-        if self.submitted == Some(false) || rejected {
+        // A refusal (4xx, or 2xx with `success: false`) means the provider created nothing.
+        let refused = self.rejected == Some(true)
+            || self
+                .status
+                .is_some_and(|status| (400..500).contains(&status));
+        if self.submitted == Some(false) || (answer_counts && refused) {
             BackendError::Command(detail)
         } else {
             BackendError::OutcomeUnknown(detail)
@@ -178,6 +185,30 @@ mod tests {
             r#"{"success":false,"submitted":true,"stage":"confirm","status":502}"#,
             r#"{"success":false,"submitted":true,"stage":"confirm"}"#,
             r#"{"success":false}"#,
+        ] {
+            let err = report(json).failure("detail".to_string());
+            assert!(
+                matches!(err, BackendError::OutcomeUnknown(_)),
+                "{json}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn success_false_at_confirm_is_a_definitive_rejection() {
+        let err = report(
+            r#"{"success":false,"submitted":true,"stage":"confirm","status":200,"rejected":true}"#,
+        )
+        .failure("detail".to_string());
+        assert!(matches!(err, BackendError::Command(_)), "{err:?}");
+    }
+
+    #[test]
+    fn an_answer_to_another_step_after_confirm_is_not_the_confirm_answer() {
+        for json in [
+            r#"{"success":false,"submitted":true,"stage":"upload","status":403}"#,
+            r#"{"success":false,"submitted":true,"stage":"upload_init","status":429,"rate_limited":true}"#,
+            r#"{"success":false,"submitted":true,"stage":"upload","rejected":true}"#,
         ] {
             let err = report(json).failure("detail".to_string());
             assert!(

@@ -34,7 +34,7 @@ pub use operation::Operation;
 pub use ops::{
     CANCELLED_BY_USER, DEFAULT_JOB_LIST_LIMIT, MAX_JOB_LIST_LIMIT, ReviewOps, require_project,
 };
-pub use redact::{redact_text, redact_value};
+pub use redact::{map_strings, redact_text, redact_value};
 pub use request::{
     Approval, CancelRequest, Eligibility, JobListQuery, JobRef, RequestOrigin, RetryRequest,
     ReviewPart, ReviewQuery, ReviewRequest,

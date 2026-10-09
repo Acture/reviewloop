@@ -1403,6 +1403,7 @@ async fn restart_resumes_the_same_receipt_and_archives_the_uploaded_snapshot() -
     assert_eq!(meta["provider"]["base_url"], json!(server.base_url));
     assert_eq!(meta["submission"]["channel"], "primary");
     assert_eq!(meta["submission"]["venue"], "ICLR");
+    assert_eq!(meta["submission"]["provider_venue"], "ICLR");
     assert_eq!(meta["submission"]["version_no"], json!(done.version_no));
     assert_eq!(meta["submission"]["round_no"], json!(done.round_no));
     assert_eq!(

@@ -45,6 +45,25 @@ pub fn redact_value(value: Value, tokens: &[&str]) -> Value {
     }
 }
 
+/// Apply `rewrite` to every string in `value`.
+pub fn map_strings(value: Value, rewrite: &impl Fn(&str) -> String) -> Value {
+    match value {
+        Value::String(text) => Value::String(rewrite(&text)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| map_strings(item, rewrite))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, item)| (key, map_strings(item, rewrite)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

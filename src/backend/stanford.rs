@@ -276,6 +276,10 @@ impl StanfordBackend {
         if reply.status.is_success() {
             return Ok(target.s3_key);
         }
+        // Nothing exists remotely yet, so a throttled upload waits like any other step.
+        if reply.status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(reply.rate_limited());
+        }
         let body = reply
             .body
             .unwrap_or_else(|err| format!("unreadable body: {err}"));
@@ -364,9 +368,14 @@ impl StanfordBackend {
                     .unwrap_or_else(|| "confirm-upload returned success=false".to_string()),
             ));
         }
-        let token = parsed.token.ok_or_else(|| {
-            BackendError::OutcomeUnknown("confirm-upload succeeded without a token".to_string())
-        })?;
+        // A blank token cannot fetch the review, so it is no receipt.
+        let token = parsed
+            .token
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                BackendError::OutcomeUnknown("confirm-upload succeeded without a token".to_string())
+            })?;
         Ok(SubmitReceipt { token })
     }
 }
@@ -468,6 +477,39 @@ mod tests {
             "<html>bad gateway</html>"
         );
         assert_eq!(provider_detail(r#"{"detail": 7}"#), "7");
+    }
+
+    /// The inferred success replies parse into what the adapter reads, so replacing a
+    /// fixture with a live copy that changed shape fails here.
+    #[test]
+    fn success_fixtures_match_the_adapter_types() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stanford");
+        let read = |name: &str| {
+            std::fs::read_to_string(dir.join(name))
+                .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+        };
+        let init: UploadUrlResponse =
+            serde_json::from_str(&read("get-upload-url-200.json")).expect("upload-init shape");
+        assert!(init.success);
+        assert!(init.presigned_url.is_some() && init.s3_key.is_some());
+        assert!(
+            init.presigned_fields
+                .is_some_and(|fields| fields.contains_key("key"))
+        );
+        let confirm: ConfirmResponse =
+            serde_json::from_str(&read("confirm-upload-200.json")).expect("confirm shape");
+        assert!(confirm.success && confirm.token.is_some_and(|token| !token.is_empty()));
+        assert_eq!(
+            provider_detail(&read("rate-limit-429.json")),
+            "Rate limit exceeded. Please try again later."
+        );
+        assert_eq!(
+            provider_detail(&read("get-upload-url-405.json")),
+            "Method Not Allowed"
+        );
+        let processing: Value = serde_json::from_str(&read("review-202.json")).expect("json");
+        assert!(!has_review_content(&processing));
+        assert!(!provider_detail(&read("review-202.json")).is_empty());
     }
 
     #[test]

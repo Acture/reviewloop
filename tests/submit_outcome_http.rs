@@ -1506,86 +1506,196 @@ async fn fallback_confirm_server_error_stays_uncertain() -> Result<()> {
     .await
 }
 
-/// The shipped script's classifier, given the network facts of each provider outcome,
-/// reports what the Rust side maps to the primary's semantics: 429 → rate limited,
-/// nothing confirmed or a 4xx → definitive, a confirm without a definite answer → unknown.
+/// Replay the page's network traffic through the shipped script's own tracking and
+/// classification. `program` gets `run(events)` (one array of reports, one per run) and
+/// must print `JSON.stringify(...)` of the scenarios.
+fn run_shipped_tracker(scenarios: &str) -> Result<Vec<Value>> {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/paperreview_fallback.mjs");
+    // A JSON string literal is a valid JS module specifier literal.
+    let url = serde_json::to_string(&format!("file://{}", script.canonicalize()?.display()))?;
+    let program = format!(
+        r#"import {{ classify, newFacts, noteAnswer, noteRequest, noteResponse, stageOf }} from {url};
+const API = 'https://paperreview.ai';
+// Each event: ['req', url, method, contentType] | ['res', url, method, contentType, status, body, retryAfterSecs]
+function run(events, error = null) {{
+  const facts = newFacts();
+  for (const [kind, url, method, contentType, status, body, retryAfterSecs] of events) {{
+    const stage = stageOf({{ url, method, contentType }}, API);
+    if (kind === 'req') noteRequest(facts, stage);
+    else {{
+      const reply = noteResponse(facts, stage, {{ status, retryAfterSecs }});
+      if (reply && body !== undefined) noteAnswer(reply, body);
+    }}
+  }}
+  return classify(facts, error);
+}}
+const INIT = [API + '/api/get-upload-url', 'POST', 'application/json'];
+const S3 = ['https://bucket.s3.amazonaws.com/', 'POST', 'multipart/form-data; boundary=x'];
+const CONFIRM = [API + '/api/confirm-upload', 'POST', 'multipart/form-data; boundary=y'];
+const BEACON = ['https://region1.google-analytics.com/g/collect?v=2', 'POST', undefined];
+const OK_INIT = [['req', ...INIT], ['res', ...INIT, 200, {{ success: true }}]];
+const UPLOADED = [...OK_INIT, ['req', ...S3], ['res', ...S3, 204]];
+console.log(JSON.stringify({scenarios}));"#
+    );
+    let out = Command::new("node")
+        .args(["--input-type=module", "-e", &program])
+        .output()?;
+    anyhow::ensure!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(serde_json::from_slice(&out.stdout)?)
+}
+
+/// The shipped script reports each provider outcome the way the primary classifies it:
+/// 429 → rate limited, nothing confirmed or a refusal of confirm → definitive, a
+/// confirm without a definite answer → unknown. Analytics beacons the live page sends
+/// (cross-origin POSTs) never count as a step.
 #[tokio::test]
 async fn shipped_fallback_script_classifies_outcomes_like_the_primary() -> Result<()> {
     if !node_available() {
         eprintln!("skipped: node is not available");
         return Ok(());
     }
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/paperreview_fallback.mjs");
-    let url = format!("file://{}", script.canonicalize()?.display());
-    let program = format!(
-        r#"import {{ classify, newFacts }} from {url};
-const at = (stage, status, extra = {{}}) => ({{
-  ...newFacts(), stage, confirmSent: stage === 'confirm',
-  responses: {{ [stage]: {{ status, detail: 'detail ' + status, ...extra }} }},
-}});
-console.log(JSON.stringify([
-  classify({{ ...newFacts(), stage: 'confirm', confirmSent: true, token: 'tok' }}),
-  classify(at('upload_init', 429, {{ retryAfterSecs: 60 }})),
-  classify(at('upload', 403)),
-  classify(at('confirm', 422)),
-  classify(at('confirm', 502)),
-  classify({{ ...newFacts(), stage: 'confirm', confirmSent: true, confirmFailed: 'confirm-upload got no response: net::ERR_CONNECTION_RESET' }}),
-  classify({{ ...newFacts(), dialog: 'File size exceeds 10MB limit.' }}),
-  classify(newFacts(), new Error('playwright missing')),
-]));"#,
-        url = json!(url)
-    );
-    let out = Command::new("node")
-        .args(["--input-type=module", "-e", &program])
-        .output()?;
-    assert!(
-        out.status.success(),
-        "node failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let reports: Vec<Value> = serde_json::from_slice(&out.stdout)?;
+    let reports = run_shipped_tracker(
+        r#"[
+  run([...UPLOADED, ['req', ...CONFIRM], ['res', ...CONFIRM, 200, { success: true, token: 'tok', message: 'ok' }], ['req', ...BEACON], ['res', ...BEACON, 204]]),
+  run([['req', ...BEACON], ['res', ...BEACON, 204], ['req', ...INIT], ['res', ...INIT, 429, { detail: 'slow down' }, 120], ['req', ...BEACON], ['res', ...BEACON, 204]]),
+  run([...OK_INIT, ['req', ...S3], ['res', ...S3, 403]]),
+  run([...UPLOADED, ['req', ...CONFIRM], ['res', ...CONFIRM, 422, { detail: [{ loc: ['body', 'email'], msg: 'Field required' }] }], ['req', ...BEACON], ['res', ...BEACON, 403]]),
+  run([...UPLOADED, ['req', ...CONFIRM], ['res', ...CONFIRM, 502, { detail: 'upstream' }], ['req', ...BEACON], ['res', ...BEACON, 204]]),
+  run([...UPLOADED, ['req', ...CONFIRM], ['req', ...BEACON], ['res', ...BEACON, 403]]),
+  run([...UPLOADED, ['req', ...CONFIRM], ['res', ...CONFIRM, 200, { success: false, message: 'duplicate paper' }]]),
+  run([...UPLOADED, ['req', ...CONFIRM], ['res', ...CONFIRM, 200, { success: true, message: 'ok' }]]),
+  run([...UPLOADED, ['req', ...CONFIRM], ['res', ...CONFIRM, 429, { detail: 'later' }, 30]]),
+  run([], new Error('playwright missing')),
+]"#,
+    )?;
     let [
         accepted,
-        limited,
-        upload_rejected,
-        confirm_rejected,
+        init_limited,
+        upload_refused,
+        confirm_invalid,
         confirm_5xx,
-        confirm_lost,
-        alerted,
+        confirm_silent,
+        confirm_refused,
+        confirm_tokenless,
+        confirm_limited,
         no_browser,
     ] = reports.as_slice()
     else {
         anyhow::bail!("unexpected reports: {reports:?}");
     };
 
-    assert_eq!(accepted["success"], true);
+    assert_eq!(accepted["success"], true, "{accepted}");
     assert_eq!(accepted["token"], "tok");
 
-    assert_eq!(limited["rate_limited"], true);
-    assert_eq!(limited["retry_after_secs"], 60);
-    assert_eq!(limited["submitted"], false);
-    assert_eq!(limited["stage"], "upload_init");
+    assert_eq!(init_limited["rate_limited"], true, "{init_limited}");
+    assert_eq!(init_limited["retry_after_secs"], 120);
+    assert_eq!(init_limited["submitted"], false);
+    assert_eq!(init_limited["stage"], "upload_init");
+    assert_eq!(init_limited["error"], "slow down");
 
-    assert_eq!(upload_rejected["submitted"], false);
-    assert_eq!(upload_rejected["stage"], "upload");
-    assert_eq!(upload_rejected["status"], 403);
+    assert_eq!(upload_refused["submitted"], false, "{upload_refused}");
+    assert_eq!(upload_refused["stage"], "upload");
+    assert_eq!(upload_refused["status"], 403);
 
-    assert_eq!(confirm_rejected["submitted"], true);
-    assert_eq!(confirm_rejected["status"], 422);
-    assert_eq!(confirm_rejected["error"], "detail 422");
+    assert_eq!(confirm_invalid["submitted"], true, "{confirm_invalid}");
+    assert_eq!(confirm_invalid["stage"], "confirm");
+    assert_eq!(confirm_invalid["status"], 422);
+    assert_eq!(confirm_invalid["error"], "email: Field required");
 
-    assert_eq!(confirm_5xx["submitted"], true);
+    assert_eq!(confirm_5xx["stage"], "confirm", "{confirm_5xx}");
     assert_eq!(confirm_5xx["status"], 502);
+    assert!(confirm_5xx.get("rejected").is_none(), "{confirm_5xx}");
 
-    assert_eq!(confirm_lost["submitted"], true);
-    assert!(confirm_lost.get("status").is_none(), "{confirm_lost}");
-    assert_contains(confirm_lost["error"].as_str(), "got no response");
+    assert_eq!(confirm_silent["submitted"], true, "{confirm_silent}");
+    assert_eq!(confirm_silent["stage"], "confirm");
+    assert!(confirm_silent.get("status").is_none(), "{confirm_silent}");
 
-    assert_eq!(alerted["submitted"], false);
-    assert_eq!(alerted["error"], "File size exceeds 10MB limit.");
+    assert_eq!(confirm_refused["rejected"], true, "{confirm_refused}");
+    assert_eq!(confirm_refused["status"], 200);
+    assert_eq!(confirm_refused["error"], "duplicate paper");
 
-    assert_eq!(no_browser["submitted"], false);
+    assert_eq!(confirm_tokenless["success"], false, "{confirm_tokenless}");
+    assert!(
+        confirm_tokenless.get("rejected").is_none(),
+        "{confirm_tokenless}"
+    );
+    assert_eq!(confirm_tokenless["submitted"], true);
+    assert_contains(confirm_tokenless["error"].as_str(), "without a token");
+
+    assert_eq!(confirm_limited["rate_limited"], true, "{confirm_limited}");
+    assert_eq!(confirm_limited["stage"], "confirm");
+    assert_eq!(confirm_limited["retry_after_secs"], 30);
+
+    assert_eq!(no_browser["submitted"], false, "{no_browser}");
     assert_eq!(no_browser["stage"], Value::Null);
     assert_contains(no_browser["error"].as_str(), "playwright missing");
     Ok(())
+}
+
+#[tokio::test]
+async fn confirm_200_success_with_blank_token_parks_uncertain() -> Result<()> {
+    assert_confirm_reply_parks_uncertain(
+        Reply::json(StatusCode::OK, json!({ "success": true, "token": "  " })),
+        "confirm-upload succeeded without a token",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn upload_rate_limit_requeues_at_the_upload_step_without_the_fallback() -> Result<()> {
+    let mut ctx = TestContext::start().await?;
+    let log = ctx.arm_fallback(FALLBACK_SUCCEEDS)?;
+    ctx.mock()
+        .push(GET_UPLOAD, Step::Reply(ctx.upload_url_reply()));
+    ctx.mock().push(
+        S3,
+        Step::Reply(
+            Reply::text(
+                StatusCode::TOO_MANY_REQUESTS,
+                "<Error><Code>SlowDown</Code></Error>",
+            )
+            .header("retry-after", "600"),
+        ),
+    );
+    let job = ctx.create_queued_job()?;
+
+    assert_eq!(ctx.submit(&job).await?, Attempt::Ran);
+
+    let queued = ctx.job(&job.id)?;
+    assert_eq!(queued.status, JobStatus::Queued);
+    assert!(!queued.fallback_used);
+    assert_minutes_from_now(queued.next_poll_at, 9, 10);
+    let events = ctx.events(&job.id)?;
+    assert_eq!(
+        event_types(&events),
+        ["submit_dispatched", "submit_rate_limited"]
+    );
+    assert_eq!(events[1].payload["retry_after_source"], "server");
+    assert_eq!(last_step(&events), Some("upload"));
+    assert_eq!(ctx.calls(), [1, 1, 0]);
+    assert!(fallback_runs(&log)?.is_empty(), "fallback ran");
+    Ok(())
+}
+
+#[tokio::test]
+async fn fallback_confirm_success_false_is_a_definitive_rejection() -> Result<()> {
+    assert_fallback_fails_needs_manual(
+        r#"console.error(JSON.stringify({ success: false, submitted: true, stage: "confirm", status: 200, rejected: true, error: "paper rejected by provider" })); process.exit(1);"#,
+        "paper rejected by provider",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn fallback_client_error_attributed_to_an_earlier_step_after_confirm_stays_uncertain()
+-> Result<()> {
+    assert_fallback_parks_uncertain(
+        r#"console.error(JSON.stringify({ success: false, submitted: true, stage: "upload", status: 403, error: "beacon refused" })); process.exit(1);"#,
+        "beacon refused",
+    )
+    .await
 }

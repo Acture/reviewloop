@@ -49,6 +49,9 @@ pub fn write_review_artifacts(
             "round_no": job.round_no,
             "submitted_at": job.started_at.map(|at| at.to_rfc3339()),
             "provider_submission_date": raw_json.get("submission_date"),
+            // The venue the provider says it reviewed for; `venue` above is the one the
+            // job recorded, null when the configured venue was sent instead.
+            "provider_venue": raw_json.get("venue"),
         },
     }))?;
 

@@ -760,13 +760,21 @@ fn accept_receipt(
                      (attach it with `reviewloop import-token --job-id {job_id} --token <token>`)",
                     kept.display()
                 ),
-                // Last resort: with neither the database nor the state dir writable, the
-                // daemon log is the only place left that can keep the token.
-                Err(keep_err) => format!(
-                    "failed to save the submit receipt for job {job_id} and to keep it on disk \
-                     ({keep_err:#}); token {}",
-                    receipt.token
-                ),
+                // Last resort: with neither the database nor the state dir writable, this
+                // log line is the only place left to keep the token. The error itself also
+                // reaches notifications, `daemon status` and the widget, so it stays clean.
+                Err(keep_err) => {
+                    error!(
+                        job_id = %job_id,
+                        channel = channel.as_str(),
+                        token = %receipt.token,
+                        "submit receipt could neither be saved nor kept on disk; its token is in this line only"
+                    );
+                    format!(
+                        "failed to save the submit receipt for job {job_id} and to keep it on disk \
+                         ({keep_err:#}); its token is in the daemon log"
+                    )
+                }
             };
             return Err(err.context(context));
         }

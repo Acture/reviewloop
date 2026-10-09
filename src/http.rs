@@ -182,6 +182,21 @@ pub fn describe_error(
     }
 }
 
+/// Reduce every parenthesised URL in `text` to its origin, the way [`describe_error`]
+/// does for new errors. For text recorded before that, such as an older `proxy_failover`
+/// error: reqwest writes the full request URL, review token included.
+pub fn redact_url_paths(text: &str) -> String {
+    let url_re = regex::Regex::new(r"\((https?://[^\s)]+)\)").expect("valid URL regex");
+    url_re
+        .replace_all(text, |captures: &regex::Captures<'_>| {
+            let origin = reqwest::Url::parse(&captures[1])
+                .map(|url| url.origin().ascii_serialization())
+                .unwrap_or_else(|_| "[redacted]".to_string());
+            format!("({origin})")
+        })
+        .into_owned()
+}
+
 /// Heuristic for "this looks like the proxy itself misbehaved, retry on a
 /// different one" vs "this is a real error that won't change with a
 /// different proxy". Conservative: only retry on errors that have no HTTP
@@ -342,6 +357,21 @@ mod tests {
             text.len() > "error sending request for url (http://127.0.0.1:9)".len(),
             "the cause must follow: {text}"
         );
+    }
+
+    #[test]
+    fn redact_url_paths_keeps_only_the_origin_of_recorded_urls() {
+        assert_eq!(
+            redact_url_paths(
+                "error sending request for url (https://paperreview.ai/api/review/tok-legacy-123)"
+            ),
+            "error sending request for url (https://paperreview.ai)"
+        );
+        assert_eq!(
+            redact_url_paths("a (http://127.0.0.1:9/x?sig=1) and (https://h.example/y/tok)"),
+            "a (http://127.0.0.1:9) and (https://h.example)"
+        );
+        assert_eq!(redact_url_paths("no url here"), "no url here");
     }
 
     #[test]
