@@ -1706,21 +1706,35 @@ impl Db {
     /// Submissions `backend` has accepted or may have accepted, over every
     /// project in this database: provider credentials are machine-level, so
     /// usage is too. A job holding a token counts as accepted, wherever the
-    /// token came from; a tokenless job left UNCERTAIN may have been.
+    /// token came from, and is split by status; a tokenless job left
+    /// UNCERTAIN may have been accepted.
     pub fn provider_usage(&self, backend: &str) -> Result<ProviderUsage> {
         let conn = self.connect()?;
+        let count = |row: &rusqlite::Row<'_>, index: usize| -> rusqlite::Result<u64> {
+            Ok(row.get::<_, i64>(index)? as u64)
+        };
         conn.query_row(
             r#"
-            SELECT COALESCE(SUM(token IS NOT NULL), 0),
-                   COALESCE(SUM(token IS NULL AND submit_stage = ?2), 0)
+            SELECT COALESCE(SUM(token IS NOT NULL AND status = ?2), 0),
+                   COALESCE(SUM(token IS NOT NULL AND status IN (?3, ?4)), 0),
+                   COALESCE(SUM(token IS NOT NULL AND status NOT IN (?2, ?3, ?4)), 0),
+                   COALESCE(SUM(token IS NULL AND submit_stage = ?5), 0)
             FROM jobs
             WHERE backend = ?1
             "#,
-            params![backend, SubmitStage::Uncertain.as_str()],
+            params![
+                backend,
+                JobStatus::Completed.as_str(),
+                JobStatus::Processing.as_str(),
+                JobStatus::Submitted.as_str(),
+                SubmitStage::Uncertain.as_str(),
+            ],
             |row| {
                 Ok(ProviderUsage {
-                    accepted: row.get::<_, i64>(0)? as u64,
-                    uncertain: row.get::<_, i64>(1)? as u64,
+                    completed: count(row, 0)?,
+                    in_progress: count(row, 1)?,
+                    ended: count(row, 2)?,
+                    uncertain: count(row, 3)?,
                 })
             },
         )
