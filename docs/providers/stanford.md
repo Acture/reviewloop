@@ -139,10 +139,12 @@ patterns.
 | `confirm` request | 5 min | outcome unknown |
 | one poll request | 2 min | retried on schedule |
 | one dispatch (primary or fallback) | 20 min | outcome unknown |
-| review | `core.review_timeout_hours` (48 h) × min(pages, 15) / 15, at least 1 h; the full 48 h when the page count is unknown | `TIMEOUT` |
+| review | `core.review_timeout_hours` (48 h), whatever the page count | `TIMEOUT` |
 
-The review timeout stops scaling at 15 pages because later pages are not reviewed.
-The page warns that reviews "can take hours or even longer" under load.
+The page warns that reviews "can take hours or even longer" under load, so processing
+time follows the provider's queue rather than the paper's length. A `TIMEOUT` is
+terminal until someone retries it, so the review timeout is not shortened for short
+papers.
 
 ReviewLoop sends at most `core.max_submissions_per_tick` (1) submissions per 30 s
 tick and polls on `polling.schedule_minutes` with jitter. A 429 on any step is

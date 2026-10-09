@@ -527,36 +527,22 @@ fn stanford_job_after_timeout_sweep(pages: usize, hours: i64) -> Result<JobStatu
     Ok(ctx.db.get_job(&job.id)?.context("missing job")?.status)
 }
 
+/// Review time is set by the provider's queue, not the paper's length, so every
+/// Stanford job gets the configured timeout (48 h) whatever its page count.
 #[test]
-fn mark_timeouts_scales_with_pdf_pages_for_stanford() -> Result<()> {
-    // 10 of the 15 reviewed pages: 48 h * 10 / 15 = 32 h.
-    assert_eq!(
-        stanford_job_after_timeout_sweep(10, 31)?,
-        JobStatus::Processing
-    );
-    assert_eq!(
-        stanford_job_after_timeout_sweep(10, 33)?,
-        JobStatus::Timeout
-    );
-    Ok(())
-}
-
-#[test]
-fn mark_timeouts_stops_scaling_at_the_fifteen_reviewed_pages() -> Result<()> {
-    // The provider reviews only the first 15 pages, so 15 and 40 pages both get the
-    // full 48 h.
-    assert_eq!(
-        stanford_job_after_timeout_sweep(15, 40)?,
-        JobStatus::Processing
-    );
-    assert_eq!(
-        stanford_job_after_timeout_sweep(40, 47)?,
-        JobStatus::Processing
-    );
-    assert_eq!(
-        stanford_job_after_timeout_sweep(15, 49)?,
-        JobStatus::Timeout
-    );
+fn mark_timeouts_uses_the_configured_timeout_whatever_the_page_count() -> Result<()> {
+    for pages in [0, 3, 10, 40] {
+        assert_eq!(
+            stanford_job_after_timeout_sweep(pages, 47)?,
+            JobStatus::Processing,
+            "{pages} pages"
+        );
+        assert_eq!(
+            stanford_job_after_timeout_sweep(pages, 49)?,
+            JobStatus::Timeout,
+            "{pages} pages"
+        );
+    }
     Ok(())
 }
 

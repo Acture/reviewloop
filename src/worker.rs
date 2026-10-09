@@ -4,7 +4,7 @@ use crate::{
         BackendError, ReviewBackend, ReviewFetchResult, SubmitProgress, SubmitReceipt,
         SubmitRequest, build_backend,
         input::{InputVerdict, input_policy, upload_file_name},
-        provider_source, stanford,
+        provider_source,
     },
     config::{Config, NotificationsConfig},
     db::{ClaimTiming, Db, JobChange, Lease, LeaseWrite, NewReview, ReceiptWrite},
@@ -18,7 +18,7 @@ use crate::{
         JobInput, SNAPSHOT_GC_GRACE, prune_unreferenced_snapshots, resolve_job_input,
     },
     trigger::{run_git_tag_trigger, run_pdf_trigger},
-    util::{compute_next_poll_at, estimate_pdf_page_count},
+    util::compute_next_poll_at,
     widget_state,
 };
 use anyhow::{Context, Result};
@@ -1343,7 +1343,7 @@ pub fn mark_timeouts(config: &Config, db: &Db) -> Result<()> {
     let now = Utc::now();
 
     for job in db.list_processing_jobs(&config.project_id)? {
-        let timeout = timeout_for_job(config, &job);
+        let timeout = review_timeout(config);
         let reference_start = job.started_at.unwrap_or(job.created_at);
         if now - reference_start < timeout {
             continue;
@@ -1383,30 +1383,12 @@ pub fn mark_timeouts(config: &Config, db: &Db) -> Result<()> {
     Ok(())
 }
 
-fn timeout_for_job(config: &Config, job: &Job) -> Duration {
-    let base_hours = i64::max(config.core.review_timeout_hours as i64, 1);
-    if job.backend != "stanford" {
-        return Duration::hours(base_hours);
-    }
-
-    // Count pages of what was uploaded; the source may have changed or vanished.
-    let pdf_path = job.snapshot_path.as_deref().unwrap_or(&job.pdf_path);
-    let pages = match estimate_pdf_page_count(Path::new(pdf_path)) {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!(error = %e, pdf_path = %pdf_path, "failed to estimate PDF page count; using base timeout");
-            0
-        }
-    };
-    if pages == 0 {
-        return Duration::hours(base_hours);
-    }
-
-    // The provider reviews only the leading pages, so pages past them take no longer.
-    let reviewed = stanford::INPUT_POLICY.reviewed_pages.unwrap_or(pages) as i64;
-    let capped_pages = i64::min(pages as i64, reviewed);
-    let scaled_hours = (base_hours * capped_pages + reviewed - 1) / reviewed;
-    Duration::hours(i64::max(scaled_hours, 1))
+/// How long a review may take. The provider says processing time follows its load
+/// ("hours or even longer"), not the paper's length, so every job gets the configured
+/// timeout; a premature TIMEOUT is terminal, while a long one only delays noticing a
+/// stuck job.
+fn review_timeout(config: &Config) -> Duration {
+    Duration::hours(i64::max(config.core.review_timeout_hours as i64, 1))
 }
 
 pub fn prune_retention(config: &Config, db: &Db, tick: Option<u64>) -> Result<()> {

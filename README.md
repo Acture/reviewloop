@@ -532,11 +532,7 @@ Safe defaults:
 - `core.max_submissions_per_tick = 1`
 - `core.state_dir = "~/.review_loop"` (or `REVIEWLOOP_STATE_DIR` when set)
 - `core.db_path = "~/.review_loop/reviewloop.db"` (or `<REVIEWLOOP_STATE_DIR>/reviewloop.db`)
-- `core.review_timeout_hours = 48`
-- Supported backends: `stanford` ([Stanford Agentic Reviewer](https://paperreview.ai), `paperreview.ai`)
-  and `cspaper` (CSPaper Agentic Review, `cspaper.org`). The Stanford contract, limits
-  (10 MiB, first 15 pages reviewed) and token handling are in
-  [docs/providers/stanford.md](docs/providers/stanford.md)
+- `core.review_timeout_hours = 48` (every job and backend, whatever its page count: provider processing time follows its load)
 - `polling.schedule_minutes = [1, 2, 5, 10, 20, 40]` (first poll within ~1 minute, then back off)
 - `polling.jitter_percent = 10`
 - `retention.enabled = true`

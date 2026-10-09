@@ -29,8 +29,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   taken at enqueue, stored owner-only (0o600 files, 0o700 directories on Unix)
   at `<state_dir>/snapshots/<sha256>/<file name>`.
   Editing or deleting the source, or repointing the paper in config, after
-  enqueue no longer changes what is submitted: the primary submit, the Node
-  fallback and the timeout page count all read the snapshot, re-verified
+  enqueue no longer changes what is submitted: the primary submit and the Node
+  fallback both read the snapshot, re-verified
   against the job's hash before every upload. `submission_input::prepare_input`
   returns the `PreparedInput` that enqueue callers pass as `JobPdf::Pinned`.
   Schema v3 adds `jobs.snapshot_path`; `meta.json` records it.
@@ -182,8 +182,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   of the raw JSON body.
 - **A `200` review reply without `sections` or `content` is not a review**: the
   job keeps polling instead of completing with an empty review.
-- **The Stanford review timeout stops scaling at 15 pages** (was 20), the pages
-  the provider reviews.
+- **The Stanford review timeout no longer scales with page count**: every job
+  gets `core.review_timeout_hours` (48 h). The provider says processing time
+  follows its load, a premature `TIMEOUT` is terminal, and the scaling never
+  applied to pdfTeX/XeTeX/LuaTeX output, whose pages were not counted.
 - **Fallback script reports in the primary's terms** — it takes `--filename`
   (the primary's upload name), watches the form's requests, and reports
   `stage`, `status`, `rate_limited` and `retry_after_secs`. A rate limit
@@ -196,8 +198,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   token goes to one daemon log line, never into the error.
 - **PDF page counts include pages in compressed object streams**, which pdfTeX,
   XeTeX and LuaTeX write by default. Those PDFs used to count 0 pages, so they
-  now get the coverage notice, and the Stanford review timeout now scales with
-  their page count as documented instead of always using the full timeout.
+  never got the coverage notice.
 - **The fallback reads the receipt from confirm-upload's reply**, ignores
   analytics beacons, and reports a 2xx confirm with `success: false` as
   `rejected`; a fallback answer for any step but `confirm`, once confirm was
