@@ -55,6 +55,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   codes with recovery hints, and what later issues still own.
 - `Db::get_review`, `Db::review_completed_at`, `Db::list_project_jobs` and
   `Db::list_registered_projects` (read-only).
+- **Stanford Agentic Reviewer contract** (`docs/providers/stanford.md`) — the
+  `paperreview.ai` API as checked on 2026-10-09, with sanitized fixtures in
+  `tests/fixtures/stanford/` marked observed or inferred, and the open
+  real-service acceptance run.
+- **Submit steps are identified** — submit outcome events (`submit_failed`,
+  `submit_rate_limited`, `submit_outcome_unknown`, `submit_failed_needs_manual`)
+  carry `channel` and the `step` reached: `upload_init`, `upload` or `confirm`.
+- **PDF preflight** — a PDF over the provider's 10 MiB limit, or one without a
+  `%PDF-` header, is refused at enqueue (`input_rejected`) and, for jobs from
+  triggers, before dispatch (`FAILED_NEEDS_MANUAL`, event
+  `submit_input_rejected`); nothing is sent and the fallback does not run.
+  PDFs with more pages than the provider reviews (15) get a notice
+  (`ManuscriptInput.notices`, event `submit_input_notice`).
+- **Review provenance** — `meta.json` adds `provider` (`backend`, `name`,
+  `base_url`) and `submission` (`channel`, `venue`, `version_no`, `round_no`,
+  `submitted_at`, `provider_submission_date`); `review.md` shows the submission
+  date and the score as `x/10 (ICLR-calibrated)`.
 
 - **CSPaper backend (OSS-353)** — `backend = "cspaper"` submits to the
   CSPaper Agentic Review API (`POST /api/platform/review`, polled at
@@ -157,6 +174,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   outcome.
 - **`import-token --job-id`** attaches a token to a named job; the reconcile
   hint for an uncertain submission uses it.
+- **Stanford requests are bounded per step** — upload-init 30 s, upload 5 min,
+  confirm 5 min, one poll 2 min — so a stuck step is reported as that step. A
+  timed-out upload step fails definitively instead of waiting out the 20-minute
+  dispatch bound as an unknown outcome.
+- **Provider errors show FastAPI's `detail`** (`email: Field required`) instead
+  of the raw JSON body.
+- **A `200` review reply without `sections` or `content` is not a review**: the
+  job keeps polling instead of completing with an empty review.
+- **The Stanford review timeout stops scaling at 15 pages** (was 20), the pages
+  the provider reviews.
+- **Fallback script reports in the primary's terms** — it takes `--filename`
+  (the primary's upload name), watches the form's requests, and reports
+  `stage`, `status`, `rate_limited` and `retry_after_secs`. A rate limit
+  requeues the job with the fallback still available; a 4xx answer is a
+  definitive rejection; `submitted` turns true only once `confirm-upload` is
+  sent.
+- **A receipt the database cannot save** is written to
+  `<state_dir>/recovery/receipt-<job_id>-<time>.json` (mode `0600`); the error
+  names the file instead of carrying the token.
 
 - **Request identity includes review options** — coverage and request keys
   compare the new `review_options` (CSPaper's `desk_rejection_enabled`)
@@ -229,6 +265,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Review tokens no longer leak into default output** — request errors are
+  described without their URL (the review URL carries the token, presigned
+  uploads carry a signature), so `last_error`, events, logs and notifications
+  stay token-free; `reviewloop status` redacts tokens in event payloads and
+  errors unless `--show-token`.
+- `reviewloop status` no longer panics truncating a non-ASCII error.
 - Git commands for a project repository ignore `GIT_DIR` / `GIT_INDEX_FILE`
   inherited from the environment. Run from a git hook (the pre-commit quality
   gate), the git trigger and its tests used to act on the repository being

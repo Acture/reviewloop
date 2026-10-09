@@ -6,6 +6,7 @@ use reviewloop::application::{
     RetryRequest, ReviewOps, ReviewRequest, require_project,
 };
 use reviewloop::artifact::write_review_artifacts;
+use reviewloop::backend::ProviderSource;
 use reviewloop::config::{
     Config, GlobalConfigFile, LegacyConfig, PaperConfigFile, ProjectConfigFile,
     default_project_config_path,
@@ -2489,8 +2490,8 @@ fn cmd_status(
                 token = token_str,
                 next_poll = next_poll_str,
             );
-            if let Some(err) = row.last_error.as_deref() {
-                let truncated = if err.len() > 80 { &err[..80] } else { err };
+            if let Some(err) = shown_error(row, show_token) {
+                let truncated: String = err.chars().take(80).collect();
                 println!("    error: {truncated}");
             }
             if row.status == "COMPLETED" {
@@ -2712,7 +2713,13 @@ async fn cmd_complete(
         .token
         .clone()
         .unwrap_or_else(|| format!("manual:{}", job.id));
-    let (_, summary_md, _) = write_review_artifacts(&config.state_dir(), &job, &token, &raw_json)?;
+    let source = ProviderSource {
+        backend: job.backend.clone(),
+        name: "manual".to_string(),
+        base_url: source_url.clone(),
+    };
+    let (_, summary_md, _) =
+        write_review_artifacts(&config.state_dir(), &job, &token, &raw_json, &source)?;
     db.upsert_review(&job.id, &token, &raw_json.to_string(), &summary_md)?;
     // user override: manual completion may move jobs out of terminal states.
     db.update_job_state_unchecked(
@@ -2815,6 +2822,29 @@ fn maybe_record_manual_poll_override(
     Ok(())
 }
 
+/// The tokens `rows` hold, hidden from status output unless `--show-token`.
+fn row_tokens(rows: &[StatusView]) -> Vec<&str> {
+    rows.iter().filter_map(|row| row.token.as_deref()).collect()
+}
+
+/// An event payload as status shows it: tokens redacted unless `show_token`.
+fn shown_payload(payload: &Value, tokens: &[&str], show_token: bool) -> Value {
+    if show_token {
+        payload.clone()
+    } else {
+        reviewloop::application::redact_value(payload.clone(), tokens)
+    }
+}
+
+/// A job's last error as status shows it: its token redacted unless `show_token`.
+fn shown_error(row: &StatusView, show_token: bool) -> Option<String> {
+    let error = row.last_error.as_deref()?;
+    Some(match (show_token, row.token.as_deref()) {
+        (false, Some(token)) => reviewloop::application::redact_text(error, &[token]),
+        _ => error.to_string(),
+    })
+}
+
 fn status_row_json(row: &StatusView, show_token: bool, state_dir: Option<&Path>) -> Value {
     let artifact_dir = if row.status == "COMPLETED" {
         state_dir.map(|dir| dir.join("artifacts").join(&row.id).display().to_string())
@@ -2834,7 +2864,7 @@ fn status_row_json(row: &StatusView, show_token: bool, state_dir: Option<&Path>)
         "started_at": row.started_at.map(|value| value.to_rfc3339()),
         "next_poll_at": row.next_poll_at.map(|value| value.to_rfc3339()),
         "updated_at": row.updated_at.to_rfc3339(),
-        "last_error": row.last_error,
+        "last_error": shown_error(row, show_token),
         "pdf_hash": row.pdf_hash,
         "git_tag": row.git_tag,
         "git_commit": row.git_commit,
@@ -2855,6 +2885,7 @@ fn timeline_json(
     show_token: bool,
     state_dir: Option<&Path>,
 ) -> Vec<Value> {
+    let tokens = row_tokens(rows);
     let mut entries = Vec::new();
     for row in rows {
         entries.push(json!({
@@ -2869,7 +2900,7 @@ fn timeline_json(
             "created_at": event.created_at.to_rfc3339(),
             "event_type": event.event_type,
             "job_id": event.job_id,
-            "payload": event.payload,
+            "payload": shown_payload(&event.payload, &tokens, show_token),
         }));
     }
     entries.sort_by(|left, right| {
@@ -2899,6 +2930,7 @@ fn render_timeline_text(
         "Paper timeline: {} (project_id={})",
         paper_id, config.project_id
     );
+    let tokens = row_tokens(rows);
     let mut grouped: std::collections::BTreeMap<(u32, u32), Vec<Value>> =
         std::collections::BTreeMap::new();
 
@@ -2947,7 +2979,7 @@ fn render_timeline_text(
                 "kind": "event",
                 "created_at": event.created_at.to_rfc3339(),
                 "event_type": event.event_type,
-                "payload": event.payload,
+                "payload": shown_payload(&event.payload, &tokens, show_token),
                 "job_id": event.job_id,
             }));
     }
@@ -3918,6 +3950,55 @@ mod tests {
                 db.create_job(&job).expect("create job");
             }
             db
+        }
+
+        /// Default status output never shows a provider token: rows mask it and event
+        /// payloads and errors redact it. `--show-token` reveals it.
+        #[test]
+        fn status_output_redacts_tokens_unless_shown() {
+            let project_id = "redact_proj";
+            let token = "tok-secret-redact-0123456789";
+            let db = make_db_with_jobs(project_id, &["p1"]);
+            let job_id = db.list_status_views(project_id, Some("p1")).unwrap()[0]
+                .id
+                .clone();
+            db.attach_token_to_job(&job_id, token, chrono::Utc::now())
+                .unwrap();
+            db.add_event(
+                Some(project_id),
+                Some(&job_id),
+                "review_completed",
+                serde_json::json!({ "token": token }),
+            )
+            .unwrap();
+            db.add_event(
+                Some(project_id),
+                Some(&job_id),
+                "poll_error",
+                serde_json::json!({ "error": format!("network error: GET /api/review/{token}") }),
+            )
+            .unwrap();
+            db.update_job_state(
+                &job_id,
+                JobStatus::Processing,
+                None,
+                None,
+                Some(Some(format!("network error: GET /api/review/{token}"))),
+            )
+            .unwrap();
+            let rows = db.list_status_views(project_id, Some("p1")).unwrap();
+            let events = db.list_timeline_events(project_id, "p1").unwrap();
+
+            let hidden = serde_json::json!({
+                "rows": rows.iter().map(|r| status_row_json(r, false, None)).collect::<Vec<Value>>(),
+                "timeline": timeline_json(&rows, &events, false, None),
+            })
+            .to_string();
+            assert!(!hidden.contains(token), "{hidden}");
+            assert!(hidden.contains("[redacted]"), "{hidden}");
+
+            let shown = serde_json::to_string(&timeline_json(&rows, &events, true, None)).unwrap();
+            assert!(shown.contains(token));
         }
 
         /// Both single-paper and multi-paper `--json` output share the same

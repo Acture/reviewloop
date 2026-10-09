@@ -958,3 +958,57 @@ async fn receipt_kept_on_cancelled_job_resumes_through_retry() -> Result<()> {
     assert_eq!(backend.submit_count(), 1);
     Ok(())
 }
+
+/// OSS-352: a receipt the database cannot save goes to a private recovery file, and the
+/// token never appears in the error that reaches the daemon log and notifications.
+#[tokio::test]
+async fn unsaved_receipt_goes_to_a_private_recovery_file_not_the_log() -> Result<()> {
+    const TOKEN: &str = "tok-unsaved-0123456789";
+    let ctx = Ctx::new()?;
+    let job = ctx.create_queued_job()?;
+    let backend = MockBackend::default().on_submit(|| Answer::OnRelease(Ok(receipt(TOKEN))));
+
+    let (attempt, broken) = with_deadline(async {
+        tokio::join!(
+            worker::submit_job_with_backend(&ctx.config, &ctx.db, &job.id, &backend),
+            async {
+                backend.entered.notified().await;
+                // The receipt's event insert now fails, which rolls back the whole save.
+                let broken = ctx
+                    .conn()
+                    .and_then(|conn| Ok(conn.execute_batch("DROP TABLE events")?));
+                backend.release.notify_one();
+                broken
+            }
+        )
+    })
+    .await?;
+    broken?;
+
+    let message = format!("{:#}", attempt.expect_err("saving the receipt must fail"));
+    assert!(
+        !message.contains(TOKEN),
+        "token leaked into the error: {message}"
+    );
+    let recovery_dir = ctx.config.state_dir().join("recovery");
+    let files: Vec<_> = std::fs::read_dir(&recovery_dir)?.collect::<std::io::Result<_>>()?;
+    assert_eq!(files.len(), 1, "{files:?}");
+    let path = files[0].path();
+    assert!(
+        message.contains(&path.display().to_string()),
+        "the error must point at the recovery file: {message}"
+    );
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    assert_eq!(saved["token"], TOKEN);
+    assert_eq!(saved["job_id"], job.id.as_str());
+    assert_eq!(saved["channel"], "primary");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path)?.permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    Ok(())
+}

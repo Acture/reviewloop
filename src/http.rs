@@ -107,7 +107,7 @@ impl reqwest_middleware::Middleware for RoundRobinProxyMiddleware {
                 Err(e) if is_transient_proxy_error(&e) => {
                     warn!(
                         proxy_index = idx,
-                        error = %e,
+                        error = %describe_error(&e, e.url()),
                         attempt = attempt + 1,
                         total_proxies = n,
                         "proxy attempt failed; trying next proxy"
@@ -131,7 +131,7 @@ impl reqwest_middleware::Middleware for RoundRobinProxyMiddleware {
         );
         let last = last_err
             .expect("loop ran at least once and last_err is set on every transient failure");
-        self.emit_failover_event(n - 1, n, Some(&last.to_string()));
+        self.emit_failover_event(n - 1, n, Some(&describe_error(&last, last.url())));
         Err(reqwest_middleware::Error::Reqwest(last))
     }
 }
@@ -159,6 +159,26 @@ impl RoundRobinProxyMiddleware {
         if let Err(e) = db.add_event(Some(pid), None, "proxy_failover", payload) {
             warn!(error = %e, "failed to write proxy_failover event to db");
         }
+    }
+}
+
+/// Describe a failed request with its cause chain but without the request URL, which
+/// can carry secrets: a review token in the path, a presigned signature in the query.
+/// The URL is replaced by its origin.
+pub fn describe_error(
+    err: &(dyn std::error::Error + 'static),
+    url: Option<&reqwest::Url>,
+) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    match url {
+        Some(url) => text.replace(url.as_str(), &url.origin().ascii_serialization()),
+        None => text,
     }
 }
 
@@ -304,6 +324,24 @@ mod tests {
             .build()
             .expect("build multipart request");
         assert!(request.try_clone().is_none());
+    }
+
+    #[tokio::test]
+    async fn describe_error_keeps_the_cause_and_drops_the_url_path() {
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:9/api/review/tok-secret-describe?X-Amz-Signature=sig")
+            .send()
+            .await
+            .expect_err("nothing listens on the discard port");
+        let text = describe_error(&err, err.url());
+        assert!(!text.contains("tok-secret-describe"), "{text}");
+        assert!(!text.contains("X-Amz-Signature"), "{text}");
+        assert!(text.contains("http://127.0.0.1:9"), "{text}");
+        assert!(text.starts_with("error sending request"), "{text}");
+        assert!(
+            text.len() > "error sending request for url (http://127.0.0.1:9)".len(),
+            "the cause must follow: {text}"
+        );
     }
 
     #[test]

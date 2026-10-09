@@ -14,6 +14,7 @@ use super::{
 };
 use crate::{
     artifact::render_summary_markdown,
+    backend::input::{InputVerdict, input_policy},
     config::{Config, PaperConfig},
     db::{CancelOutcome, Db, Requeue},
     email_account::resolve_submission_email,
@@ -150,6 +151,20 @@ impl<'a> ReviewOps<'a> {
         }
 
         check_provider_settings(self.config, paper)?;
+        let notices = match input_policy(&paper.backend) {
+            Some(policy) => match policy.check(pdf_path)? {
+                InputVerdict::Accepted { notices, .. } => notices,
+                InputVerdict::Rejected { reason } => {
+                    return Err(OpError::InputRejected {
+                        paper_id: paper.id.clone(),
+                        backend: paper.backend.clone(),
+                        reason,
+                    });
+                }
+            },
+            None => Vec::new(),
+        };
+
         let email = if paper.backend == "stanford" {
             resolve_submission_email(self.config, "stanford", None).map_err(|err| {
                 OpError::SubmitterEmailUnavailable {
@@ -178,7 +193,7 @@ impl<'a> ReviewOps<'a> {
             git_commit: None,
             next_poll_at: None,
         };
-        let input = ManuscriptInput::new(&job);
+        let input = ManuscriptInput::new(&job, notices);
 
         let outcome = self
             .db

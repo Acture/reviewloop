@@ -34,6 +34,7 @@ use reqwest_middleware::ClientWithMiddleware;
 use serde_json::{Map, Value, json};
 
 pub const BACKEND: &str = "cspaper";
+pub const PROVIDER_NAME: &str = "CSPaper Agentic Review";
 /// Review option carrying the desk-rejection setting; see
 /// [`crate::config::Config::review_options_for`].
 pub const DESK_REJECTION_ENABLED: &str = "desk_rejection_enabled";

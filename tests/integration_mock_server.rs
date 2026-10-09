@@ -1318,3 +1318,172 @@ async fn retention_keeps_referenced_snapshots_and_removes_orphans() -> Result<()
     assert_eq!(pruned.payload["snapshots"], json!(1));
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------
+// OSS-352 acceptance: restart keeps the receipt, archives carry provenance, tokens stay
+// out of diagnostics
+// ---------------------------------------------------------------------------------------
+
+/// The review payload shape `paperreview.ai/static/review.js` renders.
+fn provider_review_payload() -> Value {
+    json!({
+        "title": "Restart Paper",
+        "venue": "ICLR",
+        "submission_date": "2026-10-09T15:30:00",
+        "numerical_score": 6.2,
+        "has_feedback": false,
+        "content": "## Summary\nFull raw review text",
+        "sections": {
+            "summary": "Solid work",
+            "strengths": "Clear writing",
+            "weaknesses": "Small benchmarks",
+            "assessment": "Borderline accept"
+        }
+    })
+}
+
+#[tokio::test]
+async fn restart_resumes_the_same_receipt_and_archives_the_uploaded_snapshot() -> Result<()> {
+    const TOKEN: &str = "tok-restart-0123456789";
+    let state = Arc::new(MockState::default());
+    let server = MockServer::start(state.clone()).await?;
+    enqueue_successful_submit(&state, &server.base_url, TOKEN);
+    state.enqueue_review(
+        TOKEN,
+        MockReply::json(
+            StatusCode::ACCEPTED,
+            json!({ "detail": "Review is still being processed" }),
+        ),
+    );
+    state.enqueue_review(
+        TOKEN,
+        MockReply::json(StatusCode::OK, provider_review_payload()),
+    );
+
+    let mut ctx = TestContext::new(server.base_url.clone())?;
+    ctx.config.polling.schedule_minutes = vec![0];
+    let original = fs::read(&ctx.pdf_path)?;
+    let job = ctx.create_pinned_job(JobStatus::Queued)?;
+
+    // First process: submits, then polls once while the provider is still working.
+    worker::run_tick(&ctx.config, &ctx.db).await?;
+    let processing = ctx.db.get_job(&job.id)?.context("job not found")?;
+    assert_eq!(processing.status, JobStatus::Processing);
+    assert_eq!(processing.token.as_deref(), Some(TOKEN));
+
+    // Restart: a fresh database handle and a reloaded config, with the source edited
+    // and the paper repointed in between.
+    mutate_source_and_config(&mut ctx)?;
+    let restarted = Db::new(Path::new(&ctx.config.core.state_dir));
+    restarted.ensure_schema()?;
+    worker::run_tick(&ctx.config, &restarted).await?;
+
+    let done = restarted.get_job(&job.id)?.context("job not found")?;
+    assert_eq!(done.status, JobStatus::Completed);
+    assert_eq!(done.token.as_deref(), Some(TOKEN));
+    assert_eq!(
+        state.call_count("get_upload"),
+        1,
+        "resubmitted after restart"
+    );
+    assert_eq!(
+        state.call_count("confirm_upload"),
+        1,
+        "resubmitted after restart"
+    );
+    assert_eq!(state.call_count(&format!("review:{TOKEN}")), 2);
+
+    let uploads = state.s3_uploads();
+    assert_eq!(uploads, vec![original]);
+    let meta = read_meta(&ctx, &job.id)?;
+    assert_eq!(meta["pdf_hash"], json!(sha256_hex(&uploads[0])));
+    assert_eq!(meta["pdf_hash"], json!(done.pdf_hash));
+    assert_eq!(meta["provider"]["name"], "Stanford Agentic Reviewer");
+    assert_eq!(meta["provider"]["backend"], "stanford");
+    assert_eq!(meta["provider"]["base_url"], json!(server.base_url));
+    assert_eq!(meta["submission"]["channel"], "primary");
+    assert_eq!(meta["submission"]["venue"], "ICLR");
+    assert_eq!(meta["submission"]["version_no"], json!(done.version_no));
+    assert_eq!(meta["submission"]["round_no"], json!(done.round_no));
+    assert_eq!(
+        meta["submission"]["provider_submission_date"],
+        "2026-10-09T15:30:00"
+    );
+
+    let artifacts = ctx.config.state_dir().join("artifacts").join(&job.id);
+    let raw: Value = serde_json::from_str(&fs::read_to_string(artifacts.join("review.json"))?)?;
+    assert_eq!(
+        raw,
+        provider_review_payload(),
+        "raw review must be kept verbatim"
+    );
+    let summary = fs::read_to_string(artifacts.join("review.md"))?;
+    assert!(summary.contains("6.2/10 (ICLR-calibrated)"), "{summary}");
+    assert!(summary.contains("2026-10-09"), "{summary}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn ready_reply_without_review_content_keeps_polling() -> Result<()> {
+    const TOKEN: &str = "tok-empty-ready";
+    let state = Arc::new(MockState::default());
+    let server = MockServer::start(state.clone()).await?;
+    state.enqueue_review(
+        TOKEN,
+        MockReply::json(StatusCode::OK, json!({ "status": "queued" })),
+    );
+
+    let ctx = TestContext::new(server.base_url.clone())?;
+    let job = ctx.create_processing_job(TOKEN)?;
+    worker::poll_job(&ctx.config, &ctx.db, &job.id).await?;
+
+    let after = ctx.db.get_job(&job.id)?.context("job not found")?;
+    assert_eq!(after.status, JobStatus::Processing);
+    assert_eq!(after.attempt, 1);
+    assert!(
+        after
+            .last_error
+            .as_deref()
+            .is_some_and(|err| err.contains("no review content")),
+        "last_error: {:?}",
+        after.last_error
+    );
+    assert!(ctx.db.get_review(&job.id)?.is_none());
+    assert!(
+        !ctx.config
+            .state_dir()
+            .join("artifacts")
+            .join(&job.id)
+            .exists()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn poll_network_error_never_records_the_token() -> Result<()> {
+    const TOKEN: &str = "tok-secret-network-0123456789";
+    // Nothing listens on the discard port: the request fails before any response.
+    let ctx = TestContext::new("http://127.0.0.1:9".to_string())?;
+    let job = ctx.create_processing_job(TOKEN)?;
+    worker::poll_job(&ctx.config, &ctx.db, &job.id).await?;
+
+    let after = ctx.db.get_job(&job.id)?.context("job not found")?;
+    assert_eq!(after.status, JobStatus::Processing);
+    let last_error = after.last_error.context("poll error recorded")?;
+    assert!(!last_error.contains(TOKEN), "token leaked: {last_error}");
+    assert!(last_error.contains("network error"), "{last_error}");
+    let poll_errors: Vec<Value> = ctx
+        .db
+        .list_timeline_events(&ctx.config.project_id, "main")?
+        .into_iter()
+        .filter(|event| event.event_type == "poll_error")
+        .map(|event| event.payload)
+        .collect();
+    assert_eq!(poll_errors.len(), 1);
+    assert!(
+        !poll_errors[0].to_string().contains(TOKEN),
+        "token leaked: {}",
+        poll_errors[0]
+    );
+    Ok(())
+}

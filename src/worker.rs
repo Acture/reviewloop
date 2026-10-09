@@ -1,7 +1,10 @@
 use crate::{
     artifact::write_review_artifacts,
     backend::{
-        BackendError, ReviewBackend, ReviewFetchResult, SubmitReceipt, SubmitRequest, build_backend,
+        BackendError, ReviewBackend, ReviewFetchResult, SubmitProgress, SubmitReceipt,
+        SubmitRequest, build_backend,
+        input::{InputVerdict, input_policy, upload_file_name},
+        provider_source, stanford,
     },
     config::{Config, NotificationsConfig},
     db::{ClaimTiming, Db, JobChange, Lease, LeaseWrite, NewReview, ReceiptWrite},
@@ -22,7 +25,9 @@ use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
 use std::{
+    fs,
     future::Future,
+    io::Write,
     path::{Path, PathBuf},
     time::Duration as StdDuration,
 };
@@ -79,7 +84,6 @@ fn fire_notification(
     }
 }
 
-const STANFORD_MAX_TIMEOUT_SCALE_PAGES: i64 = 20;
 const TERMINAL_REVIEW_FAILURE_HINTS: [&str; 3] = [
     "review generation failed",
     "unable to generate review",
@@ -333,12 +337,16 @@ struct SubmitPlan {
     fallback: Option<FallbackPlan>,
 }
 
+/// The same manuscript, email and venue as the primary request, sent by the fallback
+/// script; it reports its own progress.
 struct FallbackPlan {
     script: PathBuf,
     base_url: String,
     pdf_path: PathBuf,
+    file_name: String,
     email: String,
     venue: Option<String>,
+    progress: SubmitProgress,
 }
 
 impl SubmitPlan {
@@ -366,22 +374,34 @@ impl SubmitPlan {
                 }),
             _ => job.venue.clone(),
         };
-        let fallback = (job.backend == "stanford"
+        let fallback = if job.backend == "stanford"
             && !job.fallback_used
-            && config.providers.stanford.fallback_mode == "node_playwright")
-            .then(|| FallbackPlan {
+            && config.providers.stanford.fallback_mode == "node_playwright"
+        {
+            Some(FallbackPlan {
                 script: PathBuf::from(&config.providers.stanford.fallback_script),
                 base_url: config.providers.stanford.base_url.clone(),
+                file_name: upload_file_name(&snapshot_path).with_context(|| {
+                    format!(
+                        "snapshot has no usable file name: {}",
+                        snapshot_path.display()
+                    )
+                })?,
                 pdf_path: snapshot_path.clone(),
                 email: email.clone(),
                 venue: venue.clone(),
-            });
+                progress: SubmitProgress::default(),
+            })
+        } else {
+            None
+        };
         Ok(Some(Self {
             request: SubmitRequest {
                 pdf_path: snapshot_path,
                 email,
                 venue,
                 review_options: job.review_options.clone(),
+                progress: SubmitProgress::default(),
             },
             fallback,
         }))
@@ -478,6 +498,11 @@ async fn submit_leased(
         Ok(None) => return Ok(()),
         Err(err) => return Err(abandon_claim(db, &lease, err)),
     };
+    match preflight(config, db, &lease, &plan.request.pdf_path) {
+        Ok(true) => {}
+        Ok(false) => return Ok(()),
+        Err(err) => return Err(abandon_claim(db, &lease, err)),
+    }
 
     if !db.begin_submit_dispatch(
         &mut lease,
@@ -489,23 +514,118 @@ async fn submit_leased(
         return Ok(());
     }
 
+    let progress = plan.request.progress.clone();
+    let primary = Dispatch {
+        channel: SubmitChannel::Primary,
+        progress: &progress,
+    };
     match bounded_submit(backend.submit(plan.request)).await {
         Ok(receipt) => accept_receipt(config, db, &lease, &receipt, SubmitChannel::Primary),
         Err(BackendError::OutcomeUnknown(detail)) => {
-            mark_uncertain(config, db, &lease, SubmitChannel::Primary, &detail)
+            mark_uncertain(config, db, &lease, primary, &detail)
         }
         Err(BackendError::RateLimited {
             message,
             retry_after,
-        }) => schedule_submit_retry(config, db, &lease, message, retry_after),
+        }) => schedule_submit_retry(config, db, &lease, primary, message, retry_after),
         // Nothing was created, but no other job of this backend can succeed until
         // someone fixes the credentials: say so instead of failing quietly.
         Err(err @ BackendError::Auth(_)) => park_submit_needs_manual(config, db, &lease, err),
         // The provider provably rejected the request, so another route cannot duplicate it.
         Err(err) => match plan.fallback {
-            Some(fallback) => submit_via_fallback(config, db, lease, fallback, err).await,
-            None => fail_submit(db, &lease, err),
+            Some(fallback) => {
+                let primary_step = progress.current();
+                submit_via_fallback(config, db, lease, fallback, err, primary_step).await
+            }
+            None => fail_submit(db, &lease, primary, err),
         },
+    }
+}
+
+/// Which route a dispatch took and the step it reached, for its outcome event.
+#[derive(Clone, Copy)]
+struct Dispatch<'a> {
+    channel: SubmitChannel,
+    progress: &'a SubmitProgress,
+}
+
+impl Dispatch<'_> {
+    /// `payload` with the step this dispatch reached, when the backend reported one.
+    fn with_step(&self, mut payload: Value) -> Value {
+        if let (Some(step), Some(fields)) = (self.progress.current(), payload.as_object_mut()) {
+            fields.insert("step".to_string(), Value::from(step.as_str()));
+        }
+        payload
+    }
+}
+
+/// Check the pinned PDF against the provider's published limits before anything is
+/// sent. Returns `false` after moving the job to FAILED_NEEDS_MANUAL when the provider
+/// would refuse it; a rejected input never reaches the provider or the fallback, whose
+/// form would refuse it client-side and leave the outcome looking unknown.
+fn preflight(config: &Config, db: &Db, lease: &Lease, pdf_path: &Path) -> Result<bool> {
+    let job = &lease.job;
+    let Some(policy) = input_policy(&job.backend) else {
+        return Ok(true);
+    };
+    match policy.check(pdf_path)? {
+        InputVerdict::Accepted {
+            estimated_pages,
+            notices,
+        } => {
+            if !notices.is_empty() {
+                for notice in &notices {
+                    warn!(job_id = %job.id, notice = %notice, "provider will not review the whole PDF");
+                }
+                db.add_event(
+                    None,
+                    Some(&job.id),
+                    "submit_input_notice",
+                    json!({
+                        "estimated_pages": estimated_pages,
+                        "reviewed_pages": policy.reviewed_pages,
+                        "notices": notices,
+                    }),
+                )?;
+            }
+            Ok(true)
+        }
+        InputVerdict::Rejected { reason } => {
+            let message = format!(
+                "submission blocked: {reason}. Nothing was sent. Request a review of the \
+                 fixed PDF with `reviewloop submit --paper-id {}`",
+                job.paper_id
+            );
+            let change = JobChange {
+                status: JobStatus::FailedNeedsManual,
+                attempt: Some(job.attempt),
+                next_poll_at: Some(None),
+                last_error: Some(Some(message.clone())),
+                submit_stage: None,
+                fallback_used: None,
+            };
+            if finish(
+                db,
+                lease,
+                &change,
+                "submit_input_rejected",
+                json!({
+                    "reason": reason,
+                    "pdf_hash": job.pdf_hash,
+                    "snapshot_path": job.snapshot_path,
+                }),
+            )? {
+                fire_notification(
+                    &config.notifications,
+                    NotificationKind::FailedNeedsManual,
+                    Some(&job.paper_id),
+                    Some(&job.id),
+                    Some(&message),
+                );
+                error!(job_id = %job.id, reason = %reason, "submission blocked: the provider would refuse this PDF");
+            }
+            Ok(false)
+        }
     }
 }
 
@@ -515,6 +635,7 @@ async fn submit_via_fallback(
     mut lease: Lease,
     fallback: FallbackPlan,
     primary_err: BackendError,
+    primary_step: Option<crate::backend::SubmitStep>,
 ) -> Result<()> {
     if !db.begin_submit_dispatch(
         &mut lease,
@@ -532,19 +653,34 @@ async fn submit_via_fallback(
         &fallback.script,
         &fallback.base_url,
         &fallback.pdf_path,
+        &fallback.file_name,
         &fallback.email,
         fallback.venue.as_deref(),
+        &fallback.progress,
     ))
     .await;
+    let dispatch = Dispatch {
+        channel: SubmitChannel::Fallback,
+        progress: &fallback.progress,
+    };
+    let primary_err = match primary_step {
+        Some(step) => format!("{primary_err} (at {})", step.as_str()),
+        None => primary_err.to_string(),
+    };
     match result {
         Ok(receipt) => accept_receipt(config, db, &lease, &receipt, SubmitChannel::Fallback),
         Err(BackendError::OutcomeUnknown(detail)) => mark_uncertain(
             config,
             db,
             &lease,
-            SubmitChannel::Fallback,
+            dispatch,
             &format!("primary submit error: {primary_err}; fallback: {detail}"),
         ),
+        // Nothing was created, so a later attempt may take either route again.
+        Err(BackendError::RateLimited {
+            message,
+            retry_after,
+        }) => schedule_submit_retry(config, db, &lease, dispatch, message, retry_after),
         Err(fallback_err) => {
             let reason =
                 format!("primary submit error: {primary_err}; fallback error: {fallback_err}");
@@ -562,7 +698,7 @@ async fn submit_via_fallback(
                 &lease,
                 &change,
                 "submit_failed_needs_manual",
-                json!({ "reason": reason }),
+                dispatch.with_step(json!({ "reason": reason, "channel": "fallback" })),
             )? {
                 fire_notification(
                     &config.notifications,
@@ -607,15 +743,34 @@ fn accept_receipt(
         config.polling.jitter_percent,
     );
     let job_id = &lease.job.id;
-    // Name the token in the error so a failed save still leaves it in the daemon log.
-    let write = db
-        .record_submit_receipt(lease, Utc::now(), &receipt.token, next_poll, channel)
-        .with_context(|| {
-            format!(
-                "failed to save submit receipt token {} for job {job_id}",
-                receipt.token
-            )
-        })?;
+    let write = match db.record_submit_receipt(
+        lease,
+        Utc::now(),
+        &receipt.token,
+        next_poll,
+        channel,
+    ) {
+        Ok(write) => write,
+        Err(err) => {
+            // The provider holds this submission: keep its token where the operator can
+            // reach it without writing it to the daemon log or a notification.
+            let context = match keep_unsaved_receipt(config, lease, receipt, channel) {
+                Ok(kept) => format!(
+                    "failed to save the submit receipt for job {job_id}; its token is kept in {} \
+                     (attach it with `reviewloop import-token --job-id {job_id} --token <token>`)",
+                    kept.display()
+                ),
+                // Last resort: with neither the database nor the state dir writable, the
+                // daemon log is the only place left that can keep the token.
+                Err(keep_err) => format!(
+                    "failed to save the submit receipt for job {job_id} and to keep it on disk \
+                     ({keep_err:#}); token {}",
+                    receipt.token
+                ),
+            };
+            return Err(err.context(context));
+        }
+    };
     match write {
         ReceiptWrite::Accepted => match channel {
             SubmitChannel::Primary => info!(job_id = %job_id, "job submitted"),
@@ -647,15 +802,52 @@ fn accept_receipt(
     Ok(())
 }
 
+/// Write a receipt the database refused to `<state_dir>/recovery/`, readable only by
+/// its owner. Returns the file's path.
+fn keep_unsaved_receipt(
+    config: &Config,
+    lease: &Lease,
+    receipt: &SubmitReceipt,
+    channel: SubmitChannel,
+) -> Result<PathBuf> {
+    let dir = config.state_dir().join("recovery");
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = dir.join(format!(
+        "receipt-{}-{}.json",
+        lease.job.id,
+        Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    let record = json!({
+        "job_id": lease.job.id,
+        "paper_id": lease.job.paper_id,
+        "backend": lease.job.backend,
+        "channel": channel.as_str(),
+        "token": receipt.token,
+        "received_at": Utc::now().to_rfc3339(),
+    });
+    file.write_all(serde_json::to_string_pretty(&record)?.as_bytes())
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
 /// The provider may hold the submission: park the job as SUBMITTED/UNCERTAIN. It is
 /// never resubmitted or handed to the fallback automatically.
 fn mark_uncertain(
     config: &Config,
     db: &Db,
     lease: &Lease,
-    channel: SubmitChannel,
+    dispatch: Dispatch<'_>,
     detail: &str,
 ) -> Result<()> {
+    let channel = dispatch.channel;
     let reason = format!(
         "submission outcome unknown ({} channel): {detail}; {}",
         channel.as_str(),
@@ -674,7 +866,9 @@ fn mark_uncertain(
         lease,
         &change,
         "submit_outcome_unknown",
-        json!({ "source": "dispatch_error", "channel": channel.as_str(), "error": detail }),
+        dispatch.with_step(
+            json!({ "source": "dispatch_error", "channel": channel.as_str(), "error": detail }),
+        ),
     )? {
         fire_notification(
             &config.notifications,
@@ -692,6 +886,7 @@ fn schedule_submit_retry(
     config: &Config,
     db: &Db,
     lease: &Lease,
+    dispatch: Dispatch<'_>,
     message: String,
     retry_after: Option<Duration>,
 ) -> Result<()> {
@@ -716,14 +911,20 @@ fn schedule_submit_retry(
         next_poll_at: Some(Some(next)),
         last_error: Some(Some(message.clone())),
         submit_stage: None,
-        fallback_used: None,
+        // A rate-limited fallback created nothing, so it stays available.
+        fallback_used: (dispatch.channel == SubmitChannel::Fallback).then_some(false),
     };
     if finish(
         db,
         lease,
         &change,
         "submit_rate_limited",
-        json!({ "message": message, "next_poll_at": next.to_rfc3339(), "retry_after_source": retry_after_source }),
+        dispatch.with_step(json!({
+            "message": message,
+            "next_poll_at": next.to_rfc3339(),
+            "retry_after_source": retry_after_source,
+            "channel": dispatch.channel.as_str(),
+        })),
     )? {
         warn!(job_id = %lease.job.id, retry_after_source, "submit rate limited; next attempt scheduled");
     }
@@ -766,7 +967,7 @@ fn park_submit_needs_manual(
     Ok(())
 }
 
-fn fail_submit(db: &Db, lease: &Lease, err: BackendError) -> Result<()> {
+fn fail_submit(db: &Db, lease: &Lease, dispatch: Dispatch<'_>, err: BackendError) -> Result<()> {
     let reason = err.to_string();
     let change = JobChange {
         status: JobStatus::Failed,
@@ -781,7 +982,7 @@ fn fail_submit(db: &Db, lease: &Lease, err: BackendError) -> Result<()> {
         lease,
         &change,
         "submit_failed",
-        json!({ "reason": reason }),
+        dispatch.with_step(json!({ "reason": reason, "channel": dispatch.channel.as_str() })),
     )? {
         error!(job_id = %lease.job.id, "submit failed");
     }
@@ -886,11 +1087,17 @@ async fn poll_leased(
             // Writing artifacts before the ownership check is harmless: a poll lease
             // guards nothing the provider holds, so a lost lease only leaves files for
             // a job that ended another way.
-            let summary_md =
-                match write_review_artifacts(&config.state_dir(), job, &token, &raw_json) {
-                    Ok((_, summary_md, _)) => summary_md,
-                    Err(err) => return Err(abandon_claim(db, &lease, err)),
-                };
+            let source = provider_source(config, &job.backend);
+            let summary_md = match write_review_artifacts(
+                &config.state_dir(),
+                job,
+                &token,
+                &raw_json,
+                &source,
+            ) {
+                Ok((_, summary_md, _)) => summary_md,
+                Err(err) => return Err(abandon_claim(db, &lease, err)),
+            };
             let raw_json = raw_json.to_string();
             let change = JobChange {
                 status: JobStatus::Completed,
@@ -1187,9 +1394,10 @@ fn timeout_for_job(config: &Config, job: &Job) -> Duration {
         return Duration::hours(base_hours);
     }
 
-    let capped_pages = i64::min(pages as i64, STANFORD_MAX_TIMEOUT_SCALE_PAGES);
-    let scaled_hours = (base_hours * capped_pages + STANFORD_MAX_TIMEOUT_SCALE_PAGES - 1)
-        / STANFORD_MAX_TIMEOUT_SCALE_PAGES;
+    // The provider reviews only the leading pages, so pages past them take no longer.
+    let reviewed = stanford::INPUT_POLICY.reviewed_pages.unwrap_or(pages) as i64;
+    let capped_pages = i64::min(pages as i64, reviewed);
+    let scaled_hours = (base_hours * capped_pages + reviewed - 1) / reviewed;
     Duration::hours(i64::max(scaled_hours, 1))
 }
 

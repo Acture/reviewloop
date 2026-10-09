@@ -17,7 +17,9 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use common::{Ctx, EMAIL, PROJECT, assert_no_lease, event_types, node_available};
 use reviewloop::{
+    backend::stanford::{StanfordBackend, StepTimeouts},
     db::{CancelOutcome, ClaimTiming, LeaseRecovery},
+    http::{Redirects, build_client},
     model::{EventRecord, Job, JobStatus, SubmitStage, WorkKind},
     worker::{self, Attempt},
 };
@@ -117,6 +119,7 @@ enum Step {
 struct MockState {
     steps: Mutex<HashMap<&'static str, VecDeque<Step>>>,
     calls: Mutex<HashMap<&'static str, usize>>,
+    bodies: Mutex<HashMap<&'static str, Vec<Vec<u8>>>>,
     entered: Notify,
     release: Notify,
 }
@@ -135,10 +138,28 @@ impl MockState {
         self.calls.lock().unwrap().get(route).copied().unwrap_or(0)
     }
 
+    /// Raw request bodies `route` received, in order.
+    fn bodies(&self, route: &'static str) -> Vec<Vec<u8>> {
+        self.bodies
+            .lock()
+            .unwrap()
+            .get(route)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     async fn serve(&self, route: &'static str, req: Request) -> Response {
         *self.calls.lock().unwrap().entry(route).or_insert(0) += 1;
         // Read the whole body first, so a gated request has provably been delivered.
-        let _ = to_bytes(req.into_body(), usize::MAX).await;
+        let body = to_bytes(req.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        self.bodies
+            .lock()
+            .unwrap()
+            .entry(route)
+            .or_default()
+            .push(body.to_vec());
         let step = self
             .steps
             .lock()
@@ -1141,5 +1162,430 @@ async fn shipped_fallback_script_reports_pre_submit_failure_as_definitive() -> R
         "fallback error: command error",
     );
     assert_contains(failed.last_error.as_deref(), "\"submitted\":false");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// OSS-352: every provider step is identified, inputs are checked before anything is
+// sent, and the fallback reports in the primary's terms
+// ---------------------------------------------------------------------------------------
+
+/// The `step` recorded on the job's last submit event.
+fn last_step(events: &[EventRecord]) -> Option<&str> {
+    events
+        .last()
+        .and_then(|event| event.payload["step"].as_str())
+}
+
+/// A Stanford backend on the mock provider whose `step` calls give up after 300 ms.
+fn impatient_backend(ctx: &TestContext, step: &str) -> Result<StanfordBackend> {
+    let short = StdDuration::from_millis(300);
+    let mut timeouts = StepTimeouts::default();
+    match step {
+        "upload_init" => timeouts.upload_init = short,
+        "confirm" => timeouts.confirm = short,
+        other => anyhow::bail!("no timeout for step {other}"),
+    }
+    Ok(StanfordBackend::new(
+        ctx.server.base_url.clone(),
+        build_client(&ctx.config, None, None, Redirects::Follow)?,
+    )
+    .with_timeouts(timeouts))
+}
+
+#[tokio::test]
+async fn upload_init_failure_is_definitive_at_the_upload_init_step() -> Result<()> {
+    let ctx = TestContext::start().await?;
+    ctx.mock().push(
+        GET_UPLOAD,
+        Step::Reply(Reply::json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "detail": "presign backend down" }),
+        )),
+    );
+    let job = ctx.create_queued_job()?;
+    assert_definitive_failure(&ctx, &job, "server error (500): presign backend down").await?;
+    assert_eq!(last_step(&ctx.events(&job.id)?), Some("upload_init"));
+    assert_eq!(ctx.calls(), [1, 0, 0]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_failure_is_definitive_at_the_upload_step_and_never_confirms() -> Result<()> {
+    let ctx = TestContext::start().await?;
+    ctx.mock()
+        .push(GET_UPLOAD, Step::Reply(ctx.upload_url_reply()));
+    ctx.mock().push(
+        S3,
+        Step::Reply(Reply::text(
+            StatusCode::FORBIDDEN,
+            "<Error><Code>AccessDenied</Code></Error>",
+        )),
+    );
+    let job = ctx.create_queued_job()?;
+    assert_definitive_failure(&ctx, &job, "AccessDenied").await?;
+    assert_eq!(last_step(&ctx.events(&job.id)?), Some("upload"));
+    assert_eq!(ctx.calls(), [1, 1, 0]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn confirm_rejection_names_the_confirm_step_and_the_validation_detail() -> Result<()> {
+    let ctx = TestContext::start().await?;
+    ctx.upload_succeeds();
+    // FastAPI reports validation failures as a list, as the live service does.
+    ctx.confirm(Step::Reply(Reply::json(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        json!({ "detail": [
+            { "type": "missing", "loc": ["body", "email"], "msg": "Field required", "input": null }
+        ] }),
+    )));
+    let job = ctx.create_queued_job()?;
+    assert_definitive_failure(&ctx, &job, "email: Field required").await?;
+    assert_eq!(last_step(&ctx.events(&job.id)?), Some("confirm"));
+    assert_eq!(ctx.calls(), [1, 1, 1]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_confirm_outcome_names_the_confirm_step() -> Result<()> {
+    let ctx = TestContext::start().await?;
+    ctx.upload_succeeds();
+    ctx.confirm(Step::Reply(Reply::json(
+        StatusCode::BAD_GATEWAY,
+        json!({ "detail": "upstream" }),
+    )));
+    let job = ctx.create_queued_job()?;
+    assert_eq!(ctx.submit(&job).await?, Attempt::Ran);
+    assert_uncertain(
+        &ctx.job(&job.id)?,
+        "primary",
+        &["confirm-upload returned 502"],
+    );
+    let events = ctx.events(&job.id)?;
+    assert_outcome_unknown_event(&events[1], "primary", "confirm-upload returned 502");
+    assert_eq!(last_step(&events), Some("confirm"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_init_rate_limit_requeues_at_the_upload_init_step() -> Result<()> {
+    let ctx = TestContext::start().await?;
+    ctx.mock().push(
+        GET_UPLOAD,
+        Step::Reply(
+            Reply::json(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({ "detail": "Rate limit exceeded: 3 per 1 hour" }),
+            )
+            .header("retry-after", "600"),
+        ),
+    );
+    let job = ctx.create_queued_job()?;
+    assert_eq!(ctx.submit(&job).await?, Attempt::Ran);
+    let queued = ctx.job(&job.id)?;
+    assert_eq!(queued.status, JobStatus::Queued);
+    assert_eq!(
+        queued.last_error.as_deref(),
+        Some("Rate limit exceeded: 3 per 1 hour")
+    );
+    assert_minutes_from_now(queued.next_poll_at, 9, 10);
+    let events = ctx.events(&job.id)?;
+    assert_eq!(
+        event_types(&events),
+        ["submit_dispatched", "submit_rate_limited"]
+    );
+    assert_eq!(events[1].payload["channel"], "primary");
+    assert_eq!(last_step(&events), Some("upload_init"));
+    assert_eq!(ctx.calls(), [1, 0, 0]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn hung_upload_init_times_out_as_definitive_without_confirming() -> Result<()> {
+    let ctx = TestContext::start().await?;
+    ctx.mock().push(GET_UPLOAD, Step::Hang);
+    let job = ctx.create_queued_job()?;
+    let backend = impatient_backend(&ctx, "upload_init")?;
+
+    let attempt = tokio::time::timeout(
+        GUARD,
+        worker::submit_job_with_backend(&ctx.config, &ctx.db, &job.id, &backend),
+    )
+    .await
+    .context("submit did not finish")??;
+    assert_eq!(attempt, Attempt::Ran);
+
+    let failed = ctx.job(&job.id)?;
+    assert_eq!(failed.status, JobStatus::Failed);
+    assert_eq!(failed.submit_stage, None);
+    assert_contains(failed.last_error.as_deref(), "get-upload-url");
+    assert_contains(failed.last_error.as_deref(), "timed out");
+    let events = ctx.events(&job.id)?;
+    assert_eq!(event_types(&events), ["submit_dispatched", "submit_failed"]);
+    assert_eq!(last_step(&events), Some("upload_init"));
+    assert_eq!(ctx.calls(), [1, 0, 0]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn hung_confirm_times_out_as_unknown_outcome() -> Result<()> {
+    let ctx = TestContext::start().await?;
+    ctx.upload_succeeds();
+    ctx.confirm(Step::Hang);
+    let job = ctx.create_queued_job()?;
+    let backend = impatient_backend(&ctx, "confirm")?;
+
+    let attempt = tokio::time::timeout(
+        GUARD,
+        worker::submit_job_with_backend(&ctx.config, &ctx.db, &job.id, &backend),
+    )
+    .await
+    .context("submit did not finish")??;
+    assert_eq!(attempt, Attempt::Ran);
+
+    assert_uncertain(
+        &ctx.job(&job.id)?,
+        "primary",
+        &["confirm-upload got no response"],
+    );
+    assert_eq!(last_step(&ctx.events(&job.id)?), Some("confirm"));
+    assert_eq!(ctx.calls(), [1, 1, 1]);
+    Ok(())
+}
+
+/// A rejected input is final before dispatch: no provider call, no fallback, and the
+/// operator is told what to fix.
+async fn assert_input_rejected_before_dispatch(pdf: &[u8], reason: &str) -> Result<()> {
+    let mut ctx = TestContext::start().await?;
+    let marker = ctx.arm_marker_fallback()?;
+    fs::write(&ctx.pdf_path, pdf)?;
+    let job = ctx.create_queued_job()?;
+
+    assert_eq!(ctx.submit(&job).await?, Attempt::Ran);
+
+    let failed = ctx.job(&job.id)?;
+    assert_eq!(failed.status, JobStatus::FailedNeedsManual);
+    assert_eq!(failed.submit_stage, None);
+    assert_eq!(failed.attempt, 0);
+    assert!(!failed.fallback_used);
+    assert_no_lease(&failed);
+    assert_contains(failed.last_error.as_deref(), reason);
+    let events = ctx.events(&job.id)?;
+    assert_eq!(event_types(&events), ["submit_input_rejected"]);
+    assert_contains(events[0].payload["reason"].as_str(), reason);
+    assert_eq!(ctx.calls(), [0, 0, 0]);
+    assert!(!marker.exists(), "fallback ran");
+    ctx.assert_ticks_leave_alone(&job, 1).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_pdf_is_rejected_before_any_request() -> Result<()> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    pdf.resize(10 * 1024 * 1024 + 1, b' ');
+    assert_input_rejected_before_dispatch(&pdf, "exceeds the provider's 10 MiB limit").await
+}
+
+#[tokio::test]
+async fn non_pdf_input_is_rejected_before_any_request() -> Result<()> {
+    assert_input_rejected_before_dispatch(b"<html>not a pdf</html>", "not a PDF").await
+}
+
+#[tokio::test]
+async fn long_paper_records_a_coverage_notice_and_still_submits() -> Result<()> {
+    let ctx = TestContext::start().await?;
+    let pages = "<< /Type /Page >>\n".repeat(18);
+    fs::write(&ctx.pdf_path, format!("%PDF-1.4\n{pages}%%EOF\n"))?;
+    ctx.upload_succeeds();
+    ctx.confirm(Step::Reply(Reply::json(
+        StatusCode::OK,
+        json!({ "success": true, "token": "tok-long" }),
+    )));
+    let job = ctx.create_queued_job()?;
+
+    assert_eq!(ctx.submit(&job).await?, Attempt::Ran);
+
+    assert_eq!(ctx.job(&job.id)?.status, JobStatus::Processing);
+    let events = ctx.events(&job.id)?;
+    assert_eq!(
+        event_types(&events),
+        ["submit_input_notice", "submit_dispatched", "submitted"]
+    );
+    let notice = &events[0].payload;
+    assert_eq!(notice["estimated_pages"], 18);
+    assert_eq!(notice["reviewed_pages"], 15);
+    assert_contains(notice["notices"][0].as_str(), "first 15 pages");
+    Ok(())
+}
+
+#[tokio::test]
+async fn primary_and_fallback_send_the_same_manuscript_email_and_venue() -> Result<()> {
+    if !node_available() {
+        eprintln!("skipped: node is not available");
+        return Ok(());
+    }
+    let mut ctx = TestContext::start().await?;
+    let log = ctx.arm_fallback(FALLBACK_SUCCEEDS)?;
+    ctx.upload_succeeds();
+    ctx.confirm(Step::Reply(confirm_400()));
+    let job = ctx.create_queued_job()?;
+
+    assert_eq!(ctx.submit(&job).await?, Attempt::Ran);
+    assert_eq!(ctx.job(&job.id)?.status, JobStatus::Processing);
+
+    let upload_init: Value = serde_json::from_slice(&ctx.mock().bodies(GET_UPLOAD)[0])?;
+    let confirm_form = String::from_utf8(ctx.mock().bodies(CONFIRM)[0].clone())?;
+    let s3_form = ctx.mock().bodies(S3)[0].clone();
+    let runs = fallback_runs(&log)?;
+    let argv = &runs[0];
+
+    assert_eq!(upload_init["filename"], "paper.pdf");
+    assert_eq!(arg_after(argv, "--filename"), Some("paper.pdf"));
+    assert_eq!(upload_init["venue"], "ICLR");
+    assert_eq!(arg_after(argv, "--venue"), Some("ICLR"));
+    assert!(confirm_form.contains(EMAIL), "confirm form: {confirm_form}");
+    assert!(
+        confirm_form.contains("ICLR"),
+        "confirm form: {confirm_form}"
+    );
+    assert_eq!(arg_after(argv, "--email"), Some(EMAIL));
+    // Both channels upload the job's pinned snapshot.
+    let snapshot = fs::read(arg_after(argv, "--pdf").context("--pdf")?)?;
+    assert!(
+        s3_form
+            .windows(snapshot.len())
+            .any(|window| window == snapshot),
+        "the S3 upload must carry the snapshot bytes"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fallback_rate_limit_requeues_like_the_primary() -> Result<()> {
+    let Some((ctx, job, _log)) = run_fallback(
+        r#"console.error(JSON.stringify({ success: false, submitted: false, stage: "upload_init", rate_limited: true, retry_after_secs: 120, error: "Rate limit exceeded" })); process.exit(1);"#,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let queued = ctx.job(&job.id)?;
+    assert_eq!(queued.status, JobStatus::Queued);
+    assert_eq!(queued.attempt, 1);
+    assert_eq!(queued.submit_stage, None);
+    assert!(
+        !queued.fallback_used,
+        "a rate-limited fallback created nothing, so a retry may use it again"
+    );
+    assert_contains(queued.last_error.as_deref(), "Rate limit exceeded");
+    assert_minutes_from_now(queued.next_poll_at, 1, 2);
+    let events = ctx.events(&job.id)?;
+    assert_eq!(event_types(&events)[2..], ["submit_rate_limited"]);
+    assert_eq!(events[2].payload["channel"], "fallback");
+    assert_eq!(events[2].payload["retry_after_source"], "server");
+    assert_eq!(last_step(&events), Some("upload_init"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fallback_confirm_rejection_is_definitive_not_uncertain() -> Result<()> {
+    assert_fallback_fails_needs_manual(
+        r#"console.error(JSON.stringify({ success: false, submitted: true, stage: "confirm", status: 400, error: "Invalid email address" })); process.exit(1);"#,
+        "Invalid email address",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn fallback_confirm_server_error_stays_uncertain() -> Result<()> {
+    assert_fallback_parks_uncertain(
+        r#"console.error(JSON.stringify({ success: false, submitted: true, stage: "confirm", status: 502, error: "Bad gateway" })); process.exit(1);"#,
+        "Bad gateway",
+    )
+    .await
+}
+
+/// The shipped script's classifier, given the network facts of each provider outcome,
+/// reports what the Rust side maps to the primary's semantics: 429 → rate limited,
+/// nothing confirmed or a 4xx → definitive, a confirm without a definite answer → unknown.
+#[tokio::test]
+async fn shipped_fallback_script_classifies_outcomes_like_the_primary() -> Result<()> {
+    if !node_available() {
+        eprintln!("skipped: node is not available");
+        return Ok(());
+    }
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/paperreview_fallback.mjs");
+    let url = format!("file://{}", script.canonicalize()?.display());
+    let program = format!(
+        r#"import {{ classify, newFacts }} from {url};
+const at = (stage, status, extra = {{}}) => ({{
+  ...newFacts(), stage, confirmSent: stage === 'confirm',
+  responses: {{ [stage]: {{ status, detail: 'detail ' + status, ...extra }} }},
+}});
+console.log(JSON.stringify([
+  classify({{ ...newFacts(), stage: 'confirm', confirmSent: true, token: 'tok' }}),
+  classify(at('upload_init', 429, {{ retryAfterSecs: 60 }})),
+  classify(at('upload', 403)),
+  classify(at('confirm', 422)),
+  classify(at('confirm', 502)),
+  classify({{ ...newFacts(), stage: 'confirm', confirmSent: true, confirmFailed: 'confirm-upload got no response: net::ERR_CONNECTION_RESET' }}),
+  classify({{ ...newFacts(), dialog: 'File size exceeds 10MB limit.' }}),
+  classify(newFacts(), new Error('playwright missing')),
+]));"#,
+        url = json!(url)
+    );
+    let out = Command::new("node")
+        .args(["--input-type=module", "-e", &program])
+        .output()?;
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let reports: Vec<Value> = serde_json::from_slice(&out.stdout)?;
+    let [
+        accepted,
+        limited,
+        upload_rejected,
+        confirm_rejected,
+        confirm_5xx,
+        confirm_lost,
+        alerted,
+        no_browser,
+    ] = reports.as_slice()
+    else {
+        anyhow::bail!("unexpected reports: {reports:?}");
+    };
+
+    assert_eq!(accepted["success"], true);
+    assert_eq!(accepted["token"], "tok");
+
+    assert_eq!(limited["rate_limited"], true);
+    assert_eq!(limited["retry_after_secs"], 60);
+    assert_eq!(limited["submitted"], false);
+    assert_eq!(limited["stage"], "upload_init");
+
+    assert_eq!(upload_rejected["submitted"], false);
+    assert_eq!(upload_rejected["stage"], "upload");
+    assert_eq!(upload_rejected["status"], 403);
+
+    assert_eq!(confirm_rejected["submitted"], true);
+    assert_eq!(confirm_rejected["status"], 422);
+    assert_eq!(confirm_rejected["error"], "detail 422");
+
+    assert_eq!(confirm_5xx["submitted"], true);
+    assert_eq!(confirm_5xx["status"], 502);
+
+    assert_eq!(confirm_lost["submitted"], true);
+    assert!(confirm_lost.get("status").is_none(), "{confirm_lost}");
+    assert_contains(confirm_lost["error"].as_str(), "got no response");
+
+    assert_eq!(alerted["submitted"], false);
+    assert_eq!(alerted["error"], "File size exceeds 10MB limit.");
+
+    assert_eq!(no_browser["submitted"], false);
+    assert_eq!(no_browser["stage"], Value::Null);
+    assert_contains(no_browser["error"].as_str(), "playwright missing");
     Ok(())
 }

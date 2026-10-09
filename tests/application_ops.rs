@@ -10,7 +10,7 @@ use reviewloop::{
         ReviewQuery, ReviewRequest, ReviewRequestOutcome,
     },
     artifact::write_review_artifacts,
-    backend::cspaper,
+    backend::{cspaper, provider_source},
     config::{CSPAPER_API_KEY_ENV, Config, PaperConfig, Redacted},
     db::Db,
     model::{EnqueueConflict, ExistingReason, Job, JobPdf, JobStatus, NewJob},
@@ -163,8 +163,13 @@ impl Fixture {
     /// A job whose review was stored the way the worker stores it.
     fn completed_job(&self, raw: &Value) -> Result<Job> {
         let job = self.submitted_job("hash-completed")?;
-        let (_, summary_md, _) =
-            write_review_artifacts(&self.config.state_dir(), &job, TOKEN, raw)?;
+        let (_, summary_md, _) = write_review_artifacts(
+            &self.config.state_dir(),
+            &job,
+            TOKEN,
+            raw,
+            &provider_source(&self.config, &job.backend),
+        )?;
         self.db
             .upsert_review(&job.id, TOKEN, &raw.to_string(), &summary_md)?;
         self.db
@@ -1377,6 +1382,70 @@ fn operations_map_to_unique_documented_tools() -> Result<()> {
 }
 
 #[test]
+fn request_review_rejects_a_pdf_the_provider_cannot_accept() -> Result<()> {
+    let fx = Fixture::new()?;
+    let mut oversized = b"%PDF-1.4\n".to_vec();
+    oversized.resize(10 * 1024 * 1024 + 1, b' ');
+    fs::write(fx.pdf_path(), &oversized)?;
+
+    let rejected = fx.request(false, Approval::Granted).unwrap_err();
+    assert_eq!(rejected.code(), "input_rejected");
+    let message = rejected.to_string();
+    assert!(message.contains("10 MiB"), "{message}");
+    assert_eq!(
+        serde_json::to_value(rejected.view())?["details"],
+        json!({ "paper_id": "main", "backend": "stanford" })
+    );
+    assert!(
+        fx.ops()
+            .list_jobs(&JobListQuery::default())?
+            .jobs
+            .is_empty()
+    );
+
+    fs::write(fx.pdf_path(), b"PK\x03\x04 a zip, not a pdf")?;
+    let not_pdf = fx.request(false, Approval::Granted).unwrap_err();
+    assert_eq!(not_pdf.code(), "input_rejected");
+    assert!(not_pdf.to_string().contains("not a PDF"), "{not_pdf}");
+    Ok(())
+}
+
+#[test]
+fn request_review_reports_the_provider_review_coverage() -> Result<()> {
+    let fx = Fixture::new()?;
+    assert!(
+        fx.request(false, Approval::Granted)?
+            .input
+            .notices
+            .is_empty()
+    );
+
+    let long = Fixture::new()?;
+    fs::write(
+        long.pdf_path(),
+        format!("%PDF-1.4\n{}%%EOF\n", "<< /Type /Page >>\n".repeat(16)),
+    )?;
+    let outcome = long.request(false, Approval::Granted)?;
+    assert_eq!(
+        outcome.input.notices.len(),
+        1,
+        "{:?}",
+        outcome.input.notices
+    );
+    assert!(
+        outcome.input.notices[0].contains("first 15 pages"),
+        "{:?}",
+        outcome.input.notices
+    );
+    assert!(
+        outcome.input.notices[0].contains("16"),
+        "{:?}",
+        outcome.input.notices
+    );
+    Ok(())
+}
+
+#[test]
 fn every_error_code_is_documented_with_a_view() -> Result<()> {
     let doc = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/review-operations.md"),
@@ -1409,6 +1478,11 @@ fn every_error_code_is_documented_with_a_view() -> Result<()> {
         OpError::SubmitterEmailUnavailable {
             backend: "stanford".into(),
             detail: "none".into(),
+        },
+        OpError::InputRejected {
+            paper_id: "p".into(),
+            backend: "stanford".into(),
+            reason: "too big".into(),
         },
         OpError::ProviderNotConfigured {
             backend: "cspaper".into(),

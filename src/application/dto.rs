@@ -212,10 +212,13 @@ pub struct ManuscriptInput {
     pub review_options: ReviewOptions,
     pub version_source: String,
     pub version_key: String,
+    /// What the provider will not review in this PDF, such as pages past the ones it
+    /// reads. Empty when it reviews all of it.
+    pub notices: Vec<String>,
 }
 
 impl ManuscriptInput {
-    pub(crate) fn new(job: &NewJob) -> Self {
+    pub(crate) fn new(job: &NewJob, notices: Vec<String>) -> Self {
         let identity = job.review_identity();
         ManuscriptInput {
             paper_id: identity.paper_id,
@@ -227,6 +230,7 @@ impl ManuscriptInput {
             review_options: identity.review_options,
             version_source: identity.version_source.as_str().to_string(),
             version_key: identity.version_key,
+            notices,
         }
     }
 }

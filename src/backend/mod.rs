@@ -1,4 +1,5 @@
 pub mod cspaper;
+pub mod input;
 pub mod stanford;
 
 use crate::config::Config;
@@ -7,8 +8,12 @@ use crate::http::Redirects;
 use crate::model::ReviewOptions;
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::Serialize;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 use thiserror::Error;
 
 /// What the worker hands a backend. Everything that shapes the review comes
@@ -19,6 +24,55 @@ pub struct SubmitRequest {
     pub email: String,
     pub venue: Option<String>,
     pub review_options: ReviewOptions,
+    /// Where the backend reports each step it starts; see [`SubmitProgress`].
+    pub progress: SubmitProgress,
+}
+
+/// One step of a provider submission, in the order they run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmitStep {
+    /// Ask the provider for an upload target. Nothing exists remotely yet.
+    UploadInit,
+    /// Upload the PDF to that target. Still no submission.
+    Upload,
+    /// Ask the provider to accept the uploaded PDF: the step that creates the submission.
+    Confirm,
+}
+
+impl SubmitStep {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubmitStep::UploadInit => "upload_init",
+            SubmitStep::Upload => "upload",
+            SubmitStep::Confirm => "confirm",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "upload_init" => Some(SubmitStep::UploadInit),
+            "upload" => Some(SubmitStep::Upload),
+            "confirm" => Some(SubmitStep::Confirm),
+            _ => None,
+        }
+    }
+}
+
+/// The step a submission has reached, shared by the worker and the backend running it.
+/// After the call, [`SubmitProgress::current`] names the step a failure happened in;
+/// every step before it completed.
+#[derive(Debug, Clone, Default)]
+pub struct SubmitProgress(Arc<Mutex<Option<SubmitStep>>>);
+
+impl SubmitProgress {
+    pub fn enter(&self, step: SubmitStep) {
+        *self.0.lock().expect("submit progress poisoned") = Some(step);
+    }
+
+    pub fn current(&self) -> Option<SubmitStep> {
+        *self.0.lock().expect("submit progress poisoned")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +137,34 @@ pub trait ReviewBackend: Send + Sync {
         &self,
         token: &str,
     ) -> std::result::Result<ReviewFetchResult, BackendError>;
+}
+
+/// Which service produced a review, recorded with its artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderSource {
+    pub backend: String,
+    pub name: String,
+    pub base_url: Option<String>,
+}
+
+pub fn provider_source(config: &Config, backend: &str) -> ProviderSource {
+    match backend {
+        "stanford" => ProviderSource {
+            backend: backend.to_string(),
+            name: stanford::PROVIDER_NAME.to_string(),
+            base_url: Some(config.providers.stanford.base_url.clone()),
+        },
+        cspaper::BACKEND => ProviderSource {
+            backend: backend.to_string(),
+            name: cspaper::PROVIDER_NAME.to_string(),
+            base_url: Some(config.providers.cspaper.base_url.clone()),
+        },
+        other => ProviderSource {
+            backend: other.to_string(),
+            name: other.to_string(),
+            base_url: None,
+        },
+    }
 }
 
 pub fn build_backend(

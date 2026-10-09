@@ -1,0 +1,13 @@
+{
+  "success": true,
+  "presigned_url": "https://example-bucket.s3.amazonaws.com/",
+  "s3_key": "uploads/00000000-0000-0000-0000-000000000000/paper.pdf",
+  "presigned_fields": {
+    "key": "uploads/00000000-0000-0000-0000-000000000000/paper.pdf",
+    "x-amz-algorithm": "AWS4-HMAC-SHA256",
+    "x-amz-credential": "REDACTED/20261009/us-west-2/s3/aws4_request",
+    "x-amz-date": "20261009T000000Z",
+    "policy": "REDACTED",
+    "x-amz-signature": "REDACTED"
+  }
+}
