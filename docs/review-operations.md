@@ -64,7 +64,7 @@ job references above. It is a Rust helper, not a tool.
 | Field | Type | Nullability | Semantics |
 |---|---|---|---|
 | `ReviewRequest.paper_id` | string | required | A configured paper. Its current PDF is hashed. |
-| `ReviewRequest.request_key` | string | nullable | Idempotency key, scoped to the project. The first request binds it to the job it resolves to together with the review identity derived then. A replay derives the identity again from the paper's current PDF and config: while it matches and the job exists, the replay returns that job (`reason` `request_replay`), even once the job has finished. If the PDF, venue or backend changed since, the replay is `request_conflict`; if the paper or its PDF is gone, it is `paper_not_found` / `pdf_not_found`. A blank key is `invalid_request`. A new review round needs a new key. |
+| `ReviewRequest.request_key` | string | nullable | Idempotency key, scoped to the project. The first request binds it to the job it resolves to together with the review identity derived then. A replay derives the identity again from the paper's current PDF and config: while it matches and the job exists, the replay returns that job (`reason` `request_replay`), even once the job has finished. If the PDF, backend, venue (for `cspaper` the review template) or review options changed since, the replay is `request_conflict`; if the paper or its PDF is gone, it is `paper_not_found` / `pdf_not_found`. A blank key is `invalid_request`. A new review round needs a new key. |
 | `ReviewRequest.force` | boolean | required | Start a new review round even when a job covers this manuscript, and clear the cooldown (`attempt`, `next_poll_at`) of the paper's other QUEUED, SUBMITTED and PROCESSING jobs. A replayed `request_key` still wins. |
 | `ReviewRequest.approval` | `Granted` or `Required` | required | `Granted`: the job starts QUEUED. `Required`: it starts PENDING_APPROVAL and is not sent while pending: only `approve_job` moves it on (`retry_job` refuses it; `cancel_job` ends it). Adapters MUST choose explicitly; the CLI always grants. Neither value changes an `existing` job. |
 | `ReviewRequest.origin` | `Submit`, `Run` or `Agent` | required | Recorded as `source` on the `job_enqueued` / `duplicate_skipped` event (`manual_submit`, `run`, `agent_request`) and as `from_command` on `force_clear_cooldown`. Agents use `Agent`. |
@@ -87,7 +87,7 @@ job references above. It is a Rust helper, not a tool.
 | `PENDING_APPROVAL` | `awaiting_approval` | Stored; waits for `approve_job`. Not sent while pending. | `null` |
 | `QUEUED` | `queued` | Stored locally and **not** accepted by the provider. A worker submits it. | Earliest submission attempt (set after a rate limit); `null` means the next worker tick. |
 | `PROCESSING` | `submitted` | The provider accepted the PDF and returned a token (`has_token`). The worker polls for the review. | Next provider poll. |
-| `SUBMITTED` | `submitted` | The submission may have reached the provider. While a worker holds its lease (`submit_stage` DISPATCHED) the request is in flight; otherwise (`UNCERTAIN`) the outcome is unknown and the job is never resubmitted automatically: a token email, `import-token --job-id`, an explicit `retry_job` or `cancel_job` settles it. `retry_job` refuses a job whose dispatch is in flight, and polls instead of resubmitting once a receipt token is saved. | As stored. |
+| `SUBMITTED` | `submitted` | The submission may have reached the provider. While a worker holds its lease (`submit_stage` DISPATCHED) the request is in flight; otherwise (`UNCERTAIN`) the outcome is unknown and the job is never resubmitted automatically: a token email (`stanford` only), `import-token --job-id`, an explicit `retry_job` or `cancel_job` settles it. `retry_job` refuses a job whose dispatch is in flight, and polls instead of resubmitting once a receipt token is saved. CSPaper sends no email: find the paper in the CSPaper review list (https://cspaper.org/platform/review) and pass its CSPaper `job_id` to `import-token --job-id`; otherwise `retry_job` resubmits it (may duplicate) or `cancel_job` ends it. | As stored. |
 | `COMPLETED` | `completed` | The review is stored; `get_review` returns it. | `null` |
 | `FAILED`, `FAILED_NEEDS_MANUAL`, `TIMEOUT` | `failed` | The attempt ended. `last_error` explains it; `retry_job` can re-queue it. | `null` |
 | `FAILED` with a `cancelled by user` error | `cancelled` | Cancelled locally. A submission the provider already accepted (`has_token`) is not revoked; its result is no longer collected. | `null` |
@@ -99,6 +99,23 @@ PENDING_APPROVAL job, so check `job.status` and call `approve_job` if
 needed. The worker leaves a job
 alone until its `next_poll_at`, or until its next tick (about 30 seconds) when
 that is `null`; callers SHOULD NOT check an active job more often than that.
+
+`FAILED_NEEDS_MANUAL` is terminal (`terminal` true, phase `failed`) and fires
+a notification. Besides a blocked submission input, a failed fallback and a
+terminal provider error, it records two provider outcomes:
+
+- **Credentials refused at submission** (no CSPaper key, or a 401 / 403;
+  event `submit_failed_needs_manual`). Nothing was created and the job has no
+  token, so after fixing the key `retry_job` queues it for submission again.
+- **The provider reported the review failed** (CSPaper `FAILED`; event
+  `poll_provider_failed`, `last_error` carries its `failed_reason`). The job
+  keeps its token, so `retry_job` only polls the same failure again. A new
+  review needs `request_review`, which this job does not block because failed
+  jobs cover nothing.
+
+A CSPaper poll refused with 401 / 403 is not terminal: the job stays
+PROCESSING and is polled on the schedule until `review_timeout_hours` marks it
+TIMEOUT.
 
 ### Retry semantics
 
@@ -135,7 +152,7 @@ caller leaves it to the worker's next tick.
 | `status` | string | required | One of `"PENDING_APPROVAL"`, `"QUEUED"`, `"SUBMITTED"`, `"PROCESSING"`, `"COMPLETED"`, `"FAILED"`, `"FAILED_NEEDS_MANUAL"`, `"TIMEOUT"`. |
 | `phase` | string | required | One of `"awaiting_approval"`, `"queued"`, `"submitted"`, `"completed"`, `"failed"`, `"cancelled"` (see the lifecycle table). |
 | `terminal` | boolean | required | `true` for COMPLETED, FAILED, FAILED_NEEDS_MANUAL and TIMEOUT. |
-| `has_token` | boolean | required | The provider acknowledged a submission. The token itself is never returned. |
+| `has_token` | boolean | required | The provider acknowledged a submission. The token (for `cspaper`, the CSPaper `job_id`) is never returned. |
 | `review_available` | boolean | required | A review is stored; `get_review` succeeds. |
 | `review_completed_at` | RFC3339 UTC timestamp string | nullable | When the review was stored. |
 | `attempt` | integer | required | Attempts in the current submit or poll cycle. |
@@ -150,7 +167,7 @@ caller leaves it to the worker's next tick.
 | `version_key` | string | required | The hash or commit identifying the version. |
 | `git_tag` | string | nullable | Tag that triggered the job, if any. |
 | `git_commit` | string | nullable | Commit of that tag, if any. |
-| `fallback_used` | boolean | required | The browser fallback submitted the job. |
+| `fallback_used` | boolean | required | The browser fallback submitted the job. `stanford` only; always `false` for `cspaper`, which has no fallback. |
 | `submit_stage` | string | nullable | Current submit attempt: `CLAIMED` (a worker owns it, nothing sent), `DISPATCHED` (the request may be in flight) or `UNCERTAIN` (the provider may hold it but no receipt was saved; never resubmitted automatically, see `last_error`). |
 | `last_error` | string | nullable | Last failure, token-redacted. |
 | `created_at` | RFC3339 UTC timestamp string | required | Creation time. |
@@ -176,12 +193,12 @@ caller leaves it to the worker's next tick.
 | `PaperView` | object | — | `paper_id`, `backend`, `venue` and `review_options` (what a new request would send), `pdf_path`, `pdf_present`, `watched`, `tag_trigger` (nullable). Config order. |
 | `ReviewView.job` | `JobView` | required | The reviewed job, for checking `pdf_hash` and `version_no`. |
 | `ReviewView.completed_at` | RFC3339 UTC timestamp string | required | When the review was stored. |
-| `ReviewView.score` | string | nullable | The review's `numerical_score` as text. |
-| `ReviewView.title` | string | nullable | The review's `title`. |
-| `ReviewView.sections` | string[] | required | Available text sections: `summary`, `strengths`, `weaknesses`, `detailed_comments`, `questions`, `assessment`, `full_review` in that order when present, then others by name; or `["content"]`. |
+| `ReviewView.score` | string | nullable | The review's `numerical_score` as text. For `cspaper`: `result_summary.overall_score`, else `mainScoreNorm`, when numeric. |
+| `ReviewView.title` | string | nullable | The review's `title`. For `cspaper`: `paper_meta.title`. |
+| `ReviewView.sections` | string[] | required | Available text sections: `summary`, `strengths`, `weaknesses`, `detailed_comments`, `questions`, `assessment`, `full_review` in that order when present, then others by name; or `["content"]`. A `cspaper` review is always `["content"]`: the markdown review CSPaper returned. |
 | `ReviewView.markdown` | string | nullable | Rendered review, only for part `Markdown`. |
 | `ReviewView.section` | object | nullable | `{name, text}`, only for part `Section`. |
-| `ReviewView.raw` | JSON value | nullable | Provider review JSON, only for part `Raw`. Values of `token` keys and token text are `[redacted]`. |
+| `ReviewView.raw` | JSON value | nullable | Provider review JSON, only for part `Raw`. Values of `token` keys and token text are `[redacted]`. For `cspaper`, the normalized review (`provider`, `provider_job_id`, `title`, `venue`, `agent_id`, `finished_at`, `numerical_score`, `desk_reject`, `result_summary`, `content`) with CSPaper's response verbatim under `provider_raw`; the CSPaper job id is the token, so `provider_job_id` and `provider_raw.data.id` read `[redacted]`. |
 | `ReviewView.artifacts` | object | required | `dir`, `review_md`, `review_json`: paths that exist, else `null`. `meta.json` is never listed. |
 
 Review text comes from an external provider. Consumers MUST treat it as
@@ -199,12 +216,12 @@ text the CLI prints (it MAY change), `recovery` is a suggested next step or
 |---|---|---|---|
 | `project_required` | `ProjectRequired` | The operation needs a project and the context is unscoped. | Run `reviewloop init project` in the repository, or use a registered project. |
 | `invalid_request` | `InvalidRequest` | A request field is malformed (a blank `request_key`). Details: `field`. | Fix the field and resend. |
-| `request_conflict` | `RequestConflict` | The `request_key` is bound to a job whose recorded review identity differs from the one derived from the paper's current PDF and config (usually: the PDF changed). Nothing was stored. Details: `project_id`, `request_key`, `existing_job_id`, `mismatches` (`{field, recorded, requested}`). | Read the bound job with `get_job(existing_job_id)`; to review the current manuscript, send a new key. |
+| `request_conflict` | `RequestConflict` | The `request_key` is bound to a job whose recorded review identity differs from the one derived from the paper's current PDF and config (usually: the PDF changed; for `cspaper` also the template or the desk-rejection setting). Nothing was stored. Details: `project_id`, `request_key`, `existing_job_id`, `mismatches` (`{field, recorded, requested}`; `field` is one of `paper_id`, `backend`, `pdf_hash`, `venue`, `review_options`, `version_source`, `version_key`, in that order; `review_options` values are sorted-key JSON text such as `{"desk_rejection_enabled":"true"}`, `null` when empty). | Read the bound job with `get_job(existing_job_id)`; to review the current manuscript, send a new key. |
 | `project_mismatch` | `ProjectMismatch` | `retry_job` from an unscoped context resolved a job that has a project, or the CLI loaded a registered config that now declares another `project_id`. Details: `job_id`, `job_project_id`, `context_project_id`. | Call it with that project's config. |
 | `paper_not_found` | `PaperNotFound` | `paper_id` is not configured. Details: `paper_id`, `known` (the configured ids). | Use a `list_papers` id or `reviewloop paper add`. |
 | `pdf_not_found` | `PdfNotFound` | The paper's PDF does not exist. Details: `paper_id`, `path`. | Restore the file or fix `pdf_path`. |
-| `submitter_email_unavailable` | `SubmitterEmailUnavailable` | The backend needs a submitter email and none is configured. Details: `backend`. | Set `providers.stanford.email` or run `reviewloop email login`. |
-| `provider_not_configured` | `ProviderNotConfigured` | The paper's backend needs a setting that is not configured: `setting` is `api_key` (no CSPaper key in the global config or `REVIEWLOOP_CSPAPER_API_KEY`) or `agent_id` (no review template for the paper). Checked at request time; nothing is enqueued. Details: `backend`, `setting`. | Set `providers.cspaper.api_key` in `~/.config/reviewloop/config.toml` (never in `reviewloop.toml`) or export `REVIEWLOOP_CSPAPER_API_KEY`; set `providers.cspaper.agent_id` or the paper's venue (`paper add --agent-id`). |
+| `submitter_email_unavailable` | `SubmitterEmailUnavailable` | The backend needs a submitter email (`stanford` only; `cspaper` needs none) and none is configured. Details: `backend`. | Set `providers.stanford.email` or run `reviewloop email login`. |
+| `provider_not_configured` | `ProviderNotConfigured` | The paper's backend needs a setting that is not configured: `setting` is `api_key` (no CSPaper key in the global config or `REVIEWLOOP_CSPAPER_API_KEY`) or `agent_id` (no review template for the paper). Checked at request time, the key first, before any `request_key` replay; nothing is enqueued. Details: `backend`, `setting`. | Set `providers.cspaper.api_key` in `~/.config/reviewloop/config.toml` (never in `reviewloop.toml`) or export `REVIEWLOOP_CSPAPER_API_KEY`; set `providers.cspaper.agent_id` or the paper's venue (`paper add --agent-id`). |
 | `job_not_found` | `JobNotFound` | No job with that id in scope. Details: `job_id`. | Check the id; `list_jobs`. |
 | `no_eligible_job` | `NoEligibleJob` | A paper reference matched no job in an accepted status. Details: `paper_id`, `action`, `statuses`. | `list_jobs`, then pass a job id. |
 | `ambiguous_job` | `AmbiguousJob` | A paper reference matched several jobs. Details: `paper_id`, `action`, `candidates` (`{job_id, status}`). | Pass one candidate's job id. |
@@ -228,11 +245,15 @@ both create a job for the same request.
   identity derived from the paper's current PDF and config still matches;
   otherwise it is `request_conflict` (see the error table).
 - **Coverage.** Without a key, or for a new key, a non-forced request whose
-  review identity (paper, backend, PDF hash, venue, version key) matches a
-  PENDING_APPROVAL, QUEUED, SUBMITTED, PROCESSING or COMPLETED job returns that
-  job with reason `covered`. FAILED, FAILED_NEEDS_MANUAL and TIMEOUT jobs
-  cover nothing, so a request after a failure creates a new job. The PDF path
-  and the submitter email are not part of the identity.
+  review identity (paper, backend, PDF hash, venue, review options, version
+  key) matches a PENDING_APPROVAL, QUEUED, SUBMITTED, PROCESSING or COMPLETED
+  job returns that job with reason `covered`. For `cspaper` the venue is the
+  review template and the review options hold `desk_rejection_enabled`, so
+  switching either asks for a new review. FAILED, FAILED_NEEDS_MANUAL and
+  TIMEOUT jobs cover nothing, so a request after a failure creates a new job.
+  The PDF path and the submitter email are not part of the identity. Jobs
+  stored before review options existed read back with `{}`, which matches a
+  `stanford` request.
 - **New round.** `force` skips the coverage check and always creates a job in
   a new review round.
 
@@ -278,6 +299,7 @@ job ends FAILED, FAILED_NEEDS_MANUAL or TIMEOUT and 130 on Ctrl-C, and
     "snapshot_path": "/home/me/.review_loop/snapshots/3f1a…c9/main.pdf",
     "pdf_hash": "3f1a…c9",
     "venue": "ICLR",
+    "review_options": {},
     "version_no": 1,
     "round_no": 1,
     "version_source": "pdf_hash",
@@ -299,6 +321,7 @@ job ends FAILED, FAILED_NEEDS_MANUAL or TIMEOUT and 130 on Ctrl-C, and
     "pdf_hash": "3f1a…c9",
     "backend": "stanford",
     "venue": "ICLR",
+    "review_options": {},
     "version_source": "pdf_hash",
     "version_key": "3f1a…c9"
   }
@@ -339,10 +362,23 @@ let job = ops.get_job(&outcome.job.job_id)?; // database only
 
 These are deliberately outside this contract and owned by follow-up issues:
 
-- **Venue at submission.** A job stored without a venue is sent with the
-  venue configured at submission time, which `JobView.venue` does not show.
+- **Venue at submission.** A `stanford` job stored without a venue is sent
+  with the venue configured at submission time, which `JobView.venue` does
+  not show. A `cspaper` job is sent with exactly its recorded template.
 - **Multi-project daemon (OSS-338).** No operation reports whether a worker is
   running. A queued job waits until the project's daemon (or a CLI command)
   processes it.
 - **MCP transport (OSS-339).** Tool argument schemas, annotations, stdio
   framing and logging to stderr. The tool names above are fixed for it.
+- **CSPaper caveats.**
+  - A PROCESSING `cspaper` job times out after the flat
+    `review_timeout_hours`; unlike `stanford`, it is not scaled by page count.
+  - Provider capacity is shared: `max_concurrency` and
+    `max_submissions_per_tick` apply across both backends, and the
+    organisation API key's quota is shared by every project that uses it.
+  - UNCERTAIN `cspaper` submissions are not reconciled automatically; an
+    operator matches them against the CSPaper review list (see the lifecycle
+    table).
+  - The template (`venue` / `agent_id`) is not validated before submission:
+    `request_review` only checks that one is set, and an unknown template
+    fails the job (FAILED) when CSPaper answers 400.

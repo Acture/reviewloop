@@ -5,14 +5,14 @@
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/github/license/Acture/reviewloop)](LICENSE)
 
-> A production-minded Rust CLI/daemon for `paperreview.ai` submission and review retrieval.
+> A production-minded Rust CLI/daemon for AI paper review submission and retrieval: `paperreview.ai` (Stanford) and CSPaper Agentic Review.
 
 Most paper review automation breaks in boring ways: duplicate submissions, lost tokens, noisy polling, and zero traceability.
 
 **ReviewLoop** gives you a durable loop with guardrails:
 - Queue reviews from Git tags or PDF hash changes
 - Persist every transition in SQLite
-- Pull tokens from Gmail OAuth or IMAP
+- Pull `paperreview.ai` tokens from Gmail OAuth or IMAP
 - Write reproducible artifacts (`review.json`, `review.md`, `meta.json`)
 - Recover from failures with explicit retries and fallback submission
 
@@ -25,7 +25,7 @@ ReviewLoop is built for the opposite:
 - human approval gates where it matters
 - clear local evidence of what happened and why
 
-If you want reliable, low-drama automation for `paperreview.ai`, this is the tool.
+If you want reliable, low-drama automation for `paperreview.ai` or CSPaper, this is the tool.
 
 ## 1-Minute Quick Start
 
@@ -36,7 +36,8 @@ reviewloop init
 # 2) for any repo, one-time project setup
 reviewloop init project --project-id main
 
-# 2.5) one-time: configure submitter email
+# 2.5) one-time: configure submitter email (Stanford backend; CSPaper needs
+#      an API key and a review template instead, see "CSPaper Backend")
 # Edit ~/.config/reviewloop/config.toml and add:
 #
 #   [providers.stanford]
@@ -54,19 +55,20 @@ it immediately with force, then drives a live polling loop until the review land
 
 Exit codes: `0` = review complete, `2` = terminal failure or a submission that needs manual reconciliation, `130` = Ctrl+C.
 
-> **A submitter email is required.** Set `providers.stanford.email` in
+> **The Stanford backend requires a submitter email.** Set `providers.stanford.email` in
 > `~/.config/reviewloop/config.toml` (step 2.5 above) or run
 > `reviewloop email login --provider google` to use OAuth.
 > Email/OAuth is also needed if you submitted via the paperreview.ai website
 > and want reviewloop to ingest tokens from your inbox.
 > See [Optional: email token ingestion](#email-token-ingestion-experimental-opt-in) below.
+> The CSPaper backend needs no email; see [CSPaper Backend](#cspaper-backend).
 
 Optional flags:
 
 ```bash
 reviewloop run paper/main.pdf \
   --paper-id main \        # override the default (filename stem)
-  --backend stanford \     # override the default backend
+  --backend stanford \     # override the default backend (stanford | cspaper)
   --watch false \          # disable PDF-change watching for this paper
   --tag-trigger "review-stanford/main/*" \  # custom tag trigger
   --quiet                  # suppress live status; print only the final line
@@ -243,15 +245,20 @@ reviewloop email logout [--account <account-id-or-email>]
 reviewloop self-update [--method auto|brew|cargo] [--yes] [--dry-run]
 ```
 
+`paper add --agent-id <agent-id>` is an alias of `--venue`: for a `cspaper`
+paper the venue is the CSPaper review template (see [CSPaper Backend](#cspaper-backend)).
+
 `submit` does not enqueue a second job when one that is pending, in flight or
-completed already covers the same manuscript bytes, backend, venue and version
-(the git commit for tag-triggered jobs, otherwise the manuscript hash); it
-prints that job instead. `--force` asks for a new review round regardless.
+completed already covers the same manuscript bytes, backend, venue (for
+CSPaper, the review template), review options (CSPaper's
+`desk_rejection_enabled`) and version (the git commit for tag-triggered jobs,
+otherwise the manuscript hash); it prints that job instead. `--force` asks for
+a new review round regardless.
 `--request-key <key>` makes the request idempotent: repeating it with the same
 key returns the job it first resolved to, even after that job has finished
-(until retention prunes it), and reusing the key for a different manuscript or
-venue fails with a conflict naming the existing job. Use a new key for each
-new review round.
+(until retention prunes it), and reusing the key for a different manuscript,
+venue or review options fails with a conflict naming the existing job. Use a
+new key for each new review round.
 
 `self-update` only replaces the executable. It does not delete:
 - global config (`~/.config/reviewloop/config.toml`)
@@ -291,14 +298,16 @@ The submit stage is persisted before anything is sent:
   the worker dies here, the claim expires and the job is picked up again.
 - `SUBMITTED` + `DISPATCHED`: the request may be on the wire.
 - `SUBMITTED` + `UNCERTAIN`: the provider may have accepted the paper, but
-  no receipt was saved (crash or timeout after sending, an unreadable or
-  5xx `confirm-upload` response). ReviewLoop does **not** resubmit these
-  or switch to the fallback, because the provider gives no idempotency
-  guarantee. `reviewloop status` shows the reason; settle it by letting
-  email ingestion attach the token, running
-  `reviewloop import-token --job-id <id> --token <token>`, resubmitting
-  explicitly with `reviewloop retry --job-id <id> --force`, or
-  `reviewloop cancel --job-id <id>`.
+  no receipt was saved (crash or timeout after sending; for Stanford an
+  unreadable or 5xx `confirm-upload` response, for CSPaper an unreadable,
+  5xx or `job_id`-less answer to the review request). ReviewLoop does
+  **not** resubmit these or switch to the fallback, because neither
+  provider gives an idempotency guarantee. `reviewloop status` shows the
+  reason; settle it by letting email ingestion attach the token (Stanford
+  only), running `reviewloop import-token --job-id <id> --token <token>`,
+  resubmitting explicitly with `reviewloop retry --job-id <id> --force`, or
+  `reviewloop cancel --job-id <id>`. CSPaper sends no email; see
+  [Reconciling an uncertain CSPaper submission](#reconciling-an-uncertain-cspaper-submission).
 
 Cancelling is local: it stops further processing and marks the job
 `FAILED`, but does not withdraw a submission the provider already
@@ -320,10 +329,10 @@ Each job also pins the exact PDF it uploads at `<state_dir>/snapshots/<sha256>/<
 ## What Makes It Reliable
 
 - **State machine, not ad-hoc scripts**: jobs move through explicit statuses (`PENDING_APPROVAL`, `QUEUED`, `PROCESSING`, `COMPLETED`, etc.)
-- **Duplicate guard**: prevents repeated submissions for the same `project_id + paper_id + backend + pdf_hash + version_key`
+- **Duplicate guard**: prevents repeated submissions for the same `project_id + paper_id + backend + pdf_hash + venue + review_options + version_key`
 - **Load-aware polling**: default schedule starts at 10 minutes with jitter/cooldown behavior
 - **Recovery built in**: every transition is evented, retries are explicit
-- **Fallback path**: optional Node + Playwright submit path when provider API flow fails
+- **Fallback path**: optional Node + Playwright submit path when the Stanford API flow fails
 
 ## Triggering Modes
 
@@ -355,6 +364,10 @@ expected `paperreview.ai` mail. The Stanford backend already returns
 the token directly from `confirm-upload`, so this path is mostly
 useful as a backup for the Playwright fallback flow or for jobs
 created out-of-band.
+
+Email ingestion is Stanford-only. CSPaper sends no review email (its job id
+arrives only in the submit response), so a token from mail is never attached
+to a `cspaper` job, even when a pattern is configured under that name.
 
 To turn either path on, set `enabled = true` explicitly in your config.
 
@@ -498,8 +511,8 @@ ReviewLoop uses two config files with separate responsibilities:
 - project config: `<repo-root>/reviewloop.toml`
 
 There is no global-overrides-project merge chain. Instead:
-- global config owns machine/user concerns such as `core.*`, `logging.*`, `polling.*`, `retention.*`, `imap.*`, `gmail_oauth.*`, and Stanford provider connection defaults
-- project config owns repo concerns such as `project_id`, `papers`, `paper_watch`, `paper_tag_triggers`, `trigger.*`, and Stanford venue
+- global config owns machine/user concerns such as `core.*`, `logging.*`, `polling.*`, `retention.*`, `imap.*`, `gmail_oauth.*`, Stanford provider connection defaults, and the CSPaper connection (`providers.cspaper.base_url` and `providers.cspaper.api_key`, which only the global config accepts)
+- project config owns repo concerns such as `project_id`, `papers`, `paper_watch`, `paper_tag_triggers`, `trigger.*`, Stanford venue, and the CSPaper review choices (`providers.cspaper.agent_id` and `providers.cspaper.desk_rejection_enabled`, which override the global defaults)
 - `--config /path/to/reviewloop.toml` explicitly points to a project config file
 - `reviewloop init` initializes the global config/data paths
 - `reviewloop init project --project-id <id>` initializes the current repo's project config
@@ -520,7 +533,7 @@ Safe defaults:
 - `core.state_dir = "~/.review_loop"` (or `REVIEWLOOP_STATE_DIR` when set)
 - `core.db_path = "~/.review_loop/reviewloop.db"` (or `<REVIEWLOOP_STATE_DIR>/reviewloop.db`)
 - `core.review_timeout_hours = 48`
-  - for `stanford`, timeout is linearly scaled by PDF page count up to 20 pages
+  - for `stanford`, timeout is linearly scaled by PDF page count up to 20 pages; `cspaper` uses the flat value
 - `polling.schedule_minutes = [1, 2, 5, 10, 20, 40]` (first poll within ~1 minute, then back off)
 - `polling.jitter_percent = 10`
 - `retention.enabled = true`
@@ -542,9 +555,167 @@ Safe defaults:
 - `email` optional (falls back to active email account)
 - `venue = "ICLR"` (project config)
 
+`providers.cspaper` defaults (see [CSPaper Backend](#cspaper-backend)):
+- `base_url = "https://cspaper.org"` (global config only)
+- `api_key` unset (global config only, or `REVIEWLOOP_CSPAPER_API_KEY`)
+- `agent_id` unset: there is no built-in review template
+- `desk_rejection_enabled = true`
+
 Logging:
 - `logging.output = "stdout" | "stderr" | "file"`
 - file mode default path: `<state_dir>/reviewloop.log`
+
+## CSPaper Backend
+
+`backend = "cspaper"` sends papers to the
+[CSPaper Agentic Review](https://cspaper.org/platform/review) API. ReviewLoop
+uploads the job's pinned PDF snapshot with `POST /api/platform/review`, keeps
+the `job_id` CSPaper answers with as the job's token (so polling resumes after
+a restart), and polls `GET /api/platform/reviews/<job_id>` until the review is
+`COMPLETED` or `FAILED`.
+
+### Configuration
+
+The API key and the base URL are machine settings and live only in the global
+config:
+
+```toml
+# ~/.config/reviewloop/config.toml
+[providers.cspaper]
+api_key = "csp_live_..."            # or export REVIEWLOOP_CSPAPER_API_KEY
+# base_url = "https://cspaper.org"  # the default
+agent_id = "ICLR_main_2026_1"       # optional machine-wide default template
+desk_rejection_enabled = true       # the default
+```
+
+- `api_key`: your organisation's API key. When it is unset or blank,
+  `REVIEWLOOP_CSPAPER_API_KEY` is used; when both are set, the config value
+  wins. It is sent only in the `X-API-Key` header and kept out of job rows,
+  events, job errors and archives.
+- `base_url`: defaults to `https://cspaper.org`. It must be `https://` with a
+  host (plain `http://` only for `localhost`, `127.0.0.1` or `[::1]`).
+  ReviewLoop calls the live `/api/platform/...` paths, not the
+  `/api/v1/platform/...` paths shown in CSPaper's examples README (on the live
+  service those redirect to a sign-in page). Redirects are never followed, so
+  the key cannot travel to another host.
+- `agent_id`: the review template, e.g. `ICLR_main_2026_1`; CSPaper lists them
+  at <https://cspaper.org/platform/review>. There is no built-in default,
+  because the template decides what the review means. A paper's own `venue`
+  (`paper add --agent-id`) overrides the project `agent_id`, which overrides
+  the global one.
+- `desk_rejection_enabled`: CSPaper's desk-rejection screening (topic fit,
+  minimum quality, prompt injection) before the review; default `true`.
+  `false` always yields a full, scored review. A project value overrides the
+  global one.
+
+The project file holds only the review choices:
+
+```toml
+# <repo>/reviewloop.toml
+project_id = "main"
+default_backend = "cspaper"   # optional: papers without a backend use cspaper
+
+[providers.cspaper]
+agent_id = "ICLR_main_2026_1"
+desk_rejection_enabled = false
+```
+
+The key never goes in `reviewloop.toml`: the project file has no `api_key` or
+`base_url` under `[providers.cspaper]`, so either one there is rejected as a
+config parse error. Keep the key in the global config or the environment.
+
+```bash
+reviewloop paper add --paper-id main --path paper/main.pdf \
+  --backend cspaper --agent-id ICLR_main_2026_1
+reviewloop submit --paper-id main
+```
+
+`submit`, `run` and `paper add --submit-now` refuse a CSPaper paper up front,
+queueing nothing, when no API key or no template is configured (error code
+`provider_not_configured`). Jobs from Git tag or PDF change triggers are not
+checked at enqueue and fail at submission instead (table below).
+
+Unlike the Stanford backend, CSPaper needs no submitter email
+(`providers.stanford.email` and `email login` are not used), has no browser
+fallback, and has no page-scaled timeout: a `PROCESSING` job times out after
+the flat `core.review_timeout_hours`. `reviewloop run` does not wait for a
+token email on an uncertain CSPaper submission; it stops at once with exit
+code 2.
+
+### Errors and outcomes
+
+Submitting:
+
+| CSPaper answer | Job becomes | What to do |
+|---|---|---|
+| No API key configured, or 401 / 403 | `FAILED_NEEDS_MANUAL`, with a notification | Nothing was created. Fix the key, then `reviewloop retry --job-id <id>`. |
+| 400 (unknown template), 422 (incomplete request), any other 4xx; no template on the job; a file that is not a PDF | `FAILED` | Nothing was created. Fix the template or file and submit again. |
+| 429 | `QUEUED`, retried after `Retry-After` (capped at 24 h), else on the polling schedule | Nothing. This assumes CSPaper throttles before creating a job; its documentation does not say. |
+| Connection never established | `FAILED` | Nothing reached CSPaper; safe to retry. |
+| 5xx, 303, a lost or unreadable response, no answer within 20 minutes, or a 2xx receipt without a usable `job_id` | `SUBMITTED` + `UNCERTAIN`, with a notification; never resent | CSPaper may hold the review: [reconcile it](#reconciling-an-uncertain-cspaper-submission). |
+| Any other 3xx | `FAILED` | The base URL points at the wrong host or path; check `providers.cspaper.base_url`. |
+
+Polling:
+
+| CSPaper answer | Job becomes | What to do |
+|---|---|---|
+| `PENDING` / `PROCESSING` | stays `PROCESSING` | Nothing. |
+| `COMPLETED` | `COMPLETED`, artifacts written | Read the review. |
+| `FAILED` | `FAILED_NEEDS_MANUAL` with CSPaper's `failed_reason`, and a notification | Polling again gives the same answer, so `retry` does not help: request a new review with `reviewloop submit --paper-id <paper>`. |
+| 404 / 410 (unknown job, or one owned by another organisation's key) | `FAILED` (`invalid token`) | Check the job id; `reviewloop import-token --job-id <id> --token <job_id>` attaches the right one. |
+| 401 / 403, 429, 5xx, or an unexpected payload | stays `PROCESSING`, polled again on the schedule (429: after `Retry-After`) | Fix the key if it was refused; the job times out after `core.review_timeout_hours` otherwise. |
+
+### Reconciling an uncertain CSPaper submission
+
+CSPaper's submit request carries no idempotency key, so a submission whose
+answer was lost is parked as `SUBMITTED` / `UNCERTAIN` and never resent
+automatically. `reviewloop status` shows it, `reviewloop run` stops on it with
+exit code 2, and no email will settle it. Settle it by hand:
+
+1. Look for the paper in the CSPaper review list
+   (<https://cspaper.org/platform/review>).
+2. If it is there, attach its job id:
+   `reviewloop import-token --job-id <id> --token <cspaper job_id>`.
+   ReviewLoop polls it at once and continues normally.
+3. If it is not there, resubmit with `reviewloop retry --job-id <id> --force`.
+   This may create a duplicate review if CSPaper did receive the first one.
+4. Or stop tracking it with `reviewloop cancel --job-id <id>`; a review
+   CSPaper already created is not withdrawn.
+
+### What is archived
+
+For each completed review, `<state_dir>/artifacts/<job-id>/` holds:
+
+- `review.json`: the normalized review: `provider` (`"cspaper"`),
+  `provider_job_id`, `title` (from `paper_meta.title`), `venue` and `agent_id`
+  (the template), `finished_at`, `numerical_score`
+  (`result_summary.overall_score`, else `mainScoreNorm`; numbers only),
+  `desk_reject`, `result_summary` (decoded; kept as the raw string plus
+  `result_summary_parse_error` when it is not valid JSON), `content` (the
+  markdown review), and `provider_raw`, CSPaper's response verbatim.
+- `review.md`: title, template and score, then the markdown review.
+- `meta.json`: the job, paper and backend, `token` (the CSPaper job id), the
+  template (`venue`), `review_options`, the manuscript version (`version_no`,
+  `round_no`, `version_source`, `version_key`, `git_tag`, `git_commit`),
+  `pdf_path`, `pdf_hash` and `snapshot_path`.
+
+### Request identity
+
+The template and the review options are part of a request's identity.
+Switching `agent_id` or `desk_rejection_enabled` for an unchanged PDF asks for
+a new review instead of returning the existing one, and replaying a
+`--request-key` after changing either is a conflict. CSPaper jobs always
+record `desk_rejection_enabled`, so leaving it unset and setting it to `true`
+are the same request.
+
+### Limitations
+
+- Uncertain submissions are not reconciled automatically.
+- The template is not checked before submission; an unknown one fails the job
+  with CSPaper's 400.
+- `core.max_concurrency` and `core.max_submissions_per_tick` are shared with
+  Stanford jobs, and the organisation key's quota is shared by every project
+  that uses it.
 
 ## CI/CD and Release Flow
 
@@ -580,6 +751,7 @@ Required secrets:
 Runtime secrets (must be provided via env or `config.toml` at runtime — not baked in at compile time):
 - `REVIEWLOOP_GMAIL_CLIENT_ID`
 - `REVIEWLOOP_GMAIL_CLIENT_SECRET`
+- `REVIEWLOOP_CSPAPER_API_KEY` (CSPaper backend; `providers.cspaper.api_key` in the global config wins when both are set)
 
 Optional repo variables:
 - `HOMEBREW_TAP_REPO` (default: `Acture/homebrew-ac`)
@@ -587,7 +759,8 @@ Optional repo variables:
 
 ## Fallback Requirements
 
-The fallback runs only when the API submit failed in a way that proves the
+The fallback exists for the Stanford backend only; CSPaper has none. It runs
+only when the API submit failed in a way that proves the
 provider did not accept the paper (an error before `confirm-upload`, or an
 explicit rejection). An ambiguous failure marks the job `UNCERTAIN`
 instead (see [Job ownership and uncertain submissions](#job-ownership-and-uncertain-submissions)).
@@ -614,7 +787,7 @@ Please keep it that way:
 
 ## Current Scope
 
-- Supported backend: `stanford` (`paperreview.ai`)
+- Supported backends: `stanford` (`paperreview.ai`) and `cspaper` (CSPaper Agentic Review, `cspaper.org`)
 - Database: SQLite (global state path by default, supports `:memory:`)
 - Interface: CLI + daemon
 

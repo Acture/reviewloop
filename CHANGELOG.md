@@ -56,6 +56,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `Db::get_review`, `Db::review_completed_at`, `Db::list_project_jobs` and
   `Db::list_registered_projects` (read-only).
 
+- **CSPaper backend (OSS-353)** — `backend = "cspaper"` submits to the
+  CSPaper Agentic Review API (`POST /api/platform/review`, polled at
+  `GET /api/platform/reviews/<job_id>`; the `/api/v1` paths in CSPaper's
+  examples README redirect to a sign-in page on the live service). The
+  CSPaper `job_id` becomes the job's token, so polling resumes after a
+  restart. Configured in `[providers.cspaper]`: `api_key` (global config
+  only, or `REVIEWLOOP_CSPAPER_API_KEY`; the config value wins when both are
+  set), `base_url` (global only, default `https://cspaper.org`), `agent_id`
+  (the review template, project over global; a paper's venue overrides it,
+  `paper add --agent-id` sets it; no built-in default) and
+  `desk_rejection_enabled` (default `true`). The key travels only in the
+  `X-API-Key` header and redirects are never followed. No submitter email,
+  no browser fallback, no page-scaled timeout.
+- **CSPaper outcomes** — at submission, a missing key or a 401 / 403 moves
+  the job to `FAILED_NEEDS_MANUAL` with a notification; 400 (unknown
+  template), 422 and other 4xx fail it; 429 requeues it after `Retry-After`;
+  a 5xx, a lost response or a receipt without a `job_id` parks it as
+  `SUBMITTED` / `UNCERTAIN`, never resent. A review CSPaper reports `FAILED`
+  moves to `FAILED_NEEDS_MANUAL` (request a new one with `submit`); a poll
+  404 fails the job with `invalid token`.
+- **CSPaper archives** — `review.json` holds the normalized review (`title`,
+  `venue` / `agent_id`, `numerical_score` from `overall_score` or
+  `mainScoreNorm`, `desk_reject`, the decoded `result_summary`, the markdown
+  `content`) with CSPaper's response verbatim under `provider_raw`;
+  `review.md` renders the markdown review.
+- **`provider_not_configured`** — `request_review` (`submit`, `run`,
+  `paper add --submit-now`) refuses a CSPaper paper that has no API key or no
+  template before anything is enqueued.
+
 ### Changed
 
 - **Coverage includes the venue.** A job covers a request with the same
@@ -124,6 +153,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`import-token --job-id`** attaches a token to a named job; the reconcile
   hint for an uncertain submission uses it.
 
+- **Request identity includes review options** — coverage and request keys
+  compare the new `review_options` (CSPaper's `desk_rejection_enabled`)
+  besides the venue (CSPaper's template), so switching either for an
+  unchanged PDF asks for a new review, and a replayed key reports a
+  `review_options` mismatch. Stanford identities are unchanged and
+  identities recorded earlier still replay. `JobView`, `PaperView` and
+  `ManuscriptInput` gain `review_options`.
+- **`meta.json`** also records `venue`, `review_options`, `version_no`,
+  `round_no`, `version_source`, `version_key`, `git_tag` and `git_commit`.
+- **Backend API** — `ReviewFetchResult::Failed { reason }` (the provider
+  finished without a review; the job moves to `FAILED_NEEDS_MANUAL`),
+  `BackendError::Auth` (credentials refused; `FAILED_NEEDS_MANUAL` at
+  submission, polling continues) and `BackendError::Rejected` (a definitive
+  refusal; `FAILED`). `SubmitReceipt.backend_submission_ref` is removed,
+  `build_client` takes a `Redirects` policy, `ReviewIdentity::new` takes
+  `&ReviewOptions` and `parse_retry_after` moved to `backend`.
+- **Provider base URLs are parsed, not prefix-matched** — for both
+  `providers.stanford.base_url` and `providers.cspaper.base_url`: `https://`
+  with a host, or `http://` on `localhost`, `127.0.0.1` or `[::1]`. Values
+  the prefix check let through, such as `http://localhost.example.com` or a
+  bare `https://`, are now rejected; `http://[::1]` is now accepted.
+- **The uncertain-submission hint depends on the backend** — for a tokenless
+  CSPaper job it points at the CSPaper review list and
+  `import-token --job-id <id> --token <cspaper job_id>` instead of a review
+  email.
+- **`run` waits for a token email only for backends that send one** — on an
+  uncertain CSPaper submission it stops at once with exit code 2.
+  `import-token` records the email-token ledger only for those backends, and
+  email ingestion never binds a token to a CSPaper job.
+- The daemon panel lists the configured backends instead of always printing
+  `stanford (paperreview.ai)`.
+
 ### Upgrade notes
 
 - Schema version 4 adds `jobs.lease_owner`, `jobs.lease_expires_at` and
@@ -134,6 +195,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - New event types: `submit_dispatched`, `submit_outcome_unknown`,
   `submit_claim_expired`, `submit_claim_taken_over`,
   `submit_receipt_after_lease_lost`, `stale_result_rejected`.
+- Schema version 5 adds `jobs.review_options` (migrated automatically from
+  v1 to v4). Existing rows read back with no options, which is what a
+  Stanford request derives, so they keep covering their requests.
+- New event types: `poll_provider_failed` (the provider reported the review
+  failed) and `submit_failed_needs_manual` (credentials refused at
+  submission). `job_enqueued` and `duplicate_skipped` payloads carry
+  `review_options`.
+- New error code: `provider_not_configured` (details `backend`, `setting`).
+- New config table `[providers.cspaper]`. `base_url` and `api_key` are
+  accepted only in the global config (in `reviewloop.toml` they are a parse
+  error); `agent_id` and `desk_rejection_enabled` in either file, the
+  project value winning.
 
 ### Fixed
 
