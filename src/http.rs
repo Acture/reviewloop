@@ -192,6 +192,19 @@ impl Redirects {
     }
 }
 
+/// Bounds connecting: TCP, a proxy's CONNECT tunnel and the TLS handshake.
+/// Backends map connect errors to "nothing was sent", so a stalled handshake
+/// must surface as one instead of running into the worker's dispatch bound,
+/// which reads as "the provider may hold the submission". Nothing bounds the
+/// request once sent: an expiry then would hide whether it arrived.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn client_builder(redirects: Redirects) -> reqwest::ClientBuilder {
+    redirects
+        .apply(reqwest::Client::builder())
+        .connect_timeout(CONNECT_TIMEOUT)
+}
+
 /// Build an outbound HTTP client with proxy pool middleware when proxies are
 /// configured.
 ///
@@ -216,8 +229,7 @@ pub fn build_client(
     redirects: Redirects,
 ) -> Result<ClientWithMiddleware> {
     let plain = || {
-        redirects
-            .apply(reqwest::Client::builder())
+        client_builder(redirects)
             .build()
             .context("failed to build HTTP client")
     };
@@ -238,8 +250,7 @@ pub fn build_client(
         .map(|(i, url)| {
             let proxy = reqwest::Proxy::all(url)
                 .with_context(|| format!("invalid proxy URL at index {i}"))?;
-            redirects
-                .apply(reqwest::Client::builder())
+            client_builder(redirects)
                 .proxy(proxy)
                 .build()
                 .with_context(|| format!("failed to build client for proxy at index {i}"))
@@ -451,5 +462,50 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    /// A peer that accepts the TCP connection and then says nothing.
+    async fn silent_listener() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent listener");
+        let addr = listener.local_addr().expect("listener address");
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        (addr, task)
+    }
+
+    /// A stalled TLS handshake or proxy tunnel must end as a connect error,
+    /// which backends read as "nothing was sent", and not hang until the
+    /// worker's dispatch bound reads it as an unknown outcome.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_handshakes_end_as_connect_errors() {
+        let (addr, task) = silent_listener().await;
+
+        let mut direct = Config::default();
+        direct.core.proxies.clear();
+        let mut proxied = Config::default();
+        proxied.core.proxies = vec![format!("http://{addr}")];
+
+        for (case, config, url) in [
+            ("TLS handshake", direct, format!("https://{addr}/api")),
+            (
+                "proxy CONNECT",
+                proxied,
+                "https://cspaper.invalid/api".to_string(),
+            ),
+        ] {
+            let client = build_client(&config, None, None, Redirects::Refuse).expect("client");
+            let result = tokio::time::timeout(CONNECT_TIMEOUT * 2, client.get(&url).send())
+                .await
+                .unwrap_or_else(|_| panic!("{case}: no connect timeout fired"));
+            let err = result.expect_err("a silent peer cannot answer");
+            assert!(err.is_connect(), "{case}: {err}");
+        }
+        task.abort();
     }
 }

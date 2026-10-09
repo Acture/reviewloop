@@ -189,6 +189,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   email ingestion never binds a token to a CSPaper job.
 - The daemon panel lists the configured backends instead of always printing
   `stanford (paperreview.ai)`.
+- **Config errors never quote the file** — a TOML error names the file, line
+  and column, and serde's message has the offending value replaced by
+  `<value>`, so a mistyped secret is not printed to the terminal or the
+  daemon log. A project file holding an `api_key`, or `csp_live_` text
+  anywhere, is refused before parsing.
+- **Outbound connect timeout** — provider clients give up connecting (TCP,
+  proxy tunnel, TLS handshake) after 30 s, so a stalled handshake fails a
+  submission as never sent instead of parking it as uncertain after the
+  20-minute dispatch bound. Nothing bounds a request once it is sent.
 
 ### Upgrade notes
 
@@ -204,14 +213,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   v1 to v4). Existing rows read back with no options, which is what a
   Stanford request derives, so they keep covering their requests.
 - New event types: `poll_provider_failed` (the provider reported the review
-  failed), `submit_failed_needs_manual` (credentials refused at submission)
-  and `provider_not_configured` (a trigger skipped a paper whose provider
-  lacks a setting). `job_enqueued` and `duplicate_skipped` payloads carry
-  `review_options`.
+  failed) and `provider_not_configured` (a trigger skipped a paper whose
+  provider lacks a setting). `submit_failed_needs_manual`, so far only a
+  failed Stanford fallback, now also records CSPaper refusing the credentials
+  at submission; `reason` tells them apart. `job_enqueued` and
+  `duplicate_skipped` payloads carry `review_options`.
 - New error code: `provider_not_configured` (details `backend`, `setting`).
 - New config table `[providers.cspaper]`. `base_url` and `api_key` are
-  accepted only in the global config (in `reviewloop.toml` they are a parse
-  error); `agent_id` and `desk_rejection_enabled` in either file, the
+  accepted only in the global config (`reviewloop.toml` refuses them);
+  `agent_id` and `desk_rejection_enabled` in either file, the
   project value winning. A global config this version creates carries the
   table, which older versions reject as an unknown field.
 - `config migrate-project` keeps an existing `[providers.cspaper]` section

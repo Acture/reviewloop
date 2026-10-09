@@ -1036,9 +1036,19 @@ where
         anyhow!(
             "failed to parse TOML config: {}{location}: {}",
             path.display(),
-            err.message()
+            scrub_values(err.message())
         )
     })
+}
+
+/// serde's type and value errors quote the offending value (`invalid type:
+/// string "csp_live_...", expected a boolean`); keep the kind, drop the value.
+fn scrub_values(message: &str) -> String {
+    let value = regex::Regex::new(
+        r#"(invalid (?:type|value): [a-z ]*?|unknown variant )("(?:[^"\\]|\\.)*"|`[^`]*`)"#,
+    )
+    .expect("valid value regex");
+    value.replace_all(message, "$1<value>").into_owned()
 }
 
 /// 1-based line and column of byte `offset` in `raw`.
@@ -1051,12 +1061,13 @@ fn line_and_column(raw: &str, offset: usize) -> Option<(usize, usize)> {
     ))
 }
 
-/// Refuses an `api_key` anywhere in a project file. Scans the raw text, so a
-/// line the TOML parser would reject (an unquoted or unterminated key) is
+/// Refuses an `api_key` anywhere in a project file, and anything shaped like a
+/// CSPaper key even in a comment or under another name. Scans the raw text, so
+/// a line the TOML parser would reject (an unquoted or unterminated key) is
 /// refused here too instead of being quoted by the parse error.
 fn refuse_project_api_key(path: &Path, raw: &str) -> Result<()> {
-    let key_line =
-        regex::Regex::new(r#"(?m)^[^#\n]*\bapi_key["']?\s*="#).expect("valid api_key regex");
+    let key_line = regex::Regex::new(r#"(?m)^[^#\n]*\bapi_key["']?\s*=|csp_live_"#)
+        .expect("valid api_key regex");
     let Some(found) = key_line.find(raw) else {
         return Ok(());
     };
@@ -1066,7 +1077,7 @@ fn refuse_project_api_key(path: &Path, raw: &str) -> Result<()> {
         |path| path.display().to_string(),
     );
     Err(anyhow!(
-        "project config {} sets an api_key (line {line}); remove it: providers.cspaper.api_key \
+        "project config {} holds an API key (line {line}); remove it: providers.cspaper.api_key \
          belongs only in the global config {global} or the {CSPAPER_API_KEY_ENV} environment \
          variable, never in a file that may be committed",
         path.display()
@@ -2600,7 +2611,7 @@ db_path = "db.sqlite"
             let err = ProjectConfigFile::load(&path).expect_err("api_key in a project file");
             assert_no_echo(&err, CSPAPER_KEY);
             let msg = format!("{err:#}");
-            assert!(msg.contains("sets an api_key"), "{msg}");
+            assert!(msg.contains("holds an API key"), "{msg}");
             assert!(msg.contains("providers.cspaper.api_key"), "{msg}");
             assert!(msg.contains("global config"), "{msg}");
             assert!(msg.contains(CSPAPER_API_KEY_ENV), "{msg}");
@@ -2660,10 +2671,11 @@ db_path = "db.sqlite"
         let path = write_config(
             &tmp,
             "reviewloop.toml",
-            &format!("project_id = \"p\"\n[providers.cspaper]\napikey = \"{CSPAPER_KEY}\"\n"),
+            // Not key-shaped, so the unknown-field path (not the key scan) reports it.
+            "project_id = \"p\"\n[providers.cspaper]\napikey = \"not-a-key-shape-secret\"\n",
         );
         let err = ProjectConfigFile::load(&path).expect_err("unknown field");
-        assert_no_echo(&err, CSPAPER_KEY);
+        assert_no_echo(&err, "not-a-key-shape-secret");
         assert!(
             format!("{err:#}").contains("unknown field `apikey`"),
             "{err:#}"
@@ -2677,6 +2689,62 @@ db_path = "db.sqlite"
         assert!(msg.contains("failed to parse TOML config"), "{msg}");
         assert!(msg.contains(&path.display().to_string()), "{msg}");
         assert!(msg.contains("line 2, column 12"), "{msg}");
+    }
+
+    #[test]
+    fn config_type_errors_name_the_kind_but_not_the_value() {
+        let tmp = TempDir::new().expect("tempdir");
+        for (name, body, secret, kind) in [
+            (
+                "config.toml",
+                format!("[providers]\ncspaper = \"{CSPAPER_KEY}\"\n"),
+                CSPAPER_KEY,
+                "invalid type: string <value>",
+            ),
+            (
+                "config.toml",
+                "[imap]\npassword = 12345678\n".to_string(),
+                "12345678",
+                "invalid type: integer <value>",
+            ),
+            (
+                "reviewloop.toml",
+                "project_id = \"p\"\n[providers.cspaper]\ndesk_rejection_enabled = \"hunter2secret\"\n"
+                    .to_string(),
+                "hunter2secret",
+                "invalid type: string <value>",
+            ),
+        ] {
+            let path = write_config(&tmp, name, &body);
+            let err = if name == "config.toml" {
+                GlobalConfigFile::load(&path).map(drop)
+            } else {
+                ProjectConfigFile::load(&path).map(drop)
+            }
+            .expect_err("type error");
+            assert_no_echo(&err, secret);
+            assert!(format!("{err:#}").contains(kind), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn project_file_refuses_a_cspaper_key_anywhere() {
+        let tmp = TempDir::new().expect("tempdir");
+        for (body, line) in [
+            (format!("project_id = \"p\"\n# old key: {CSPAPER_KEY}\n"), 2),
+            (
+                format!("project_id = \"p\"\n[providers.cspaper]\nagent_id = \"{CSPAPER_KEY}\"\n"),
+                3,
+            ),
+        ] {
+            let path = write_config(&tmp, "reviewloop.toml", &body);
+            let err = ProjectConfigFile::load(&path).expect_err("key-shaped text refused");
+            assert_no_echo(&err, CSPAPER_KEY);
+            assert!(
+                format!("{err:#}").contains(&format!("(line {line})")),
+                "{err:#}"
+            );
+        }
     }
 
     #[test]

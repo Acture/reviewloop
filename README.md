@@ -622,9 +622,11 @@ agent_id = "ICLR_main_2026_1"
 desk_rejection_enabled = false
 ```
 
-The key never goes in `reviewloop.toml`: the project file has no `api_key` or
-`base_url` under `[providers.cspaper]`, so either one there is rejected as a
-config parse error. Keep the key in the global config or the environment.
+The key never goes in `reviewloop.toml`: a project file with an `api_key`, or
+with `csp_live_` text anywhere (even in a comment), is refused before it is
+parsed, and a `base_url` under `[providers.cspaper]` is a parse error. Config
+errors name the line but never print it or the value. Keep the key in the
+global config or the environment.
 
 ```bash
 reviewloop paper add --paper-id main --path paper/main.pdf \
@@ -654,7 +656,7 @@ Submitting:
 | No API key configured, or 401 / 403 | `FAILED_NEEDS_MANUAL`, with a notification | Nothing was created. Fix the key, then `reviewloop retry --job-id <id>`. |
 | 400 (unknown template), 422 (incomplete request), any other 4xx; no template on the job; a file that is not a PDF | `FAILED` | Nothing was created. Fix the template or file, then request a new review with `reviewloop submit --paper-id <paper>`: `retry` resends what the job recorded. |
 | 429 | `QUEUED`, retried after `Retry-After` (capped at 24 h), else on the polling schedule | Nothing. This assumes CSPaper throttles before creating a job; its documentation does not say. |
-| Connection never established | `FAILED` | Nothing reached CSPaper; safe to retry. |
+| Connection never established (including a TCP, proxy or TLS handshake still stalled after 30 s) | `FAILED` | Nothing reached CSPaper; safe to retry. |
 | 5xx, 301 / 302 / 303, a lost or unreadable response, no answer within 20 minutes, or a 2xx receipt without a usable `job_id` | `SUBMITTED` + `UNCERTAIN`, with a notification; never resent | CSPaper may hold the review: [reconcile it](#reconciling-an-uncertain-cspaper-submission). |
 | Any other 3xx (307 / 308 ask for the request to be resent elsewhere) | `FAILED` | The base URL points at the wrong host or path; check `providers.cspaper.base_url`. |
 
@@ -665,7 +667,7 @@ Polling:
 | `PENDING` / `PROCESSING` | stays `PROCESSING` | Nothing. |
 | `COMPLETED` | `COMPLETED`, artifacts written | Read the review. |
 | `FAILED` | `FAILED_NEEDS_MANUAL` with CSPaper's `failed_reason`, and a notification | Polling again gives the same answer, so `retry` does not help: request a new review with `reviewloop submit --paper-id <paper> --force` (`--force` because an earlier review of the same manuscript would otherwise be returned instead). |
-| 404 / 410 (unknown job, or one owned by another organisation's key) | `FAILED` (`invalid token`) | Check the job id; `reviewloop import-token --job-id <id> --token <job_id>` attaches the right one. |
+| 404 / 410 (unknown job, or one owned by another organisation's key) | `FAILED` (`invalid token`) | Check the job id and the key's organisation. A `FAILED` job cannot take a new token, so attach the right one to a new job: `reviewloop import-token --paper-id <paper> --token <cspaper job_id>`. |
 | 401 / 403, 429, 5xx, or an unexpected payload | stays `PROCESSING`, polled again on the schedule (429: after `Retry-After`) | Fix the key if it was refused; the job times out after `core.review_timeout_hours` otherwise. |
 
 ### Reconciling an uncertain CSPaper submission
