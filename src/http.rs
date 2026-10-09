@@ -171,13 +171,6 @@ fn is_transient_proxy_error(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout() || err.status().is_none()
 }
 
-/// Build an outbound HTTP client with proxy pool middleware when proxies are
-/// configured.
-///
-/// When `config.core.proxies` is empty, returns a plain
-/// `ClientWithMiddleware` with no middleware — behaviour identical to a bare
-/// `reqwest::Client::new()`.
-///
 /// Whether a client follows HTTP redirects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Redirects {
@@ -199,6 +192,13 @@ impl Redirects {
     }
 }
 
+/// Build an outbound HTTP client with proxy pool middleware when proxies are
+/// configured.
+///
+/// When `config.core.proxies` is empty, returns a plain
+/// `ClientWithMiddleware` with no middleware — behaviour identical to a bare
+/// `reqwest::Client` with the chosen redirect policy.
+///
 /// When proxies are configured, installs [`RoundRobinProxyMiddleware`] so
 /// every request cycles through the proxy list.  Only the count is logged;
 /// individual proxy URLs are never emitted to avoid leaking embedded

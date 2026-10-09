@@ -110,8 +110,8 @@ terminal provider error, it records two provider outcomes:
 - **The provider reported the review failed** (CSPaper `FAILED`; event
   `poll_provider_failed`, `last_error` carries its `failed_reason`). The job
   keeps its token, so `retry_job` only polls the same failure again. A new
-  review needs `request_review`, which this job does not block because failed
-  jobs cover nothing.
+  review needs `request_review` with `force`: this job covers nothing, but an
+  earlier completed review of the same manuscript would otherwise be returned.
 
 A CSPaper poll refused with 401 / 403 is not terminal: the job stays
 PROCESSING and is polled on the schedule until `review_timeout_hours` marks it

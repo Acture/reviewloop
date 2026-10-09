@@ -925,7 +925,7 @@ async fn poll_leased(
         }
         Ok(ReviewFetchResult::Failed { reason }) => {
             let detail = format!(
-                "provider reported the review failed: {reason}; request a new review with `reviewloop submit --paper-id {}`",
+                "provider reported the review failed: {reason}; request a new review with `reviewloop submit --paper-id {} --force`",
                 job.paper_id
             );
             let change = JobChange {

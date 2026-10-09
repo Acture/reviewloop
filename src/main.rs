@@ -7,7 +7,8 @@ use reviewloop::application::{
 };
 use reviewloop::artifact::write_review_artifacts;
 use reviewloop::config::{
-    Config, LegacyConfig, PaperConfigFile, ProjectConfigFile, default_project_config_path,
+    Config, GlobalConfigFile, LegacyConfig, PaperConfigFile, ProjectConfigFile,
+    default_project_config_path,
 };
 use reviewloop::db::Db;
 use reviewloop::email_account;
@@ -978,7 +979,11 @@ fn cmd_config_migrate_project(
 
     let global_path = Config::ensure_global_config_file()?
         .ok_or_else(|| anyhow!("failed to determine global config path"))?;
-    legacy.global_config().save(&global_path)?;
+    // Legacy files predate CSPaper; keep a CSPaper section (and its API key)
+    // already saved in the global config instead of resetting it.
+    let mut global = legacy.global_config();
+    global.providers.cspaper = GlobalConfigFile::load(&global_path)?.providers.cspaper;
+    global.save(&global_path)?;
 
     let backup_path = legacy_path.with_file_name("reviewloop.legacy.bak.toml");
     if backup_path.exists() {
@@ -1161,6 +1166,9 @@ fn cmd_daemon_install(config_override: Option<&Path>, start: bool) -> Result<()>
             println!("- project config: {}", path.display());
         } else {
             println!("- mode: global-only daemon (no project config bound)");
+        }
+        if let Some(warning) = daemon_cspaper_key_warning(&config, &global_path)? {
+            println!("{warning}");
         }
 
         if start {
@@ -2240,6 +2248,30 @@ async fn cmd_import_token(
 
     println!("Created job {} and attached imported token", job.id);
     poll_imported_token(config, db, &job.id).await
+}
+
+/// launchd starts the daemon without the installing shell's environment, so a
+/// CSPaper key that only comes from the environment never reaches it.
+#[cfg(target_os = "macos")]
+fn daemon_cspaper_key_warning(config: &Config, global_path: &Path) -> Result<Option<String>> {
+    let uses_cspaper = config
+        .papers
+        .iter()
+        .any(|paper| paper.backend == reviewloop::backend::cspaper::BACKEND);
+    let key_in_file = GlobalConfigFile::load(global_path)?
+        .providers
+        .cspaper
+        .api_key
+        .is_some_and(|key| !key.trim().is_empty());
+    Ok((uses_cspaper && !key_in_file).then(|| {
+        format!(
+            "warning: this project uses backend=cspaper but {} has no providers.cspaper.api_key; \
+             the daemon does not inherit {} from this shell, so its CSPaper submissions would \
+             fail. Set the key in the global config.",
+            global_path.display(),
+            reviewloop::config::CSPAPER_API_KEY_ENV
+        )
+    }))
 }
 
 /// Imported tokens join the email-token ledger only for backends whose tokens
@@ -4031,6 +4063,54 @@ mod tests {
                     "{label}: 'papers' value must be a JSON array"
                 );
             }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    mod daemon_cspaper_key {
+        use crate::daemon_cspaper_key_warning;
+        use reviewloop::config::{Config, GlobalConfigFile, PaperConfig, Redacted};
+
+        fn config_with(backend: &str) -> Config {
+            let mut config = Config {
+                papers: vec![PaperConfig {
+                    id: "main".to_string(),
+                    pdf_path: "main.pdf".to_string(),
+                    backend: backend.to_string(),
+                    venue: None,
+                }],
+                ..Config::default()
+            };
+            // Present at runtime, as if it came from the environment.
+            config.providers.cspaper.api_key = Some(Redacted("csp_live_env".to_string()));
+            config
+        }
+
+        #[test]
+        fn warns_only_when_a_cspaper_project_has_no_key_in_the_global_file() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("config.toml");
+            GlobalConfigFile::default().save(&path).expect("save");
+
+            let warning = daemon_cspaper_key_warning(&config_with("cspaper"), &path)
+                .expect("check")
+                .expect("a CSPaper project without a key on file is warned about");
+            assert!(warning.contains("REVIEWLOOP_CSPAPER_API_KEY"), "{warning}");
+            assert!(!warning.contains("csp_live_env"), "{warning}");
+            assert!(
+                daemon_cspaper_key_warning(&config_with("stanford"), &path)
+                    .expect("check")
+                    .is_none()
+            );
+
+            let mut global = GlobalConfigFile::default();
+            global.providers.cspaper.api_key = Some(Redacted("csp_live_file".to_string()));
+            global.save(&path).expect("save");
+            assert!(
+                daemon_cspaper_key_warning(&config_with("cspaper"), &path)
+                    .expect("check")
+                    .is_none()
+            );
         }
     }
 

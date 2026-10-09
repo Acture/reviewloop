@@ -304,9 +304,48 @@ impl Config {
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
-            cspaper::BACKEND => self.providers.cspaper.agent_id.clone(),
+            cspaper::BACKEND => self
+                .providers
+                .cspaper
+                .agent_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
             _ => None,
         }
+    }
+
+    /// The setting `paper`'s provider still needs before a review of it can
+    /// be submitted, with a message naming it, or `None` when nothing is
+    /// missing. Every enqueue path checks this, so a job that could only fail
+    /// is never queued.
+    pub fn missing_provider_setting(&self, paper: &PaperConfig) -> Option<(&'static str, String)> {
+        if paper.backend != cspaper::BACKEND {
+            return None;
+        }
+        if self
+            .providers
+            .cspaper
+            .api_key
+            .as_ref()
+            .is_none_or(|key| key.trim().is_empty())
+        {
+            return Some((
+                "api_key",
+                "no CSPaper API key configured for backend=cspaper".to_string(),
+            ));
+        }
+        if self.venue_for(paper).is_none() {
+            return Some((
+                "agent_id",
+                format!(
+                    "no CSPaper review template (agent_id) configured for paper {}",
+                    paper.id
+                ),
+            ));
+        }
+        None
     }
 
     /// Provider options beyond the venue that a new review of `paper` is

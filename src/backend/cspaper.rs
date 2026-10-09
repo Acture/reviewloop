@@ -43,6 +43,9 @@ const REVIEWS_PATH: &str = "/api/platform/reviews";
 const API_KEY_HEADER: &str = "X-API-Key";
 /// Provider text quoted into job errors and events is cut to this many chars.
 const MAX_QUOTED_CHARS: usize = 512;
+/// Retrying a job resends what it recorded at request time, so a corrected
+/// template needs a new request.
+const NEW_REVIEW_HINT: &str = "request a new review with `reviewloop submit --paper-id <paper>` (retrying this job resends what it recorded)";
 
 /// No `Debug`: it would be one `{:?}` away from printing the key holder.
 pub struct CspaperBackend {
@@ -56,7 +59,7 @@ impl CspaperBackend {
         Self {
             client,
             base_url: config.base_url.trim_end_matches('/').to_string(),
-            api_key: config.api_key.clone(),
+            api_key: config.api_key.clone().filter(|key| !key.trim().is_empty()),
         }
     }
 
@@ -125,9 +128,9 @@ impl ReviewBackend for CspaperBackend {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
-                BackendError::Rejected(
-                    "no CSPaper review template: set providers.cspaper.agent_id or the paper's venue to an agent_id such as ICLR_main_2026_1".into(),
-                )
+                BackendError::Rejected(format!(
+                    "no CSPaper review template recorded on this job; set providers.cspaper.agent_id or the paper's venue to an agent_id such as ICLR_main_2026_1, then {NEW_REVIEW_HINT}"
+                ))
             })?
             .to_string();
         let desk_rejection_enabled = desk_rejection_field(&req.review_options)?;
@@ -201,18 +204,21 @@ impl ReviewBackend for CspaperBackend {
             }),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(self.auth_error(status, &body)),
             StatusCode::BAD_REQUEST => Err(BackendError::Rejected(format!(
-                "CSPaper rejected review template {agent_id:?} (400): {}",
+                "CSPaper rejected review template {agent_id:?} (400): {}; fix providers.cspaper.agent_id or the paper's venue, then {NEW_REVIEW_HINT}",
                 self.quote(&body)
             ))),
             StatusCode::UNPROCESSABLE_ENTITY => Err(BackendError::Rejected(format!(
                 "CSPaper rejected the submission as incomplete or invalid (422): {}",
                 self.quote(&body)
             ))),
-            // "See other" is how a server answers a POST it has processed.
-            StatusCode::SEE_OTHER => Err(BackendError::OutcomeUnknown(format!(
-                "CSPaper answered 303 (redirect to {}) instead of a receipt",
-                location.as_deref().unwrap_or("<none>")
-            ))),
+            // A server may answer a POST it has processed with 301/302/303
+            // (post/redirect/get); only 307/308 ask for the request to be resent.
+            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER => {
+                Err(BackendError::OutcomeUnknown(format!(
+                    "CSPaper answered {status} (redirect to {}) instead of a receipt",
+                    location.as_deref().unwrap_or("<none>")
+                )))
+            }
             status if status.is_redirection() => Err(redirect_error(status, location.as_deref())),
             status if status.is_server_error() => Err(BackendError::OutcomeUnknown(format!(
                 "CSPaper answered {status}: {}",

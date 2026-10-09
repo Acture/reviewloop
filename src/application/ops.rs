@@ -14,7 +14,6 @@ use super::{
 };
 use crate::{
     artifact::render_summary_markdown,
-    backend::cspaper,
     config::{Config, PaperConfig},
     db::{CancelOutcome, Db, Requeue},
     email_account::resolve_submission_email,
@@ -34,30 +33,14 @@ use tracing::info;
 /// Checked at enqueue, like the Stanford submitter email, so a job that could
 /// only fail is never queued.
 fn check_provider_settings(config: &Config, paper: &PaperConfig) -> Result<(), OpError> {
-    if paper.backend != cspaper::BACKEND {
-        return Ok(());
+    match config.missing_provider_setting(paper) {
+        Some((setting, message)) => Err(OpError::ProviderNotConfigured {
+            backend: paper.backend.clone(),
+            setting,
+            message,
+        }),
+        None => Ok(()),
     }
-    let missing = |setting: &'static str, message: String| OpError::ProviderNotConfigured {
-        backend: paper.backend.clone(),
-        setting,
-        message,
-    };
-    if config.providers.cspaper.api_key.is_none() {
-        return Err(missing(
-            "api_key",
-            "no CSPaper API key configured for backend=cspaper".to_string(),
-        ));
-    }
-    if config.venue_for(paper).is_none() {
-        return Err(missing(
-            "agent_id",
-            format!(
-                "no CSPaper review template (agent_id) configured for paper {}",
-                paper.id
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// `last_error` prefix of a cancelled job. The widget and the failure lists

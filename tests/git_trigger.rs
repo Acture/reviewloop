@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use reviewloop::{
     backend::cspaper,
-    config::{Config, PaperConfig},
+    config::{Config, PaperConfig, Redacted},
     db::Db,
     model::{JobStatus, ReviewOptions},
     trigger::{run_git_tag_trigger, run_pdf_trigger},
@@ -168,6 +168,7 @@ fn git_trigger_enqueues_cspaper_job_with_template_and_options() -> Result<()> {
     const TAG: &str = "review-cspaper/cs/v1";
     let mut ctx = GitTriggerTestContext::new()?;
     ctx.add_second_paper("cs", cspaper::BACKEND)?;
+    ctx.config.providers.cspaper.api_key = Some(Redacted("csp_live_test".to_string()));
     ctx.config.providers.cspaper.agent_id = Some(AGENT_ID.to_string());
     // Not the default, so the job must have read it from the config.
     ctx.config.providers.cspaper.desk_rejection_enabled = false;
@@ -199,6 +200,49 @@ fn git_trigger_enqueues_cspaper_job_with_template_and_options() -> Result<()> {
             .is_none(),
         "a cspaper tag must not enqueue the stanford paper"
     );
+    Ok(())
+}
+
+#[test]
+fn git_trigger_waits_for_an_unconfigured_cspaper_paper() -> Result<()> {
+    // A paper id of its own: the once-per-process warning set is shared by
+    // every test in this binary.
+    const PAPER: &str = "cs-unconfigured";
+    const TAG: &str = "review-cspaper/cs-unconfigured/v1";
+    let mut ctx = GitTriggerTestContext::new()?;
+    ctx.add_second_paper(PAPER, cspaper::BACKEND)?;
+    ctx.config.providers.cspaper.api_key = Some(Redacted("csp_live_test".to_string()));
+    ctx.create_tag(TAG)?;
+
+    // No template anywhere: nothing is enqueued and the tag stays unseen.
+    run_git_tag_trigger(&ctx.config, &ctx.db)?;
+    assert!(
+        ctx.db
+            .find_latest_open_job_for_paper(&ctx.config.project_id, PAPER)?
+            .is_none(),
+        "a job without a template could only fail"
+    );
+    let event = ctx
+        .db
+        .most_recent_event_of_type(&ctx.config.project_id, "provider_not_configured")?
+        .context("expected a provider_not_configured event")?;
+    assert_eq!(event.payload["paper_id"], PAPER);
+    assert_eq!(event.payload["setting"], "agent_id");
+    assert_eq!(event.payload["source"], "git_tag_trigger");
+    assert!(
+        !ctx.db
+            .is_tag_seen(&format!("{}::{TAG}", ctx.config.project_id))?
+    );
+
+    // Once configured, the same tag enqueues on the next run.
+    ctx.config.providers.cspaper.agent_id = Some("ICLR_main_2026_1".to_string());
+    run_git_tag_trigger(&ctx.config, &ctx.db)?;
+    let job = ctx
+        .db
+        .find_latest_open_job_for_paper(&ctx.config.project_id, PAPER)?
+        .context("expected the tag to enqueue once configured")?;
+    assert_eq!(job.venue.as_deref(), Some("ICLR_main_2026_1"));
+    assert_eq!(job.git_tag.as_deref(), Some(TAG));
     Ok(())
 }
 

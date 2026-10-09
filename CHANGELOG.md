@@ -72,10 +72,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **CSPaper outcomes** — at submission, a missing key or a 401 / 403 moves
   the job to `FAILED_NEEDS_MANUAL` with a notification; 400 (unknown
   template), 422 and other 4xx fail it; 429 requeues it after `Retry-After`;
-  a 5xx, a lost response or a receipt without a `job_id` parks it as
-  `SUBMITTED` / `UNCERTAIN`, never resent. A review CSPaper reports `FAILED`
-  moves to `FAILED_NEEDS_MANUAL` (request a new one with `submit`); a poll
-  404 fails the job with `invalid token`.
+  a 5xx, a 301/302/303, a lost response or a receipt without a `job_id`
+  parks it as `SUBMITTED` / `UNCERTAIN`, never resent. A review CSPaper
+  reports `FAILED` moves to `FAILED_NEEDS_MANUAL` (request a new one with
+  `submit --force`); a poll 404 fails the job with `invalid token`.
 - **CSPaper archives** — `review.json` holds the normalized review (`title`,
   `venue` / `agent_id`, `numerical_score` from `overall_score` or
   `mainScoreNorm`, `desk_reject`, the decoded `result_summary`, the markdown
@@ -83,7 +83,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `review.md` renders the markdown review.
 - **`provider_not_configured`** — `request_review` (`submit`, `run`,
   `paper add --submit-now`) refuses a CSPaper paper that has no API key or no
-  template before anything is enqueued.
+  template before anything is enqueued. Git tag and PDF change triggers skip
+  such a paper with a `provider_not_configured` event (once per paper and
+  setting per process) and leave the tag unprocessed until it is configured.
+- **`daemon install` key check** — warns when a CSPaper project's key is not
+  in the global config: launchd does not pass the shell's
+  `REVIEWLOOP_CSPAPER_API_KEY` to the daemon.
 
 ### Changed
 
@@ -199,14 +204,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   v1 to v4). Existing rows read back with no options, which is what a
   Stanford request derives, so they keep covering their requests.
 - New event types: `poll_provider_failed` (the provider reported the review
-  failed) and `submit_failed_needs_manual` (credentials refused at
-  submission). `job_enqueued` and `duplicate_skipped` payloads carry
+  failed), `submit_failed_needs_manual` (credentials refused at submission)
+  and `provider_not_configured` (a trigger skipped a paper whose provider
+  lacks a setting). `job_enqueued` and `duplicate_skipped` payloads carry
   `review_options`.
 - New error code: `provider_not_configured` (details `backend`, `setting`).
 - New config table `[providers.cspaper]`. `base_url` and `api_key` are
   accepted only in the global config (in `reviewloop.toml` they are a parse
   error); `agent_id` and `desk_rejection_enabled` in either file, the
-  project value winning.
+  project value winning. A global config this version creates carries the
+  table, which older versions reject as an unknown field.
+- `config migrate-project` keeps an existing `[providers.cspaper]` section
+  of the global config instead of resetting it.
 
 ### Fixed
 

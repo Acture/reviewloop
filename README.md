@@ -591,7 +591,9 @@ desk_rejection_enabled = true       # the default
 - `api_key`: your organisation's API key. When it is unset or blank,
   `REVIEWLOOP_CSPAPER_API_KEY` is used; when both are set, the config value
   wins. It is sent only in the `X-API-Key` header and kept out of job rows,
-  events, job errors and archives.
+  events, job errors and archives. The launchd daemon does not inherit your
+  shell's environment, so a daemon needs the key in the global config;
+  `reviewloop daemon install` warns when it is missing there.
 - `base_url`: defaults to `https://cspaper.org`. It must be `https://` with a
   host (plain `http://` only for `localhost`, `127.0.0.1` or `[::1]`).
   ReviewLoop calls the live `/api/platform/...` paths, not the
@@ -632,8 +634,9 @@ reviewloop submit --paper-id main
 
 `submit`, `run` and `paper add --submit-now` refuse a CSPaper paper up front,
 queueing nothing, when no API key or no template is configured (error code
-`provider_not_configured`). Jobs from Git tag or PDF change triggers are not
-checked at enqueue and fail at submission instead (table below).
+`provider_not_configured`). Git tag and PDF change triggers skip such a paper
+and record one `provider_not_configured` event per paper and setting; a
+skipped tag stays unprocessed, so it enqueues once the setting exists.
 
 Unlike the Stanford backend, CSPaper needs no submitter email
 (`providers.stanford.email` and `email login` are not used), has no browser
@@ -649,11 +652,11 @@ Submitting:
 | CSPaper answer | Job becomes | What to do |
 |---|---|---|
 | No API key configured, or 401 / 403 | `FAILED_NEEDS_MANUAL`, with a notification | Nothing was created. Fix the key, then `reviewloop retry --job-id <id>`. |
-| 400 (unknown template), 422 (incomplete request), any other 4xx; no template on the job; a file that is not a PDF | `FAILED` | Nothing was created. Fix the template or file and submit again. |
+| 400 (unknown template), 422 (incomplete request), any other 4xx; no template on the job; a file that is not a PDF | `FAILED` | Nothing was created. Fix the template or file, then request a new review with `reviewloop submit --paper-id <paper>`: `retry` resends what the job recorded. |
 | 429 | `QUEUED`, retried after `Retry-After` (capped at 24 h), else on the polling schedule | Nothing. This assumes CSPaper throttles before creating a job; its documentation does not say. |
 | Connection never established | `FAILED` | Nothing reached CSPaper; safe to retry. |
-| 5xx, 303, a lost or unreadable response, no answer within 20 minutes, or a 2xx receipt without a usable `job_id` | `SUBMITTED` + `UNCERTAIN`, with a notification; never resent | CSPaper may hold the review: [reconcile it](#reconciling-an-uncertain-cspaper-submission). |
-| Any other 3xx | `FAILED` | The base URL points at the wrong host or path; check `providers.cspaper.base_url`. |
+| 5xx, 301 / 302 / 303, a lost or unreadable response, no answer within 20 minutes, or a 2xx receipt without a usable `job_id` | `SUBMITTED` + `UNCERTAIN`, with a notification; never resent | CSPaper may hold the review: [reconcile it](#reconciling-an-uncertain-cspaper-submission). |
+| Any other 3xx (307 / 308 ask for the request to be resent elsewhere) | `FAILED` | The base URL points at the wrong host or path; check `providers.cspaper.base_url`. |
 
 Polling:
 
@@ -661,7 +664,7 @@ Polling:
 |---|---|---|
 | `PENDING` / `PROCESSING` | stays `PROCESSING` | Nothing. |
 | `COMPLETED` | `COMPLETED`, artifacts written | Read the review. |
-| `FAILED` | `FAILED_NEEDS_MANUAL` with CSPaper's `failed_reason`, and a notification | Polling again gives the same answer, so `retry` does not help: request a new review with `reviewloop submit --paper-id <paper>`. |
+| `FAILED` | `FAILED_NEEDS_MANUAL` with CSPaper's `failed_reason`, and a notification | Polling again gives the same answer, so `retry` does not help: request a new review with `reviewloop submit --paper-id <paper> --force` (`--force` because an earlier review of the same manuscript would otherwise be returned instead). |
 | 404 / 410 (unknown job, or one owned by another organisation's key) | `FAILED` (`invalid token`) | Check the job id; `reviewloop import-token --job-id <id> --token <job_id>` attaches the right one. |
 | 401 / 403, 429, 5xx, or an unexpected payload | stays `PROCESSING`, polled again on the schedule (429: after `Retry-After`) | Fix the key if it was refused; the job times out after `core.review_timeout_hours` otherwise. |
 

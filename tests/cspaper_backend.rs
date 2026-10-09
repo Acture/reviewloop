@@ -1397,7 +1397,18 @@ async fn submit_2xx_html_parks_uncertain() -> Result<()> {
 async fn submit_303_parks_uncertain() -> Result<()> {
     assert_reply_parks_uncertain(
         Reply::html(StatusCode::SEE_OTHER, "").header("location", "/platform/review"),
-        "CSPaper answered 303 (redirect to /platform/review)",
+        "CSPaper answered 303 See Other (redirect to /platform/review)",
+    )
+    .await
+}
+
+/// 302 is the default post/redirect/get answer of many frameworks: the job may
+/// already exist, so it is never resubmitted (unlike 307/308, which ask for it).
+#[tokio::test]
+async fn submit_302_parks_uncertain() -> Result<()> {
+    assert_reply_parks_uncertain(
+        Reply::html(StatusCode::FOUND, "").header("location", "/platform/review"),
+        "CSPaper answered 302 Found (redirect to /platform/review)",
     )
     .await
 }
