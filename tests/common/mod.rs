@@ -13,7 +13,7 @@ use reviewloop::{
     model::{EventRecord, Job, JobPdf, JobStatus, NewJob},
     submission_input::prepare_input,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, types::ValueRef};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -288,6 +288,96 @@ pub fn completed_change() -> JobChange {
         submit_stage: None,
         fallback_used: None,
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Secret containment
+// ---------------------------------------------------------------------------------------
+
+/// Tables [`assert_secret_absent`] reads in full.
+const SECRET_SCANNED_TABLES: [&str; 4] = ["jobs", "events", "enqueue_requests", "reviews"];
+
+/// Fail when `secret` appears anywhere the project keeps or prints state: any column of
+/// the job, event, request-key and review tables, the bytes of any file under the state
+/// dir (the database and its WAL included, so even overwritten rows count), or the
+/// config's `Debug` and serialized provider settings.
+pub fn assert_secret_absent(ctx: &Ctx, secret: &str) -> Result<()> {
+    assert!(!secret.is_empty(), "an empty secret would match everything");
+    let conn = ctx.conn()?;
+    for table in SECRET_SCANNED_TABLES {
+        let rows = table_text(&conn, table)?;
+        if table == "jobs" {
+            assert!(!rows.is_empty(), "nothing to scan: the jobs table is empty");
+        }
+        for (index, row) in rows.iter().enumerate() {
+            assert!(
+                !row.iter().any(|cell| cell.contains(secret)),
+                "secret stored in {table} row {index}: {row:?}"
+            );
+        }
+    }
+
+    let files = files_under(&ctx.config.state_dir())?;
+    assert!(!files.is_empty(), "nothing to scan: the state dir is empty");
+    for file in files {
+        let bytes = fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
+        assert!(
+            !bytes
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "secret written to {}",
+            file.display()
+        );
+    }
+
+    assert!(
+        !format!("{:?}", ctx.config).contains(secret),
+        "secret in the config's Debug output"
+    );
+    assert!(
+        !serde_json::to_string(&ctx.config.providers)?.contains(secret),
+        "secret in the serialized provider settings"
+    );
+    Ok(())
+}
+
+/// Every row of `table`, each column rendered as text (`NULL` as empty).
+fn table_text(conn: &Connection, table: &str) -> Result<Vec<Vec<String>>> {
+    let mut stmt = conn.prepare(&format!("SELECT * FROM {table}"))?;
+    let columns = stmt.column_count();
+    let rows = stmt.query_map([], |row| {
+        (0..columns)
+            .map(|index| {
+                Ok(match row.get_ref(index)? {
+                    ValueRef::Null => String::new(),
+                    ValueRef::Integer(value) => value.to_string(),
+                    ValueRef::Real(value) => value.to_string(),
+                    ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+                        String::from_utf8_lossy(bytes).into_owned()
+                    }
+                })
+            })
+            .collect::<rusqlite::Result<Vec<String>>>()
+    })?;
+    rows.collect::<rusqlite::Result<_>>()
+        .with_context(|| format!("reading table {table}"))
+}
+
+/// Every regular file below `root`, recursively.
+fn files_under(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).with_context(|| format!("listing {}", dir.display()))? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    Ok(files)
 }
 
 /// Fail instead of hanging when a gate is never opened.
