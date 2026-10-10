@@ -661,8 +661,11 @@ The count is local: every CSPaper job in the state database that holds a
 CSPaper job id (including imported ones), across all projects, since the key
 is machine-level, split into completed, in progress (accepted, still being
 reviewed) and ended without a review (provider failure, timeout, cancel).
-All three count toward the credit estimate; uncertain submissions are listed
-separately. It is an estimate, not CSPaper's balance.
+All three count toward the credit estimate. Uncertain submissions are listed
+separately: jobs parked `UNCERTAIN`, and jobs whose submission outcome was
+unknown before they were cancelled or resubmitted with `retry --force` (those
+are known from job events, kept for `retention.events_days`, default 30). It
+is an estimate, not CSPaper's balance.
 
 ### Errors and outcomes
 

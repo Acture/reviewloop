@@ -782,8 +782,9 @@ fn describe_mismatches(mismatches: &[FieldMismatch]) -> String {
 }
 
 /// What this machine has sent a provider. Accepted submissions (a stored
-/// receipt) are split by where the review stands; `uncertain` counts tokenless
-/// ones whose outcome is unknown.
+/// receipt) are split by where the review stands; `uncertain` counts jobs
+/// with a dispatch whose outcome is unknown and was never settled by a
+/// receipt (see `Db::provider_usage`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ProviderUsage {
     pub completed: u64,

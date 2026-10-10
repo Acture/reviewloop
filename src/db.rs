@@ -1706,8 +1706,13 @@ impl Db {
     /// Submissions `backend` has accepted or may have accepted, over every
     /// project in this database: provider credentials are machine-level, so
     /// usage is too. A job holding a token counts as accepted, wherever the
-    /// token came from, and is split by status; a tokenless job left
-    /// UNCERTAIN may have been accepted.
+    /// token came from, and is split by status.
+    ///
+    /// A job counts as uncertain when it is parked UNCERTAIN without a token,
+    /// or when its history has a `submit_outcome_unknown` that no receipt
+    /// settled (a token arriving with no newer `submit_dispatched`): cancel
+    /// and `retry --force` clear the stage but do not withdraw what the
+    /// provider may hold. History lasts as long as `retention.events_days`.
     pub fn provider_usage(&self, backend: &str) -> Result<ProviderUsage> {
         let conn = self.connect()?;
         let count = |row: &rusqlite::Row<'_>, index: usize| -> rusqlite::Result<u64> {
@@ -1718,7 +1723,20 @@ impl Db {
             SELECT COALESCE(SUM(token IS NOT NULL AND status = ?2), 0),
                    COALESCE(SUM(token IS NOT NULL AND status IN (?3, ?4)), 0),
                    COALESCE(SUM(token IS NOT NULL AND status NOT IN (?2, ?3, ?4)), 0),
-                   COALESCE(SUM(token IS NULL AND submit_stage = ?5), 0)
+                   COALESCE(SUM(
+                       (token IS NULL AND submit_stage = ?5)
+                       OR EXISTS (
+                           SELECT 1 FROM events unknown
+                           WHERE unknown.job_id = jobs.id
+                             AND unknown.event_type = 'submit_outcome_unknown'
+                             AND (jobs.token IS NULL OR EXISTS (
+                                 SELECT 1 FROM events later
+                                 WHERE later.job_id = jobs.id
+                                   AND later.event_type = 'submit_dispatched'
+                                   AND later.id > unknown.id
+                             ))
+                       )
+                   ), 0)
             FROM jobs
             WHERE backend = ?1
             "#,

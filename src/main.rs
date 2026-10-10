@@ -2446,7 +2446,7 @@ fn cmd_status(
             return Ok(());
         }
         render_timeline_text(config, paper_id, &rows, &events, show_token, &hidden);
-        return Ok(());
+        return print_status_usage(config, db, &rows);
     }
 
     if as_json {
@@ -2481,7 +2481,7 @@ fn cmd_status(
 
     if rows.is_empty() {
         println!("No jobs found.");
-        return Ok(());
+        return print_status_usage(config, db, &rows);
     }
 
     // Group rows by paper_id, ordered alphabetically (BTreeMap).
@@ -2524,6 +2524,12 @@ fn cmd_status(
         }
     }
 
+    print_status_usage(config, db, &rows)
+}
+
+/// The text views of `status` end with the CSPaper usage line when the project
+/// uses CSPaper (JSON output stays unchanged).
+fn print_status_usage(config: &Config, db: &Db, rows: &[StatusView]) -> Result<()> {
     let uses_cspaper = config
         .papers
         .iter()

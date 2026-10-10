@@ -1044,6 +1044,37 @@ fn provider_usage_splits_cspaper_submissions_by_stage_across_projects() -> Resul
         }
     );
     assert_eq!(usage.accepted(), 3);
+
+    // History keeps a possibly charged dispatch counted after its stage is gone.
+    let event = |job: &Job, kind: &str| {
+        ctx.db
+            .add_event(Some(&job.project_id), Some(&job.id), kind, json!({}))
+    };
+    // Unknown outcome, then cancelled: the stage is cleared, CSPaper may still hold it.
+    let cancelled = ctx.create_cspaper_job("proj-a", JobStatus::Failed, "hash-h1", options())?;
+    event(&cancelled, "submit_dispatched")?;
+    event(&cancelled, "submit_outcome_unknown")?;
+    // Unknown outcome, then `retry --force` accepted: the first dispatch stays uncertain.
+    let resent = accepted("proj-a", "hash-h2", "856f388c-0004")?;
+    event(&resent, "submit_dispatched")?;
+    event(&resent, "submit_outcome_unknown")?;
+    event(&resent, "submit_dispatched")?;
+    // Unknown outcome settled by importing its job id: accepted, not uncertain.
+    let imported = ctx.create_cspaper_job("proj-a", JobStatus::Submitted, "hash-h3", options())?;
+    event(&imported, "submit_dispatched")?;
+    event(&imported, "submit_outcome_unknown")?;
+    ctx.db
+        .attach_token_to_job(&imported.id, "856f388c-0005", Utc::now())?;
+
+    assert_eq!(
+        ctx.db.provider_usage(cspaper::BACKEND)?,
+        ProviderUsage {
+            completed: 1,
+            in_progress: 3,
+            ended: 1,
+            uncertain: 3,
+        }
+    );
     assert_eq!(ctx.db.provider_usage("unknown")?, ProviderUsage::default());
     Ok(())
 }
