@@ -871,3 +871,14 @@ pub struct SupervisorRecord {
     pub last_tick_error: Option<String>,
     pub last_tick_error_at: Option<DateTime<Utc>>,
 }
+
+impl SupervisorRecord {
+    /// The machine-level error of the latest tick, when that tick failed.
+    pub fn current_tick_error(&self) -> Option<&str> {
+        if self.last_tick_error_at.is_some() && self.last_tick_error_at == self.last_tick_at {
+            self.last_tick_error.as_deref()
+        } else {
+            None
+        }
+    }
+}

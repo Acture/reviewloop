@@ -2204,24 +2204,14 @@ impl Db {
         collect_rows(rows)
     }
 
-    /// Count COMPLETED jobs whose `updated_at` starts with `date_prefix` (e.g. `"2026-05-05"`).
-    /// Used by the widget state builder for `summary.completed_today`.
-    /// The date is compared against the UTC date stored in `updated_at`.
-    pub fn count_completed_today(&self, project_id: &str, date_prefix: &str) -> Result<usize> {
+    /// Count COMPLETED jobs, in every project, whose `updated_at` starts with
+    /// `date_prefix` (e.g. `"2026-05-05"`, a UTC date). Used by the widget
+    /// state builder for `summary.completed_today`.
+    pub fn count_completed_on(&self, date_prefix: &str) -> Result<usize> {
         let conn = self.connect()?;
         let count: i64 = conn.query_row(
-            r#"
-            SELECT COUNT(*)
-            FROM jobs
-            WHERE project_id = ?1
-              AND status = ?2
-              AND updated_at LIKE ?3
-            "#,
-            params![
-                project_id,
-                JobStatus::Completed.as_str(),
-                format!("{date_prefix}%"),
-            ],
+            "SELECT COUNT(*) FROM jobs WHERE status = ?1 AND updated_at LIKE ?2",
+            params![JobStatus::Completed.as_str(), format!("{date_prefix}%")],
             |row| row.get(0),
         )?;
         Ok(count as usize)

@@ -58,6 +58,20 @@ pub struct MachineConfig {
 }
 
 impl MachineConfig {
+    /// Machine settings from `global` alone, without reading any file or the
+    /// environment.
+    pub fn from_global(global: GlobalConfigFile) -> Result<Self> {
+        global.validate()?;
+        let config = Config::from_parts(global.clone(), ProjectConfigFile::default(), None);
+        config.validate_runtime(false)?;
+        Ok(Self {
+            config,
+            global,
+            global_path: None,
+            legacy_global_path: None,
+        })
+    }
+
     /// The runtime config of the project whose `reviewloop.toml` is at
     /// `config_path` (canonical), on this machine snapshot.
     pub fn project(&self, config_path: &Path) -> Result<Config> {
@@ -170,16 +184,11 @@ impl Config {
             Some(path) => GlobalConfigFile::load(path)?,
             None => GlobalConfigFile::default(),
         };
-        global.validate()?;
-        let config =
-            Self::from_parts(global.clone(), ProjectConfigFile::default(), None).with_env_secrets();
-        config.validate_runtime(false)?;
-        Ok(MachineConfig {
-            config,
-            global,
-            global_path,
-            legacy_global_path,
-        })
+        let mut machine = MachineConfig::from_global(global)?;
+        machine.config = machine.config.with_env_secrets();
+        machine.global_path = global_path;
+        machine.legacy_global_path = legacy_global_path;
+        Ok(machine)
     }
 
     /// A project's runtime config: its `reviewloop.toml` at `path` (whose
@@ -490,10 +499,10 @@ impl Config {
             core.review_timeout_hours = hours;
         }
         // Project proxy list replaces global when non-empty.
-        if let Some(proxies) = project.core.proxies {
-            if !proxies.is_empty() {
-                core.proxies = proxies;
-            }
+        if let Some(proxies) = project.core.proxies
+            && !proxies.is_empty()
+        {
+            core.proxies = proxies;
         }
 
         let trigger = TriggerConfig {
@@ -747,7 +756,14 @@ impl Config {
         let script = self.providers.stanford.fallback_script.trim();
         if !script.is_empty() {
             let path = Path::new(script);
-            if path.is_absolute() {
+            // A project-relative script was resolved against the project root,
+            // which `validate_fallback_script` already keeps it inside; only a
+            // script elsewhere must be under HOME.
+            let in_project = self
+                .project_root
+                .as_deref()
+                .is_some_and(|root| path_is_within_dir(path, root));
+            if path.is_absolute() && !in_project {
                 let home = home_dir_for_security()?;
                 if !path_is_within_dir(path, &home) {
                     anyhow::bail!(
@@ -2570,6 +2586,28 @@ db_path = "db.sqlite"
             err.contains("fallback_script outside HOME"),
             "unexpected error: {err}"
         );
+    }
+
+    /// The default script, resolved against a project root outside HOME
+    /// (`/Volumes/papers/...`), is the project's own: a registry load (the
+    /// supervisor, `retry` from elsewhere) must not refuse the project.
+    #[test]
+    fn foreign_load_allows_the_projects_own_script_outside_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut cfg = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        cfg.providers.stanford.fallback_script = root
+            .join("tools/paperreview_fallback.mjs")
+            .to_string_lossy()
+            .to_string();
+        assert!(cfg.validate_for_foreign_load().is_ok());
+
+        // Outside the project root it is still refused unless under HOME.
+        cfg.providers.stanford.fallback_script = "/tmp/evil/script.js".to_string();
+        assert!(cfg.validate_for_foreign_load().is_err());
     }
 
     #[test]

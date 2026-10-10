@@ -240,9 +240,19 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
-    /// Start the daemon in the foreground (useful for debugging).
+    /// Run the machine supervisor in the foreground: every enabled project,
+    /// until Ctrl+C. This is what the launchd service runs.
     Run {
-        #[arg(long, default_value_t = true)]
+        /// Repaint a status panel after every tick (only on a terminal).
+        /// Accepts `--panel`, `--panel true` and `--panel false`, as
+        /// installed launchd services pass.
+        #[arg(
+            long,
+            default_value_t = true,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            action = clap::ArgAction::Set
+        )]
         panel: bool,
     },
     /// Install and optionally start the launchd service (macOS only).
@@ -470,15 +480,20 @@ async fn run() -> Result<()> {
                         "note: panel requested but stdout is not a TTY; running without panel."
                     );
                 }
-                let (config, db) = load_runtime(config_override.as_deref(), panel_enabled, false)?;
-                reviewloop::worker::run_daemon(&config, &db, panel_enabled).await
+                cmd_daemon_run(config_override.as_deref(), panel_enabled).await
             }
             DaemonCommand::Install { start } => {
                 cmd_daemon_install(config_override.as_deref(), start)
             }
             DaemonCommand::Uninstall => cmd_daemon_uninstall(),
-            DaemonCommand::Pause => cmd_daemon_pause(),
-            DaemonCommand::Resume => cmd_daemon_resume(),
+            DaemonCommand::Pause => {
+                let (_, db) = load_machine_runtime(false)?;
+                cmd_daemon_pause(&db)
+            }
+            DaemonCommand::Resume => {
+                let (_, db) = load_machine_runtime(false)?;
+                cmd_daemon_resume(&db)
+            }
             DaemonCommand::Status { json } => {
                 // Load config softly — daemon status is still useful without a project config.
                 let config_res =
@@ -1257,60 +1272,159 @@ fn cmd_daemon_uninstall() -> Result<()> {
     }
 }
 
-/// Pause the daemon by unloading it from launchd (macOS only).
-/// The plist remains on disk; `daemon resume` re-loads it.
-fn cmd_daemon_pause() -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        const DAEMON_LABEL: &str = "ai.reviewloop.daemon";
-        let uid = current_uid_string()?;
-        let target = format!("gui/{uid}/{DAEMON_LABEL}");
-        let status = ProcessCommand::new("launchctl")
-            .args(["bootout", &target])
-            .status()
-            .context("failed to run launchctl bootout")?;
-        if status.success() {
-            println!(
-                "Daemon paused (launchd service unloaded). Run `reviewloop daemon resume` to restart."
-            );
-        } else {
-            anyhow::bail!(
-                "launchctl bootout failed — the daemon may not be loaded. \
-                Check `reviewloop daemon status`."
-            );
+/// Run the machine supervisor in the foreground until Ctrl+C or SIGTERM.
+/// `legacy_config` is the `--config` an old single-project launchd plist
+/// still passes: that project stays enabled unless someone already decided.
+async fn cmd_daemon_run(legacy_config: Option<&Path>, panel: bool) -> Result<()> {
+    use reviewloop::supervisor::{LegacyAdoption, Supervisor, TICK_INTERVAL, adopt_legacy_binding};
+
+    let (machine, db) = load_machine_runtime(panel)?;
+    info!("{}", render_guardrail_notice(&machine.config));
+    print_guardrail_warnings(&machine.config);
+    if let Some(path) = legacy_config {
+        match adopt_legacy_binding(&db, &machine, path, Utc::now()) {
+            Ok((project_id, LegacyAdoption::Enabled)) => eprintln!(
+                "note: this daemon was installed for project {project_id} alone; it now runs every enabled project, and {project_id} is enabled. Run `reviewloop daemon install` to update the launchd service."
+            ),
+            Ok((project_id, LegacyAdoption::AlreadyDecided { enabled })) => info!(
+                project_id,
+                enabled, "--config names a project whose enablement is already decided"
+            ),
+            Ok((project_id, LegacyAdoption::Conflict(conflict))) => eprintln!(
+                "warning: not enabling project {project_id} for the supervisor: {conflict}"
+            ),
+            Err(err) => eprintln!("warning: {err:#}; the supervisor runs without it"),
         }
-        Ok(())
+    }
+    if let Some(legacy) = &machine.legacy_global_path {
+        warn!(
+            path = %legacy.display(),
+            "legacy single-file config found: the supervisor runs only projects with a reviewloop.toml; migrate it with `reviewloop config migrate-project --project-id <id>`"
+        );
+    }
+    let enabled = db
+        .list_registered_projects()?
+        .into_iter()
+        .filter(|project| project.enabled)
+        .count();
+    if enabled == 0 {
+        warn!("no project is enabled; the supervisor idles until `reviewloop project enable`");
     }
 
-    #[cfg(not(target_os = "macos"))]
+    Supervisor {
+        db: &db,
+        backends: &reviewloop::worker::LiveBackends,
+        load_machine: &Config::load_machine,
+        interval: TICK_INTERVAL,
+        panel,
+    }
+    .run(shutdown_signal())
+    .await
+}
+
+/// Resolves on Ctrl+C or, on Unix, SIGTERM (what launchd sends on unload).
+async fn shutdown_signal() {
+    #[cfg(unix)]
     {
-        anyhow::bail!(
-            "`daemon pause` is currently macOS-only. \
-            Use your system service manager to stop the daemon."
-        );
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "cannot listen for SIGTERM; stop the supervisor with Ctrl+C");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
-/// Resume the daemon by re-loading it into launchd (macOS only).
-fn cmd_daemon_resume() -> Result<()> {
+/// Pause the supervisor: it keeps running (and its service stays loaded) but
+/// starts no trigger, submission or poll until resumed, across restarts.
+fn cmd_daemon_pause(db: &Db) -> Result<()> {
+    use reviewloop::supervisor::SupervisorState;
+
+    if db.set_supervisor_paused(true, Utc::now())? {
+        println!(
+            "Supervisor paused: no triggers, submissions or polls until `reviewloop daemon resume` (the pause survives restarts). A request already sent finishes first."
+        );
+    } else {
+        println!("Supervisor already paused. Resume it with `reviewloop daemon resume`.");
+    }
+    if SupervisorState::of(&db.supervisor_record()?, Utc::now()) == SupervisorState::Stopped {
+        println!("note: no supervisor is running now; it will start paused.");
+    }
+    Ok(())
+}
+
+/// Resume a paused supervisor. On macOS this also reloads the launchd
+/// service when it is installed but unloaded (as the pause of older
+/// versions left it).
+fn cmd_daemon_resume(db: &Db) -> Result<()> {
+    use reviewloop::supervisor::SupervisorState;
+
+    if db.set_supervisor_paused(false, Utc::now())? {
+        println!("Supervisor resumed.");
+    } else {
+        println!("Supervisor was not paused.");
+    }
     #[cfg(target_os = "macos")]
-    {
-        const DAEMON_LABEL: &str = "ai.reviewloop.daemon";
-        let home = env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
-        let plist_path = PathBuf::from(home)
+    if launchd::plist_path()?.exists() && !launchd::is_loaded()? {
+        launchd::bootstrap(&launchd::plist_path()?)?;
+        println!("Reloaded the launchd service {}.", launchd::LABEL);
+        return Ok(());
+    }
+    if SupervisorState::of(&db.supervisor_record()?, Utc::now()) == SupervisorState::Stopped {
+        println!(
+            "note: no supervisor is running; start one with `reviewloop daemon install` (macOS) or `reviewloop daemon run`."
+        );
+    }
+    Ok(())
+}
+
+/// The launchd LaunchAgent that runs the supervisor (macOS).
+#[cfg(target_os = "macos")]
+mod launchd {
+    use anyhow::{Context, Result, anyhow};
+    use std::{env, path::Path, path::PathBuf, process::Command};
+
+    pub const LABEL: &str = "ai.reviewloop.daemon";
+
+    pub fn plist_path() -> Result<PathBuf> {
+        let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME not set"))?;
+        Ok(PathBuf::from(home)
             .join("Library")
             .join("LaunchAgents")
-            .join(format!("{DAEMON_LABEL}.plist"));
-        if !plist_path.exists() {
-            anyhow::bail!(
-                "No plist found at {}. Run `reviewloop daemon install` first.",
-                plist_path.display()
-            );
-        }
-        let uid = current_uid_string()?;
-        let domain = format!("gui/{uid}");
-        let out = ProcessCommand::new("launchctl")
-            .args(["bootstrap", &domain, plist_path.to_string_lossy().as_ref()])
+            .join(format!("{LABEL}.plist")))
+    }
+
+    pub fn domain() -> Result<String> {
+        Ok(format!("gui/{}", super::current_uid_string()?))
+    }
+
+    pub fn target() -> Result<String> {
+        Ok(format!("{}/{LABEL}", domain()?))
+    }
+
+    pub fn is_loaded() -> Result<bool> {
+        Ok(Command::new("launchctl")
+            .args(["print", &target()?])
+            .output()
+            .context("failed to run launchctl print")?
+            .status
+            .success())
+    }
+
+    pub fn bootstrap(plist: &Path) -> Result<()> {
+        let out = Command::new("launchctl")
+            .args(["bootstrap", &domain()?, plist.to_string_lossy().as_ref()])
             .output()
             .context("failed to run launchctl bootstrap")?;
         if !out.status.success() {
@@ -1319,16 +1433,7 @@ fn cmd_daemon_resume() -> Result<()> {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        println!("Daemon resumed (launchd service loaded).");
         Ok(())
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        anyhow::bail!(
-            "`daemon resume` is currently macOS-only. \
-            Use your system service manager to start the daemon."
-        );
     }
 }
 
@@ -1835,6 +1940,19 @@ fn load_runtime_for_path(config_path: &Path) -> Result<Config> {
     let config = loaded.config;
     config.validate_for_foreign_load()?;
     Ok(config)
+}
+
+/// The machine settings (the global config alone, whatever directory this
+/// runs in) and the database, for commands about the supervisor itself.
+fn load_machine_runtime(
+    force_stderr_logs: bool,
+) -> Result<(reviewloop::config::MachineConfig, Db)> {
+    let machine = Config::load_machine()?;
+    reviewloop::logging::init_logging(&machine.config, force_stderr_logs)?;
+    ensure_runtime_dirs(&machine.config)?;
+    let db = Db::from_config(&machine.config)?;
+    db.ensure_schema()?;
+    Ok((machine, db))
 }
 
 fn ensure_runtime_dirs(config: &Config) -> Result<()> {
@@ -3954,6 +4072,38 @@ mod tests {
     }
 
     mod daemon_pause_resume {
+        /// Installed launchd services run `daemon run --panel false`; that
+        /// (and the bare forms) must parse, or launchd crash-loops.
+        #[test]
+        fn daemon_run_panel_accepts_the_installed_arguments() {
+            use crate::{Cli, Command, DaemonCommand};
+            use clap::Parser;
+            for (args, expected) in [
+                (
+                    &["reviewloop", "daemon", "run", "--panel", "false"][..],
+                    false,
+                ),
+                (
+                    &["reviewloop", "daemon", "run", "--panel", "true"][..],
+                    true,
+                ),
+                (&["reviewloop", "daemon", "run", "--panel"][..], true),
+                (&["reviewloop", "daemon", "run"][..], true),
+            ] {
+                let parsed = Cli::try_parse_from(args)
+                    .unwrap_or_else(|err| panic!("{args:?} should parse: {err}"));
+                assert!(
+                    matches!(
+                        parsed.command,
+                        Command::Daemon {
+                            command: DaemonCommand::Run { panel }
+                        } if panel == expected
+                    ),
+                    "{args:?}"
+                );
+            }
+        }
+
         /// `daemon pause` parses to the Pause variant.
         #[test]
         fn daemon_pause_parses() {

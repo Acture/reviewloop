@@ -60,23 +60,23 @@ fn build_body(
 
     let mut parts: Vec<String> = Vec::new();
 
-    if let Some(pid) = paper_id {
-        if !pid.is_empty() {
-            parts.push(pid.to_string());
-        }
+    if let Some(pid) = paper_id
+        && !pid.is_empty()
+    {
+        parts.push(pid.to_string());
     }
 
-    if let Some(jid) = job_id {
-        if !jid.is_empty() {
-            let short = if jid.len() > 8 { &jid[..8] } else { jid };
-            parts.push(format!("job {short}"));
-        }
+    if let Some(jid) = job_id
+        && !jid.is_empty()
+    {
+        let short = if jid.len() > 8 { &jid[..8] } else { jid };
+        parts.push(format!("job {short}"));
     }
 
-    if let Some(b) = body {
-        if !b.is_empty() {
-            parts.push(b.to_string());
-        }
+    if let Some(b) = body
+        && !b.is_empty()
+    {
+        parts.push(b.to_string());
     }
 
     parts.join(" · ")

@@ -14,6 +14,7 @@ pub mod oauth;
 pub mod panel;
 pub mod registry;
 pub mod submission_input;
+pub mod supervisor;
 pub mod token;
 pub mod trigger;
 pub mod util;
