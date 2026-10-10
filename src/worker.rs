@@ -530,7 +530,9 @@ async fn submit_leased(
         }) => schedule_submit_retry(config, db, &lease, primary, message, retry_after),
         // Nothing was created, but no other job of this backend can succeed until
         // someone fixes the credentials: say so instead of failing quietly.
-        Err(err @ BackendError::Auth(_)) => park_submit_needs_manual(config, db, &lease, err),
+        Err(err @ BackendError::Auth(_)) => {
+            park_submit_needs_manual(config, db, &lease, primary, err)
+        }
         // The provider provably rejected the request, so another route cannot duplicate it.
         Err(err) => match plan.fallback {
             Some(fallback) => {
@@ -945,6 +947,7 @@ fn park_submit_needs_manual(
     config: &Config,
     db: &Db,
     lease: &Lease,
+    dispatch: Dispatch<'_>,
     err: BackendError,
 ) -> Result<()> {
     let reason = err.to_string();
@@ -961,7 +964,7 @@ fn park_submit_needs_manual(
         lease,
         &change,
         "submit_failed_needs_manual",
-        json!({ "reason": reason }),
+        dispatch.with_step(json!({ "reason": reason, "channel": dispatch.channel.as_str() })),
     )? {
         fire_notification(
             &config.notifications,

@@ -1948,3 +1948,31 @@ async fn a_key_echoed_by_the_provider_on_poll_is_scrubbed() -> Result<()> {
     assert_eq!(ctx.calls(), [1, 1, 0]);
     ctx.assert_secret_contained()
 }
+
+/// A poll that gets no response is recorded without its URL, whose path holds the
+/// job id (the job's token), as for the Stanford backend.
+#[tokio::test]
+async fn unreachable_poll_never_records_the_job_id() -> Result<()> {
+    let mut ctx = TestContext::start().await?;
+    let job = ctx.submitted().await?;
+    ctx.config.providers.cspaper.base_url = "http://127.0.0.1:9".to_string();
+
+    assert_eq!(ctx.poll(&job.id).await?, Attempt::Ran);
+
+    let after = ctx.job(&job.id)?;
+    assert_eq!(after.status, JobStatus::Processing);
+    let last_error = after.last_error.context("poll error recorded")?;
+    assert!(last_error.contains("network error"), "{last_error}");
+    assert!(!last_error.contains(JOB_ID), "token leaked: {last_error}");
+    let events = ctx.events(&job.id)?;
+    let poll_error = events
+        .iter()
+        .find(|event| event.event_type == "poll_error")
+        .context("poll_error event")?;
+    assert!(
+        !poll_error.payload.to_string().contains(JOB_ID),
+        "token leaked: {}",
+        poll_error.payload
+    );
+    Ok(())
+}

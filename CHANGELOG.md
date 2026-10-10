@@ -280,10 +280,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - **Review tokens no longer leak into default output** — request errors are
-  described without their URL (the review URL carries the token, presigned
-  uploads carry a signature), so `last_error`, events, logs and notifications
-  stay token-free; `reviewloop status` redacts tokens in event payloads and
-  errors unless `--show-token`.
+  described without their URL (the Stanford review URL and the CSPaper job URL
+  carry the token, presigned uploads carry a signature), so `last_error`,
+  events, logs and notifications stay token-free; `reviewloop status` redacts
+  tokens in event payloads and errors unless `--show-token`.
 - `reviewloop status` no longer panics truncating a non-ASCII error.
 - A presigned upload answering 429 is rate limited (requeued after `Retry-After`)
   instead of a definitive failure that started the fallback.
