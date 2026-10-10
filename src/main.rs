@@ -1267,6 +1267,7 @@ fn cmd_daemon_install(config_override: Option<&Path>, start: bool) -> Result<()>
 
 /// Point at `project enable` when the current directory's project is not
 /// enabled yet.
+#[cfg(target_os = "macos")]
 fn hint_current_project(db: &Db) {
     let Ok(loaded) = Config::load_runtime_with_metadata(None, false) else {
         return;
@@ -1440,6 +1441,8 @@ fn cmd_daemon_resume(db: &Db) -> Result<()> {
 }
 
 /// What `daemon status` reports about the supervisor's service manager.
+/// Only launchd (macOS) has one to report; elsewhere tests alone build it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ServiceState {
     /// The launchd plist exists.
