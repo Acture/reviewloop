@@ -46,6 +46,43 @@ pub struct LoadedConfig {
     pub compat_notice: Option<String>,
 }
 
+/// Machine-wide settings, loaded once per supervisor tick; every project's
+/// config of that tick is built on the same snapshot.
+#[derive(Debug, Clone)]
+pub struct MachineConfig {
+    /// The global settings with no project.
+    pub config: Config,
+    pub global: GlobalConfigFile,
+    pub global_path: Option<PathBuf>,
+    pub legacy_global_path: Option<PathBuf>,
+}
+
+impl MachineConfig {
+    /// Machine settings from `global` alone, without reading any file or the
+    /// environment.
+    pub fn from_global(global: GlobalConfigFile) -> Result<Self> {
+        global.validate()?;
+        let config = Config::from_parts(global.clone(), ProjectConfigFile::default(), None);
+        config.validate_runtime(false)?;
+        Ok(Self {
+            config,
+            global,
+            global_path: None,
+            legacy_global_path: None,
+        })
+    }
+
+    /// The runtime config of the project whose `reviewloop.toml` is at
+    /// `config_path` (canonical), on this machine snapshot.
+    pub fn project(&self, config_path: &Path) -> Result<Config> {
+        Config::project_from(
+            self.global.clone(),
+            self.legacy_global_path.as_deref(),
+            config_path,
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub project_id: String,
@@ -96,19 +133,14 @@ impl Config {
         global.validate()?;
 
         let project = if let Some(path) = discovered_project_path.as_deref() {
-            if legacy_global_path.is_some() {
-                return Err(anyhow!(
-                    "legacy global config {} still carries project-owned fields while project config {} exists. run `reviewloop config migrate-project --project-id <id>` and remove the legacy file",
-                    legacy_global_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default(),
-                    path.display()
-                ));
-            }
-            let project = ProjectConfigFile::load(path)?;
-            project.validate(true)?;
-            project
+            let config = Self::project_from(global, legacy_global_path.as_deref(), path)?;
+            return Ok(LoadedConfig {
+                config,
+                global_path,
+                project_path: discovered_project_path,
+                legacy_global_path,
+                compat_notice: None,
+            });
         } else if let Some(path) = legacy_global_path.as_deref() {
             let legacy = LegacyConfig::load(path)?;
             let project = legacy.project_config();
@@ -132,19 +164,53 @@ impl Config {
             project
         };
 
-        let project_root = discovered_project_path
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf);
-        let config = Self::from_parts(global, project, project_root).with_env_secrets();
+        let config = Self::from_parts(global, project, None).with_env_secrets();
         config.validate_runtime(require_project)?;
         Ok(LoadedConfig {
             config,
             global_path,
-            project_path: discovered_project_path,
+            project_path: None,
             legacy_global_path,
             compat_notice: None,
         })
+    }
+
+    /// The settings the supervisor itself runs on: the global config alone,
+    /// whatever `reviewloop.toml` surrounds the current directory.
+    pub fn load_machine() -> Result<MachineConfig> {
+        let global_path = Self::ensure_global_config_file()?;
+        let legacy_global_path = Self::legacy_global_config_path().filter(|path| path.exists());
+        let global = match global_path.as_deref() {
+            Some(path) => GlobalConfigFile::load(path)?,
+            None => GlobalConfigFile::default(),
+        };
+        let mut machine = MachineConfig::from_global(global)?;
+        machine.config = machine.config.with_env_secrets();
+        machine.global_path = global_path;
+        machine.legacy_global_path = legacy_global_path;
+        Ok(machine)
+    }
+
+    /// A project's runtime config: its `reviewloop.toml` at `path` (whose
+    /// parent is the project root) over the machine's `global` settings.
+    fn project_from(
+        global: GlobalConfigFile,
+        legacy_global_path: Option<&Path>,
+        path: &Path,
+    ) -> Result<Self> {
+        if let Some(legacy) = legacy_global_path {
+            return Err(anyhow!(
+                "legacy global config {} still carries project-owned fields while project config {} exists. run `reviewloop config migrate-project --project-id <id>` and remove the legacy file",
+                legacy.display(),
+                path.display()
+            ));
+        }
+        let project = ProjectConfigFile::load(path)?;
+        project.validate(true)?;
+        let project_root = path.parent().map(Path::to_path_buf);
+        let config = Self::from_parts(global, project, project_root).with_env_secrets();
+        config.validate_runtime(true)?;
+        Ok(config)
     }
 
     pub fn global_config_path() -> Option<PathBuf> {
@@ -433,10 +499,10 @@ impl Config {
             core.review_timeout_hours = hours;
         }
         // Project proxy list replaces global when non-empty.
-        if let Some(proxies) = project.core.proxies {
-            if !proxies.is_empty() {
-                core.proxies = proxies;
-            }
+        if let Some(proxies) = project.core.proxies
+            && !proxies.is_empty()
+        {
+            core.proxies = proxies;
         }
 
         let trigger = TriggerConfig {
@@ -690,7 +756,14 @@ impl Config {
         let script = self.providers.stanford.fallback_script.trim();
         if !script.is_empty() {
             let path = Path::new(script);
-            if path.is_absolute() {
+            // A project-relative script was resolved against the project root,
+            // which `validate_fallback_script` already keeps it inside; only a
+            // script elsewhere must be under HOME.
+            let in_project = self
+                .project_root
+                .as_deref()
+                .is_some_and(|root| path_is_within_dir(path, root));
+            if path.is_absolute() && !in_project {
                 let home = home_dir_for_security()?;
                 if !path_is_within_dir(path, &home) {
                     anyhow::bail!(
@@ -751,11 +824,33 @@ fn home_dir_for_security() -> Result<PathBuf> {
 }
 
 fn path_is_within_dir(path: &Path, dir: &Path) -> bool {
-    if let (Ok(canonical_path), Ok(canonical_dir)) = (path.canonicalize(), dir.canonicalize()) {
-        return canonical_path.starts_with(canonical_dir);
-    }
+    resolve_for_security(path).starts_with(resolve_for_security(dir))
+}
 
-    normalize_for_security(path).starts_with(normalize_for_security(dir))
+/// `path` with its longest existing ancestor canonicalized and the rest
+/// normalized, so a file that does not exist yet compares like its directory
+/// (project roots are canonical, while `HOME` may be spelled through a
+/// symlink such as macOS's `/var` -> `/private/var`).
+fn resolve_for_security(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(canonical) = existing.canonicalize() {
+            return normalize_for_security(
+                &missing
+                    .iter()
+                    .rev()
+                    .fold(canonical, |acc, part| acc.join(part)),
+            );
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return normalize_for_security(path),
+        }
+    }
 }
 
 fn normalize_for_security(path: &Path) -> PathBuf {
@@ -883,6 +978,7 @@ impl ProjectConfigFile {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = read_config_file(path)?;
         refuse_project_api_key(path, &raw)?;
+        refuse_machine_settings(path, &raw)?;
         parse_toml(path, &raw)
     }
 
@@ -1084,6 +1180,52 @@ fn refuse_project_api_key(path: &Path, raw: &str) -> Result<()> {
     ))
 }
 
+/// Sections and `[core]` keys every project on the machine shares: one
+/// supervisor runs all projects against one database and state directory,
+/// within one provider budget, and reads one mailbox.
+const MACHINE_SECTIONS: [&str; 5] = ["logging", "polling", "retention", "imap", "gmail_oauth"];
+const MACHINE_CORE_KEYS: [&str; 6] = [
+    "db_path",
+    "state_dir",
+    "max_concurrency",
+    "max_submissions_per_tick",
+    "widget_state_enabled",
+    "widget_state_dir",
+];
+
+/// Refuses a machine-wide setting in a project file by name, instead of the
+/// parser's generic unknown-field error.
+fn refuse_machine_settings(path: &Path, raw: &str) -> Result<()> {
+    // Malformed TOML is reported by the typed parse that follows.
+    let Ok(table) = raw.parse::<toml::Table>() else {
+        return Ok(());
+    };
+    let section = MACHINE_SECTIONS
+        .into_iter()
+        .find(|section| table.contains_key(*section))
+        .map(|section| format!("[{section}]"));
+    let core_key = || {
+        let core = table.get("core")?.as_table()?;
+        MACHINE_CORE_KEYS
+            .into_iter()
+            .find(|key| core.contains_key(*key))
+            .map(|key| format!("core.{key}"))
+    };
+    let Some(setting) = section.or_else(core_key) else {
+        return Ok(());
+    };
+    let global = Config::global_config_path().map_or_else(
+        || format!("~/.config/reviewloop/{GLOBAL_CONFIG_FILE}"),
+        |path| path.display().to_string(),
+    );
+    Err(anyhow!(
+        "project config {} sets {setting}, which is machine-wide: every project shares the \
+         database, state directory, provider budget and mailbox configured in the global config \
+         {global}. remove it from the project config (set it in the global config instead)",
+        path.display()
+    ))
+}
+
 fn save_toml_file<T>(path: &Path, value: &T) -> Result<()>
 where
     T: Serialize,
@@ -1143,6 +1285,9 @@ where
     Ok(())
 }
 
+/// The project config in effect: `explicit_path`, or the nearest
+/// `reviewloop.toml` from the current directory up to the git root. Always
+/// canonical, so the project root and the registry never depend on the cwd.
 fn discover_project_config_path(explicit_path: Option<&Path>) -> Result<Option<PathBuf>> {
     if let Some(path) = explicit_path {
         if let Err(err) = fs::metadata(path) {
@@ -1154,7 +1299,7 @@ fn discover_project_config_path(explicit_path: Option<&Path>) -> Result<Option<P
                 format!("failed to access project config file: {}", path.display())
             });
         }
-        return Ok(Some(path.to_path_buf()));
+        return canonical_config_path(path).map(Some);
     }
 
     let cwd = env::current_dir().context("failed to resolve current working directory")?;
@@ -1164,7 +1309,7 @@ fn discover_project_config_path(explicit_path: Option<&Path>) -> Result<Option<P
     loop {
         let candidate = current.join(PROJECT_CONFIG_FILE);
         if candidate.exists() {
-            return Ok(Some(candidate));
+            return canonical_config_path(&candidate).map(Some);
         }
         if git_root.as_deref() == Some(current) {
             break;
@@ -1176,6 +1321,32 @@ fn discover_project_config_path(explicit_path: Option<&Path>) -> Result<Option<P
     }
 
     Ok(None)
+}
+
+/// The canonical form of a config path: absolute, symlinks and the on-disk
+/// spelling resolved. A `reviewloop.toml` that is itself a symlink keeps its
+/// own name in its resolved directory, so it keeps the repository it sits in
+/// as its project root.
+pub fn canonical_config_path(path: &Path) -> Result<PathBuf> {
+    let context = || format!("failed to resolve project config path {}", path.display());
+    if !fs::symlink_metadata(path)
+        .with_context(context)?
+        .file_type()
+        .is_symlink()
+    {
+        return fs::canonicalize(path).with_context(context);
+    }
+    fs::metadata(path).with_context(context)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("project config path {} names no file", path.display()))?;
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let dir = fs::canonicalize(dir)
+        .with_context(|| format!("failed to resolve project config path {}", path.display()))?;
+    Ok(dir.join(file_name))
 }
 
 pub fn default_project_config_path() -> Result<PathBuf> {
@@ -2437,6 +2608,28 @@ db_path = "db.sqlite"
         );
     }
 
+    /// The default script, resolved against a project root outside HOME
+    /// (`/Volumes/papers/...`), is the project's own: a registry load (the
+    /// supervisor, `retry` from elsewhere) must not refuse the project.
+    #[test]
+    fn foreign_load_allows_the_projects_own_script_outside_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut cfg = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        cfg.providers.stanford.fallback_script = root
+            .join("tools/paperreview_fallback.mjs")
+            .to_string_lossy()
+            .to_string();
+        assert!(cfg.validate_for_foreign_load().is_ok());
+
+        // Outside the project root it is still refused unless under HOME.
+        cfg.providers.stanford.fallback_script = "/tmp/evil/script.js".to_string();
+        assert!(cfg.validate_for_foreign_load().is_err());
+    }
+
     #[test]
     fn foreign_load_allows_relative_fallback_script() {
         let mut cfg = Config::default();
@@ -2455,6 +2648,66 @@ db_path = "db.sqlite"
         cfg.providers.stanford.fallback_script = script.to_string_lossy().to_string();
 
         assert!(cfg.validate_for_foreign_load().is_ok());
+    }
+
+    /// A `reviewloop.toml` symlinked into a repository (from a dotfiles repo,
+    /// say) belongs to the repository it sits in, not to its target.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_project_file_keeps_its_own_directory_as_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("dotfiles");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&shared).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(shared.join("reviewloop.toml"), "project_id = \"p\"\n").unwrap();
+        std::os::unix::fs::symlink(shared.join("reviewloop.toml"), repo.join("reviewloop.toml"))
+            .unwrap();
+
+        let path = super::canonical_config_path(&repo.join("reviewloop.toml")).unwrap();
+        assert_eq!(path, repo.canonicalize().unwrap().join("reviewloop.toml"));
+        let machine = super::MachineConfig::from_global(GlobalConfigFile::default()).unwrap();
+        let config = machine.project(&path).unwrap();
+        assert_eq!(config.project_root, Some(repo.canonicalize().unwrap()));
+    }
+
+    /// On a case-insensitive volume (macOS default) a differently cased
+    /// spelling of the file names the same config.
+    #[test]
+    fn canonical_paths_take_the_on_disk_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("reviewloop.toml");
+        fs::write(&path, "project_id = \"p\"\n").unwrap();
+        let upper = tmp.path().join("REVIEWLOOP.TOML");
+        if upper.exists() {
+            assert_eq!(
+                super::canonical_config_path(&upper).unwrap(),
+                super::canonical_config_path(&path).unwrap()
+            );
+        }
+    }
+
+    /// Project roots are canonical; a directory reached through a symlink
+    /// (macOS's `/var` -> `/private/var`) still contains a file that does not
+    /// exist yet, and a `..` cannot climb out of it.
+    #[cfg(unix)]
+    #[test]
+    fn containment_sees_through_symlinked_dirs_for_missing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir_all(real.join("project")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canonical_root = real.join("project").canonicalize().unwrap();
+
+        assert!(super::path_is_within_dir(
+            &canonical_root.join("tools/missing.mjs"),
+            &link
+        ));
+        assert!(!super::path_is_within_dir(
+            &canonical_root.join("missing/../../../escape.mjs"),
+            &link
+        ));
     }
 
     // ──────────────────────────────────────────────────────────────────────

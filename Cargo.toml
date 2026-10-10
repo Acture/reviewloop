@@ -2,7 +2,7 @@
 name = "reviewloop"
 version = "0.2.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Reproducible, guardrailed automation for academic review workflows on paperreview.ai"
 readme = "README.md"
 license = "GPL-3.0-only"

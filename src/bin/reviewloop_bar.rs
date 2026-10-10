@@ -21,16 +21,15 @@
 //!   without contaminating real project counts in the menu header
 //! - Submit new… spawns `reviewloop run <pdf>` with cwd set to the PDF's
 //!   parent directory so the CLI's own config discovery picks the project
-//! - Pause/Resume daemon — state-aware via launchctl
+//! - Pause/Resume daemon — state-aware via the supervisor's control row
 //!
-//! ## Daemon scoping (v0.2.0)
+//! ## Supervisor
 //!
-//! The bar shows fleet-wide job data from all projects registered in the
-//! shared SQLite database. However, the daemon is single-project-bound:
-//! the launchd label `ai.reviewloop.daemon` is shared across all projects,
-//! and only one daemon can be installed at a time. The bar's "Pause /
-//! Resume daemon" buttons control that single daemon. Multi-daemon support
-//! is planned for v0.3.0.
+//! One machine-level supervisor (`reviewloop daemon run`, installed as the
+//! launchd agent `ai.reviewloop.daemon`) runs every enabled project. Its
+//! pause is a persistent flag in the shared database, so the bar reads the
+//! supervisor's state from there; launchctl only tells whether the service
+//! is loaded, which "Resume" also repairs.
 
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
@@ -38,6 +37,7 @@ use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use reviewloop::config::Config;
 use reviewloop::db::Db;
 use reviewloop::model::{Job, JobStatus};
+use reviewloop::supervisor::SupervisorState;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -179,12 +179,22 @@ fn poll_daemon_state() -> Option<DaemonState> {
 
 // ── Background state snapshot ────────────────────────────────────────────────
 
+/// The supervisor as the database records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SupervisorView {
+    state: SupervisorState,
+    /// The pause flag, which outlives the process (a stopped supervisor
+    /// starts paused).
+    paused: bool,
+}
+
 /// State polled by the background thread, read cheaply by the main event loop.
 #[derive(Default, Clone)]
 struct BarSnapshot {
     all_active: Vec<Job>,
     all_failed: Vec<Job>,
     daemon_state: Option<DaemonState>,
+    supervisor: Option<SupervisorView>,
     db_error: Option<String>,
 }
 
@@ -203,8 +213,10 @@ fn poll_daemon_state_with_timeout() -> Option<DaemonState> {
 fn start_background_poller(db: Db, snapshot: Arc<Mutex<BarSnapshot>>, interval: Duration) {
     std::thread::spawn(move || {
         loop {
-            let mut new_snap = BarSnapshot::default();
-            new_snap.daemon_state = poll_daemon_state_with_timeout();
+            let mut new_snap = BarSnapshot {
+                daemon_state: poll_daemon_state_with_timeout(),
+                ..BarSnapshot::default()
+            };
 
             match db.list_active_jobs_all() {
                 Ok(jobs) => new_snap.all_active = jobs,
@@ -214,6 +226,17 @@ fn start_background_poller(db: Db, snapshot: Arc<Mutex<BarSnapshot>>, interval: 
                 match db.list_failed_jobs_all_per_project(FAILURES_PER_PROJECT_LIMIT) {
                     Ok(jobs) => new_snap.all_failed = jobs,
                     Err(e) => new_snap.db_error = Some(format!("failed: {e}")),
+                }
+            }
+            if new_snap.db_error.is_none() {
+                match db.supervisor_record() {
+                    Ok(record) => {
+                        new_snap.supervisor = Some(SupervisorView {
+                            state: SupervisorState::of(&record, Utc::now()),
+                            paused: record.paused_at.is_some(),
+                        })
+                    }
+                    Err(e) => new_snap.db_error = Some(format!("supervisor: {e}")),
                 }
             }
 
@@ -397,6 +420,7 @@ enum ClickAction {
 struct MenuSignature {
     aggregate: Aggregate,
     daemon_state: Option<DaemonState>,
+    supervisor: Option<SupervisorView>,
     db_error: Option<String>,
     last_action: Option<String>,
     /// (project_id, active_job_id, status, attempt, has_next_poll)
@@ -409,6 +433,7 @@ fn compute_signature(snap: &BarSnapshot, last_action: Option<&str>) -> MenuSigna
     MenuSignature {
         aggregate: aggregate(snap),
         daemon_state: snap.daemon_state,
+        supervisor: snap.supervisor,
         db_error: snap.db_error.clone(),
         last_action: last_action.map(|s| s.to_string()),
         active_jobs: snap
@@ -443,6 +468,37 @@ fn compute_signature(snap: &BarSnapshot, last_action: Option<&str>) -> MenuSigna
     }
 }
 
+/// Labels and enablement of the Pause and Resume items. Pausing sets the
+/// supervisor's flag (a stopped one then starts paused); resuming clears it
+/// and, on macOS, reloads a launchd service that is installed but unloaded.
+fn pause_resume_items(
+    supervisor: Option<SupervisorView>,
+    service: Option<DaemonState>,
+) -> (String, String, bool, bool) {
+    let Some(view) = supervisor else {
+        return (
+            "Pause daemon (state unavailable)".to_string(),
+            "Resume daemon (state unavailable)".to_string(),
+            false,
+            false,
+        );
+    };
+    let note = match view.state {
+        SupervisorState::Running => "",
+        SupervisorState::Paused => " (paused)",
+        SupervisorState::Stopped => " (not running)",
+    };
+    // Reloading the service only helps when nothing supervises; beside a
+    // running supervisor the reloaded one would be refused in a loop.
+    let service_unloaded = matches!(service, Some(DaemonState { loaded: false, .. }));
+    (
+        format!("Pause daemon{note}"),
+        format!("Resume daemon{note}"),
+        !view.paused,
+        view.paused || (service_unloaded && view.state == SupervisorState::Stopped),
+    )
+}
+
 // ── Icon colour rules ────────────────────────────────────────────────────────
 
 fn icon_color(snap: &BarSnapshot) -> (u8, u8, u8) {
@@ -473,20 +529,20 @@ fn rebuild_menu(
     let menu = Menu::new();
 
     // ── Last-action summary (TTL 5min) ───────────────────────────────────────
-    if let Ok(guard) = last_action.lock() {
-        if let Some((summary, ts)) = guard.as_ref() {
-            let elapsed = ts.elapsed();
-            if elapsed < Duration::from_secs(300) {
-                let display = if elapsed >= Duration::from_secs(60) {
-                    let mins = elapsed.as_secs() / 60;
-                    format!("{summary} ({mins}m ago)")
-                } else {
-                    summary.clone()
-                };
-                let item = MenuItem::new(format!("↳ {display}"), false, None);
-                let _ = menu.append(&item);
-                let _ = menu.append(&PredefinedMenuItem::separator());
-            }
+    if let Ok(guard) = last_action.lock()
+        && let Some((summary, ts)) = guard.as_ref()
+    {
+        let elapsed = ts.elapsed();
+        if elapsed < Duration::from_secs(300) {
+            let display = if elapsed >= Duration::from_secs(60) {
+                let mins = elapsed.as_secs() / 60;
+                format!("{summary} ({mins}m ago)")
+            } else {
+                summary.clone()
+            };
+            let item = MenuItem::new(format!("↳ {display}"), false, None);
+            let _ = menu.append(&item);
+            let _ = menu.append(&PredefinedMenuItem::separator());
         }
     }
 
@@ -604,51 +660,20 @@ fn rebuild_menu(
     click_map.insert(submit_item.id().clone(), ClickAction::SubmitNew);
     let _ = menu.append(&submit_item);
 
-    // Pause / Resume daemon — state-aware.
-    #[cfg(target_os = "macos")]
-    {
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        match snapshot.daemon_state {
-            None
-            | Some(DaemonState {
-                loaded: false,
-                running: _,
-            }) => {
-                let _ = menu.append(&MenuItem::new(
-                    "Pause/Resume daemon (service not installed)",
-                    false,
-                    None,
-                ));
-            }
-            Some(DaemonState {
-                loaded: true,
-                running,
-            }) => {
-                if running {
-                    let pause_item = MenuItem::new("Pause daemon", true, None);
-                    let resume_item =
-                        MenuItem::new("Resume daemon (currently running)", false, None);
-                    click_map.insert(pause_item.id().clone(), ClickAction::PauseDaemon);
-                    let _ = menu.append(&pause_item);
-                    let _ = menu.append(&resume_item);
-                } else {
-                    let pause_item = MenuItem::new("Pause daemon (currently stopped)", false, None);
-                    let resume_item = MenuItem::new("Resume daemon", true, None);
-                    click_map.insert(resume_item.id().clone(), ClickAction::ResumeDaemon);
-                    let _ = menu.append(&pause_item);
-                    let _ = menu.append(&resume_item);
-                }
-            }
-        }
+    // Pause / Resume daemon — from the supervisor's persistent pause flag.
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    let (pause_label, resume_label, pause_enabled, resume_enabled) =
+        pause_resume_items(snapshot.supervisor, snapshot.daemon_state);
+    let pause_item = MenuItem::new(pause_label, pause_enabled, None);
+    let resume_item = MenuItem::new(resume_label, resume_enabled, None);
+    if pause_enabled {
+        click_map.insert(pause_item.id().clone(), ClickAction::PauseDaemon);
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = menu.append(&MenuItem::new(
-            "Pause/Resume daemon (macOS only)",
-            false,
-            None,
-        ));
+    if resume_enabled {
+        click_map.insert(resume_item.id().clone(), ClickAction::ResumeDaemon);
     }
+    let _ = menu.append(&pause_item);
+    let _ = menu.append(&resume_item);
 
     let _ = menu.append(&PredefinedMenuItem::separator());
 
@@ -831,11 +856,11 @@ fn run_tray(db: Db, artifacts_dir: PathBuf, log_path: PathBuf) -> Result<()> {
 
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             let action = click_map.borrow().get(&ev.id).cloned();
-            if let Some(action) = action {
-                if execute_action(&action, &last_action) {
-                    *control_flow = ControlFlow::Exit;
-                    return;
-                }
+            if let Some(action) = action
+                && execute_action(&action, &last_action)
+            {
+                *control_flow = ControlFlow::Exit;
+                return;
             }
         }
 
@@ -1065,9 +1090,50 @@ mod tests {
     }
 
     #[test]
+    fn pause_and_resume_follow_the_supervisors_flag() {
+        let view = |state, paused| Some(SupervisorView { state, paused });
+        let loaded = Some(DaemonState {
+            loaded: true,
+            running: true,
+        });
+        let unloaded = Some(DaemonState {
+            loaded: false,
+            running: false,
+        });
+
+        let (pause, resume, can_pause, can_resume) =
+            pause_resume_items(view(SupervisorState::Running, false), loaded);
+        assert_eq!(
+            (pause.as_str(), resume.as_str()),
+            ("Pause daemon", "Resume daemon")
+        );
+        assert!(can_pause && !can_resume);
+
+        // Paused, the service stays loaded: Resume must be reachable.
+        let (_, resume, can_pause, can_resume) =
+            pause_resume_items(view(SupervisorState::Paused, true), loaded);
+        assert_eq!(resume, "Resume daemon (paused)");
+        assert!(!can_pause && can_resume);
+
+        // An older version's pause unloaded the service: Resume reloads it.
+        let (_, _, can_pause, can_resume) =
+            pause_resume_items(view(SupervisorState::Stopped, false), unloaded);
+        assert!(can_pause && can_resume);
+        // ...but not beside a supervisor running outside launchd.
+        let (_, _, _, can_resume) =
+            pause_resume_items(view(SupervisorState::Running, false), unloaded);
+        assert!(!can_resume);
+
+        let (_, _, can_pause, can_resume) = pause_resume_items(None, loaded);
+        assert!(!can_pause && !can_resume);
+    }
+
+    #[test]
     fn icon_color_priority_db_error_over_failures() {
-        let mut snap = BarSnapshot::default();
-        snap.db_error = Some("disk full".to_string());
+        let mut snap = BarSnapshot {
+            db_error: Some("disk full".to_string()),
+            ..BarSnapshot::default()
+        };
         snap.all_failed.push(job("p", "1", JobStatus::Failed, 1));
         assert_eq!(icon_color(&snap), (200, 100, 30));
     }

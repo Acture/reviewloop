@@ -58,11 +58,19 @@ enum Command {
         #[command(subcommand)]
         command: PaperCommand,
     },
-    /// Manage the background daemon that processes triggers, submissions, and
-    /// polls. Subcommands: run, install, uninstall, status, pause, resume.
+    /// Manage the machine supervisor that runs every enabled project's
+    /// triggers, submissions and polls. Subcommands: run, install,
+    /// uninstall, status, pause, resume.
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    /// Choose which projects the machine supervisor runs. Subcommands: list,
+    /// enable, disable. Loading a project's config registers it; only
+    /// `enable` makes the supervisor run it.
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
     },
     /// Enqueue a paper for submission. A pending, in-flight or completed job
     /// for the same manuscript bytes, backend, venue and version is reported
@@ -240,31 +248,70 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
-    /// Start the daemon in the foreground (useful for debugging).
+    /// Run the machine supervisor in the foreground: every enabled project,
+    /// until Ctrl+C. This is what the launchd service runs.
     Run {
-        #[arg(long, default_value_t = true)]
+        /// Repaint a status panel after every tick (only on a terminal).
+        /// Accepts `--panel`, `--panel true` and `--panel false`, as
+        /// installed launchd services pass.
+        #[arg(
+            long,
+            default_value_t = true,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            action = clap::ArgAction::Set
+        )]
         panel: bool,
     },
-    /// Install and optionally start the launchd service (macOS only).
-    ///
-    /// Note: this overwrites any previously-installed reviewloop daemon plist.
-    /// The launchd label `ai.reviewloop.daemon` is shared across all projects
-    /// (multi-daemon deployment is planned for v0.3.0).
+    /// Install and optionally start the supervisor's launchd service
+    /// (macOS only). One service runs every enabled project; installing
+    /// keeps the project an older single-project install was bound to
+    /// enabled, and enables nothing else.
     Install {
-        #[arg(long, default_value_t = true)]
+        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         start: bool,
     },
     /// Uninstall the launchd service (macOS only).
     Uninstall,
-    /// Show daemon health, last tick time, and active jobs.
+    /// Show the supervisor (running, paused or stopped), the launchd service,
+    /// and every registered project with its health and active jobs.
     Status {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Pause the daemon by unloading the launchd service (macOS only).
+    /// Pause the supervisor: it stays loaded but runs no triggers,
+    /// submissions or polls until resumed, across restarts.
     Pause,
-    /// Resume the daemon by re-loading the launchd service (macOS only).
+    /// Resume a paused supervisor (and reload its launchd service on macOS
+    /// if it is installed but unloaded).
     Resume,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectCommand {
+    /// List registered projects: whether the supervisor runs each, its
+    /// config, and the supervisor's last pass over it.
+    List {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Let the supervisor run this project: the reviewloop.toml found from
+    /// the current directory (or --config), or the registered project
+    /// --project-id. Takes effect within seconds.
+    Enable {
+        #[arg(long)]
+        project_id: Option<String>,
+        /// Move the registration to this config even though another config
+        /// (a second clone or worktree) still declares the same project_id.
+        #[arg(long, default_value_t = false)]
+        replace: bool,
+    },
+    /// Stop the supervisor from running this project (or --project-id).
+    /// Its jobs keep their state; explicit commands still act on them.
+    Disable {
+        #[arg(long)]
+        project_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -470,29 +517,30 @@ async fn run() -> Result<()> {
                         "note: panel requested but stdout is not a TTY; running without panel."
                     );
                 }
-                let (config, db) = load_runtime(config_override.as_deref(), panel_enabled, false)?;
-                reviewloop::worker::run_daemon(&config, &db, panel_enabled).await
+                cmd_daemon_run(config_override.as_deref(), panel_enabled).await
             }
             DaemonCommand::Install { start } => {
                 cmd_daemon_install(config_override.as_deref(), start)
             }
             DaemonCommand::Uninstall => cmd_daemon_uninstall(),
-            DaemonCommand::Pause => cmd_daemon_pause(),
-            DaemonCommand::Resume => cmd_daemon_resume(),
-            DaemonCommand::Status { json } => {
-                // Load config softly — daemon status is still useful without a project config.
-                let config_res =
-                    Config::load_runtime_with_metadata(config_override.as_deref(), false);
-                match config_res {
-                    Ok(loaded) => {
-                        let config = loaded.config;
-                        ensure_runtime_dirs(&config)?;
-                        let db = Db::from_config(&config)?;
-                        db.ensure_schema()?;
-                        cmd_daemon_status(Some(&config), Some(&db), json)
-                    }
-                    Err(_) => cmd_daemon_status(None, None, json),
-                }
+            DaemonCommand::Pause => {
+                let (_, db) = load_machine_runtime(false)?;
+                cmd_daemon_pause(&db)
+            }
+            DaemonCommand::Resume => {
+                let (_, db) = load_machine_runtime(false)?;
+                cmd_daemon_resume(&db)
+            }
+            DaemonCommand::Status { json } => cmd_daemon_status(config_override.as_deref(), json),
+        },
+        Command::Project { command } => match command {
+            ProjectCommand::List { json } => cmd_project_list(config_override.as_deref(), json),
+            ProjectCommand::Enable {
+                project_id,
+                replace,
+            } => cmd_project_enable(config_override.as_deref(), project_id.as_deref(), replace),
+            ProjectCommand::Disable { project_id } => {
+                cmd_project_disable(config_override.as_deref(), project_id.as_deref())
             }
         },
         Command::Submit {
@@ -1106,92 +1154,85 @@ fn is_brew_formula_installed(formula: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Install the supervisor's launchd service. It runs every enabled
+/// project; an older install's single-project binding stays enabled.
 fn cmd_daemon_install(config_override: Option<&Path>, start: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        const DAEMON_LABEL: &str = "ai.reviewloop.daemon";
-
-        let loaded = Config::load_runtime_with_metadata(config_override, false)?;
-        let reviewloop::config::LoadedConfig {
-            config,
-            global_path,
-            project_path,
-            legacy_global_path: _,
-            compat_notice,
-        } = loaded;
-        if let Some(notice) = compat_notice.as_deref() {
-            warn!("{notice}");
+        if let Some(path) = config_override {
+            anyhow::bail!(
+                "`daemon install` installs the machine-wide supervisor and takes no project config; \
+                 to have it run that project, enable it with `reviewloop --config {} project enable`",
+                path.display()
+            );
         }
-        ensure_runtime_dirs(&config)?;
+        let (machine, db) = load_machine_runtime(false)?;
+        let plist_path = launchd::plist_path()?;
+        if let Ok(existing) = fs::read_to_string(&plist_path)
+            && let Some(bound) = launchd::bound_config(&existing)
+        {
+            report_legacy_adoption(&db, &machine, &bound);
+        }
 
-        let global_path = global_path
-            .map(|path| fs::canonicalize(&path).unwrap_or(path))
-            .ok_or_else(|| anyhow!("failed to determine global config path"))?;
-        let project_path = project_path.map(|path| fs::canonicalize(&path).unwrap_or(path));
-
-        let home = env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
-        let launch_agents_dir = PathBuf::from(home).join("Library").join("LaunchAgents");
-        fs::create_dir_all(&launch_agents_dir).with_context(|| {
-            format!(
-                "failed to create launch agents directory: {}",
-                launch_agents_dir.display()
-            )
-        })?;
-
-        let plist_path = launch_agents_dir.join(format!("{DAEMON_LABEL}.plist"));
+        if let Some(dir) = plist_path.parent() {
+            fs::create_dir_all(dir).with_context(|| {
+                format!(
+                    "failed to create launch agents directory: {}",
+                    dir.display()
+                )
+            })?;
+        }
         let exe = env::current_exe().context("failed to locate current executable path")?;
-        let stdout_log = config.state_dir().join("daemon.stdout.log");
-        let stderr_log = config.state_dir().join("daemon.stderr.log");
-
-        let mut args = vec![exe.display().to_string()];
-        if let Some(path) = project_path.as_ref() {
-            args.push("--config".to_string());
-            args.push(path.display().to_string());
-        }
-        args.extend([
+        let args = [
+            exe.display().to_string(),
             "daemon".to_string(),
             "run".to_string(),
             "--panel".to_string(),
             "false".to_string(),
-        ]);
-        let plist = render_launchd_plist(DAEMON_LABEL, &args, &stdout_log, &stderr_log);
+        ];
+        let state_dir = machine.config.state_dir();
+        let plist = launchd::render_plist(
+            &args,
+            &launchd::current_environment(),
+            &state_dir.join("daemon.stdout.log"),
+            &state_dir.join("daemon.stderr.log"),
+        );
         fs::write(&plist_path, plist)
             .with_context(|| format!("failed to write launchd plist: {}", plist_path.display()))?;
 
+        let global_path = machine
+            .global_path
+            .clone()
+            .ok_or_else(|| anyhow!("failed to determine global config path"))?;
         println!(
-            "Installed launchd plist at {}\n- global config: {}",
+            "Installed the supervisor's launchd service at {}\n- global config: {}\n- database: {}",
             plist_path.display(),
-            global_path.display()
+            global_path.display(),
+            db.path.display()
         );
-        if let Some(path) = project_path.as_ref() {
-            println!("- project config: {}", path.display());
-        } else {
-            println!("- mode: global-only daemon (no project config bound)");
+        let enabled = reviewloop::supervisor::load_enabled_projects(&db, &machine)?;
+        if enabled.loaded.is_empty() && enabled.failed.is_empty() {
+            println!(
+                "- enabled projects: none yet; run `reviewloop project enable` in each project repository"
+            );
         }
-        if let Some(warning) = daemon_cspaper_key_warning(&config, &global_path)? {
+        for config in &enabled.loaded {
+            println!("- enabled project: {}", config.project_id);
+        }
+        for (project_id, error) in &enabled.failed {
+            println!("- enabled project: {project_id} (does not load: {error})");
+        }
+        if let Some(warning) = daemon_cspaper_key_warning(&enabled.loaded, &global_path)? {
             println!("{warning}");
         }
+        hint_current_project(&db);
 
         if start {
-            let uid = current_uid_string()?;
-            let domain = format!("gui/{uid}");
-            let target = format!("{domain}/{DAEMON_LABEL}");
-
+            let target = launchd::target()?;
             let _ = ProcessCommand::new("launchctl")
                 .args(["bootout", &target])
                 .output();
-
-            let bootstrap = ProcessCommand::new("launchctl")
-                .args(["bootstrap", &domain, plist_path.to_string_lossy().as_ref()])
-                .output()
-                .context("failed to run launchctl bootstrap")?;
-            if !bootstrap.status.success() {
-                anyhow::bail!(
-                    "launchctl bootstrap failed: {}",
-                    String::from_utf8_lossy(&bootstrap.stderr)
-                );
-            }
-
+            launchd::bootstrap(&plist_path)?;
             let _ = ProcessCommand::new("launchctl")
                 .args(["enable", &target])
                 .output();
@@ -1205,40 +1246,86 @@ fn cmd_daemon_install(config_override: Option<&Path>, start: bool) -> Result<()>
                     String::from_utf8_lossy(&kickstart.stderr)
                 );
             }
-
-            println!("Daemon started via launchd.");
+            println!("Supervisor started via launchd.");
         } else {
             println!(
                 "Run `launchctl bootstrap gui/$(id -u) {}` to start it.",
                 plist_path.display()
             );
         }
-
         Ok(())
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = config_override;
-        let _ = start;
-        anyhow::bail!("`daemon install` is currently supported on macOS only");
+        let _ = (config_override, start);
+        anyhow::bail!(
+            "`daemon install` is currently supported on macOS only; run `reviewloop daemon run` under your service manager"
+        );
+    }
+}
+
+/// Point at `project enable` when the current directory's project is not
+/// enabled yet.
+#[cfg(target_os = "macos")]
+fn hint_current_project(db: &Db) {
+    let Ok(loaded) = Config::load_runtime_with_metadata(None, false) else {
+        return;
+    };
+    let project_id = loaded.config.project_id;
+    if project_id.trim().is_empty() {
+        return;
+    }
+    let enabled = db
+        .get_registered_project(&project_id)
+        .ok()
+        .flatten()
+        .is_some_and(|project| project.enabled);
+    if !enabled {
+        println!(
+            "note: project {project_id} (this directory) is not enabled; run `reviewloop project enable` to have the supervisor run it"
+        );
+    }
+}
+
+/// Keep the project an older single-project install bound the daemon to,
+/// and say what happened.
+fn report_legacy_adoption(db: &Db, machine: &reviewloop::config::MachineConfig, bound: &Path) {
+    use reviewloop::supervisor::{LegacyAdoption, adopt_legacy_binding};
+
+    match adopt_legacy_binding(db, machine, bound, Utc::now()) {
+        Ok((project_id, LegacyAdoption::Enabled { moved_from })) => {
+            eprintln!(
+                "note: the daemon was installed for project {project_id} alone; the supervisor now runs every enabled project, and {project_id} is enabled at {}. Other registered projects stay disabled until `reviewloop project enable`.",
+                bound.display()
+            );
+            if let Some(from) = moved_from {
+                eprintln!(
+                    "note: project {project_id} was registered at {}; the daemon's binding moved it",
+                    from.display()
+                );
+            }
+        }
+        Ok((project_id, LegacyAdoption::AlreadyDecided { enabled })) => info!(
+            project_id,
+            enabled, "the daemon's --config names a project whose enablement is already decided"
+        ),
+        Ok((project_id, LegacyAdoption::Conflict(why))) => {
+            eprintln!("warning: not enabling project {project_id} for the supervisor: {why}")
+        }
+        Err(err) => eprintln!(
+            "warning: the daemon was bound to {}, which no longer loads ({err:#}); the supervisor runs without it",
+            bound.display()
+        ),
     }
 }
 
 fn cmd_daemon_uninstall() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        const DAEMON_LABEL: &str = "ai.reviewloop.daemon";
-        let home = env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
-        let plist_path = PathBuf::from(home)
-            .join("Library")
-            .join("LaunchAgents")
-            .join(format!("{DAEMON_LABEL}.plist"));
-
-        let uid = current_uid_string()?;
-        let target = format!("gui/{uid}/{DAEMON_LABEL}");
+        let plist_path = launchd::plist_path()?;
         let _ = ProcessCommand::new("launchctl")
-            .args(["bootout", &target])
+            .args(["bootout", &launchd::target()?])
             .output();
 
         if plist_path.exists() {
@@ -1257,417 +1344,901 @@ fn cmd_daemon_uninstall() -> Result<()> {
     }
 }
 
-/// Pause the daemon by unloading it from launchd (macOS only).
-/// The plist remains on disk; `daemon resume` re-loads it.
-fn cmd_daemon_pause() -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        const DAEMON_LABEL: &str = "ai.reviewloop.daemon";
-        let uid = current_uid_string()?;
-        let target = format!("gui/{uid}/{DAEMON_LABEL}");
-        let status = ProcessCommand::new("launchctl")
-            .args(["bootout", &target])
-            .status()
-            .context("failed to run launchctl bootout")?;
-        if status.success() {
-            println!(
-                "Daemon paused (launchd service unloaded). Run `reviewloop daemon resume` to restart."
-            );
-        } else {
-            anyhow::bail!(
-                "launchctl bootout failed — the daemon may not be loaded. \
-                Check `reviewloop daemon status`."
-            );
-        }
-        Ok(())
+/// Run the machine supervisor in the foreground until Ctrl+C or SIGTERM.
+/// `legacy_config` is the `--config` an old single-project launchd plist
+/// still passes: that project stays enabled unless someone already decided.
+async fn cmd_daemon_run(legacy_config: Option<&Path>, panel: bool) -> Result<()> {
+    use reviewloop::supervisor::{Supervisor, TICK_INTERVAL};
+
+    let (machine, db) = load_machine_runtime(panel)?;
+    info!("{}", render_guardrail_notice(&machine.config));
+    print_guardrail_warnings(&machine.config);
+    if let Some(path) = legacy_config {
+        report_legacy_adoption(&db, &machine, path);
+    }
+    if let Some(legacy) = &machine.legacy_global_path {
+        warn!(
+            path = %legacy.display(),
+            "legacy single-file config found: the supervisor runs only projects with a reviewloop.toml; migrate it with `reviewloop config migrate-project --project-id <id>`"
+        );
+    }
+    let enabled = db
+        .list_registered_projects()?
+        .into_iter()
+        .filter(|project| project.enabled)
+        .count();
+    if enabled == 0 {
+        warn!("no project is enabled; the supervisor idles until `reviewloop project enable`");
     }
 
-    #[cfg(not(target_os = "macos"))]
+    Supervisor {
+        db: &db,
+        backends: &reviewloop::worker::LiveBackends,
+        load_machine: &Config::load_machine,
+        interval: TICK_INTERVAL,
+        panel,
+    }
+    .run(shutdown_signal())
+    .await
+}
+
+/// Resolves on Ctrl+C or, on Unix, SIGTERM (what launchd sends on unload).
+async fn shutdown_signal() {
+    #[cfg(unix)]
     {
-        anyhow::bail!(
-            "`daemon pause` is currently macOS-only. \
-            Use your system service manager to stop the daemon."
-        );
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "cannot listen for SIGTERM; stop the supervisor with Ctrl+C");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
-/// Resume the daemon by re-loading it into launchd (macOS only).
-fn cmd_daemon_resume() -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        const DAEMON_LABEL: &str = "ai.reviewloop.daemon";
-        let home = env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
-        let plist_path = PathBuf::from(home)
-            .join("Library")
-            .join("LaunchAgents")
-            .join(format!("{DAEMON_LABEL}.plist"));
-        if !plist_path.exists() {
-            anyhow::bail!(
-                "No plist found at {}. Run `reviewloop daemon install` first.",
-                plist_path.display()
-            );
-        }
-        let uid = current_uid_string()?;
-        let domain = format!("gui/{uid}");
-        let out = ProcessCommand::new("launchctl")
-            .args(["bootstrap", &domain, plist_path.to_string_lossy().as_ref()])
-            .output()
-            .context("failed to run launchctl bootstrap")?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "launchctl bootstrap failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        println!("Daemon resumed (launchd service loaded).");
-        Ok(())
-    }
+/// Pause the supervisor: it keeps running (and its service stays loaded) but
+/// starts no trigger, submission or poll until resumed, across restarts.
+fn cmd_daemon_pause(db: &Db) -> Result<()> {
+    use reviewloop::supervisor::SupervisorState;
 
-    #[cfg(not(target_os = "macos"))]
-    {
-        anyhow::bail!(
-            "`daemon resume` is currently macOS-only. \
-            Use your system service manager to start the daemon."
+    if db.set_supervisor_paused(true, Utc::now())? {
+        println!(
+            "Supervisor paused: no triggers, submissions or polls until `reviewloop daemon resume` (the pause survives restarts). A request already sent finishes first."
         );
+    } else {
+        println!("Supervisor already paused. Resume it with `reviewloop daemon resume`.");
     }
+    if SupervisorState::of(&db.supervisor_record()?, Utc::now()) == SupervisorState::Stopped {
+        println!("note: no supervisor is running now; it will start paused.");
+    }
+    Ok(())
 }
 
-fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) -> Result<()> {
+/// Resume a paused supervisor. On macOS this also reloads the launchd
+/// service when it is installed but unloaded (as the pause of older
+/// versions left it).
+fn cmd_daemon_resume(db: &Db) -> Result<()> {
+    use reviewloop::supervisor::SupervisorState;
+
+    if db.set_supervisor_paused(false, Utc::now())? {
+        println!("Supervisor resumed.");
+    } else {
+        println!("Supervisor was not paused.");
+    }
+    let stopped =
+        SupervisorState::of(&db.supervisor_record()?, Utc::now()) == SupervisorState::Stopped;
+    // Only when nothing supervises: a second supervisor (say beside a
+    // foreground `daemon run`) would be refused and relaunched in a loop.
     #[cfg(target_os = "macos")]
-    {
-        const DAEMON_LABEL: &str = "ai.reviewloop.daemon";
-        let uid = current_uid_string()?;
-        let target = format!("gui/{uid}/{DAEMON_LABEL}");
-        let output = ProcessCommand::new("launchctl")
-            .args(["print", &target])
-            .output()
-            .context("failed to run launchctl print")?;
+    if stopped && launchd::plist_path()?.exists() && !launchd::is_loaded()? {
+        launchd::bootstrap(&launchd::plist_path()?)?;
+        println!("Reloaded the launchd service {}.", launchd::LABEL);
+        return Ok(());
+    }
+    if stopped {
+        println!(
+            "note: no supervisor is running; start one with `reviewloop daemon install` (macOS) or `reviewloop daemon run`."
+        );
+    }
+    Ok(())
+}
 
-        let loaded = output.status.success();
+/// What `daemon status` reports about the supervisor's service manager.
+/// Only launchd (macOS) has one to report; elsewhere tests alone build it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ServiceState {
+    /// The launchd plist exists.
+    installed: bool,
+    loaded: bool,
+    running: bool,
+    /// The project config an older single-project plist still passes.
+    bound_config: Option<PathBuf>,
+    /// Pinned variables whose installed value differs from this shell's:
+    /// the service then resolves another global config or database.
+    environment_mismatch: Vec<String>,
+}
 
-        // Detect if daemon process is actually running via launchctl list.
-        let running = if loaded {
-            ProcessCommand::new("launchctl")
-                .args(["list", DAEMON_LABEL])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
+/// The launchd LaunchAgent that runs the supervisor (macOS); the plist text
+/// helpers are pure, so they are tested on every platform.
+#[cfg(any(target_os = "macos", test))]
+mod launchd {
+    use std::{collections::BTreeMap, path::Path, path::PathBuf};
+
+    pub const LABEL: &str = "ai.reviewloop.daemon";
+    /// What decides which global config and database the supervisor uses.
+    /// launchd starts services without the installing shell's environment,
+    /// so `daemon install` pins these when the shell sets them.
+    pub const PINNED_ENV: [&str; 2] = ["XDG_CONFIG_HOME", "REVIEWLOOP_STATE_DIR"];
+
+    pub fn render_plist(
+        args: &[String],
+        environment: &[(String, String)],
+        stdout_log: &Path,
+        stderr_log: &Path,
+    ) -> String {
+        let args_xml = args
+            .iter()
+            .map(|arg| format!("    <string>{}</string>", xml_escape(arg)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let environment_xml = if environment.is_empty() {
+            String::new()
         } else {
-            false
+            let pairs = environment
+                .iter()
+                .map(|(key, value)| {
+                    format!(
+                        "    <key>{}</key>\n    <string>{}</string>",
+                        xml_escape(key),
+                        xml_escape(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("  <key>EnvironmentVariables</key>\n  <dict>\n{pairs}\n  </dict>\n")
         };
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+{args_xml}
+  </array>
+{environment_xml}  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{stdout_log}</string>
+  <key>StandardErrorPath</key>
+  <string>{stderr_log}</string>
+</dict>
+</plist>
+"#,
+            label = xml_escape(LABEL),
+            stdout_log = xml_escape(&stdout_log.to_string_lossy()),
+            stderr_log = xml_escape(&stderr_log.to_string_lossy())
+        )
+    }
 
-        let now = Utc::now();
+    /// The `<string>` values between `<key>{key}</key>` and the end of the
+    /// element that follows it.
+    fn section<'a>(plist: &'a str, key: &str, close: &str) -> Option<&'a str> {
+        let start = plist.find(&format!("<key>{key}</key>"))?;
+        let rest = &plist[start..];
+        let end = rest.find(close)?;
+        Some(&rest[..end])
+    }
 
-        // Collect DB-backed context when available.
-        let project_id = config.map(|c| c.project_id.as_str()).unwrap_or("");
-        let last_tick_at: Option<chrono::DateTime<Utc>> = db.and_then(|d| {
-            if project_id.is_empty() {
-                return None;
-            }
-            match d.most_recent_event_created_at(project_id) {
-                Ok(ts) => ts,
-                Err(e) => {
-                    tracing::warn!(error = %e, project_id, "failed to read last tick time for daemon status");
-                    None
-                }
-            }
-        });
-        // Surface the most recent tick failure if the worker logged one.
-        // Only show it when it's recent enough that it could plausibly be the
-        // current state of the daemon: we use 6x the daemon tick interval
-        // (30s) as the freshness window, so an error from >3 minutes ago is
-        // assumed to have been resolved by a subsequent successful tick.
-        let last_tick_error_msg: Option<(chrono::DateTime<Utc>, String)> = db.and_then(|d| {
-            if project_id.is_empty() {
-                return None;
-            }
-            let ev = match d.most_recent_event_of_type(project_id, "tick_failed") {
-                Ok(opt) => opt?,
-                Err(e) => {
-                    tracing::warn!(error = %e, project_id, "failed to read last tick_failed event for daemon status");
-                    return None;
-                }
-            };
-            // Only include if the most recent tick_failed is also the most
-            // recent event overall (no successful work has happened since).
-            // If we've recorded a `submitted`, `polled`, etc. after it, the
-            // daemon has clearly recovered.
-            if last_tick_at
-                .map(|latest| latest > ev.created_at)
-                .unwrap_or(false)
-            {
-                return None;
-            }
-            // And require it to be within ~3 minutes (6 ticks).
-            let age = now - ev.created_at;
-            if age > chrono::Duration::seconds(180) {
-                return None;
-            }
-            let msg = ev
-                .payload
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("(no error message)")
-                .to_string();
-            Some((ev.created_at, msg))
-        });
-        let active_jobs: Vec<reviewloop::model::Job> = db
-            .and_then(|d| {
-                if project_id.is_empty() {
-                    None
-                } else {
-                    match d.list_active_jobs_for_project(project_id) {
-                        Ok(jobs) => Some(jobs),
-                        Err(e) => {
-                            tracing::warn!(error = %e, project_id, "failed to read active jobs for daemon status");
-                            None
-                        }
-                    }
-                }
+    fn strings(text: &str) -> Vec<String> {
+        let string = regex::Regex::new(r"<string>(.*?)</string>").expect("valid regex");
+        string
+            .captures_iter(text)
+            .map(|captures| xml_unescape(&captures[1]))
+            .collect()
+    }
+
+    pub fn program_arguments(plist: &str) -> Vec<String> {
+        section(plist, "ProgramArguments", "</array>")
+            .map(strings)
+            .unwrap_or_default()
+    }
+
+    /// The project config a single-project plist (before OSS-338) passes.
+    pub fn bound_config(plist: &str) -> Option<PathBuf> {
+        let args = program_arguments(plist);
+        args.iter()
+            .position(|arg| arg == "--config")
+            .and_then(|index| args.get(index + 1))
+            .map(PathBuf::from)
+    }
+
+    pub fn environment(plist: &str) -> BTreeMap<String, String> {
+        let Some(dict) = section(plist, "EnvironmentVariables", "</dict>") else {
+            return BTreeMap::new();
+        };
+        let pair =
+            regex::Regex::new(r"<key>(.*?)</key>\s*<string>(.*?)</string>").expect("valid regex");
+        pair.captures_iter(dict)
+            .filter(|captures| &captures[1] != "EnvironmentVariables")
+            .map(|captures| (xml_unescape(&captures[1]), xml_unescape(&captures[2])))
+            .collect()
+    }
+
+    /// The pinned variables whose effective value (set, or the default the
+    /// config resolution uses under `home`) differs between the installed
+    /// service and `current`: the two then use another global config or
+    /// database.
+    pub fn environment_mismatch(
+        installed: &BTreeMap<String, String>,
+        current: impl Fn(&str) -> Option<String>,
+        home: Option<&str>,
+    ) -> Vec<String> {
+        let effective = |key: &str, value: Option<String>| {
+            value
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    let home = home?;
+                    Some(match key {
+                        "XDG_CONFIG_HOME" => format!("{home}/.config"),
+                        _ => format!("{home}/.review_loop"),
+                    })
+                })
+                .map(|value| value.trim_end_matches('/').to_string())
+        };
+        PINNED_ENV
+            .into_iter()
+            .filter(|key| {
+                effective(key, installed.get(*key).cloned()) != effective(key, current(key))
             })
-            .unwrap_or_default();
+            .map(str::to_string)
+            .collect()
+    }
 
-        // Surface a recent Gmail OAuth refresh failure (U6).  Use a 24-hour
-        // freshness window: OAuth tokens stay broken until the user re-authorises
-        // (not a transient error like a tick failure), so the 1-hour window
-        // was hiding ongoing failures that required user action.
-        let gmail_oauth_stale: Option<(chrono::DateTime<Utc>, String)> = db.and_then(|d| {
-            if project_id.is_empty() {
-                return None;
+    fn xml_escape(input: &str) -> String {
+        input
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    }
+
+    fn xml_unescape(input: &str) -> String {
+        input
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&")
+    }
+
+    #[cfg(target_os = "macos")]
+    pub use live::*;
+
+    #[cfg(target_os = "macos")]
+    mod live {
+        use super::{LABEL, PINNED_ENV, bound_config, environment, environment_mismatch};
+        use anyhow::{Context, Result, anyhow};
+        use std::{env, path::Path, path::PathBuf, process::Command};
+
+        pub fn plist_path() -> Result<PathBuf> {
+            let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME not set"))?;
+            Ok(PathBuf::from(home)
+                .join("Library")
+                .join("LaunchAgents")
+                .join(format!("{LABEL}.plist")))
+        }
+
+        pub fn domain() -> Result<String> {
+            Ok(format!("gui/{}", crate::current_uid_string()?))
+        }
+
+        pub fn target() -> Result<String> {
+            Ok(format!("{}/{LABEL}", domain()?))
+        }
+
+        /// The pinned variables this process sets, to bake into the plist.
+        pub fn current_environment() -> Vec<(String, String)> {
+            PINNED_ENV
+                .into_iter()
+                .filter_map(|key| {
+                    env::var(key)
+                        .ok()
+                        .filter(|value| !value.is_empty())
+                        .map(|value| (key.to_string(), value))
+                })
+                .collect()
+        }
+
+        pub fn is_loaded() -> Result<bool> {
+            Ok(Command::new("launchctl")
+                .args(["print", &target()?])
+                .output()
+                .context("failed to run launchctl print")?
+                .status
+                .success())
+        }
+
+        pub fn bootstrap(plist: &Path) -> Result<()> {
+            let out = Command::new("launchctl")
+                .args(["bootstrap", &domain()?, plist.to_string_lossy().as_ref()])
+                .output()
+                .context("failed to run launchctl bootstrap")?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "launchctl bootstrap failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
             }
-            let ev = match d.most_recent_event_of_type(project_id, "gmail_oauth_refresh_failed") {
-                Ok(opt) => opt?,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        project_id,
-                        "failed to read last gmail_oauth_refresh_failed event for daemon status"
-                    );
-                    return None;
+            Ok(())
+        }
+
+        /// The service as launchd and its plist describe it.
+        pub fn probe() -> Result<crate::ServiceState> {
+            let plist_path = plist_path()?;
+            let plist = std::fs::read_to_string(&plist_path).ok();
+            let print = Command::new("launchctl")
+                .args(["print", &target()?])
+                .output()
+                .context("failed to run launchctl print")?;
+            let loaded = print.status.success();
+            let running = loaded
+                && String::from_utf8_lossy(&print.stdout)
+                    .lines()
+                    .any(|line| line.trim() == "state = running");
+            Ok(crate::ServiceState {
+                installed: plist.is_some(),
+                loaded,
+                running,
+                bound_config: plist.as_deref().and_then(bound_config),
+                environment_mismatch: plist
+                    .as_deref()
+                    .map(|plist| {
+                        environment_mismatch(
+                            &environment(plist),
+                            |key| env::var(key).ok().filter(|value| !value.is_empty()),
+                            env::var("HOME").ok().as_deref(),
+                        )
+                    })
+                    .unwrap_or_default(),
+            })
+        }
+    }
+}
+
+/// The current directory's project (or `--config`'s), registered like any
+/// load, for marking it and reporting its worker availability; the
+/// machine's settings with no project when none loads.
+fn current_project_context(
+    config_override: Option<&Path>,
+    machine: &reviewloop::config::MachineConfig,
+    db: &Db,
+) -> Config {
+    match Config::load_runtime_with_metadata(config_override, false) {
+        Ok(loaded) => {
+            if let Some(path) = loaded.project_path.as_deref()
+                && !loaded.config.project_id.trim().is_empty()
+            {
+                register_loaded_project(db, &loaded.config.project_id, path);
+            }
+            loaded.config
+        }
+        Err(err) => {
+            warn!(error = %format!("{err:#}"), "no project config loads here");
+            machine.config.clone()
+        }
+    }
+}
+
+/// List registered projects with whether the supervisor runs them.
+fn cmd_project_list(config_override: Option<&Path>, as_json: bool) -> Result<()> {
+    use reviewloop::registry::ConfigFileState;
+
+    let (machine, db) = load_machine_runtime(false)?;
+    let context = current_project_context(config_override, &machine, &db);
+    let ops = ReviewOps::new(&context, &db);
+    let projects = ops.list_projects()?;
+    let worker = ops.get_worker_status()?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "supervisor": worker.supervisor,
+                "projects": projects,
+            }))?
+        );
+        return Ok(());
+    }
+    println!("Supervisor: {}", worker.supervisor.state.as_str());
+    if projects.is_empty() {
+        println!(
+            "No registered projects. A project registers when a command loads its reviewloop.toml; enable it with `reviewloop project enable`."
+        );
+        return Ok(());
+    }
+    for project in &projects {
+        let file = match ConfigFileState::probe(Path::new(&project.config_path)) {
+            ConfigFileState::Declares(id) if id == project.project_id => String::new(),
+            ConfigFileState::Declares(id) => format!(" (now declares {id:?})"),
+            ConfigFileState::Missing => " (missing)".to_string(),
+            ConfigFileState::Unreadable(why) => format!(" (unreadable: {why})"),
+        };
+        println!(
+            "{} {:<24} {:<9} {:<8} {}{file}",
+            if project.current { "*" } else { " " },
+            project.project_id,
+            if project.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            project.state.as_str(),
+            project.config_path,
+        );
+        if let Some(error) = &project.last_error {
+            println!("    error: {error}");
+        }
+    }
+    Ok(())
+}
+
+/// Let the supervisor run a project: this directory's (or --config), or a
+/// registered one by id.
+fn cmd_project_enable(
+    config_override: Option<&Path>,
+    project_id: Option<&str>,
+    replace: bool,
+) -> Result<()> {
+    let (config, db, config_path) = match project_id {
+        None => {
+            let (config, db, path) = load_runtime_with_path(config_override, false, true)?;
+            let path = path.ok_or_else(|| {
+                anyhow!(
+                    "project {} comes from the legacy global config, which the supervisor does not run; migrate it with `reviewloop config migrate-project --project-id {}` first",
+                    config.project_id,
+                    config.project_id
+                )
+            })?;
+            (config, db, path)
+        }
+        Some(project_id) => {
+            if config_override.is_some() {
+                anyhow::bail!("--config and --project-id cannot be combined");
+            }
+            let (machine, db) = load_machine_runtime(false)?;
+            let registered = db.get_registered_project(project_id)?.ok_or_else(|| {
+                OpError::ProjectNotRegistered {
+                    project_id: project_id.to_string(),
                 }
-            };
-            let age = now - ev.created_at;
-            if age > chrono::Duration::hours(24) {
-                return None;
+            })?;
+            let path = reviewloop::config::canonical_config_path(&registered.config_path)?;
+            let config = machine.project(&path)?;
+            if config.project_id != project_id {
+                anyhow::bail!(
+                    "{} now declares project {:?}, not {project_id}; run `reviewloop project enable` there instead",
+                    path.display(),
+                    config.project_id
+                );
             }
-            let msg = ev
+            // Loaded exactly as the supervisor will load it.
+            (config, db, path)
+        }
+    };
+    let outcome = ReviewOps::new(&config, &db).enable_project(
+        &reviewloop::application::EnableProjectRequest {
+            config_path,
+            replace,
+        },
+    )?;
+    let project = &outcome.project;
+    if outcome.changed {
+        println!("Enabled project {} for the supervisor.", project.project_id);
+    } else {
+        println!("Project {} is already enabled.", project.project_id);
+    }
+    println!("- config: {}", project.config_path);
+    if let Some(from) = &outcome.moved_from {
+        println!("- moved from: {from}");
+    }
+    print_worker_availability(&outcome.worker);
+    #[cfg(target_os = "macos")]
+    if let Ok(service) = launchd::probe()
+        && service.installed
+    {
+        if !service.environment_mismatch.is_empty() {
+            println!(
+                "warning: the installed supervisor runs with different {} than this shell, so it uses another database and will not see this project; re-run `reviewloop daemon install` from this environment",
+                service.environment_mismatch.join(" and ")
+            );
+        }
+        if let Some(global_path) = Config::global_config_path()
+            && let Some(warning) =
+                daemon_cspaper_key_warning(std::slice::from_ref(&config), &global_path)?
+        {
+            println!("{warning}");
+        }
+    }
+    Ok(())
+}
+
+/// Stop the supervisor from running a project. Works by id even when the
+/// project's config no longer loads.
+fn cmd_project_disable(config_override: Option<&Path>, project_id: Option<&str>) -> Result<()> {
+    let (config, db) = match project_id {
+        Some(_) => {
+            let (machine, db) = load_machine_runtime(false)?;
+            (machine.config, db)
+        }
+        None => load_runtime(config_override, false, true)?,
+    };
+    let outcome = ReviewOps::new(&config, &db).disable_project(
+        &reviewloop::application::DisableProjectRequest {
+            project_id: project_id.map(str::to_string),
+        },
+    )?;
+    if outcome.changed {
+        println!(
+            "Disabled project {}: the supervisor no longer runs its triggers, submissions or polls. Its jobs keep their state; explicit commands still act on them.",
+            outcome.project.project_id
+        );
+    } else {
+        println!("Project {} was not enabled.", outcome.project.project_id);
+    }
+    Ok(())
+}
+
+/// One line on whether queued work of the project moves without a caller.
+fn print_worker_availability(worker: &reviewloop::application::WorkerStatus) {
+    if let Some(project) = &worker.project {
+        println!(
+            "worker: {}",
+            project.availability.describe(&project.project_id)
+        );
+    }
+}
+
+/// [`print_worker_availability`] for `config`'s project; a failure to read
+/// it only costs the line.
+fn print_project_worker(config: &Config, db: &Db) {
+    match ReviewOps::new(config, db).get_worker_status() {
+        Ok(worker) => print_worker_availability(&worker),
+        Err(err) => warn!(error = %err, "failed to read the worker status"),
+    }
+}
+
+/// Show the supervisor, its service, and every registered project.
+fn cmd_daemon_status(config_override: Option<&Path>, as_json: bool) -> Result<()> {
+    let (machine, db) = load_machine_runtime(false)?;
+    let context = current_project_context(config_override, &machine, &db);
+    #[cfg(target_os = "macos")]
+    let service = launchd::probe()
+        .inspect_err(|err| warn!(error = %format!("{err:#}"), "cannot read the launchd service"))
+        .ok();
+    #[cfg(not(target_os = "macos"))]
+    let service = None;
+    let status = collect_daemon_status(&machine.config, &context, &db, service, Utc::now())?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&daemon_status_json(&status)?)?
+        );
+    } else {
+        print_daemon_status(&status);
+    }
+    Ok(())
+}
+
+/// Everything `daemon status` shows.
+struct DaemonStatus {
+    worker: reviewloop::application::WorkerStatus,
+    service: Option<ServiceState>,
+    budget: reviewloop::worker::TickBudget,
+    /// Every registered project with its active jobs.
+    projects: Vec<(
+        reviewloop::application::ProjectView,
+        Vec<reviewloop::model::Job>,
+    )>,
+    /// Active jobs of projects the registry does not know (legacy data, or
+    /// a project never loaded here): no supervisor runs them.
+    unregistered_active_jobs: usize,
+    gmail_oauth_stale: Option<(chrono::DateTime<Utc>, String)>,
+    /// The newest `proxy_failover` events across projects.
+    proxy_failovers: Vec<EventRecord>,
+    now: chrono::DateTime<Utc>,
+}
+
+fn collect_daemon_status(
+    machine: &Config,
+    context: &Config,
+    db: &Db,
+    service: Option<ServiceState>,
+    now: chrono::DateTime<Utc>,
+) -> Result<DaemonStatus> {
+    let ops = ReviewOps::new(context, db);
+    let worker = ops.get_worker_status()?;
+    let mut active: std::collections::BTreeMap<String, Vec<reviewloop::model::Job>> =
+        std::collections::BTreeMap::new();
+    for job in db.list_active_jobs_all()? {
+        active.entry(job.project_id.clone()).or_default().push(job);
+    }
+    let mut proxy_failovers = Vec::new();
+    let mut projects = Vec::new();
+    for project in ops.list_projects()? {
+        proxy_failovers.extend(db.list_recent_events_of_type(
+            &project.project_id,
+            "proxy_failover",
+            10,
+        )?);
+        let jobs = active.remove(&project.project_id).unwrap_or_default();
+        projects.push((project, jobs));
+    }
+    proxy_failovers.sort_by_key(|event| std::cmp::Reverse(event.created_at));
+    proxy_failovers.truncate(10);
+
+    // OAuth tokens stay broken until the user re-authorises, so a refresh
+    // failure of the last day is still current. The mailbox is machine-wide.
+    let gmail_oauth_stale = db
+        .most_recent_event_of_type("", "gmail_oauth_refresh_failed")?
+        .filter(|event| now - event.created_at <= chrono::Duration::hours(24))
+        .map(|event| {
+            let message = event
                 .payload
                 .get("error")
-                .and_then(serde_json::Value::as_str)
+                .and_then(Value::as_str)
                 .unwrap_or("OAuth token refresh failed")
                 .to_string();
-            Some((ev.created_at, msg))
+            (event.created_at, message)
         });
 
-        // Compute tick health based on how long ago the last tick occurred.
-        // Thresholds: < 60s = normal, 60-300s = stale (note), > 300s = stuck (warning).
-        // None means no tick events have ever been recorded, so health is unknown.
-        let tick_health = match last_tick_at {
-            None => "unknown",
-            Some(ts) => {
-                let age_secs = (now - ts).num_seconds();
-                if age_secs < 60 {
-                    "normal"
-                } else if age_secs < 300 {
-                    "stale"
-                } else {
-                    "stuck"
-                }
-            }
-        };
+    Ok(DaemonStatus {
+        worker,
+        service,
+        budget: reviewloop::worker::TickBudget::from_config(machine),
+        projects,
+        unregistered_active_jobs: active.values().map(Vec::len).sum(),
+        gmail_oauth_stale,
+        proxy_failovers,
+        now,
+    })
+}
 
-        // Query recent proxy_failover events for R3 (proxy health section).
-        let recent_proxy_failovers: Vec<EventRecord> = db
-            .and_then(|d| {
-                if project_id.is_empty() {
-                    return None;
-                }
-                match d.list_recent_events_of_type(project_id, "proxy_failover", 10) {
-                    Ok(evs) => Some(evs),
-                    Err(e) => {
-                        tracing::warn!(error = %e, project_id, "failed to read proxy_failover events for daemon status");
-                        None
-                    }
-                }
-            })
-            .unwrap_or_default();
-        let cutoff_5m = now - chrono::Duration::minutes(5);
-        let cutoff_1h = now - chrono::Duration::hours(1);
-        let failovers_5m = recent_proxy_failovers
-            .iter()
-            .filter(|ev| ev.created_at >= cutoff_5m)
-            .count();
-        let failovers_1h = recent_proxy_failovers
-            .iter()
-            .filter(|ev| ev.created_at >= cutoff_1h)
-            .count();
-
-        if as_json {
-            let jobs_json: Vec<serde_json::Value> = active_jobs
+fn daemon_status_json(status: &DaemonStatus) -> Result<Value> {
+    let supervisor = &status.worker.supervisor;
+    let projects = status
+        .projects
+        .iter()
+        .map(|(project, jobs)| {
+            let mut value = serde_json::to_value(project)?;
+            value["active_jobs"] = jobs
                 .iter()
-                .map(|j| {
+                .map(|job| {
                     json!({
-                        "job_id": j.id,
-                        "paper_id": j.paper_id,
-                        "status": j.status.as_str(),
-                        "attempt": j.attempt,
-                        "next_poll_at": j.next_poll_at.map(|t| t.to_rfc3339()),
+                        "job_id": job.id,
+                        "paper_id": job.paper_id,
+                        "status": job.status.as_str(),
+                        "attempt": job.attempt,
+                        "next_poll_at": job.next_poll_at.map(|t| t.to_rfc3339()),
                     })
                 })
                 .collect();
-            let last_tick_error_json = match &last_tick_error_msg {
-                Some((ts, msg)) => json!({
-                    "at": ts.to_rfc3339(),
-                    "message": msg,
-                }),
-                None => serde_json::Value::Null,
-            };
-            let gmail_oauth_json = match &gmail_oauth_stale {
-                Some((ts, msg)) => json!({
-                    "stale": true,
-                    "since": ts.to_rfc3339(),
-                    "message": msg,
-                }),
-                None => serde_json::Value::Null,
-            };
-            let proxy_health_recent: Vec<serde_json::Value> = recent_proxy_failovers
-                .iter()
-                .map(|ev| {
-                    json!({
-                        "id": ev.id,
-                        "created_at": ev.created_at.to_rfc3339(),
-                        // Older failovers recorded the full request URL, token included.
-                        "payload": reviewloop::application::map_strings(
-                            ev.payload.clone(),
-                            &reviewloop::http::redact_url_paths,
-                        ),
-                    })
-                })
-                .collect();
-            let payload = json!({
-                "project_id": project_id,
-                "service": { "loaded": loaded, "running": running },
-                "last_tick_at": last_tick_at.map(|t| t.to_rfc3339()),
-                "tick_health": tick_health,
-                "last_tick_error": last_tick_error_json,
-                "active_jobs": jobs_json,
-                "gmail_oauth_status": gmail_oauth_json,
-                "proxy_health": {
-                    "failovers_5m": failovers_5m,
-                    "failovers_1h": failovers_1h,
-                    "recent": proxy_health_recent,
-                },
-            });
-            println!("{}", serde_json::to_string_pretty(&payload)?);
-            return Ok(());
-        }
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let cutoff = |minutes| status.now - chrono::Duration::minutes(minutes);
+    Ok(json!({
+        "supervisor": supervisor,
+        "tick_health": reviewloop::widget_state::tick_health_label(supervisor.last_tick_at),
+        "service": status.service.as_ref().map(|service| json!({
+            "manager": "launchd",
+            "installed": service.installed,
+            "loaded": service.loaded,
+            "running": service.running,
+            "bound_config": service.bound_config,
+            "environment_mismatch": service.environment_mismatch,
+        })),
+        "budget": {
+            "submissions_per_tick": status.budget.submits,
+            "polls_per_tick": status.budget.polls,
+        },
+        "current_project": status.worker.project,
+        "projects": projects,
+        "unregistered_active_jobs": status.unregistered_active_jobs,
+        "gmail_oauth_status": status.gmail_oauth_stale.as_ref().map(|(since, message)| json!({
+            "stale": true,
+            "since": since.to_rfc3339(),
+            "message": message,
+        })),
+        "proxy_health": {
+            "failovers_5m": status.proxy_failovers.iter().filter(|ev| ev.created_at >= cutoff(5)).count(),
+            "failovers_1h": status.proxy_failovers.iter().filter(|ev| ev.created_at >= cutoff(60)).count(),
+            "recent": status.proxy_failovers.iter().map(|ev| json!({
+                "id": ev.id,
+                "project_id": ev.project_id,
+                "created_at": ev.created_at.to_rfc3339(),
+                // Older failovers recorded the full request URL, token included.
+                "payload": reviewloop::application::map_strings(
+                    ev.payload.clone(),
+                    &reviewloop::http::redact_url_paths,
+                ),
+            })).collect::<Vec<_>>(),
+        },
+    }))
+}
 
-        // --- Human-readable output ---
-        let service_text = match (loaded, running) {
-            (true, true) => "loaded (running)".to_string(),
-            (true, false) => "loaded (not running)".to_string(),
-            _ => format!("not loaded: {target}"),
-        };
+fn print_daemon_status(status: &DaemonStatus) {
+    use reviewloop::supervisor::{ProjectState, SupervisorState};
 
-        let project_display = if project_id.is_empty() {
-            "(no project config)".to_string()
-        } else {
-            project_id.to_string()
-        };
-
-        println!("Daemon status (project={project_display}):");
-        println!("  service: {service_text}");
-
-        match last_tick_at {
-            Some(ts) => {
-                let ago = format_elapsed(ts, now);
-                println!(
-                    "  last activity: {} ({ago} ago)",
-                    ts.format("%Y-%m-%dT%H:%M:%S UTC")
-                );
-                match tick_health {
-                    "stale" => println!(
-                        "  last tick: {} (NOTE: older than usual 30s tick)",
-                        ts.format("%Y-%m-%dT%H:%M:%S UTC")
-                    ),
-                    "stuck" => println!(
-                        "  last tick: {} (WARNING: daemon may be stuck or stopped)",
-                        ts.format("%Y-%m-%dT%H:%M:%S UTC")
-                    ),
-                    _ => {}
-                }
-            }
-            None => {
-                println!("  last activity: none recorded");
-                println!("  tick health: unknown (no events recorded yet)");
-            }
-        }
-        match &last_tick_error_msg {
-            Some((ts, msg)) => {
-                let ago = format_elapsed(*ts, now);
-                println!(
-                    "  last tick error: {} ({ago} ago)",
-                    ts.format("%Y-%m-%dT%H:%M:%S UTC")
-                );
-                // Indent the message so it's clearly grouped under the label.
-                for line in msg.lines() {
-                    println!("    {line}");
-                }
-            }
-            None => {
-                println!("  last tick error: none");
-            }
-        }
-        if let Some((ts, _msg)) = &gmail_oauth_stale {
-            println!(
-                "  gmail oauth: stale (refresh failed at {}); run 'reviewloop email login --provider google' to re-authorize",
-                ts.format("%Y-%m-%dT%H:%M:%S UTC")
-            );
-        }
-        if failovers_1h > 0 {
-            println!(
-                "  proxy: {failovers_5m} failover(s) in last 5min, {failovers_1h} in last hour"
-            );
-        }
-
-        println!();
-        if active_jobs.is_empty() {
-            println!("Active jobs (0): none");
-        } else {
-            println!("Active jobs ({}):", active_jobs.len());
-            for job in &active_jobs {
-                let next_poll_text = match job.next_poll_at {
-                    None => "now".to_string(),
-                    Some(t) => {
-                        let secs = (t - now).num_seconds();
-                        if secs <= 0 {
-                            "now".to_string()
-                        } else {
-                            format!("{} (in {}s)", t.format("%H:%M:%S UTC"), secs)
-                        }
-                    }
-                };
-                println!(
-                    "  {} · {} · attempt={} · next_poll_at={}",
-                    job.paper_id,
-                    job.status.as_str(),
-                    job.attempt,
-                    next_poll_text
-                );
-            }
-        }
-
-        Ok(())
+    let now = status.now;
+    let ago = |at: chrono::DateTime<Utc>| format!("{} ago", format_elapsed(at, now));
+    let supervisor = &status.worker.supervisor;
+    let pid = supervisor
+        .pid
+        .map_or_else(|| "pid unknown".to_string(), |pid| format!("pid {pid}"));
+    match supervisor.state {
+        SupervisorState::Running => println!("Supervisor: running ({pid})"),
+        SupervisorState::Paused => println!(
+            "Supervisor: paused ({pid}); no triggers, submissions or polls until `reviewloop daemon resume`"
+        ),
+        SupervisorState::Stopped if supervisor.paused_at.is_some() => println!(
+            "Supervisor: stopped (it will start paused; `reviewloop daemon resume` clears that)"
+        ),
+        SupervisorState::Stopped => println!("Supervisor: stopped"),
     }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (config, db, as_json);
-        anyhow::bail!(
-            "`daemon status` is currently supported on macOS only (requires launchctl).\n  \
-             tip: query the database directly for job state:\n    \
-             sqlite3 ~/.review_loop/reviewloop.db 'SELECT id, paper_id, status FROM jobs WHERE status NOT IN (\"COMPLETED\", \"FAILED\");'"
+    match (supervisor.state, supervisor.heartbeat_at) {
+        (SupervisorState::Stopped, Some(beat)) => println!("  last seen: {}", ago(beat)),
+        (SupervisorState::Stopped, None) => {
+            println!("  never started on this database")
+        }
+        (_, _) => {
+            if let Some(at) = supervisor.started_at {
+                println!(
+                    "  started: {} ({})",
+                    at.format("%Y-%m-%dT%H:%M:%S UTC"),
+                    ago(at)
+                );
+            }
+        }
+    }
+    if let Some(at) = supervisor.last_tick_at {
+        println!(
+            "  last tick: {} ({})",
+            ago(at),
+            reviewloop::widget_state::tick_health_label(Some(at))
         );
+    }
+    if let Some(error) = &supervisor.last_tick_error {
+        println!("  last tick error: {error}");
+    }
+    match &status.service {
+        Some(service) if !service.installed => {
+            println!("  service: launchd service not installed (`reviewloop daemon install`)")
+        }
+        Some(service) => {
+            println!(
+                "  service: launchd {}",
+                match (service.loaded, service.running) {
+                    (true, true) => "loaded, running",
+                    (true, false) => "loaded, not running",
+                    _ => "installed but not loaded (`reviewloop daemon resume` loads it)",
+                }
+            );
+            if let Some(bound) = &service.bound_config {
+                println!(
+                    "  note: the service still passes --config {}; run `reviewloop daemon install` to update it",
+                    bound.display()
+                );
+            }
+            if !service.environment_mismatch.is_empty() {
+                println!(
+                    "  warning: the service runs with different {} than this shell, so it uses another global config or database and will not see this shell's projects; re-run `reviewloop daemon install` from the environment you use",
+                    service.environment_mismatch.join(" and ")
+                );
+            }
+        }
+        None => {}
+    }
+    println!(
+        "  budget: {} submission(s) and {} poll(s) per tick, across all projects",
+        status.budget.submits, status.budget.polls
+    );
+
+    println!();
+    let enabled = status
+        .projects
+        .iter()
+        .filter(|(project, _)| project.enabled)
+        .count();
+    println!(
+        "Projects: {enabled} enabled of {} registered",
+        status.projects.len()
+    );
+    if status.projects.is_empty() {
+        println!("  none registered; run `reviewloop project enable` in a project repository");
+    }
+    for (project, jobs) in &status.projects {
+        let marker = if project.current { "*" } else { " " };
+        println!(
+            "{marker} {} [{}] {}{}",
+            project.project_id,
+            project.state.as_str(),
+            project.config_path,
+            if project.config_present {
+                ""
+            } else {
+                " (missing)"
+            }
+        );
+        if let Some(at) = project.last_run_at {
+            println!("    last pass: {}", ago(at));
+        }
+        if let Some(error) = &project.last_error {
+            println!("    error: {error}");
+        }
+        if project.state == ProjectState::Disabled && !jobs.is_empty() {
+            println!(
+                "    {} active job(s) wait: the supervisor does not run a disabled project",
+                jobs.len()
+            );
+        }
+        for job in jobs {
+            let next_poll = match job.next_poll_at {
+                Some(at) if at > now => format!(
+                    "{} (in {}s)",
+                    at.format("%H:%M:%S UTC"),
+                    (at - now).num_seconds()
+                ),
+                _ => "now".to_string(),
+            };
+            println!(
+                "    {} · {} · attempt={} · next_poll_at={next_poll}",
+                job.paper_id,
+                job.status.as_str(),
+                job.attempt
+            );
+        }
+    }
+    if status.unregistered_active_jobs > 0 {
+        println!(
+            "  {} active job(s) belong to unregistered projects (or legacy data) and are not run",
+            status.unregistered_active_jobs
+        );
+    }
+    if let Some(project) = &status.worker.project {
+        println!();
+        println!(
+            "This project: {}",
+            project.availability.describe(&project.project_id)
+        );
+    }
+    if let Some((since, _)) = &status.gmail_oauth_stale {
+        println!(
+            "gmail oauth: stale (refresh failed at {}); run 'reviewloop email login --provider google' to re-authorize",
+            since.format("%Y-%m-%dT%H:%M:%S UTC")
+        );
+    }
+    let failovers_1h = status
+        .proxy_failovers
+        .iter()
+        .filter(|ev| ev.created_at >= now - chrono::Duration::hours(1))
+        .count();
+    if failovers_1h > 0 {
+        println!("proxy: {failovers_1h} failover(s) in the last hour");
     }
 }
 
@@ -1687,62 +2258,23 @@ fn current_uid_string() -> Result<String> {
     Ok(uid)
 }
 
-#[cfg(target_os = "macos")]
-fn render_launchd_plist(
-    label: &str,
-    args: &[String],
-    stdout_log: &Path,
-    stderr_log: &Path,
-) -> String {
-    let args_xml = args
-        .iter()
-        .map(|arg| format!("    <string>{}</string>", xml_escape(arg)))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-{args_xml}
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>{stdout_log}</string>
-  <key>StandardErrorPath</key>
-  <string>{stderr_log}</string>
-</dict>
-</plist>
-"#,
-        label = xml_escape(label),
-        args_xml = args_xml,
-        stdout_log = xml_escape(&stdout_log.to_string_lossy()),
-        stderr_log = xml_escape(&stderr_log.to_string_lossy())
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn xml_escape(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 fn load_runtime(
     config_override: Option<&Path>,
     force_stderr_logs: bool,
     require_project: bool,
 ) -> Result<(Config, Db)> {
+    load_runtime_with_path(config_override, force_stderr_logs, require_project)
+        .map(|(config, db, _)| (config, db))
+}
+
+/// [`load_runtime`], plus the canonical `reviewloop.toml` it loaded (`None`
+/// when no project file was found, or settings came from the legacy global
+/// config).
+fn load_runtime_with_path(
+    config_override: Option<&Path>,
+    force_stderr_logs: bool,
+    require_project: bool,
+) -> Result<(Config, Db, Option<PathBuf>)> {
     let loaded = Config::load_runtime_with_metadata(config_override, require_project)?;
     let reviewloop::config::LoadedConfig {
         config,
@@ -1773,23 +2305,43 @@ fn load_runtime(
     // Register this project's config path so fleet-wide commands (eg the
     // bar's "Retry now") can resolve `project_id -> config path` later
     // even when invoked from a directory without a reviewloop.toml.
-    // Falls back to the legacy global config path when project settings
-    // are still served from ~/.config/reviewloop/reviewloop.toml.
-    let registration_path = project_path.as_deref().or(legacy_global_path.as_deref());
-    if !config.project_id.trim().is_empty() {
-        if let Some(path) = registration_path {
-            if let Err(e) = db.register_project_config(&config.project_id, path) {
-                tracing::warn!(
-                    project_id = %config.project_id,
-                    config_path = %path.display(),
-                    error = %e,
-                    "failed to register project config path; cross-project --job-id commands may need a manual cd",
-                );
-            }
-        }
+    // Registering never enables the project for the supervisor.
+    if let Some(path) = project_path.as_deref()
+        && !config.project_id.trim().is_empty()
+    {
+        register_loaded_project(&db, &config.project_id, path);
     }
 
-    Ok((config, db))
+    Ok((config, db, project_path))
+}
+
+/// Record a loaded project in the registry. A registration kept elsewhere is
+/// worth one stderr line (worktrees of one repo share a `project_id`); a
+/// failure only costs cross-project resolution, so it is logged.
+fn register_loaded_project(db: &Db, project_id: &str, config_path: &Path) {
+    match reviewloop::registry::register_seen(db, project_id, config_path, Utc::now()) {
+        Ok(reviewloop::registry::Registration::Kept(conflict)) => {
+            let hint = if conflict.registered_enabled {
+                "; the supervisor keeps using it (move it with `reviewloop project enable --replace`)"
+            } else {
+                ""
+            };
+            eprintln!("note: {conflict}{hint}");
+        }
+        Ok(reviewloop::registry::Registration::Repointed { from }) => info!(
+            project_id,
+            from = %from.display(),
+            to = %config_path.display(),
+            "moved the stale project registration to this config"
+        ),
+        Ok(_) => {}
+        Err(e) => warn!(
+            project_id,
+            config_path = %config_path.display(),
+            error = %e,
+            "failed to register project config path; cross-project --job-id commands may need a manual cd",
+        ),
+    }
 }
 
 /// Quietly load only the Config for a specific project's config file. Used by
@@ -1815,6 +2367,19 @@ fn load_runtime_for_path(config_path: &Path) -> Result<Config> {
     let config = loaded.config;
     config.validate_for_foreign_load()?;
     Ok(config)
+}
+
+/// The machine settings (the global config alone, whatever directory this
+/// runs in) and the database, for commands about the supervisor itself.
+fn load_machine_runtime(
+    force_stderr_logs: bool,
+) -> Result<(reviewloop::config::MachineConfig, Db)> {
+    let machine = Config::load_machine()?;
+    reviewloop::logging::init_logging(&machine.config, force_stderr_logs)?;
+    ensure_runtime_dirs(&machine.config)?;
+    let db = Db::from_config(&machine.config)?;
+    db.ensure_schema()?;
+    Ok((machine, db))
 }
 
 fn ensure_runtime_dirs(config: &Config) -> Result<()> {
@@ -1917,6 +2482,9 @@ async fn cmd_submit(
             job.round_no,
             job.status.as_str()
         );
+        if !job.status.is_terminal() {
+            print_project_worker(config, db);
+        }
         return Ok(());
     }
 
@@ -1925,6 +2493,7 @@ async fn cmd_submit(
             "Queued job {} for paper_id={paper_id}; another reviewloop worker is submitting it",
             job.job_id
         );
+        print_project_worker(config, db);
         return Ok(());
     }
     let submitted = db
@@ -1940,6 +2509,33 @@ async fn cmd_submit(
             submitted.last_error.as_deref().unwrap_or("(no details)")
         );
     }
+    if !submitted.status.is_terminal() {
+        print_project_worker(config, db);
+    }
+    Ok(())
+}
+
+/// Move `run`'s job on while no supervisor runs its project: settle expired
+/// leases of the project, read the mailbox (when the job may get its token by
+/// email), then time out, submit or poll the job itself when due. No other
+/// job is sent or polled.
+async fn drive_run_job(
+    config: &Config,
+    db: &Db,
+    job_id: &str,
+    waits_for_token_email: bool,
+) -> Result<()> {
+    // Settle leases a vanished worker left on this project's jobs (a
+    // supervisor that died mid-submission, say): its submission becomes
+    // UNCERTAIN instead of hanging.
+    reviewloop::worker::recover_stale_leases(config, db)?;
+    let job = db
+        .get_job(job_id)?
+        .ok_or_else(|| anyhow!("job no longer exists: {job_id}"))?;
+    if waits_for_token_email && job.token.is_none() && job.status == JobStatus::Submitted {
+        reviewloop::email::poll_imap_if_enabled(config, db).await?;
+    }
+    reviewloop::worker::advance_job(config, db, &reviewloop::worker::LiveBackends, job_id).await?;
     Ok(())
 }
 
@@ -2007,11 +2603,22 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
     let submit_attempt = submit_now(&config, &db, &job_id).await?;
 
     if !args.quiet {
-        match submit_attempt {
-            Attempt::Ran => println!("Submitted job {} for paper_id={paper_id}", job_id),
-            Attempt::NotClaimed => println!(
+        let after = db
+            .get_job(&job_id)?
+            .ok_or_else(|| anyhow!("job no longer exists: {}", job_id))?;
+        match (submit_attempt, after.status) {
+            (Attempt::NotClaimed, _) => println!(
                 "Job {} for paper_id={paper_id} is being submitted by another reviewloop worker",
                 job_id
+            ),
+            (Attempt::Ran, JobStatus::Processing) => {
+                println!("Submitted job {} for paper_id={paper_id}", job_id)
+            }
+            (Attempt::Ran, status) => println!(
+                "Job {} for paper_id={paper_id} is {}: {}",
+                job_id,
+                status.as_str(),
+                after.last_error.as_deref().unwrap_or("(no details)")
             ),
         }
     }
@@ -2026,12 +2633,44 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
         });
     let mut uncertain_since: Option<std::time::Instant> = None;
 
-    // Foreground polling loop.
+    // Foreground loop: show the job every few seconds. While a supervisor
+    // runs this project it does the work and `run` only watches; otherwise
+    // `run` moves this job alone, by its own schedule, at the supervisor's
+    // cadence. Decided again every round, so a supervisor that stops or
+    // starts mid-run is followed.
     let start = std::time::Instant::now();
     let is_tty = std::io::stdout().is_terminal();
+    let mut driving: Option<bool> = None;
+    let mut last_drive: Option<std::time::Instant> = None;
     loop {
-        if let Err(e) = reviewloop::worker::run_tick(&config, &db).await {
-            warn!("run: tick error: {e:#}");
+        let supervised = ReviewOps::new(&config, &db)
+            .get_worker_status()?
+            .project
+            .is_some_and(|project| project.availability.is_ready());
+        if driving != Some(!supervised) {
+            if !args.quiet {
+                if is_tty && driving.is_some() {
+                    println!();
+                }
+                if supervised {
+                    eprintln!(
+                        "note: the supervisor runs this project; `run` only watches job {job_id}"
+                    );
+                } else {
+                    eprintln!(
+                        "note: no supervisor runs this project; `run` checks job {job_id} itself by its schedule until it finishes"
+                    );
+                }
+            }
+            driving = Some(!supervised);
+        }
+        if !supervised
+            && last_drive.is_none_or(|at| at.elapsed() >= reviewloop::supervisor::TICK_INTERVAL)
+        {
+            last_drive = Some(std::time::Instant::now());
+            if let Err(e) = drive_run_job(&config, &db, &job_id, waits_for_token_email).await {
+                warn!("run: {e:#}");
+            }
         }
 
         let updated = db
@@ -2126,10 +2765,11 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
 fn cmd_approve(config: &Config, db: &Db, job_ref: &JobRef) -> Result<()> {
     let outcome = ReviewOps::new(config, db).approve_job(job_ref)?;
     println!(
-        "Approved job {}, now {}",
+        "Approved job {}, now {} (stored locally, not yet sent to the provider)",
         outcome.job.job_id,
         outcome.job.status.as_str()
     );
+    print_project_worker(config, db);
     Ok(())
 }
 
@@ -2255,24 +2895,32 @@ async fn cmd_import_token(
     poll_imported_token(config, db, &job.id).await
 }
 
-/// launchd starts the daemon without the installing shell's environment, so a
-/// CSPaper key that only comes from the environment never reaches it.
-#[cfg(target_os = "macos")]
-fn daemon_cspaper_key_warning(config: &Config, global_path: &Path) -> Result<Option<String>> {
-    let uses_cspaper = config
-        .papers
+/// launchd starts the supervisor without the installing shell's
+/// environment, so a CSPaper key that only comes from the environment never
+/// reaches it. Names the enabled `projects` that would fail.
+#[cfg(any(target_os = "macos", test))]
+fn daemon_cspaper_key_warning(projects: &[Config], global_path: &Path) -> Result<Option<String>> {
+    let using: Vec<&str> = projects
         .iter()
-        .any(|paper| paper.backend == reviewloop::backend::cspaper::BACKEND);
+        .filter(|config| {
+            config
+                .papers
+                .iter()
+                .any(|paper| paper.backend == reviewloop::backend::cspaper::BACKEND)
+        })
+        .map(|config| config.project_id.as_str())
+        .collect();
     let key_in_file = GlobalConfigFile::load(global_path)?
         .providers
         .cspaper
         .api_key
         .is_some_and(|key| !key.trim().is_empty());
-    Ok((uses_cspaper && !key_in_file).then(|| {
+    Ok((!using.is_empty() && !key_in_file).then(|| {
         format!(
-            "warning: this project uses backend=cspaper but {} has no providers.cspaper.api_key; \
-             the daemon does not inherit {} from this shell, so its CSPaper submissions would \
-             fail. Set the key in the global config.",
+            "warning: project(s) {} use backend=cspaper but {} has no providers.cspaper.api_key; \
+             the supervisor does not inherit {} from this shell, so their CSPaper submissions \
+             would fail. Set the key in the global config.",
+            using.join(", "),
             global_path.display(),
             reviewloop::config::CSPAPER_API_KEY_ENV
         )
@@ -2308,6 +2956,12 @@ async fn poll_imported_token(config: &Config, db: &Db, job_id: &str) -> Result<(
             detail
         );
         std::process::exit(2);
+    }
+    if db
+        .get_job(job_id)?
+        .is_some_and(|job| !job.status.is_terminal())
+    {
+        print_project_worker(config, db);
     }
     Ok(())
 }
@@ -2428,11 +3082,13 @@ fn cmd_status(
                     "rows": rows.iter().map(|row| status_row_json(row, show_token, Some(&state_dir))).collect::<Vec<_>>(),
                     "timeline": timeline_json(&rows, &events, show_token, Some(&state_dir), &hidden),
                 }],
+                "worker": ReviewOps::new(config, db).get_worker_status()?,
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
             return Ok(());
         }
         render_timeline_text(config, paper_id, &rows, &events, show_token, &hidden);
+        print_project_worker(config, db);
         return Ok(());
     }
 
@@ -2461,6 +3117,7 @@ fn cmd_status(
         let payload = json!({
             "project_id": config.project_id,
             "papers": papers_json,
+            "worker": ReviewOps::new(config, db).get_worker_status()?,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
@@ -2468,6 +3125,7 @@ fn cmd_status(
 
     if rows.is_empty() {
         println!("No jobs found.");
+        print_project_worker(config, db);
         return Ok(());
     }
 
@@ -2510,6 +3168,7 @@ fn cmd_status(
             }
         }
     }
+    print_project_worker(config, db);
 
     Ok(())
 }
@@ -2612,6 +3271,7 @@ async fn cmd_retry(
             println!("Retry scheduled for job {}", job.id);
         }
     }
+    print_project_worker(job_config, db);
     Ok(())
 }
 
@@ -2657,9 +3317,9 @@ fn load_effective_config_for_job(db: &Db, job: &reviewloop::model::Job) -> Resul
     match load_runtime_for_path(&config_path) {
         Ok(config) => Ok(config),
         Err(err) if error_chain_contains_not_found(&err) => {
-            // Self-heal: forget the stale row so the next CLI call from the
-            // moved repo can re-register cleanly.
-            let _ = db.forget_project_registration(&job.project_id);
+            // The next CLI call from the moved repo re-registers it there (a
+            // disabled registration follows a stale path; an enabled one
+            // keeps its explicit decision until `project enable` moves it).
             anyhow::bail!(
                 "project '{}' cannot be located — its config file used to be at {} but that path no longer exists.\n\n\
                  To fix:\n\
@@ -3573,7 +4233,7 @@ mod tests {
 
         let db = Db::new_in_memory("cmd_retry_foreign_config_audit").unwrap();
         db.ensure_schema().unwrap();
-        db.register_project_config(project_id, &config_path)
+        db.insert_project_registration(project_id, &config_path, chrono::Utc::now())
             .unwrap();
         let job = db.create_job(&new_retry_job(project_id)).unwrap();
 
@@ -3604,7 +4264,7 @@ mod tests {
 
         let db = Db::new_in_memory("cmd_retry_missing_registered_path").unwrap();
         db.ensure_schema().unwrap();
-        db.register_project_config(project_id, &config_path)
+        db.insert_project_registration(project_id, &config_path, chrono::Utc::now())
             .unwrap();
         let job = db.create_job(&new_retry_job(project_id)).unwrap();
 
@@ -3616,10 +4276,15 @@ mod tests {
             msg.contains("no longer exists") || msg.contains("not found"),
             "got: {msg}"
         );
-        assert!(
-            db.resolve_project_config_path(project_id)
-                .unwrap()
-                .is_none()
+
+        // Loading the config from its new location moves the registration.
+        let moved = config_path.with_file_name("moved.toml");
+        write_project_config(&moved, project_id);
+        let moved = fs::canonicalize(&moved).unwrap();
+        reviewloop::registry::register_seen(&db, project_id, &moved, chrono::Utc::now()).unwrap();
+        assert_eq!(
+            db.resolve_project_config_path(project_id).unwrap(),
+            Some(moved)
         );
     }
 
@@ -3803,45 +4468,81 @@ mod tests {
 
         #[test]
         fn daemon_status_json_structure() {
-            use super::super::cmd_daemon_status;
-            // We can't easily capture stdout in unit tests, but we can verify the
-            // DB helpers return the right shape that would feed into JSON output.
+            use crate::{ServiceState, collect_daemon_status, daemon_status_json};
+            use chrono::Utc;
+            use reviewloop::config::Config;
+            use std::path::Path;
+
             let db = Db::new_in_memory("daemon_status_json").unwrap();
             db.ensure_schema().unwrap();
-
+            let now = Utc::now();
+            let path = Path::new("/repos/proj/reviewloop.toml");
+            db.enable_project("proj", path, None, false, now).unwrap();
+            db.record_project_health("proj", now, Some("pdf trigger: gone"))
+                .unwrap();
+            db.insert_project_registration("idle", Path::new("/repos/idle/reviewloop.toml"), now)
+                .unwrap();
+            db.claim_supervisor(77, Path::new("/state"), "test", now, |_| false)
+                .unwrap();
             db.create_job(&make_job("main", JobStatus::Processing, 1))
                 .unwrap();
             db.create_job(&make_job("cr", JobStatus::Queued, 2))
                 .unwrap();
+            let mut legacy = make_job("old", JobStatus::Queued, 3);
+            legacy.project_id = String::new();
+            db.create_job(&legacy).unwrap();
 
-            let active = db.list_active_jobs_for_project("proj").unwrap();
-            assert_eq!(active.len(), 2);
+            let context = Config {
+                project_id: "proj".to_string(),
+                ..Config::default()
+            };
+            let service = ServiceState {
+                installed: true,
+                loaded: true,
+                running: true,
+                bound_config: Some("/repos/proj/reviewloop.toml".into()),
+                environment_mismatch: vec!["REVIEWLOOP_STATE_DIR".to_string()],
+            };
+            let status =
+                collect_daemon_status(&context, &context, &db, Some(service), now).unwrap();
+            let json: Value = daemon_status_json(&status).unwrap();
 
-            let jobs_json: Vec<Value> = active
+            assert_eq!(json["supervisor"]["state"], "running");
+            assert_eq!(json["supervisor"]["pid"], 77);
+            assert_eq!(json["tick_health"], "unknown");
+            assert_eq!(json["service"]["running"], true);
+            assert_eq!(
+                json["service"]["bound_config"],
+                "/repos/proj/reviewloop.toml"
+            );
+            assert_eq!(
+                json["service"]["environment_mismatch"],
+                serde_json::json!(["REVIEWLOOP_STATE_DIR"])
+            );
+            assert_eq!(json["budget"]["submissions_per_tick"], 1);
+            assert_eq!(json["budget"]["polls_per_tick"], 2);
+            assert_eq!(json["current_project"]["availability"], "project_failing");
+            let projects = json["projects"].as_array().unwrap();
+            assert_eq!(projects.len(), 2);
+            assert_eq!(projects[0]["project_id"], "idle");
+            assert_eq!(projects[0]["enabled"], false);
+            assert_eq!(projects[1]["project_id"], "proj");
+            assert_eq!(projects[1]["state"], "error");
+            assert_eq!(projects[1]["last_error"], "pdf trigger: gone");
+            let statuses: Vec<&str> = projects[1]["active_jobs"]
+                .as_array()
+                .unwrap()
                 .iter()
-                .map(|j| {
-                    serde_json::json!({
-                        "job_id": j.id,
-                        "paper_id": j.paper_id,
-                        "status": j.status.as_str(),
-                        "attempt": j.attempt,
-                        "next_poll_at": j.next_poll_at.map(|t| t.to_rfc3339()),
-                    })
-                })
+                .map(|job| job["status"].as_str().unwrap())
                 .collect();
+            assert_eq!(statuses, ["PROCESSING", "QUEUED"]);
+            assert_eq!(json["unregistered_active_jobs"], 1);
+            assert!(json["gmail_oauth_status"].is_null());
+            assert_eq!(json["proxy_health"]["failovers_1h"], 0);
 
-            // Verify shape
-            assert!(jobs_json.iter().all(|j| j.get("job_id").is_some()));
-            assert!(jobs_json.iter().all(|j| j.get("paper_id").is_some()));
-            assert!(jobs_json.iter().all(|j| j.get("status").is_some()));
-            assert!(jobs_json.iter().any(|j| j["status"] == "PROCESSING"));
-            assert!(jobs_json.iter().any(|j| j["status"] == "QUEUED"));
-
-            // Verify cmd_daemon_status can be called without panicking when both
-            // config and db are None (offline / no-project case).
-            // On non-macOS this returns an error; that's fine — we just check no panic.
-            let _ = cmd_daemon_status(None, None, false);
-            let _ = cmd_daemon_status(None, None, true);
+            // Without a service manager (Linux) the section is null.
+            let status = collect_daemon_status(&context, &context, &db, None, now).unwrap();
+            assert!(daemon_status_json(&status).unwrap()["service"].is_null());
         }
     }
 
@@ -3934,6 +4635,38 @@ mod tests {
     }
 
     mod daemon_pause_resume {
+        /// Installed launchd services run `daemon run --panel false`; that
+        /// (and the bare forms) must parse, or launchd crash-loops.
+        #[test]
+        fn daemon_run_panel_accepts_the_installed_arguments() {
+            use crate::{Cli, Command, DaemonCommand};
+            use clap::Parser;
+            for (args, expected) in [
+                (
+                    &["reviewloop", "daemon", "run", "--panel", "false"][..],
+                    false,
+                ),
+                (
+                    &["reviewloop", "daemon", "run", "--panel", "true"][..],
+                    true,
+                ),
+                (&["reviewloop", "daemon", "run", "--panel"][..], true),
+                (&["reviewloop", "daemon", "run"][..], true),
+            ] {
+                let parsed = Cli::try_parse_from(args)
+                    .unwrap_or_else(|err| panic!("{args:?} should parse: {err}"));
+                assert!(
+                    matches!(
+                        parsed.command,
+                        Command::Daemon {
+                            command: DaemonCommand::Run { panel }
+                        } if panel == expected
+                    ),
+                    "{args:?}"
+                );
+            }
+        }
+
         /// `daemon pause` parses to the Pause variant.
         #[test]
         fn daemon_pause_parses() {
@@ -4255,13 +4988,101 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    mod launchd_plist {
+        use crate::launchd::{
+            bound_config, environment, environment_mismatch, program_arguments, render_plist,
+        };
+        use std::path::Path;
+
+        /// The plist `daemon install` wrote before OSS-338, verbatim.
+        const SINGLE_PROJECT_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.reviewloop.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/reviewloop</string>
+    <string>--config</string>
+    <string>/Users/me/papers/a &amp; b/reviewloop.toml</string>
+    <string>daemon</string>
+    <string>run</string>
+    <string>--panel</string>
+    <string>false</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+"#;
+
+        #[test]
+        fn an_old_single_project_plist_names_its_project() {
+            assert_eq!(
+                bound_config(SINGLE_PROJECT_PLIST).as_deref(),
+                Some(Path::new("/Users/me/papers/a & b/reviewloop.toml"))
+            );
+            assert!(environment(SINGLE_PROJECT_PLIST).is_empty());
+        }
+
+        #[test]
+        fn the_supervisor_plist_round_trips_and_pins_the_environment() {
+            let args: Vec<String> = ["/bin/reviewloop", "daemon", "run", "--panel", "false"]
+                .map(str::to_string)
+                .to_vec();
+            let pinned = vec![(
+                "REVIEWLOOP_STATE_DIR".to_string(),
+                "/Volumes/data/<state>".to_string(),
+            )];
+            let plist = render_plist(
+                &args,
+                &pinned,
+                Path::new("/state/out.log"),
+                Path::new("/state/err.log"),
+            );
+            assert_eq!(program_arguments(&plist), args);
+            assert_eq!(
+                bound_config(&plist),
+                None,
+                "the supervisor binds no project"
+            );
+            let installed = environment(&plist);
+            assert_eq!(
+                installed.get("REVIEWLOOP_STATE_DIR").map(String::as_str),
+                Some("/Volumes/data/<state>")
+            );
+
+            let home = Some("/Users/me");
+            let same = |key: &str| installed.get(key).cloned();
+            assert!(environment_mismatch(&installed, same, home).is_empty());
+            let other_db =
+                |key: &str| (key == "REVIEWLOOP_STATE_DIR").then(|| "/elsewhere".to_string());
+            assert_eq!(
+                environment_mismatch(&installed, other_db, home),
+                ["REVIEWLOOP_STATE_DIR"]
+            );
+            // A variable this shell sets but the service lacks is a mismatch too.
+            let extra = |key: &str| Some(format!("/x/{key}"));
+            assert_eq!(environment_mismatch(&installed, extra, home).len(), 2);
+
+            // A value spelling out the default is no mismatch with an unset one.
+            let mut defaults = std::collections::BTreeMap::new();
+            defaults.insert(
+                "XDG_CONFIG_HOME".to_string(),
+                "/Users/me/.config/".to_string(),
+            );
+            assert!(environment_mismatch(&defaults, |_| None, home).is_empty());
+        }
+    }
+
     mod daemon_cspaper_key {
         use crate::daemon_cspaper_key_warning;
         use reviewloop::config::{Config, GlobalConfigFile, PaperConfig, Redacted};
 
         fn config_with(backend: &str) -> Config {
             let mut config = Config {
+                project_id: format!("uses-{backend}"),
                 papers: vec![PaperConfig {
                     id: "main".to_string(),
                     pdf_path: "main.pdf".to_string(),
@@ -4281,13 +5102,17 @@ mod tests {
             let path = tmp.path().join("config.toml");
             GlobalConfigFile::default().save(&path).expect("save");
 
-            let warning = daemon_cspaper_key_warning(&config_with("cspaper"), &path)
+            let warning = daemon_cspaper_key_warning(&[config_with("cspaper")], &path)
                 .expect("check")
                 .expect("a CSPaper project without a key on file is warned about");
             assert!(warning.contains("REVIEWLOOP_CSPAPER_API_KEY"), "{warning}");
+            assert!(
+                warning.contains("uses-cspaper"),
+                "names the project: {warning}"
+            );
             assert!(!warning.contains("csp_live_env"), "{warning}");
             assert!(
-                daemon_cspaper_key_warning(&config_with("stanford"), &path)
+                daemon_cspaper_key_warning(&[config_with("stanford")], &path)
                     .expect("check")
                     .is_none()
             );
@@ -4296,7 +5121,7 @@ mod tests {
             global.providers.cspaper.api_key = Some(Redacted("csp_live_file".to_string()));
             global.save(&path).expect("save");
             assert!(
-                daemon_cspaper_key_warning(&config_with("cspaper"), &path)
+                daemon_cspaper_key_warning(&[config_with("cspaper")], &path)
                     .expect("check")
                     .is_none()
             );

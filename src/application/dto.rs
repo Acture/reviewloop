@@ -1,5 +1,12 @@
 use super::{ops::CANCELLED_BY_USER, redact::redact_text};
-use crate::model::{ExistingReason, Job, JobStatus, NewJob, ReviewOptions, SubmitStage};
+use crate::{
+    http::redact_url_paths,
+    model::{
+        ExistingReason, Job, JobStatus, NewJob, RegisteredProject, ReviewOptions, SubmitStage,
+        SupervisorRecord,
+    },
+    supervisor::{ProjectState, SupervisorState, WorkerAvailability},
+};
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Serializer};
 use serde_json::Value;
@@ -168,7 +175,7 @@ pub struct JobCandidate {
 }
 
 /// A project from the registry the CLI keeps of every `reviewloop.toml` it
-/// has loaded.
+/// has loaded, with whether the supervisor runs it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProjectView {
     pub project_id: String,
@@ -178,6 +185,91 @@ pub struct ProjectView {
     pub last_seen_at: DateTime<Utc>,
     /// This is the project the operations were called for.
     pub current: bool,
+    /// The supervisor runs it (`enable_project`).
+    pub enabled: bool,
+    pub state: ProjectState,
+    /// The supervisor's last pass over it.
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub last_ok_at: Option<DateTime<Utc>>,
+    /// The error of its last pass, when that pass failed.
+    pub last_error: Option<String>,
+}
+
+impl ProjectView {
+    pub(super) fn of(project: RegisteredProject, context_project_id: &str) -> Self {
+        Self {
+            current: project.project_id == context_project_id,
+            config_present: project.config_path.exists(),
+            config_path: project.config_path.display().to_string(),
+            last_seen_at: project.last_seen_at,
+            enabled: project.enabled,
+            state: ProjectState::of(&project),
+            last_run_at: project.health.last_run_at,
+            last_ok_at: project.health.last_ok_at,
+            last_error: project.health.last_error.as_deref().map(redact_url_paths),
+            project_id: project.project_id,
+        }
+    }
+}
+
+/// The machine supervisor as the database records it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SupervisorView {
+    pub state: SupervisorState,
+    pub pid: Option<u32>,
+    pub version: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    /// Liveness: refreshed every few seconds while it runs.
+    pub heartbeat_at: Option<DateTime<Utc>>,
+    pub last_tick_at: Option<DateTime<Utc>>,
+    pub paused_at: Option<DateTime<Utc>>,
+    /// The machine-level failure of the latest tick, if it failed.
+    pub last_tick_error: Option<String>,
+}
+
+impl SupervisorView {
+    pub(super) fn of(record: &SupervisorRecord, now: DateTime<Utc>) -> Self {
+        Self {
+            state: SupervisorState::of(record, now),
+            pid: record.pid,
+            version: record.version.clone(),
+            started_at: record.started_at,
+            heartbeat_at: record.heartbeat_at,
+            last_tick_at: record.last_tick_at,
+            paused_at: record.paused_at,
+            last_tick_error: record.current_tick_error().map(redact_url_paths),
+        }
+    }
+}
+
+/// Whether the context project's queued and submitted jobs move without a
+/// caller running them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectWorkerView {
+    pub project_id: String,
+    pub availability: WorkerAvailability,
+    /// The error of the supervisor's last pass over the project, if it failed.
+    pub last_error: Option<String>,
+}
+
+/// The supervisor, and what it means for the context project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkerStatus {
+    pub supervisor: SupervisorView,
+    /// `null` for an unscoped context.
+    pub project: Option<ProjectWorkerView>,
+}
+
+/// The result of `enable_project` and `disable_project`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectEnablement {
+    pub project: ProjectView,
+    /// The call changed whether the supervisor runs the project (or, for an
+    /// enable, which config backs it).
+    pub changed: bool,
+    /// The config the registration pointed at before an enable moved it.
+    pub moved_from: Option<String>,
+    pub worker: WorkerStatus,
 }
 
 /// A paper configured in the project's `reviewloop.toml`.

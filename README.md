@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Acture/reviewloop/actions/workflows/ci.yml/badge.svg)](https://github.com/Acture/reviewloop/actions/workflows/ci.yml)
 [![Release](https://github.com/Acture/reviewloop/actions/workflows/release.yml/badge.svg)](https://github.com/Acture/reviewloop/actions/workflows/release.yml)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/github/license/Acture/reviewloop)](LICENSE)
 
 > A production-minded Rust CLI/daemon for AI paper review submission and retrieval: `paperreview.ai` (Stanford) and CSPaper Agentic Review.
@@ -91,34 +91,56 @@ reviewloop paper add \
   --venue NeurIPS \
   --tag-trigger "custom-review/camera_ready/*"
 
-# install and start the background daemon (macOS)
-reviewloop daemon install --start true
+# let the machine supervisor run this project (once per project repo)
+reviewloop project enable
+
+# install and start the supervisor (macOS, once per machine)
+reviewloop daemon install
 ```
 
-The daemon runs every 30 seconds, handles retries, token ingestion, and retention pruning
-automatically. Use `reviewloop status` and `reviewloop check` to monitor it.
+The supervisor runs every 30 seconds, handles triggers, submissions, polls, retries, token
+ingestion and retention pruning for every enabled project. Use `reviewloop daemon status`,
+`reviewloop status` and `reviewloop check` to monitor it.
 
-## Deployment model (v0.2.0)
+## Deployment model: one supervisor, explicitly enabled projects
 
-reviewloop is **single-daemon-per-machine** in v0.2.0:
+One **supervisor** (`reviewloop daemon run`, installed on macOS as the launchd
+agent `ai.reviewloop.daemon`) runs every project you **enable** on the machine:
 
-- One launchd LaunchAgent label is used: `ai.reviewloop.daemon`. Running
-  `reviewloop daemon install` from a second project repo overwrites the first
-  plist; only the most recently installed daemon will run.
-- The shared SQLite database (`~/.local/state/reviewloop/reviewloop.db`)
-  stores job state for **all** projects you've ever used reviewloop in. The
-  menu bar app (`reviewloop-bar`) reads this DB and shows a fleet view —
-  jobs across every registered project.
-- The active daemon services jobs **only** for its installed project. Other
-  projects' jobs are visible in the bar but won't be processed until you
-  reinstall the daemon for them.
-- The bar's "Pause / Resume daemon" buttons control the single installed
-  daemon. There is no per-project pause control.
+- **Enable explicitly.** Any command that loads a project's `reviewloop.toml`
+  registers it (`reviewloop project list` shows the registry), but only
+  `reviewloop project enable` makes the supervisor run it: its git-tag and
+  PDF triggers, queue, polls, timeouts and recovery. `reviewloop project
+  disable` stops that; the project's jobs keep their state and explicit
+  commands (`submit`, `check`, `retry`, …) still act on them.
+- **One registration per `project_id`.** Paths are stored canonical. A
+  second clone or worktree declaring the same `project_id` never takes the
+  registration over silently: commands there print one note, and enabling it
+  needs `reviewloop project enable --replace`.
+- **One supervisor per state dir.** A second `daemon run` on the same state
+  directory (or database) is refused; a crashed one is replaced at once.
+- **One budget for the machine.** `core.max_submissions_per_tick` and
+  `core.max_concurrency` are shared by every project and both providers, so
+  enabling more projects never adds provider load; projects take turns, and
+  one project's broken config or failing request never stops the others
+  (`reviewloop daemon status` shows each project's last error).
+- **Pause** (`reviewloop daemon pause`) is persistent: the service stays
+  loaded but nothing is submitted, polled or triggered until `reviewloop
+  daemon resume`, across restarts.
+- **Config changes** apply on the next tick; a project whose config stops
+  loading is skipped and reported until fixed.
+- **No supervisor?** Commands still work; `submit`, `status`, `approve` and
+  `retry` say whether anything will move the job without you, instead of
+  reporting a queued job as submitted. `reviewloop run` then checks its own
+  job by its schedule.
+- The shared SQLite database (`~/.review_loop/reviewloop.db` by default)
+  holds every project's jobs; the menu bar app (`reviewloop-bar`) and the
+  widget show all of them.
 
-**Multi-daemon support** (one daemon per project, with distinct launchd
-labels) is on the v0.3.0 roadmap. For v0.2.0, if you switch between project
-repos, run `reviewloop daemon install` again from the new repo to point the
-daemon at it.
+Upgrading from a single-project install: the old launchd service passes
+`--config <project>`; the supervisor keeps that project enabled (unless you
+disabled it since) and enables nothing else. Run `reviewloop daemon install`
+once to rewrite the service.
 
 ## Installation
 
@@ -190,8 +212,8 @@ reviewloop-bar &
 - **Submit new…** — opens a native PDF file picker and spawns
   `reviewloop run <path>` in the background.
 - **Pause / Resume daemon** — shells out to `reviewloop daemon pause`
-  / `reviewloop daemon resume` (macOS only; menu item is disabled on
-  other platforms).
+  / `reviewloop daemon resume`, following the supervisor's persistent
+  pause flag (Resume also reloads an unloaded launchd service).
 - **Open Artifacts Folder** and **Open Daemon Log** — cross-platform
   (`open` / `xdg-open` / `explorer`).
 - Menu is rebuilt every 5 s so the job list stays current without
@@ -201,10 +223,9 @@ The bar is opt-in (gated behind the `bar` Cargo feature) so headless
 servers and CI continue to build the standard `reviewloop` binary
 without the GUI dependencies.
 
-> **Note:** The menu bar companion has no automated integration tests
-> (it is GUI-bound). Manual smoke-testing on macOS is the verification
-> path. Multi-project switching and "Retry Failed" enumeration are
-> deferred to a future phase (they require new `Db` helpers).
+> **Note:** The menu bar companion has no automated integration tests of
+> its GUI. Manual smoke-testing on macOS is the verification path; build it
+> with `cargo test --features bar --bin reviewloop-bar` for its unit tests.
 
 ## Command Surface
 
@@ -223,11 +244,16 @@ reviewloop run <pdf-path> [--paper-id <id>] [--backend <backend>] [--watch true|
 reviewloop paper add --paper-id <id> --path <pdf-or-build-artifact> [--backend <backend>] [--venue <venue>] [--watch true|false] [--tag-trigger "<pattern>"] [--submit-now] [--no-submit-prompt]
 reviewloop paper watch --paper-id <id> --enabled <true|false>
 reviewloop paper remove --paper-id <id> [--purge-history]
-reviewloop daemon run
-reviewloop daemon run --panel false
+reviewloop project list [--json]
+reviewloop project enable [--project-id <id>] [--replace]
+reviewloop project disable [--project-id <id>]
+reviewloop daemon run [--panel false]
 reviewloop daemon install [--start true]
 reviewloop daemon uninstall
-reviewloop daemon status
+reviewloop daemon status [--json]
+reviewloop daemon pause
+reviewloop daemon resume
+reviewloop cancel (--job-id <job-id> | --paper-id <id>) [--reason <text>]
 reviewloop submit --paper-id main [--force] [--request-key <key>]
 reviewloop approve --job-id <job-id>
 reviewloop import-token (--paper-id main | --job-id <job-id>) --token <token> [--source email]
@@ -273,15 +299,24 @@ new key for each new review round.
 
 ## Runtime Model
 
-Daemon tick interval: every 30 seconds.
+Supervisor tick interval: 30 seconds after the previous tick ends (pause,
+resume, enable and disable wake it within 2 seconds).
 
-Each tick performs:
-1. Trigger scan (`git tags`, PDF hash changes)
-2. Optional Gmail OAuth + IMAP token ingestion
-3. Timeout marking
-4. Lease recovery (claims left behind by a crashed or killed worker)
-5. Submission processing (`QUEUED -> SUBMITTED -> PROCESSING`)
-6. Poll processing (`PROCESSING -> COMPLETED/FAILED/...`)
+Each tick reloads the global config and every enabled project's config, then:
+1. Per enabled project, in turn: trigger scan (`git tags`, PDF hash changes),
+   timeout marking, lease recovery (claims left behind by a crashed or killed
+   worker)
+2. Optional Gmail OAuth + IMAP token ingestion, once for the machine
+   (tokens are bound to the job that holds them in any project)
+3. Submission processing (`QUEUED -> SUBMITTED -> PROCESSING`), up to
+   `core.max_submissions_per_tick` for the whole machine, one project per turn
+4. Poll processing (`PROCESSING -> COMPLETED/FAILED/...`), up to
+   `core.max_concurrency` for the whole machine, one project per turn
+5. Retention pruning (every `retention.prune_every_ticks` ticks), the widget
+   snapshot, and each project's health
+
+Provider calls are sequential. A step or job that fails fails only its
+project's pass; the error is in `reviewloop daemon status`.
 
 ### Job ownership and uncertain submissions
 
@@ -516,7 +551,8 @@ There is no global-overrides-project merge chain. Instead:
 - `--config /path/to/reviewloop.toml` explicitly points to a project config file
 - `reviewloop init` initializes the global config/data paths
 - `reviewloop init project --project-id <id>` initializes the current repo's project config
-- `reviewloop daemon install` can run in global-only mode when no project config is present; if a project config is found, it binds the daemon to that project config
+- `reviewloop daemon install` installs the one machine-wide supervisor; `reviewloop project enable` (from the repo, or `--config`) chooses the projects it runs
+- a project config cannot set machine-wide settings (`core.db_path`, `core.state_dir`, the provider budget, `[polling]`, `[retention]`, `[logging]`, `[imap]`, `[gmail_oauth]`): such a file is refused by name
 
 Project commands require a non-empty `project_id` in the project config. Jobs, events, dedupe, and status views are isolated inside the shared global DB by `project_id`.
 
@@ -528,8 +564,8 @@ Paper registration:
 - control PDF watcher per paper with `reviewloop paper watch ...`
 
 Safe defaults:
-- `core.max_concurrency = 2`
-- `core.max_submissions_per_tick = 1`
+- `core.max_concurrency = 2` (polls per tick, for the whole machine)
+- `core.max_submissions_per_tick = 1` (submissions per tick, for the whole machine)
 - `core.state_dir = "~/.review_loop"` (or `REVIEWLOOP_STATE_DIR` when set)
 - `core.db_path = "~/.review_loop/reviewloop.db"` (or `<REVIEWLOOP_STATE_DIR>/reviewloop.db`)
 - `core.review_timeout_hours = 48` (every job and backend, whatever its page count: provider processing time follows its load)
@@ -590,9 +626,10 @@ desk_rejection_enabled = true       # the default
 - `api_key`: your organisation's API key. When it is unset or blank,
   `REVIEWLOOP_CSPAPER_API_KEY` is used; when both are set, the config value
   wins. It is sent only in the `X-API-Key` header and kept out of job rows,
-  events, job errors and archives. The launchd daemon does not inherit your
-  shell's environment, so a daemon needs the key in the global config;
-  `reviewloop daemon install` warns when it is missing there.
+  events, job errors and archives. The launchd supervisor does not inherit
+  your shell's environment, so it needs the key in the global config;
+  `reviewloop daemon install` warns, naming the enabled projects that use
+  CSPaper, when it is missing there.
 - `base_url`: defaults to `https://cspaper.org`. It must be `https://` with a
   host (plain `http://` only for `localhost`, `127.0.0.1` or `[::1]`).
   ReviewLoop calls the live `/api/platform/...` paths, not the
@@ -717,9 +754,9 @@ are the same request.
 - Uncertain submissions are not reconciled automatically.
 - The template is not checked before submission; an unknown one fails the job
   with CSPaper's 400.
-- `core.max_concurrency` and `core.max_submissions_per_tick` are shared with
-  Stanford jobs, and the organisation key's quota is shared by every project
-  that uses it.
+- `core.max_concurrency` and `core.max_submissions_per_tick` are one budget
+  for the machine, shared with Stanford jobs and every project, and the
+  organisation key's quota is shared by every project that uses it.
 
 ## CI/CD and Release Flow
 
@@ -807,9 +844,11 @@ Please keep it that way:
 
 ## macOS Widget (preview)
 
-The daemon writes a small JSON status snapshot (`widget-state.json`) every tick.
-A separate macOS WidgetKit extension reads that snapshot and renders a glance UI
-(active job count, recent failures) in macOS desktop / Notification Center widgets.
+The supervisor writes a small JSON status snapshot (`widget-state.json`) every
+tick, covering every project on the machine (see
+[docs/widget-schema.md](docs/widget-schema.md)). A separate macOS WidgetKit
+extension reads that snapshot and renders a glance UI (active job count, recent
+failures) in macOS desktop / Notification Center widgets.
 
 **Platform**: macOS only. **Distribution**: opt-in via build — no signed binary is
 distributed. You build the `.app` yourself with your Personal Team.

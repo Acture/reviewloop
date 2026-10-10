@@ -15,8 +15,11 @@ every operation against a temporary config and database.
   events at INFO; the host's logging configuration decides where they go
   (the CLI's default is stdout, so an MCP host MUST log to stderr).
 - Requesting a review is a **persistent enqueue**. Sending the PDF to the
-  provider and polling for the result belong to the worker (the daemon) or to
-  a caller that executes a job immediately, as `reviewloop submit` does.
+  provider and polling for the result belong to the worker (the machine
+  supervisor, `reviewloop daemon run`, for every enabled project) or to a
+  caller that executes a job immediately, as `reviewloop submit` does.
+  `get_worker_status` says which applies; a queued job is never reported as
+  submitted.
 - Status queries read the database only. Refreshing a job from the provider
   (`reviewloop check`) is a separate, network-bound action outside this
   contract.
@@ -36,7 +39,8 @@ every operation against a temporary config and database.
 |---|---|
 | Project | The `project_id` of a `reviewloop.toml`. `ReviewOps` acts for its config's `project_id`. |
 | Unscoped context | A config with an empty `project_id` (no `reviewloop.toml`, as for the menu bar). `get_job`, `get_review` and `cancel_job` by job id then search every project; `retry_job` by job id fails with `project_mismatch` for a job that has a project; `list_papers`, `request_review`, `list_jobs`, `approve_job` and every paper reference fail with `project_required`. A scoped context reports another project's job id as `job_not_found`. |
-| Registry | Every `reviewloop.toml` the CLI loads is recorded with its path. `list_projects` reads it. Loading another project's config from that path is the adapter's job, not an operation. |
+| Registry | Every `reviewloop.toml` the CLI loads is recorded with its canonical path. Recording never enables a project and never takes a registration from another config that still declares the same `project_id` (a second clone or worktree): that is reported, not overwritten. `list_projects` reads it. Loading another project's config from that path is the adapter's job, not an operation. |
+| Enabled project | A registered project the machine supervisor runs: its triggers, queue, polls, timeouts and lease recovery. Only `enable_project` enables one (or, once, the migration of a single-project daemon install); `disable_project` stops it. A disabled project's jobs keep their state, and explicit commands still act on them. One config file backs at most one enabled project. |
 | `paper_id` | Unique within a project; configured in `[[papers]]`. |
 | `job_id` | A UUID, unique across projects. Jobs are scoped to their project. |
 | Job reference | A job id, or a paper id. A paper reference needs a project and resolves to the single job of that paper whose status the operation accepts (newest `updated_at` first). Zero matches is `no_eligible_job`; several is `ambiguous_job`. |
@@ -54,6 +58,9 @@ every operation against a temporary config and database.
 | `get_review` | `ReviewOps::get_review` | yes | `ReviewQuery` | `ReviewView` | none |
 | `approve_job` | `ReviewOps::approve_job` | no | job reference (needs a project) | `TransitionOutcome` | PENDING_APPROVAL → QUEUED; `approved` event `{}`. |
 | `retry_job` | `ReviewOps::retry_job` | no | `RetryRequest` | `RetryOutcome` | Re-queues the job (see Retry semantics); `retried` event `{}`, or `manual_rate_limit_override` when forced. |
+| `get_worker_status` | `ReviewOps::get_worker_status` | yes | none | `WorkerStatus` | none |
+| `enable_project` | `ReviewOps::enable_project` | no | `EnableProjectRequest` (needs a project) | `ProjectEnablement` | Registers the project at `config_path` (moving a registration only when its config is gone, now declares another project, or `replace` is set) and enables it; `project_enabled` event `{config_path}`; wakes a sleeping supervisor. |
+| `disable_project` | `ReviewOps::disable_project` | no | `DisableProjectRequest` | `ProjectEnablement` | Disables the project; `project_disabled` event `{}` when it was enabled; wakes a sleeping supervisor. Jobs are not touched. |
 | `cancel_job` | `ReviewOps::cancel_job` | no | `CancelRequest` | `TransitionOutcome` | Non-terminal → FAILED with `last_error` `"cancelled by user"` or `"cancelled by user: <reason>"`; `cancelled` event `{reason, previous_status, previous_submit_stage, lease_was_active}`. Check, write and event share one transaction that revokes any worker lease, so a worker finishing at the same time either lands first (the cancel fails as terminal) or has its result rejected. The provider is not contacted. |
 
 `ReviewOps::find_job(job_ref, eligibility)` is the shared resolver behind the
@@ -79,6 +86,9 @@ job references above. It is a Rust helper, not a tool.
 | `RetryRequest.caller_executes` | boolean | required | With `force`, the caller submits or polls the job itself right after the call (`reviewloop retry --force`). A forced poll then leaves `next_poll_at` unchanged so no worker polls the job concurrently. Adapters that leave execution to the worker pass `false`. |
 | `CancelRequest.job` | job reference | required | Paper references match PENDING_APPROVAL, QUEUED, SUBMITTED and PROCESSING jobs. |
 | `CancelRequest.reason` | string | nullable | Recorded in `last_error` and the `cancelled` event. |
+| `EnableProjectRequest.config_path` | path | required | The `reviewloop.toml` the context config was loaded from. It must declare the context's project (`invalid_request` otherwise); it is stored canonical. |
+| `EnableProjectRequest.replace` | boolean | required | Move the registration here even when it points at another config that still declares this project. Without it that is `project_conflict`. |
+| `DisableProjectRequest.project_id` | string | nullable | The project to disable; `null` is the context's project. The project's config need not load. |
 
 ## Job lifecycle
 
@@ -189,7 +199,10 @@ caller leaves it to the worker's next tick.
 | `TransitionOutcome.previous_status` | string | required | Status before the change. |
 | `RetryOutcome.job`, `.previous_status` | as above | required | As for `TransitionOutcome`. |
 | `RetryOutcome.action` | string | required | One of `"poll_scheduled"`, `"submission_queued"`, `"poll_now"`, `"submit_now"` (see Retry semantics). |
-| `ProjectView` | object | — | `project_id`, `config_path`, `config_present` (the file still exists), `last_seen_at`, `current` (the project these operations act for). Ordered by `project_id`. |
+| `ProjectView` | object | — | `project_id`, `config_path`, `config_present` (the file still exists), `last_seen_at`, `current` (the project these operations act for), `enabled` (the supervisor runs it), `state` (`"disabled"`, `"pending"` (enabled, not run yet), `"ok"` or `"error"`), `last_run_at` and `last_ok_at` (nullable: the supervisor's last pass, and its last clean one), `last_error` (nullable: the failure of its last pass). Ordered by `project_id`. |
+| `WorkerStatus.supervisor` | `SupervisorView` | required | `state` (`"running"`, `"paused"` or `"stopped"`; stopped also when its heartbeat is over 60 s old), `pid`, `version`, `started_at`, `heartbeat_at`, `last_tick_at`, `paused_at` (nullable: the persistent pause), `last_tick_error` (nullable: the machine-level failure of its latest tick). |
+| `WorkerStatus.project` | object | nullable | For a scoped context: `project_id`, `availability` and `last_error`. `availability` is `"ready"` (a running supervisor runs the project), `"project_not_registered"`, `"project_disabled"`, `"supervisor_stopped"`, `"supervisor_paused"` or `"project_failing"` (its last pass failed). Only `"ready"` means queued jobs move without a caller. `null` for an unscoped context. |
+| `ProjectEnablement` | object | — | `project` (`ProjectView`), `changed` (whether the call changed what the supervisor runs, or which config backs the project), `moved_from` (nullable: the config an enable moved the registration from), `worker` (`WorkerStatus` for that project). |
 | `PaperView` | object | — | `paper_id`, `backend`, `venue` and `review_options` (what a new request would send), `pdf_path`, `pdf_present`, `watched`, `tag_trigger` (nullable). Config order. |
 | `ReviewView.job` | `JobView` | required | The reviewed job, for checking `pdf_hash` and `version_no`. |
 | `ReviewView.completed_at` | RFC3339 UTC timestamp string | required | When the review was stored. |
@@ -229,6 +242,8 @@ text the CLI prints (it MAY change), `recovery` is a suggested next step or
 | `invalid_state` | `InvalidState` | The job's status does not allow the operation (approve a non-pending job, cancel a finished one, retry a PENDING_APPROVAL job, force-retry an unsupported status). Details: `job_id`, `status`, `operation` (tool name). | `get_job`; see the operation's accepted statuses; a PENDING_APPROVAL job needs `approve_job`. |
 | `review_not_available` | `ReviewNotAvailable` | No review is stored for the job. Details: `job_id`, `status`. | Active job: wait for COMPLETED and re-check after `next_poll_at`. Terminal job: it ended without a review; `retry_job` or `request_review`. |
 | `section_not_found` | `SectionNotFound` | The requested section does not exist. Details: `job_id`, `section`, `available`. | Request an available section or the markdown. |
+| `project_conflict` | `ProjectConflict` | `enable_project` would take the registration from another config that still declares the project (without `replace`), or the config already backs another enabled project. Details: `project_id`, `registered_path`, `requested_path`, `enabled_as` (the other enabled project, else `null`). | Keep one copy per `project_id` or pass `replace`; for `enabled_as`, disable that project first. |
+| `project_not_registered` | `ProjectNotRegistered` | `disable_project` named a project the registry does not know. Details: `project_id`. | Check the id with `list_projects`. |
 | `internal` | `Internal` | Database, filesystem or other unexpected failure. | None; the message carries the cause. |
 
 ## Duplicate requests and idempotency
@@ -264,12 +279,16 @@ both create a job for the same request.
 |---|---|---|
 | `submit` | `request_review` (origin `Submit`, approval granted, `--request-key`, `--force`) | On `existing`, print `Skipped submit: <reason> existing job …` and exit 0. On `created`, submit the job to the provider immediately and pull its first poll forward to about 60 seconds. |
 | `paper add --submit-now` | as `submit` | |
-| `run` | `request_review` (origin `Run`, `force`) | Paper registration, immediate submission, the foreground polling loop and its exit codes. |
+| `run` | `request_review` (origin `Run`, `force`), `get_worker_status` | Paper registration, immediate submission, and the foreground loop with its exit codes. While a running supervisor runs the project, the loop only watches the job; otherwise it submits or polls this job alone, when the job's schedule makes it due (and reads the mailbox for a token while the submission's outcome is unknown). It never runs other jobs, triggers or retention. |
 | `approve` | `approve_job` | Printing `Approved job …`. |
 | `retry` | `find_job`, then `retry_job` with the job's project config (`caller_executes` = `--force`) | Loading a foreign project's config from the registry; with `--force`, the immediate poll or submit. A PENDING_APPROVAL job is refused. |
 | `cancel` | `cancel_job` | The `hint:` line for a paper with no active job. |
 | `complete --paper-id` | `find_job` | Everything else. |
-| `status`, `check`, `import-token`, `complete` | not routed | Unchanged. `check` is the network refresh. |
+| `project list` | `list_projects`, `get_worker_status` | Showing whether each registered config still declares its project. |
+| `project enable` | `enable_project` (`--replace`) | Loading the config (the current repository, `--config`, or the registered config of `--project-id`). |
+| `project disable` | `disable_project` (`--project-id`) | |
+| `daemon status` | `list_projects`, `get_worker_status` | The launchd service state, active jobs, mailbox and proxy health. |
+| `status`, `check`, `import-token`, `complete` | not routed | `status`, `submit`, `approve` and `retry` print the project's worker availability after the queue state. `check` is the network refresh. |
 
 Exit codes are unchanged. Every command exits 0 on success, 1 on an error
 (message on stderr) and 2 on a usage error. In addition, `run` exits 2 when the
@@ -366,17 +385,15 @@ These are deliberately outside this contract and owned by follow-up issues:
 - **Venue at submission.** A `stanford` job stored without a venue is sent
   with the venue configured at submission time, which `JobView.venue` does
   not show. A `cspaper` job is sent with exactly its recorded template.
-- **Multi-project daemon (OSS-338).** No operation reports whether a worker is
-  running. A queued job waits until the project's daemon (or a CLI command)
-  processes it.
 - **MCP transport (OSS-339).** Tool argument schemas, annotations, stdio
   framing and logging to stderr. The tool names above are fixed for it.
 - **CSPaper caveats.**
   - A PROCESSING `cspaper` job times out after the flat
     `review_timeout_hours`; unlike `stanford`, it is not scaled by page count.
   - Provider capacity is shared: `max_concurrency` and
-    `max_submissions_per_tick` apply across both backends, and the
-    organisation API key's quota is shared by every project that uses it.
+    `max_submissions_per_tick` are one machine-wide budget per supervisor
+    tick across both backends and every project, and the organisation API
+    key's quota is shared by every project that uses it.
   - UNCERTAIN `cspaper` submissions are not reconciled automatically; an
     operator matches them against the CSPaper review list (see the lifecycle
     table).

@@ -25,9 +25,10 @@ mod redact;
 mod request;
 
 pub use dto::{
-    JobCandidate, JobList, JobPhase, JobView, ManuscriptInput, PaperView, ProjectView,
-    RequestDisposition, RetryAction, RetryOutcome, ReviewArtifacts, ReviewRequestOutcome,
-    ReviewSection, ReviewView, TransitionOutcome,
+    JobCandidate, JobList, JobPhase, JobView, ManuscriptInput, PaperView, ProjectEnablement,
+    ProjectView, ProjectWorkerView, RequestDisposition, RetryAction, RetryOutcome, ReviewArtifacts,
+    ReviewRequestOutcome, ReviewSection, ReviewView, SupervisorView, TransitionOutcome,
+    WorkerStatus,
 };
 pub use error::{ErrorView, OpError};
 pub use operation::Operation;
@@ -36,6 +37,6 @@ pub use ops::{
 };
 pub use redact::{map_strings, redact_text, redact_value};
 pub use request::{
-    Approval, CancelRequest, Eligibility, JobListQuery, JobRef, RequestOrigin, RetryRequest,
-    ReviewPart, ReviewQuery, ReviewRequest,
+    Approval, CancelRequest, DisableProjectRequest, Eligibility, EnableProjectRequest,
+    JobListQuery, JobRef, RequestOrigin, RetryRequest, ReviewPart, ReviewQuery, ReviewRequest,
 };

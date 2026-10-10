@@ -1,28 +1,33 @@
 use super::{
     dto::{
-        JobCandidate, JobList, JobView, ManuscriptInput, PaperView, ProjectView,
-        RequestDisposition, RetryAction, RetryOutcome, ReviewArtifacts, ReviewRequestOutcome,
-        ReviewSection, ReviewView, TransitionOutcome,
+        JobCandidate, JobList, JobView, ManuscriptInput, PaperView, ProjectEnablement, ProjectView,
+        ProjectWorkerView, RequestDisposition, RetryAction, RetryOutcome, ReviewArtifacts,
+        ReviewRequestOutcome, ReviewSection, ReviewView, SupervisorView, TransitionOutcome,
+        WorkerStatus,
     },
     error::OpError,
     operation::Operation,
     redact::redact_value,
     request::{
-        Approval, CancelRequest, Eligibility, JobListQuery, JobRef, RetryRequest, ReviewPart,
-        ReviewQuery, ReviewRequest,
+        Approval, CancelRequest, DisableProjectRequest, Eligibility, EnableProjectRequest,
+        JobListQuery, JobRef, RetryRequest, ReviewPart, ReviewQuery, ReviewRequest,
     },
 };
 use crate::{
     artifact::render_summary_markdown,
     backend::input::{InputVerdict, input_policy},
+    config::canonical_config_path,
     config::{Config, PaperConfig},
     db::{CancelOutcome, Db, Requeue},
     email_account::resolve_submission_email,
+    http::redact_url_paths,
     model::{
         EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, Job, JobPdf, JobStatus,
         NewJob,
     },
+    registry::{self, ConfigFileState, Disabled, EnableError},
     submission_input::prepare_input,
+    supervisor::WorkerAvailability,
     util::compute_next_poll_at,
 };
 use chrono::Utc;
@@ -89,14 +94,158 @@ impl<'a> ReviewOps<'a> {
             .db
             .list_registered_projects()?
             .into_iter()
-            .map(|project| ProjectView {
-                current: project.project_id == self.config.project_id,
-                config_present: project.config_path.exists(),
-                config_path: project.config_path.display().to_string(),
-                last_seen_at: project.last_seen_at,
-                project_id: project.project_id,
-            })
+            .map(|project| ProjectView::of(project, &self.config.project_id))
             .collect())
+    }
+
+    /// The machine supervisor, and whether it runs this project's jobs.
+    pub fn get_worker_status(&self) -> Result<WorkerStatus, OpError> {
+        let now = Utc::now();
+        let record = self.db.supervisor_record()?;
+        let project = if self.config.project_id.trim().is_empty() {
+            None
+        } else {
+            let row = self.db.get_registered_project(&self.config.project_id)?;
+            Some(ProjectWorkerView {
+                availability: WorkerAvailability::of(&record, row.as_ref(), now),
+                last_error: row
+                    .and_then(|row| row.health.last_error)
+                    .as_deref()
+                    .map(redact_url_paths),
+                project_id: self.config.project_id.clone(),
+            })
+        };
+        Ok(WorkerStatus {
+            supervisor: SupervisorView::of(&record, now),
+            project,
+        })
+    }
+
+    /// Let the machine supervisor run this project from `config_path`. Never
+    /// takes the registration from another live config unless `replace`, and
+    /// never gives one config two enabled projects.
+    pub fn enable_project(
+        &self,
+        request: &EnableProjectRequest,
+    ) -> Result<ProjectEnablement, OpError> {
+        let project_id = require_project(self.config)?;
+        let config_path =
+            canonical_config_path(&request.config_path).map_err(|err| OpError::InvalidRequest {
+                field: "config_path",
+                message: format!("{err:#}"),
+            })?;
+        if ConfigFileState::probe(&config_path) != ConfigFileState::Declares(project_id.to_string())
+        {
+            return Err(OpError::InvalidRequest {
+                field: "config_path",
+                message: format!(
+                    "{} does not declare project {project_id}",
+                    config_path.display()
+                ),
+            });
+        }
+        let enabled = registry::enable(
+            self.db,
+            project_id,
+            &config_path,
+            request.replace,
+            Utc::now(),
+        )
+        .map_err(|err| {
+            let message = err.to_string();
+            match err {
+                EnableError::Conflict(conflict) => OpError::ProjectConflict {
+                    message: format!(
+                        "{message}, which still declares it; keep one copy per project_id, or move the registration here with --replace"
+                    ),
+                    project_id: conflict.project_id,
+                    registered_path: Some(conflict.registered.display().to_string()),
+                    requested_path: conflict.requested.display().to_string(),
+                    enabled_as: None,
+                },
+                EnableError::FileEnabledAs {
+                    config_path,
+                    enabled_as,
+                } => OpError::ProjectConflict {
+                    project_id: project_id.to_string(),
+                    registered_path: None,
+                    requested_path: config_path.display().to_string(),
+                    enabled_as: Some(enabled_as),
+                    message,
+                },
+                EnableError::Concurrent { .. } => OpError::Internal(anyhow::anyhow!(message)),
+                EnableError::Internal(err) => OpError::Internal(err),
+            }
+        })?;
+        info!(
+            project_id,
+            config_path = %config_path.display(),
+            changed = !enabled.already,
+            "project enabled for the supervisor"
+        );
+        self.enablement(
+            project_id,
+            !enabled.already,
+            enabled.moved_from.map(|path| path.display().to_string()),
+        )
+    }
+
+    /// Stop the machine supervisor from running a project (by default this
+    /// one). Its jobs keep their state.
+    pub fn disable_project(
+        &self,
+        request: &DisableProjectRequest,
+    ) -> Result<ProjectEnablement, OpError> {
+        let project_id = match request.project_id.as_deref().map(str::trim) {
+            Some(id) if !id.is_empty() => id,
+            Some(_) => {
+                return Err(OpError::InvalidRequest {
+                    field: "project_id",
+                    message: "project_id must not be blank".to_string(),
+                });
+            }
+            None => require_project(self.config)?,
+        };
+        let changed = match registry::disable(self.db, project_id, Utc::now())? {
+            Disabled::NotRegistered => {
+                return Err(OpError::ProjectNotRegistered {
+                    project_id: project_id.to_string(),
+                });
+            }
+            Disabled::WasEnabled => true,
+            Disabled::AlreadyDisabled => false,
+        };
+        info!(project_id, changed, "project disabled for the supervisor");
+        self.enablement(project_id, changed, None)
+    }
+
+    fn enablement(
+        &self,
+        project_id: &str,
+        changed: bool,
+        moved_from: Option<String>,
+    ) -> Result<ProjectEnablement, OpError> {
+        let row = self.db.get_registered_project(project_id)?.ok_or_else(|| {
+            OpError::ProjectNotRegistered {
+                project_id: project_id.to_string(),
+            }
+        })?;
+        let now = Utc::now();
+        let record = self.db.supervisor_record()?;
+        let worker = WorkerStatus {
+            supervisor: SupervisorView::of(&record, now),
+            project: Some(ProjectWorkerView {
+                project_id: project_id.to_string(),
+                availability: WorkerAvailability::of(&record, Some(&row), now),
+                last_error: row.health.last_error.as_deref().map(redact_url_paths),
+            }),
+        };
+        Ok(ProjectEnablement {
+            project: ProjectView::of(row, &self.config.project_id),
+            changed,
+            moved_from,
+            worker,
+        })
     }
 
     /// The papers configured for this project.
