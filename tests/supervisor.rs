@@ -641,3 +641,60 @@ async fn wait_until(mut ready: impl FnMut() -> bool) {
     .await
     .expect("condition not reached in time");
 }
+
+/// Another live supervisor took the control row (this one's heartbeat went
+/// stale across a sleep): this one stops instead of running beside it.
+#[tokio::test]
+async fn a_displaced_supervisor_stops() -> Result<()> {
+    let fleet = Fleet::new(&["p"])?;
+    let backends = FleetBackends::new(accepting_backend());
+    let load = || Ok(fleet.machine_config());
+    fleet.db.claim_supervisor(
+        PID + 1,
+        &fleet.tmp.path().join("elsewhere"),
+        "0.0.0",
+        Utc::now(),
+        |_| false,
+    )?;
+    let err = supervisor(&fleet, &backends, &load)
+        .tick_once(
+            PID,
+            1,
+            &mut SupervisorMemory::default(),
+            &AtomicBool::new(false),
+        )
+        .await
+        .expect_err("displaced");
+    assert!(err.is::<reviewloop::supervisor::Displaced>(), "{err:#}");
+    Ok(())
+}
+
+/// v0.2.1 wrote the fully resolved config path into the plist. When the
+/// repository's `reviewloop.toml` is a symlink (into a dotfiles repo, say),
+/// the binding names the target; the project stays at the link, with the
+/// repository as its root.
+#[cfg(unix)]
+#[test]
+fn a_binding_to_a_symlink_target_keeps_the_link() -> Result<()> {
+    let fleet = Fleet::new(&["p"])?;
+    let machine = fleet.machine_config();
+    let dotfiles = fleet.tmp.path().join("dotfiles");
+    fs::create_dir_all(&dotfiles)?;
+    let link = fleet.project("p").config_path.clone();
+    fs::rename(&link, dotfiles.join("reviewloop.toml"))?;
+    std::os::unix::fs::symlink(dotfiles.join("reviewloop.toml"), &link)?;
+    let link = reviewloop::config::canonical_config_path(&link)?;
+    registry::register_seen(&fleet.db, "p", &link, Utc::now())?;
+
+    let target = fs::canonicalize(dotfiles.join("reviewloop.toml"))?;
+    let (_, adoption) = adopt_legacy_binding(&fleet.db, &machine, &target, Utc::now())?;
+    assert_eq!(adoption, LegacyAdoption::Enabled { moved_from: None });
+    let row = fleet.db.get_registered_project("p")?.expect("row");
+    assert!(row.enabled);
+    assert_eq!(row.config_path, link);
+    assert_eq!(
+        machine.project(&row.config_path)?.project_root.as_deref(),
+        link.parent()
+    );
+    Ok(())
+}

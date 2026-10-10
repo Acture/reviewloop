@@ -179,6 +179,44 @@ pub fn enable(
     replace: bool,
     now: DateTime<Utc>,
 ) -> Result<Enabled, EnableError> {
+    enable_with(db, project_id, config_path, replace, false, now)
+}
+
+/// [`enable`] with `replace`, but only while nobody has enabled or disabled
+/// the project: what an old single-project install's binding may do. `None`
+/// when a decision exists (checked in the same transaction as the write).
+pub fn enable_if_undecided(
+    db: &Db,
+    project_id: &str,
+    config_path: &Path,
+    now: DateTime<Utc>,
+) -> Result<Option<Enabled>, EnableError> {
+    if db
+        .get_registered_project(project_id)?
+        .is_some_and(|row| row.enabled_changed_at.is_some())
+    {
+        return Ok(None);
+    }
+    match enable_with(db, project_id, config_path, true, true, now) {
+        Err(EnableError::Concurrent { .. })
+            if db
+                .get_registered_project(project_id)?
+                .is_some_and(|row| row.enabled_changed_at.is_some()) =>
+        {
+            Ok(None)
+        }
+        other => other.map(Some),
+    }
+}
+
+fn enable_with(
+    db: &Db,
+    project_id: &str,
+    config_path: &Path,
+    replace: bool,
+    undecided_only: bool,
+    now: DateTime<Utc>,
+) -> Result<Enabled, EnableError> {
     let projects = db.list_registered_projects()?;
     if let Some(other) = projects.iter().find(|row| {
         row.enabled
@@ -194,6 +232,7 @@ pub fn enable(
     // Already enabled here: nothing to decide, and its health stays.
     if let Some(row) = existing
         && row.enabled
+        && !undecided_only
         && same_config_file(&row.config_path, config_path)
     {
         db.touch_project_registration(project_id, &row.config_path, config_path, now)?;
@@ -213,7 +252,7 @@ pub fn enable(
         moved_from = Some(row.config_path.clone());
     }
     let expected = existing.map(|row| row.config_path.as_path());
-    if !db.enable_project(project_id, config_path, expected, now)? {
+    if !db.enable_project(project_id, config_path, expected, undecided_only, now)? {
         return Err(EnableError::Concurrent {
             project_id: project_id.to_string(),
         });

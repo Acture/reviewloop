@@ -1,6 +1,6 @@
 //! Schema migrations up to the current version: the lease columns (v4, OSS-337),
-//! review options (v5, OSS-353) and project enablement plus the supervisor row (v6,
-//! OSS-338) land on older databases without disturbing existing rows,
+//! review options (v5, OSS-353) and project enablement, the supervisor row and the
+//! registry guard triggers (v6-v7, OSS-338) land on older databases without disturbing existing rows,
 //! legacy SUBMITTED rows are settled as UNCERTAIN instead of being resubmitted, concurrent
 //! migrations do not collide, and the lease primitives work on a freshly created database.
 
@@ -30,7 +30,7 @@ const LEASE_COLUMNS: [&str; 3] = ["lease_owner", "lease_expires_at", "submit_sta
 /// Added by schema v5 (OSS-353).
 const REVIEW_OPTIONS_COLUMN: &str = "review_options";
 /// Schema version written by this build (`SCHEMA_VERSION` in src/db.rs).
-const CURRENT_SCHEMA_VERSION: i64 = 6;
+const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 /// `create_tables_if_missing` + `create_indexes` as of schema v1 (commit 4aeff29),
 /// verbatim: `jobs` has no lease columns.
@@ -1255,7 +1255,7 @@ fn old_binaries_cannot_move_or_drop_an_enabled_project() -> Result<()> {
     db.ensure_schema()?;
     let now = Utc::now();
     let home = Path::new("/repos/enabled/reviewloop.toml");
-    db.enable_project(PROJECT, home, None, now)?;
+    db.enable_project(PROJECT, home, None, false, now)?;
     db.insert_project_registration(
         OTHER_PROJECT,
         Path::new("/repos/other/reviewloop.toml"),
@@ -1302,11 +1302,46 @@ fn old_binaries_cannot_move_or_drop_an_enabled_project() -> Result<()> {
         PROJECT,
         Path::new("/repos/new/reviewloop.toml"),
         Some(home),
+        false,
         now,
     )?;
     assert_eq!(
         db.resolve_project_config_path(PROJECT)?,
         Some(PathBuf::from("/repos/new/reviewloop.toml"))
     );
+    Ok(())
+}
+
+/// A v6 database from a pre-release build of OSS-338 has the registry
+/// columns but not the guard triggers; opening it adds them.
+#[test]
+fn v6_database_gains_the_registry_guard_triggers() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().join("reviewloop.db");
+    Db::new_file(path.clone()).ensure_schema()?;
+    let triggers = |path: &Path| -> Result<i64> {
+        Ok(Connection::open(path)?.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'projects_keep_enabled_%'",
+            [],
+            |row| row.get(0),
+        )?)
+    };
+    assert_eq!(triggers(&path)?, 2);
+    {
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(
+            "DROP TRIGGER projects_keep_enabled_path; DROP TRIGGER projects_keep_enabled_rows;",
+        )?;
+        conn.pragma_update(None, "user_version", 6)?;
+    }
+    assert_eq!(
+        triggers(&path)?,
+        0,
+        "test setup: a v6 file without triggers"
+    );
+
+    Db::new_file(path.clone()).ensure_schema()?;
+    assert_eq!(user_version(&path)?, CURRENT_SCHEMA_VERSION);
+    assert_eq!(triggers(&path)?, 2);
     Ok(())
 }
