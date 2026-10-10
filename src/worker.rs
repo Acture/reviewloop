@@ -28,6 +28,7 @@ use std::{
     future::Future,
     io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
     time::Duration as StdDuration,
 };
 use tracing::{error, info, warn};
@@ -189,6 +190,30 @@ pub struct LiveBackends;
 impl BackendFactory for LiveBackends {
     fn build(&self, config: &Config, db: &Db, backend: &str) -> Result<Box<dyn ReviewBackend>> {
         build_backend(config, backend, Some(db), Some(&config.project_id))
+    }
+}
+
+/// A backend that counts the requests reaching it, so the budget is charged
+/// for a provider call even when the local work after it fails.
+struct Counted<'a> {
+    inner: Box<dyn ReviewBackend>,
+    calls: &'a AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ReviewBackend for Counted<'_> {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    async fn submit(&self, req: SubmitRequest) -> Result<SubmitReceipt, BackendError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.submit(req).await
+    }
+
+    async fn fetch_review(&self, token: &str) -> Result<ReviewFetchResult, BackendError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.fetch_review(token).await
     }
 }
 
@@ -394,16 +419,18 @@ impl Scheduler<'_> {
                         report.stopped_early = true;
                         return sent;
                     }
-                    match self.submit_ready(config, &job.id).await {
+                    let calls = AtomicUsize::new(0);
+                    let result = self.submit_ready(config, &job.id, &calls).await;
+                    // A submission that reached the provider spends budget,
+                    // whatever happened after it.
+                    if calls.load(Ordering::SeqCst) > 0 {
+                        sent += 1;
+                        *last_served = Some(config.project_id.clone());
+                    }
+                    match result {
                         // Taken or changed since the listing: try the next one.
-                        Ok(None) => continue,
-                        Ok(Some(dispatched)) => {
-                            if dispatched {
-                                sent += 1;
-                                *last_served = Some(config.project_id.clone());
-                            }
-                            break;
-                        }
+                        Ok(false) => continue,
+                        Ok(true) => break,
                         Err(err) => {
                             report.fail(&config.project_id, "submission", err);
                             queue.clear();
@@ -415,9 +442,15 @@ impl Scheduler<'_> {
         sent
     }
 
-    /// Claim and submit one listed job. `None` when another worker got it
-    /// first or it changed; otherwise whether anything reached the provider.
-    async fn submit_ready(&self, config: &Config, job_id: &str) -> Result<Option<bool>> {
+    /// Claim and submit one listed job; `false` when another worker got it
+    /// first or it changed. `calls` counts the requests that reached the
+    /// provider.
+    async fn submit_ready(
+        &self,
+        config: &Config,
+        job_id: &str,
+        calls: &AtomicUsize,
+    ) -> Result<bool> {
         let Some(lease) = self.db.claim_job(
             job_id,
             WorkKind::Submit,
@@ -426,15 +459,14 @@ impl Scheduler<'_> {
             SUBMIT_LEASE_TTL,
         )?
         else {
-            return Ok(None);
+            return Ok(false);
         };
         let backend = match self.backends.build(config, self.db, &lease.job.backend) {
-            Ok(backend) => backend,
+            Ok(inner) => Counted { inner, calls },
             Err(err) => return Err(abandon_claim(self.db, &lease, err)),
         };
-        submit_leased(config, self.db, lease, backend.as_ref())
-            .await
-            .map(Some)
+        submit_leased(config, self.db, lease, &backend).await?;
+        Ok(true)
     }
 
     /// Poll due jobs the same way as [`Scheduler::submit_round`]. Returns the
@@ -467,13 +499,15 @@ impl Scheduler<'_> {
                         report.stopped_early = true;
                         return sent;
                     }
-                    match self.poll_due(config, &job.id).await {
+                    let calls = AtomicUsize::new(0);
+                    let result = self.poll_due(config, &job.id, &calls).await;
+                    if calls.load(Ordering::SeqCst) > 0 {
+                        sent += 1;
+                        *last_served = Some(config.project_id.clone());
+                    }
+                    match result {
                         Ok(false) => continue,
-                        Ok(true) => {
-                            sent += 1;
-                            *last_served = Some(config.project_id.clone());
-                            break;
-                        }
+                        Ok(true) => break,
                         Err(err) => {
                             report.fail(&config.project_id, "poll", err);
                             queue.clear();
@@ -486,7 +520,8 @@ impl Scheduler<'_> {
     }
 
     /// Claim and poll one listed job; `false` when it was not claimable.
-    async fn poll_due(&self, config: &Config, job_id: &str) -> Result<bool> {
+    /// `calls` counts the requests that reached the provider.
+    async fn poll_due(&self, config: &Config, job_id: &str, calls: &AtomicUsize) -> Result<bool> {
         let Some(lease) = self.db.claim_job(
             job_id,
             WorkKind::Poll,
@@ -498,10 +533,10 @@ impl Scheduler<'_> {
             return Ok(false);
         };
         let backend = match self.backends.build(config, self.db, &lease.job.backend) {
-            Ok(backend) => backend,
+            Ok(inner) => Counted { inner, calls },
             Err(err) => return Err(abandon_claim(self.db, &lease, err)),
         };
-        poll_leased(config, self.db, lease, backend.as_ref()).await?;
+        poll_leased(config, self.db, lease, &backend).await?;
         Ok(true)
     }
 }
@@ -716,14 +751,12 @@ fn pinned_input(config: &Config, db: &Db, job: &Job) -> Result<Option<PathBuf>> 
     }
 }
 
-/// Submit a claimed job. Returns whether anything was sent to a provider: a
-/// job whose input is refused, or whose lease is lost first, sends nothing.
 async fn submit_leased(
     config: &Config,
     db: &Db,
     mut lease: Lease,
     backend: &dyn ReviewBackend,
-) -> Result<bool> {
+) -> Result<()> {
     // NOTE: span is entered here; context is carried through sync code but
     // not propagated across .await points (pragmatic trade-off over a full
     // async body rewrite — still provides structured context on function entry).
@@ -738,12 +771,12 @@ async fn submit_leased(
 
     let plan = match SubmitPlan::prepare(config, db, &lease.job) {
         Ok(Some(plan)) => plan,
-        Ok(None) => return Ok(false),
+        Ok(None) => return Ok(()),
         Err(err) => return Err(abandon_claim(db, &lease, err)),
     };
     match preflight(config, db, &lease, &plan.request.pdf_path) {
         Ok(true) => {}
-        Ok(false) => return Ok(false),
+        Ok(false) => return Ok(()),
         Err(err) => return Err(abandon_claim(db, &lease, err)),
     }
 
@@ -754,7 +787,7 @@ async fn submit_leased(
         SUBMIT_LEASE_TTL,
     )? {
         warn!(job_id = %lease.job.id, "submit lease lost before dispatch; nothing sent");
-        return Ok(false);
+        return Ok(());
     }
 
     let progress = plan.request.progress.clone();
@@ -762,7 +795,7 @@ async fn submit_leased(
         channel: SubmitChannel::Primary,
         progress: &progress,
     };
-    let outcome = match bounded_submit(backend.submit(plan.request)).await {
+    match bounded_submit(backend.submit(plan.request)).await {
         Ok(receipt) => accept_receipt(config, db, &lease, &receipt, SubmitChannel::Primary),
         Err(BackendError::OutcomeUnknown(detail)) => {
             mark_uncertain(config, db, &lease, primary, &detail)
@@ -784,8 +817,7 @@ async fn submit_leased(
             }
             None => fail_submit(db, &lease, primary, err),
         },
-    };
-    outcome.map(|()| true)
+    }
 }
 
 /// Which route a dispatch took and the step it reached, for its outcome event.

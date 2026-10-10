@@ -44,10 +44,11 @@ pub fn render_supervisor_panel(
         let count = |status: &str| counts.get(status).copied().unwrap_or(0);
         let failed = count("FAILED") + count("FAILED_NEEDS_MANUAL") + count("TIMEOUT");
         println!(
-            "- {} [{}] queued {} · submitted {} · processing {} · completed {} · failed {}",
+            "- {} [{}] pending approval {} · queued {} · submitted {} · processing {} · completed {} · failed {}",
             project.project_id,
             ProjectState::of(project).as_str(),
-            count("QUEUED") + count("PENDING_APPROVAL"),
+            count("PENDING_APPROVAL"),
+            count("QUEUED"),
             count("SUBMITTED"),
             count("PROCESSING"),
             count("COMPLETED"),

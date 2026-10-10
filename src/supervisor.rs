@@ -27,7 +27,7 @@ use crate::{
     model::{RegisteredProject, SupervisorRecord},
     notifier::NotificationKind,
     panel,
-    registry::{self, Registration, RegistryConflict},
+    registry::{self, EnableError},
     widget_state,
     worker::{BackendFactory, RoundRobin, Scheduler, TickBudget, TickReport, fire_notification},
 };
@@ -288,25 +288,31 @@ fn load_enabled_project(machine: &MachineConfig, row: &RegisteredProject) -> Res
             row.project_id
         ));
     }
-    config.validate_for_foreign_load()?;
+    // Enabling was explicit, so the project runs under the same validation
+    // as the CLI in its repository (`MachineConfig::project`), not the
+    // stricter checks for configs loaded on someone else's behalf.
     Ok(config)
 }
 
 /// What became of the project a single-project daemon install was bound to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LegacyAdoption {
-    /// Nobody had decided yet: it is enabled now and keeps running.
-    Enabled,
+    /// Nobody had decided yet: it is enabled now, at the bound config, and
+    /// keeps running.
+    Enabled { moved_from: Option<PathBuf> },
     /// Someone already enabled or disabled it; that decision stands.
     AlreadyDecided { enabled: bool },
-    /// Another live config holds its registration; nothing was enabled.
-    Conflict(RegistryConflict),
+    /// The bound config already backs another enabled project; nothing was
+    /// enabled.
+    Conflict(String),
 }
 
 /// Keep the project an old `daemon install --config <path>` bound the daemon
-/// to running under the supervisor: register it and enable it, unless
-/// someone already decided otherwise. Other registered projects stay as
-/// they are. Returns the project id with the outcome.
+/// to running under the supervisor: enable it at that config, unless someone
+/// already enabled or disabled it. The binding was explicit, so it also wins
+/// over an undecided registration that last saw another clone of the
+/// project. Other registered projects stay as they are. Returns the project
+/// id with the outcome.
 pub fn adopt_legacy_binding(
     db: &Db,
     machine: &MachineConfig,
@@ -321,16 +327,24 @@ pub fn adopt_legacy_binding(
         )
     })?;
     let project_id = config.project_id;
-    if let Registration::Kept(conflict) = registry::register_seen(db, &project_id, &path, now)? {
-        return Ok((project_id, LegacyAdoption::Conflict(conflict)));
+    if let Some(row) = db.get_registered_project(&project_id)?
+        && row.enabled_changed_at.is_some()
+    {
+        return Ok((
+            project_id,
+            LegacyAdoption::AlreadyDecided {
+                enabled: row.enabled,
+            },
+        ));
     }
-    if db.enable_undecided_project(&project_id, now)? {
-        return Ok((project_id, LegacyAdoption::Enabled));
-    }
-    let enabled = db
-        .get_registered_project(&project_id)?
-        .is_some_and(|row| row.enabled);
-    Ok((project_id, LegacyAdoption::AlreadyDecided { enabled }))
+    let adoption = match registry::enable(db, &project_id, &path, true, now) {
+        Ok(enabled) => LegacyAdoption::Enabled {
+            moved_from: enabled.moved_from,
+        },
+        Err(err @ EnableError::FileEnabledAs { .. }) => LegacyAdoption::Conflict(err.to_string()),
+        Err(err) => return Err(err.into()),
+    };
+    Ok((project_id, adoption))
 }
 
 /// What one supervisor tick did.
@@ -348,6 +362,9 @@ pub struct SupervisorMemory {
     turns: RoundRobin,
     project_errors: HashMap<String, String>,
     machine_error: Option<String>,
+    /// The last machine config that loaded, for reporting a tick that could
+    /// not load one (its notifications and widget path).
+    last_machine: Option<Config>,
 }
 
 /// The global config moved the database or state directory away from the
@@ -383,25 +400,30 @@ impl Supervisor<'_> {
         let state_dir = machine.config.state_dir();
         let _lock = SupervisorLock::acquire(&state_dir)?;
         let pid = std::process::id();
-        let record = self.db.supervisor_record()?;
-        if SupervisorState::of(&record, Utc::now()) != SupervisorState::Stopped
-            && record.state_dir.as_deref() != Some(state_dir.as_path())
+        let now = Utc::now();
+        // The lock covers this state dir; another live supervisor of this
+        // database from elsewhere is refused here.
+        let elsewhere = |record: &SupervisorRecord| {
+            SupervisorState::of(record, now) != SupervisorState::Stopped
+                && record.state_dir.as_deref() != Some(state_dir.as_path())
+        };
+        if let Some(holder) =
+            self.db
+                .claim_supervisor(pid, &state_dir, env!("CARGO_PKG_VERSION"), now, elsewhere)?
         {
             return Err(anyhow!(
                 "database {} is already supervised from state dir {} (pid {}); one database takes \
                  one supervisor, so point both at the same state dir or stop the other one",
                 self.db.path.display(),
-                record
+                holder
                     .state_dir
                     .as_deref()
                     .map_or_else(|| "unknown".to_string(), |dir| dir.display().to_string()),
-                record
+                holder
                     .pid
                     .map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
             ));
         }
-        self.db
-            .record_supervisor_start(pid, &state_dir, env!("CARGO_PKG_VERSION"), Utc::now())?;
         info!(pid, state_dir = %state_dir.display(), db = %self.db.path.display(), "supervisor started");
 
         let stopping = Arc::new(AtomicBool::new(false));
@@ -417,7 +439,10 @@ impl Supervisor<'_> {
         };
         let heartbeat = tokio::spawn(heartbeat(self.db.reopen()?, pid));
 
-        let mut memory = SupervisorMemory::default();
+        let mut memory = SupervisorMemory {
+            last_machine: Some(machine.config.clone()),
+            ..SupervisorMemory::default()
+        };
         let mut number = 0;
         let mut result = Ok(());
         while !stopping.load(Ordering::SeqCst) {
@@ -440,6 +465,10 @@ impl Supervisor<'_> {
         if let Err(err) = self.db.record_supervisor_stop(pid, Utc::now()) {
             warn!(error = %err, "failed to record the supervisor stop");
         }
+        // The widget would otherwise keep showing a running supervisor.
+        if let Some(machine) = &memory.last_machine {
+            self.write_widget(machine);
+        }
         info!(pid, "supervisor stopped");
         result
     }
@@ -455,7 +484,8 @@ impl Supervisor<'_> {
         stopping: &AtomicBool,
     ) -> Result<TickOutcome> {
         let machine = (self.load_machine)().context("loading the global config")?;
-        self.ensure_same_storage(&machine)?;
+        self.ensure_same_storage(&machine, pid)?;
+        memory.last_machine = Some(machine.config.clone());
         if self.db.supervisor_record()?.paused_at.is_some() {
             self.db.record_supervisor_tick(pid, Utc::now(), None)?;
             self.publish(&machine.config, number, &TickOutcome::Paused);
@@ -503,24 +533,28 @@ impl Supervisor<'_> {
             (!report.machine_errors.is_empty()).then(|| report.machine_errors.join("; "));
         self.db
             .record_supervisor_tick(pid, finished, machine_error.as_deref())?;
-        self.note_machine_error(machine_error, &machine.config, memory)?;
+        self.note_machine_error(machine_error, &machine.config.notifications, memory)?;
 
         let outcome = TickOutcome::Ran(report);
         self.publish(&machine.config, number, &outcome);
         Ok(outcome)
     }
 
-    fn ensure_same_storage(&self, machine: &MachineConfig) -> Result<()> {
+    /// The machine config still points at the state dir and database this
+    /// supervisor holds. The state dir is the one recorded when this process
+    /// (`pid`) claimed the control row.
+    fn ensure_same_storage(&self, machine: &MachineConfig, pid: u32) -> Result<()> {
         let record = self.db.supervisor_record()?;
         let state_dir = machine.config.state_dir();
         let db_moved = machine
             .config
             .db_path()
             .is_some_and(|path| path != self.db.path);
-        let dir_moved = record
-            .state_dir
-            .as_deref()
-            .is_some_and(|held| held != state_dir);
+        let dir_moved = record.pid == Some(pid)
+            && record
+                .state_dir
+                .as_deref()
+                .is_some_and(|held| held != state_dir);
         if !db_moved && !dir_moved {
             return Ok(());
         }
@@ -576,7 +610,7 @@ impl Supervisor<'_> {
     fn note_machine_error(
         &self,
         error: Option<String>,
-        machine: &Config,
+        notifications: &crate::config::NotificationsConfig,
         memory: &mut SupervisorMemory,
     ) -> Result<()> {
         if error.is_some() && error != memory.machine_error {
@@ -584,7 +618,7 @@ impl Supervisor<'_> {
             self.db
                 .add_event(None, None, "tick_failed", json!({ "error": message }))?;
             fire_notification(
-                &machine.notifications,
+                notifications,
                 NotificationKind::TickError,
                 None,
                 None,
@@ -595,30 +629,44 @@ impl Supervisor<'_> {
         Ok(())
     }
 
-    /// A tick that could not run at all (global config, database).
+    /// A tick that could not run at all (global config, database): recorded
+    /// as the supervisor's tick error, with one event and notification per
+    /// new error, and shown in the widget through the last config that
+    /// loaded. Every write here is best effort; the database may be the
+    /// thing that failed.
     fn machine_failure(&self, pid: u32, err: &anyhow::Error, memory: &mut SupervisorMemory) {
         let message = format!("{err:#}");
-        error!(error = %message, "supervisor tick failed");
+        error!(error = %message, "supervisor tick failed; no project ran");
         if let Err(record_err) = self
             .db
             .record_supervisor_tick(pid, Utc::now(), Some(&message))
         {
             warn!(error = %record_err, "failed to record the supervisor tick failure");
         }
-        if memory.machine_error.as_ref() != Some(&message) {
-            warn!(error = %message, "supervisor cannot run its projects until this is fixed");
+        let notifications = memory.last_machine.as_ref().map_or_else(
+            || Config::default().notifications,
+            |machine| machine.notifications.clone(),
+        );
+        if let Err(note_err) = self.note_machine_error(Some(message), &notifications, memory) {
+            warn!(error = %note_err, "failed to record the supervisor tick failure event");
         }
-        memory.machine_error = Some(message);
+        if let Some(machine) = &memory.last_machine {
+            self.write_widget(machine);
+        }
     }
 
-    /// The fleet widget document and the foreground panel. Their failures
-    /// are logged only: neither may stop the supervisor.
-    fn publish(&self, machine: &Config, number: u64, outcome: &TickOutcome) {
+    fn write_widget(&self, machine: &Config) {
         if let Some(path) = machine.widget_state_path()
             && let Err(err) = widget_state::write_fleet(self.db, &path, Utc::now())
         {
             warn!(error = %format!("{err:#}"), "failed to write widget state file");
         }
+    }
+
+    /// The fleet widget document and the foreground panel. Their failures
+    /// are logged only: neither may stop the supervisor.
+    fn publish(&self, machine: &Config, number: u64, outcome: &TickOutcome) {
+        self.write_widget(machine);
         if self.panel
             && let Err(err) = panel::render_supervisor_panel(machine, self.db, number, outcome)
         {

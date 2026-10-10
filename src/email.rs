@@ -980,9 +980,9 @@ mod tests {
         assert_eq!(updated.next_poll_at, Some(far_future));
     }
 
-    /// The mailbox is machine-wide: a token binds to the newest tokenless job of
-    /// its backend in any project, never to one still awaiting approval (which
-    /// was never sent, and whose status cannot take a token).
+    /// The mailbox is machine-wide: a token binds to the newest submitted,
+    /// tokenless job of its backend in any project, never to one that was not
+    /// sent (queued, or awaiting approval).
     #[test]
     fn email_tokens_bind_across_projects_but_not_to_unapproved_jobs() {
         let db = Db::new_in_memory("email_cross_project").expect("in-memory db");
@@ -1004,10 +1004,14 @@ mod tests {
             next_poll_at: None,
         };
         let older = db
-            .create_job(&new_job("project-a", JobStatus::Queued))
+            .create_job(&new_job("project-a", JobStatus::Submitted))
             .expect("create job");
         let newer = db
             .create_job(&new_job("project-b", JobStatus::Submitted))
+            .expect("create job");
+        // Newer still, but never sent: neither can own a token.
+        let queued = db
+            .create_job(&new_job("project-d", JobStatus::Queued))
             .expect("create job");
         let unapproved = db
             .create_job(&new_job("project-c", JobStatus::PendingApproval))
@@ -1028,6 +1032,7 @@ mod tests {
         let token_of = |id: &str| db.get_job(id).expect("get job").expect("job").token;
         assert_eq!(token_of(&newer.id).as_deref(), Some("tok_cross"));
         assert_eq!(token_of(&older.id), None);
+        assert_eq!(token_of(&queued.id), None);
         assert_eq!(token_of(&unapproved.id), None);
     }
 
@@ -1047,7 +1052,7 @@ mod tests {
                 pdf_path: "paper.pdf".to_string(),
                 pdf_hash: format!("hash-{paper_id}"),
             },
-            status: JobStatus::Queued,
+            status: JobStatus::Submitted,
             email: "user@example.com".to_string(),
             venue: None,
             review_options: Default::default(),
@@ -1103,7 +1108,7 @@ mod tests {
             .expect("get job")
             .expect("job exists");
         assert_eq!(cspaper_after.token, None);
-        assert_eq!(cspaper_after.status, JobStatus::Queued);
+        assert_eq!(cspaper_after.status, JobStatus::Submitted);
         assert_eq!(cspaper_after.next_poll_at, None);
         let stanford_after = db
             .get_job(&stanford_job.id)
