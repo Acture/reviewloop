@@ -126,7 +126,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - `daemon pause` / `daemon resume` set a persistent flag: the paused
     supervisor stays loaded but runs no triggers and contacts no provider, a
     request in flight finishes, and a restart stays paused. Pause, resume,
-    enable and disable take effect within 2 seconds.
+    enable and disable take effect within 2 seconds; a project disabled
+    during a tick sends nothing more in it.
   - `daemon status [--json]` works on every platform: supervisor state from
     its heartbeat, the launchd service, the budget, every registered project
     with its health and active jobs, and jobs no supervisor runs.
@@ -161,7 +162,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   tick every 5 seconds (triggers, every due job of the project, mailbox,
   retention, widget). While a supervisor runs the project it only watches;
   otherwise it submits or polls its own job when the job's schedule makes it
-  due, every 30 seconds.
+  due, every 30 seconds, applies the review timeout to it, and settles leases
+  a vanished worker left in the project.
 - **`daemon install`** installs the machine-wide service: it refuses
   `--config`, keeps the project an older single-project install was bound to
   enabled at that config (and enables nothing else; the binding also wins

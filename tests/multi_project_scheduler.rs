@@ -32,6 +32,10 @@ fn never() -> bool {
     false
 }
 
+fn always(_: &reviewloop::config::Config) -> bool {
+    true
+}
+
 async fn tick(
     fleet: &Fleet,
     backends: &FleetBackends,
@@ -43,6 +47,7 @@ async fn tick(
         backends,
         budget: TickBudget::from_config(&fleet.machine),
         stop: &never,
+        runs: &always,
     };
     scheduler
         .tick(&fleet.machine, &fleet.configs(), Some(number), turns)
@@ -240,6 +245,7 @@ async fn stop_ends_provider_work_for_the_rest_of_the_tick() -> Result<()> {
         backends: &backends,
         budget: TickBudget::from_config(&fleet.machine),
         stop: &stop_after_first,
+        runs: &always,
     };
     let report = scheduler
         .tick(
@@ -334,5 +340,56 @@ async fn a_call_that_fails_after_reaching_the_provider_spends_budget() -> Result
             backends.calls()
         );
     }
+    Ok(())
+}
+
+/// `run` without a supervisor still applies `review_timeout_hours`: an
+/// overdue review ends TIMEOUT instead of being polled forever.
+#[tokio::test]
+async fn advance_job_times_out_an_overdue_review() -> Result<()> {
+    let fleet = Fleet::new(&["p"])?;
+    let backends = FleetBackends::new(accepting_backend());
+    let job = fleet.processing_job("p", "tok-old", Utc::now() - Duration::minutes(1))?;
+    rusqlite::Connection::open(&fleet.db.path)?.execute(
+        "UPDATE jobs SET started_at = ?1 WHERE id = ?2",
+        rusqlite::params![(Utc::now() - Duration::days(30)).to_rfc3339(), job.id],
+    )?;
+
+    worker::advance_job(fleet.config("p"), &fleet.db, &backends, &job.id).await?;
+    assert_eq!(load_job(&fleet.db, &job.id)?.status, JobStatus::Timeout);
+    assert!(
+        backends.calls().is_empty(),
+        "an overdue review is not polled"
+    );
+    Ok(())
+}
+
+/// A project disabled while a tick runs sends nothing more in that tick.
+#[tokio::test]
+async fn a_project_that_stops_running_mid_tick_sends_nothing_more() -> Result<()> {
+    let mut fleet = Fleet::new(&["kept", "dropped"])?;
+    fleet.set_budget(2, 2);
+    let backends = FleetBackends::new(accepting_backend());
+    let dropped = fleet.queue_job("dropped")?;
+    fleet.queue_job("kept")?;
+    let runs = |config: &reviewloop::config::Config| config.project_id != "dropped";
+    let scheduler = Scheduler {
+        db: &fleet.db,
+        backends: &backends,
+        budget: TickBudget::from_config(&fleet.machine),
+        stop: &never,
+        runs: &runs,
+    };
+    let report = scheduler
+        .tick(
+            &fleet.machine,
+            &fleet.configs(),
+            Some(1),
+            &mut RoundRobin::default(),
+        )
+        .await;
+    assert!(report.errors().is_empty(), "{:?}", report.errors());
+    assert_eq!(backends.callers("submit"), ["kept"]);
+    assert_eq!(load_job(&fleet.db, &dropped.id)?.status, JobStatus::Queued);
     Ok(())
 }

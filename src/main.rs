@@ -1580,15 +1580,32 @@ mod launchd {
             .collect()
     }
 
-    /// The pinned variables whose value in the installed service differs from
-    /// `current`'s.
+    /// The pinned variables whose effective value (set, or the default the
+    /// config resolution uses under `home`) differs between the installed
+    /// service and `current`: the two then use another global config or
+    /// database.
     pub fn environment_mismatch(
         installed: &BTreeMap<String, String>,
         current: impl Fn(&str) -> Option<String>,
+        home: Option<&str>,
     ) -> Vec<String> {
+        let effective = |key: &str, value: Option<String>| {
+            value
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    let home = home?;
+                    Some(match key {
+                        "XDG_CONFIG_HOME" => format!("{home}/.config"),
+                        _ => format!("{home}/.review_loop"),
+                    })
+                })
+                .map(|value| value.trim_end_matches('/').to_string())
+        };
         PINNED_ENV
             .into_iter()
-            .filter(|key| installed.get(*key).cloned() != current(key))
+            .filter(|key| {
+                effective(key, installed.get(*key).cloned()) != effective(key, current(key))
+            })
             .map(str::to_string)
             .collect()
     }
@@ -1693,12 +1710,38 @@ mod launchd {
                 environment_mismatch: plist
                     .as_deref()
                     .map(|plist| {
-                        environment_mismatch(&environment(plist), |key| {
-                            env::var(key).ok().filter(|value| !value.is_empty())
-                        })
+                        environment_mismatch(
+                            &environment(plist),
+                            |key| env::var(key).ok().filter(|value| !value.is_empty()),
+                            env::var("HOME").ok().as_deref(),
+                        )
                     })
                     .unwrap_or_default(),
             })
+        }
+    }
+}
+
+/// The current directory's project (or `--config`'s), registered like any
+/// load, for marking it and reporting its worker availability; the
+/// machine's settings with no project when none loads.
+fn current_project_context(
+    config_override: Option<&Path>,
+    machine: &reviewloop::config::MachineConfig,
+    db: &Db,
+) -> Config {
+    match Config::load_runtime_with_metadata(config_override, false) {
+        Ok(loaded) => {
+            if let Some(path) = loaded.project_path.as_deref()
+                && !loaded.config.project_id.trim().is_empty()
+            {
+                register_loaded_project(db, &loaded.config.project_id, path);
+            }
+            loaded.config
+        }
+        Err(err) => {
+            warn!(error = %format!("{err:#}"), "no project config loads here");
+            machine.config.clone()
         }
     }
 }
@@ -1708,9 +1751,7 @@ fn cmd_project_list(config_override: Option<&Path>, as_json: bool) -> Result<()>
     use reviewloop::registry::ConfigFileState;
 
     let (machine, db) = load_machine_runtime(false)?;
-    let context = Config::load_runtime_with_metadata(config_override, false)
-        .map(|loaded| loaded.config)
-        .unwrap_or_else(|_| machine.config.clone());
+    let context = current_project_context(config_override, &machine, &db);
     let ops = ReviewOps::new(&context, &db);
     let projects = ops.list_projects()?;
     let worker = ops.get_worker_status()?;
@@ -1795,7 +1836,7 @@ fn cmd_project_enable(
                     config.project_id
                 );
             }
-            config.validate_for_foreign_load()?;
+            // Loaded exactly as the supervisor will load it.
             (config, db, path)
         }
     };
@@ -1818,12 +1859,20 @@ fn cmd_project_enable(
     print_worker_availability(&outcome.worker);
     #[cfg(target_os = "macos")]
     if let Ok(service) = launchd::probe()
-        && !service.environment_mismatch.is_empty()
+        && service.installed
     {
-        println!(
-            "warning: the installed supervisor runs with different {} than this shell, so it uses another database and will not see this project; re-run `reviewloop daemon install` from this environment",
-            service.environment_mismatch.join(" and ")
-        );
+        if !service.environment_mismatch.is_empty() {
+            println!(
+                "warning: the installed supervisor runs with different {} than this shell, so it uses another database and will not see this project; re-run `reviewloop daemon install` from this environment",
+                service.environment_mismatch.join(" and ")
+            );
+        }
+        if let Some(global_path) = Config::global_config_path()
+            && let Some(warning) =
+                daemon_cspaper_key_warning(std::slice::from_ref(&config), &global_path)?
+        {
+            println!("{warning}");
+        }
     }
     Ok(())
 }
@@ -1876,11 +1925,7 @@ fn print_project_worker(config: &Config, db: &Db) {
 /// Show the supervisor, its service, and every registered project.
 fn cmd_daemon_status(config_override: Option<&Path>, as_json: bool) -> Result<()> {
     let (machine, db) = load_machine_runtime(false)?;
-    // The current directory's project, when one loads, is marked and gets
-    // its worker availability; status works without one.
-    let context = Config::load_runtime_with_metadata(config_override, false)
-        .map(|loaded| loaded.config)
-        .unwrap_or_else(|_| machine.config.clone());
+    let context = current_project_context(config_override, &machine, &db);
     #[cfg(target_os = "macos")]
     let service = launchd::probe()
         .inspect_err(|err| warn!(error = %format!("{err:#}"), "cannot read the launchd service"))
@@ -2470,15 +2515,20 @@ async fn cmd_submit(
     Ok(())
 }
 
-/// Move `run`'s job on while no supervisor runs its project: the mailbox
-/// (when the job may get its token by email), then the job's own submit or
-/// poll when due. Nothing else of the project is touched.
+/// Move `run`'s job on while no supervisor runs its project: settle expired
+/// leases of the project, read the mailbox (when the job may get its token by
+/// email), then time out, submit or poll the job itself when due. No other
+/// job is sent or polled.
 async fn drive_run_job(
     config: &Config,
     db: &Db,
     job_id: &str,
     waits_for_token_email: bool,
 ) -> Result<()> {
+    // Settle leases a vanished worker left on this project's jobs (a
+    // supervisor that died mid-submission, say): its submission becomes
+    // UNCERTAIN instead of hanging.
+    reviewloop::worker::recover_stale_leases(config, db)?;
     let job = db
         .get_job(job_id)?
         .ok_or_else(|| anyhow!("job no longer exists: {job_id}"))?;
@@ -5003,17 +5053,26 @@ mod tests {
                 Some("/Volumes/data/<state>")
             );
 
+            let home = Some("/Users/me");
             let same = |key: &str| installed.get(key).cloned();
-            assert!(environment_mismatch(&installed, same).is_empty());
+            assert!(environment_mismatch(&installed, same, home).is_empty());
             let other_db =
                 |key: &str| (key == "REVIEWLOOP_STATE_DIR").then(|| "/elsewhere".to_string());
             assert_eq!(
-                environment_mismatch(&installed, other_db),
+                environment_mismatch(&installed, other_db, home),
                 ["REVIEWLOOP_STATE_DIR"]
             );
             // A variable this shell sets but the service lacks is a mismatch too.
             let extra = |key: &str| Some(format!("/x/{key}"));
-            assert_eq!(environment_mismatch(&installed, extra).len(), 2);
+            assert_eq!(environment_mismatch(&installed, extra, home).len(), 2);
+
+            // A value spelling out the default is no mismatch with an unset one.
+            let mut defaults = std::collections::BTreeMap::new();
+            defaults.insert(
+                "XDG_CONFIG_HOME".to_string(),
+                "/Users/me/.config/".to_string(),
+            );
+            assert!(environment_mismatch(&defaults, |_| None, home).is_empty());
         }
     }
 

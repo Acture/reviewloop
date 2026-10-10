@@ -1873,9 +1873,10 @@ impl Db {
         Ok(moved == 1)
     }
 
-    /// Enable `project_id` at `config_path`. `expected` is the path the caller
-    /// checked the registration against (`None`: it was not registered);
-    /// returns `false`, writing nothing, if the row changed since.
+    /// Enable `project_id` at `config_path`, starting its health afresh.
+    /// `expected` is the path the caller checked the registration against
+    /// (`None`: it was not registered); returns `false`, writing nothing, if
+    /// the row changed since.
     pub fn enable_project(
         &self,
         project_id: &str,
@@ -1910,7 +1911,11 @@ impl Db {
                 config_path        = excluded.config_path,
                 last_seen_at       = excluded.last_seen_at,
                 enabled            = 1,
-                enabled_changed_at = excluded.enabled_changed_at
+                enabled_changed_at = excluded.enabled_changed_at,
+                last_run_at        = NULL,
+                last_ok_at         = NULL,
+                last_error         = NULL,
+                last_error_at      = NULL
             "#,
             params![project_id, config_path.to_string_lossy(), now],
         )?;
@@ -3993,6 +3998,23 @@ mod tests {
         assert_eq!(health.last_ok_at, Some(ok));
         assert_eq!(health.last_error, None);
         assert_eq!(health.last_error_at, None);
+    }
+
+    /// A re-enabled project starts afresh: an error from before it was
+    /// disabled no longer reports it as failing.
+    #[test]
+    fn re_enabling_clears_the_previous_health() {
+        let db = Db::new_in_memory("project_health_reenable").unwrap();
+        db.ensure_schema().unwrap();
+        let path = std::path::Path::new("/tmp/a/reviewloop.toml");
+        let now = Utc::now();
+        db.enable_project("a", path, None, now).unwrap();
+        db.record_project_health("a", now, Some("config gone"))
+            .unwrap();
+        db.disable_project("a", now).unwrap();
+        db.enable_project("a", path, Some(path), now).unwrap();
+        let row = db.get_registered_project("a").unwrap().unwrap();
+        assert_eq!(row.health, ProjectHealth::default());
     }
 
     #[test]
