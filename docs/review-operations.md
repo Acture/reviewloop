@@ -279,7 +279,7 @@ both create a job for the same request.
 |---|---|---|
 | `submit` | `request_review` (origin `Submit`, approval granted, `--request-key`, `--force`) | On `existing`, print `Skipped submit: <reason> existing job …` and exit 0. On `created`, submit the job to the provider immediately and pull its first poll forward to about 60 seconds. |
 | `paper add --submit-now` | as `submit` | |
-| `run` | `request_review` (origin `Run`, `force`) | Paper registration, immediate submission, the foreground polling loop and its exit codes. |
+| `run` | `request_review` (origin `Run`, `force`), `get_worker_status` | Paper registration, immediate submission, and the foreground loop with its exit codes. While a running supervisor runs the project, the loop only watches the job; otherwise it submits or polls this job alone, when the job's schedule makes it due (and reads the mailbox for a token while the submission's outcome is unknown). It never runs other jobs, triggers or retention. |
 | `approve` | `approve_job` | Printing `Approved job …`. |
 | `retry` | `find_job`, then `retry_job` with the job's project config (`caller_executes` = `--force`) | Loading a foreign project's config from the registry; with `--force`, the immediate poll or submit. A PENDING_APPROVAL job is refused. |
 | `cancel` | `cancel_job` | The `hint:` line for a paper with no active job. |

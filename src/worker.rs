@@ -506,6 +506,38 @@ impl Scheduler<'_> {
     }
 }
 
+/// Move one job on by its own schedule: submit it when it is QUEUED and
+/// due, poll it when it is PROCESSING and due. What `reviewloop run` does for
+/// its job while no supervisor runs the project: never more than the job's
+/// schedule allows, and never another job.
+pub async fn advance_job(
+    config: &Config,
+    db: &Db,
+    backends: &dyn BackendFactory,
+    job_id: &str,
+) -> Result<Attempt> {
+    let job = project_job(config, db, job_id)?;
+    let (kind, ttl) = match job.status {
+        JobStatus::Queued => (WorkKind::Submit, SUBMIT_LEASE_TTL),
+        JobStatus::Processing => (WorkKind::Poll, POLL_LEASE_TTL),
+        _ => return Ok(Attempt::NotClaimed),
+    };
+    let Some(lease) = db.claim_job(job_id, kind, ClaimTiming::WhenDue, Utc::now(), ttl)? else {
+        return Ok(Attempt::NotClaimed);
+    };
+    let backend = match backends.build(config, db, &lease.job.backend) {
+        Ok(backend) => backend,
+        Err(err) => return Err(abandon_claim(db, &lease, err)),
+    };
+    match kind {
+        WorkKind::Submit => {
+            submit_leased(config, db, lease, backend.as_ref()).await?;
+        }
+        WorkKind::Poll => poll_leased(config, db, lease, backend.as_ref()).await?,
+    }
+    Ok(Attempt::Ran)
+}
+
 /// Submit one QUEUED job now, ignoring its cooldown (explicit CLI action).
 pub async fn submit_job(config: &Config, db: &Db, job_id: &str) -> Result<Attempt> {
     let job = project_job(config, db, job_id)?;
