@@ -1759,6 +1759,18 @@ impl Db {
         .map_err(Into::into)
     }
 
+    /// Provider references (tokens) of every `backend` job in this database,
+    /// across projects: matches the provider's own job list to reviewloop.
+    pub fn provider_tokens(&self, backend: &str) -> Result<HashSet<String>> {
+        let conn = self.connect()?;
+        let mut stmt =
+            conn.prepare("SELECT token FROM jobs WHERE backend = ?1 AND token IS NOT NULL")?;
+        let tokens = stmt
+            .query_map(params![backend], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        Ok(tokens)
+    }
+
     /// Fleet-wide: recent failures across all projects, capped per project.
     ///
     /// Uses a window function so a single noisy project cannot starve

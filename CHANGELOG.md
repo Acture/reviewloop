@@ -103,6 +103,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   template before anything is enqueued. Git tag and PDF change triggers skip
   such a paper with a `provider_not_configured` event (once per paper and
   setting per process) and leave the tag unprocessed until it is configured.
+- **`reviewloop cspaper usage`** — reads CSPaper's organisation job list
+  with the API key (read-only, paged, no credits used) and reports the
+  organisation's jobs by status, how many this machine's reviewloop submitted
+  (matched by job id) versus other clients, and the estimated credits used.
+  CSPaper has no balance API, so the remainder is estimated against
+  `providers.cspaper.credit_budget` (global config). `--json` for scripts.
 - **Local CSPaper usage** — after a CSPaper submission, `submit` and `run`
   print this machine's CSPaper reviews as completed, in progress and ended
   without a review (est. 1 credit each) plus uncertain submissions; `status`

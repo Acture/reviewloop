@@ -180,6 +180,11 @@ enum Command {
         #[command(subcommand)]
         command: EmailCommand,
     },
+    /// CSPaper provider tools.
+    Cspaper {
+        #[command(subcommand)]
+        command: CspaperCommand,
+    },
     /// Update the reviewloop binary to the latest release.
     SelfUpdate {
         #[arg(long, value_enum, default_value_t = UpdateMethod::Auto)]
@@ -335,6 +340,18 @@ enum EmailCommand {
     },
     /// Show which email accounts are configured and their auth status.
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum CspaperCommand {
+    /// Credit usage: the organisation's CSPaper jobs from every client (read
+    /// from CSPaper's job list, which costs no credits), how many this
+    /// machine's reviewloop submitted, and the estimated remainder against
+    /// `providers.cspaper.credit_budget`.
+    Usage {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 /// Argument group for commands that accept either `--job-id` or `--paper-id`.
@@ -600,6 +617,12 @@ async fn run() -> Result<()> {
                 EmailCommand::Logout { account } => cmd_email_logout(&config, account.as_deref()),
                 EmailCommand::Switch { account } => cmd_email_switch(&config, &account),
                 EmailCommand::Status => cmd_email_status(&config),
+            }
+        }
+        Command::Cspaper { command } => {
+            let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
+            match command {
+                CspaperCommand::Usage { json } => cmd_cspaper_usage(&config, &db, json).await,
             }
         }
         Command::SelfUpdate {
@@ -1942,6 +1965,41 @@ async fn cmd_submit(
         );
     }
     print_provider_usage(db, &job.backend)
+}
+
+/// The organisation's CSPaper usage from CSPaper's job list, split into this
+/// machine's reviewloop jobs and other clients, with the estimated remainder.
+async fn cmd_cspaper_usage(config: &Config, db: &Db, as_json: bool) -> Result<()> {
+    let listed = cspaper::CspaperBackend::from_config(config)?
+        .list_jobs()
+        .await
+        .context("failed to read CSPaper's job list")?;
+    let org = cspaper::summarize(&listed.jobs, &db.provider_tokens(cspaper::BACKEND)?);
+    let local = db.provider_usage(cspaper::BACKEND)?;
+    let budget = config.providers.cspaper.credit_budget;
+    if as_json {
+        let used = org.estimated_credits();
+        let payload = json!({
+            "organisation": org,
+            "via_other_clients": org.via_other_clients(),
+            "list_truncated": listed.truncated,
+            "local": local,
+            "credits": {
+                "per_review": cspaper::ESTIMATED_CREDITS_PER_REVIEW,
+                "estimated_used": used,
+                "budget": budget,
+                "estimated_remaining": budget.map(|budget| budget as i64 - used as i64),
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+    println!(
+        "{}",
+        cspaper::org_usage_report(&org, listed.truncated, budget)
+    );
+    println!("{}", cspaper::usage_note(local));
+    Ok(())
 }
 
 /// After a submission to a provider that bills per review, say what this

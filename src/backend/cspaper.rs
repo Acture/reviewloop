@@ -25,14 +25,16 @@
 use super::{
     BackendError, ReviewBackend, ReviewFetchResult, SubmitReceipt, SubmitRequest, parse_retry_after,
 };
-use crate::config::{CSPAPER_API_KEY_ENV, CspaperProviderConfig, Redacted};
-use crate::http::describe_error;
+use crate::config::{CSPAPER_API_KEY_ENV, Config, CspaperProviderConfig, Redacted};
+use crate::http::{Redirects, describe_error};
 use crate::model::{ProviderUsage, ReviewOptions};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, LOCATION};
 use reqwest::{Response, StatusCode, multipart};
 use reqwest_middleware::ClientWithMiddleware;
+use serde::Serialize;
 use serde_json::{Map, Value, json};
+use std::collections::HashSet;
 
 pub const BACKEND: &str = "cspaper";
 pub const PROVIDER_NAME: &str = "CSPaper Agentic Review";
@@ -294,6 +296,204 @@ impl ReviewBackend for CspaperBackend {
             .map_err(|e| BackendError::Schema(format!("invalid CSPaper job payload: {e}")))?;
         interpret_job(token, payload)
     }
+}
+
+/// Page size for the organisation job list: CSPaper's documented default.
+const LIST_PAGE_SIZE: usize = 50;
+/// Pages read for one usage report at most (10 000 jobs).
+const MAX_LIST_PAGES: usize = 200;
+
+/// One job from CSPaper's organisation-scoped job list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteJob {
+    pub id: String,
+    pub status: String,
+}
+
+/// The organisation's job list as far as it was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteJobList {
+    pub jobs: Vec<RemoteJob>,
+    /// Stopped at [`MAX_LIST_PAGES`] with more pages left.
+    pub truncated: bool,
+}
+
+impl CspaperBackend {
+    /// The adapter for read-only calls made outside the worker.
+    pub fn from_config(config: &Config) -> anyhow::Result<Self> {
+        let client = crate::http::build_client(config, None, None, Redirects::Refuse)?;
+        Ok(Self::new(&config.providers.cspaper, client))
+    }
+
+    /// Every job of the key's organisation, from any client (reviewloop, the
+    /// web playground, other tools). Read-only: it costs no credits.
+    pub async fn list_jobs(&self) -> Result<RemoteJobList, BackendError> {
+        let api_key = self.api_key_header()?;
+        let mut seen = HashSet::new();
+        let mut jobs = Vec::new();
+        for page in 0..MAX_LIST_PAGES {
+            let offset = page * LIST_PAGE_SIZE;
+            let resp = self
+                .client
+                .get(self.endpoint(&format!(
+                    "{REVIEWS_PATH}?limit={LIST_PAGE_SIZE}&offset={offset}"
+                )))
+                .header(API_KEY_HEADER, api_key.clone())
+                .send()
+                .await
+                .map_err(|e| BackendError::Network(describe_error(&e, e.url())))?;
+            let status = resp.status();
+            let (retry_after, location) = response_meta(resp.headers());
+            if !status.is_success() {
+                let body = read_body(resp).await;
+                return Err(match status {
+                    StatusCode::TOO_MANY_REQUESTS => BackendError::RateLimited {
+                        message: format!(
+                            "CSPaper rate limited the job list: {}",
+                            self.quote(&body)
+                        ),
+                        retry_after,
+                    },
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                        self.auth_error(status, &body)
+                    }
+                    status if status.is_server_error() => BackendError::Server {
+                        status: status.as_u16(),
+                        body: self.quote(&body),
+                    },
+                    status if status.is_redirection() => {
+                        redirect_error(status, location.as_deref())
+                    }
+                    status => BackendError::Schema(format!(
+                        "unexpected status {status} when listing CSPaper jobs: {}",
+                        self.quote(&body)
+                    )),
+                });
+            }
+            let payload = resp
+                .json::<Value>()
+                .await
+                .map_err(|e| BackendError::Schema(format!("invalid CSPaper job list: {e}")))?;
+            let batch = parse_job_list(&payload)?;
+            let received = batch.len();
+            let before = jobs.len();
+            jobs.extend(batch.into_iter().filter(|job| seen.insert(job.id.clone())));
+            // A short page ends the list; a page with nothing new means the
+            // server ignores `offset`.
+            if received < LIST_PAGE_SIZE || jobs.len() == before {
+                return Ok(RemoteJobList {
+                    jobs,
+                    truncated: false,
+                });
+            }
+        }
+        Ok(RemoteJobList {
+            jobs,
+            truncated: true,
+        })
+    }
+}
+
+fn parse_job_list(payload: &Value) -> Result<Vec<RemoteJob>, BackendError> {
+    let items = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| BackendError::Schema("CSPaper job list has no data array".into()))?;
+    items
+        .iter()
+        .map(|item| {
+            let field = |name: &str| {
+                item.get(name)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        BackendError::Schema(format!("CSPaper job list entry has no {name}"))
+                    })
+            };
+            Ok(RemoteJob {
+                id: field("id")?,
+                status: field("status")?.trim().to_ascii_uppercase(),
+            })
+        })
+        .collect()
+}
+
+/// The organisation's CSPaper jobs, split by status and by whether this
+/// machine's reviewloop submitted them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct OrgUsage {
+    pub total: u64,
+    pub completed: u64,
+    pub in_progress: u64,
+    pub failed: u64,
+    /// Statuses this adapter does not know.
+    pub other: u64,
+    /// Jobs whose id is the token of a reviewloop job on this machine.
+    pub via_reviewloop: u64,
+}
+
+impl OrgUsage {
+    pub fn via_other_clients(&self) -> u64 {
+        self.total - self.via_reviewloop
+    }
+
+    /// Every job counts, failed ones included, as for local usage.
+    pub fn estimated_credits(&self) -> u64 {
+        self.total * ESTIMATED_CREDITS_PER_REVIEW
+    }
+}
+
+pub fn summarize(jobs: &[RemoteJob], local_job_ids: &HashSet<String>) -> OrgUsage {
+    jobs.iter().fold(OrgUsage::default(), |mut usage, job| {
+        usage.total += 1;
+        match job.status.as_str() {
+            "COMPLETED" => usage.completed += 1,
+            "PENDING" | "PROCESSING" => usage.in_progress += 1,
+            "FAILED" => usage.failed += 1,
+            _ => usage.other += 1,
+        }
+        if local_job_ids.contains(&job.id) {
+            usage.via_reviewloop += 1;
+        }
+        usage
+    })
+}
+
+/// The `reviewloop cspaper usage` report. CSPaper publishes no balance API,
+/// so the remainder needs the credits bought, `providers.cspaper.credit_budget`.
+pub fn org_usage_report(usage: &OrgUsage, truncated: bool, budget: Option<u64>) -> String {
+    let mut statuses = vec![
+        format!("{} completed", usage.completed),
+        format!("{} in progress", usage.in_progress),
+    ];
+    if usage.failed > 0 {
+        statuses.push(format!("{} failed", usage.failed));
+    }
+    if usage.other > 0 {
+        statuses.push(format!("{} other", usage.other));
+    }
+    let used = usage.estimated_credits();
+    let remaining = match budget {
+        Some(budget) if budget >= used => {
+            format!("budget {budget}, est. {} remaining", budget - used)
+        }
+        Some(budget) => format!("budget {budget}, est. {} over budget", used - budget),
+        None => "remaining unknown: CSPaper publishes no balance API; set providers.cspaper.credit_budget in the global config to the credits you bought".to_string(),
+    };
+    let mut report = format!(
+        "CSPaper organisation jobs (all clients): {} ({})\n  via reviewloop on this machine: {}\n  via other clients: {}\nCredits: est. {used} used at {ESTIMATED_CREDITS_PER_REVIEW} per review; {remaining}",
+        usage.total,
+        statuses.join(", "),
+        usage.via_reviewloop,
+        usage.via_other_clients(),
+    );
+    if truncated {
+        report.push_str(&format!(
+            "\n(stopped after {} jobs; CSPaper lists more)",
+            MAX_LIST_PAGES * LIST_PAGE_SIZE
+        ));
+    }
+    report
 }
 
 /// One-line local usage summary for the CLI. Every accepted submission is
@@ -641,6 +841,89 @@ mod tests {
             busy,
             "CSPaper usage from this machine: 1 completed, 0 in progress, 2 ended without a review (est. 3 credit(s) at 1 per review); 1 uncertain submission(s) may also have been charged"
         );
+    }
+
+    fn remote(id: &str, status: &str) -> RemoteJob {
+        RemoteJob {
+            id: id.to_string(),
+            status: status.to_string(),
+        }
+    }
+
+    #[test]
+    fn org_usage_splits_by_status_and_by_client() {
+        let jobs = [
+            remote("a", "COMPLETED"),
+            remote("b", "COMPLETED"),
+            remote("c", "PROCESSING"),
+            remote("d", "PENDING"),
+            remote("e", "FAILED"),
+            remote("f", "ARCHIVED"),
+        ];
+        let local: HashSet<String> = ["a", "c", "zz"].map(str::to_string).into();
+        let usage = summarize(&jobs, &local);
+        assert_eq!(
+            usage,
+            OrgUsage {
+                total: 6,
+                completed: 2,
+                in_progress: 2,
+                failed: 1,
+                other: 1,
+                via_reviewloop: 2,
+            }
+        );
+        assert_eq!(usage.via_other_clients(), 4);
+        assert_eq!(usage.estimated_credits(), 6);
+    }
+
+    #[test]
+    fn org_usage_report_estimates_the_remainder_against_the_budget() {
+        let usage = OrgUsage {
+            total: 12,
+            completed: 9,
+            in_progress: 1,
+            failed: 2,
+            other: 0,
+            via_reviewloop: 7,
+        };
+        assert_eq!(
+            org_usage_report(&usage, false, Some(50)),
+            "CSPaper organisation jobs (all clients): 12 (9 completed, 1 in progress, 2 failed)\n  via reviewloop on this machine: 7\n  via other clients: 5\nCredits: est. 12 used at 1 per review; budget 50, est. 38 remaining"
+        );
+        assert!(
+            org_usage_report(&usage, false, Some(10)).ends_with("budget 10, est. 2 over budget")
+        );
+        let unknown = org_usage_report(&usage, true, None);
+        assert!(unknown.contains("remaining unknown"), "{unknown}");
+        assert!(
+            unknown.contains("providers.cspaper.credit_budget"),
+            "{unknown}"
+        );
+        assert!(
+            unknown.ends_with("(stopped after 10000 jobs; CSPaper lists more)"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
+    fn job_list_entries_need_an_id_and_a_status() {
+        let listed = parse_job_list(&json!({"status": 200, "data": [
+            {"id": "a", "status": "completed", "agent_id": "ICLR_main_2026_1"},
+        ]}))
+        .unwrap();
+        assert_eq!(listed, vec![remote("a", "COMPLETED")]);
+        for payload in [
+            json!({"status": 200}),
+            json!({"status": 200, "data": {"id": "a"}}),
+            json!({"status": 200, "data": [{"id": "a"}]}),
+            json!({"status": 200, "data": [{"status": "COMPLETED"}]}),
+        ] {
+            assert!(
+                matches!(parse_job_list(&payload), Err(BackendError::Schema(_))),
+                "{payload}"
+            );
+        }
     }
 
     #[test]

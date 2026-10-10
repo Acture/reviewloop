@@ -240,6 +240,7 @@ reviewloop config init project --project-id <id> [--project-root <path>] [--forc
 reviewloop config migrate-project --project-id <id> [--project-root <path>]
 reviewloop email login --provider google
 reviewloop email status
+reviewloop cspaper usage [--json]
 reviewloop email switch --account <account-id-or-email>
 reviewloop email logout [--account <account-id-or-email>]
 reviewloop self-update [--method auto|brew|cargo] [--yes] [--dry-run]
@@ -608,6 +609,8 @@ desk_rejection_enabled = true       # the default
   minimum quality, prompt injection) before the review; default `true`.
   `false` always yields a full, scored review. A project value overrides the
   global one.
+- `credit_budget`: optional, global config only. The credits bought for the
+  organisation; `reviewloop cspaper usage` estimates the remainder from it.
 
 The project file holds only the review choices:
 
@@ -666,6 +669,23 @@ separately: jobs parked `UNCERTAIN`, and jobs whose submission outcome was
 unknown before they were cancelled or resubmitted with `retry --force` (those
 are known from job events, kept for `retention.events_days`, default 30). It
 is an estimate, not CSPaper's balance.
+
+For the whole organisation, `reviewloop cspaper usage` reads CSPaper's own job
+list with the API key (read-only, no credits used) and splits it into jobs
+this machine's reviewloop submitted (matched by job id) and jobs from other
+clients such as the web playground or other tools:
+
+```text
+CSPaper organisation jobs (all clients): 12 (9 completed, 1 in progress, 2 failed)
+  via reviewloop on this machine: 7
+  via other clients: 5
+Credits: est. 12 used at 1 per review; budget 50, est. 38 remaining
+```
+
+CSPaper publishes no balance API (its web Usage page counts jobs and needs a
+browser login), so the remainder comes from the credits you bought: set
+`credit_budget` under `[providers.cspaper]` in the global config. Without it
+the report says the remainder is unknown. `--json` prints the same numbers.
 
 ### Errors and outcomes
 
