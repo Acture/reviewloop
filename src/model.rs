@@ -827,11 +827,47 @@ pub struct ReviewRecord {
     pub completed_at: DateTime<Utc>,
 }
 
-/// One row of the project registry (`projects` table): where the CLI last
-/// found a project's `reviewloop.toml`.
+/// One row of the project registry (`projects` table): where the CLI found a
+/// project's `reviewloop.toml`, and whether the supervisor runs it.
 #[derive(Debug, Clone)]
 pub struct RegisteredProject {
     pub project_id: String,
     pub config_path: std::path::PathBuf,
     pub last_seen_at: DateTime<Utc>,
+    /// Only an explicit `project enable` (or the one-time migration of a
+    /// single-project daemon install) sets this; loading a config never does.
+    pub enabled: bool,
+    /// When `enabled` was last decided; `None` means never, which is the only
+    /// state the legacy install migration may enable.
+    pub enabled_changed_at: Option<DateTime<Utc>>,
+    pub health: ProjectHealth,
+}
+
+/// The supervisor's last pass over one project.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectHealth {
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub last_ok_at: Option<DateTime<Utc>>,
+    /// Cleared by the next pass without errors.
+    pub last_error: Option<String>,
+    pub last_error_at: Option<DateTime<Utc>>,
+}
+
+/// The machine-wide supervisor control row (`supervisor` table). Pause lives
+/// here so it survives restarts; the rest is written by the running supervisor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SupervisorRecord {
+    /// Bumped by every pause, resume, enable and disable, so a sleeping
+    /// supervisor notices them before its next scheduled tick.
+    pub control_version: i64,
+    pub paused_at: Option<DateTime<Utc>>,
+    pub pid: Option<u32>,
+    pub state_dir: Option<std::path::PathBuf>,
+    pub version: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub heartbeat_at: Option<DateTime<Utc>>,
+    pub stopped_at: Option<DateTime<Utc>>,
+    pub last_tick_at: Option<DateTime<Utc>>,
+    pub last_tick_error: Option<String>,
+    pub last_tick_error_at: Option<DateTime<Utc>>,
 }

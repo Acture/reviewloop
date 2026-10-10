@@ -1773,23 +1773,43 @@ fn load_runtime(
     // Register this project's config path so fleet-wide commands (eg the
     // bar's "Retry now") can resolve `project_id -> config path` later
     // even when invoked from a directory without a reviewloop.toml.
-    // Falls back to the legacy global config path when project settings
-    // are still served from ~/.config/reviewloop/reviewloop.toml.
-    let registration_path = project_path.as_deref().or(legacy_global_path.as_deref());
-    if !config.project_id.trim().is_empty() {
-        if let Some(path) = registration_path {
-            if let Err(e) = db.register_project_config(&config.project_id, path) {
-                tracing::warn!(
-                    project_id = %config.project_id,
-                    config_path = %path.display(),
-                    error = %e,
-                    "failed to register project config path; cross-project --job-id commands may need a manual cd",
-                );
-            }
-        }
+    // Registering never enables the project for the supervisor.
+    if let Some(path) = project_path.as_deref()
+        && !config.project_id.trim().is_empty()
+    {
+        register_loaded_project(&db, &config.project_id, path);
     }
 
     Ok((config, db))
+}
+
+/// Record a loaded project in the registry. A registration kept elsewhere is
+/// worth one stderr line (worktrees of one repo share a `project_id`); a
+/// failure only costs cross-project resolution, so it is logged.
+fn register_loaded_project(db: &Db, project_id: &str, config_path: &Path) {
+    match reviewloop::registry::register_seen(db, project_id, config_path, Utc::now()) {
+        Ok(reviewloop::registry::Registration::Kept(conflict)) => {
+            let hint = if conflict.registered_enabled {
+                "; the supervisor keeps using it (move it with `reviewloop project enable --replace`)"
+            } else {
+                ""
+            };
+            eprintln!("note: {conflict}{hint}");
+        }
+        Ok(reviewloop::registry::Registration::Repointed { from }) => info!(
+            project_id,
+            from = %from.display(),
+            to = %config_path.display(),
+            "moved the stale project registration to this config"
+        ),
+        Ok(_) => {}
+        Err(e) => warn!(
+            project_id,
+            config_path = %config_path.display(),
+            error = %e,
+            "failed to register project config path; cross-project --job-id commands may need a manual cd",
+        ),
+    }
 }
 
 /// Quietly load only the Config for a specific project's config file. Used by
@@ -3573,7 +3593,7 @@ mod tests {
 
         let db = Db::new_in_memory("cmd_retry_foreign_config_audit").unwrap();
         db.ensure_schema().unwrap();
-        db.register_project_config(project_id, &config_path)
+        db.insert_project_registration(project_id, &config_path, chrono::Utc::now())
             .unwrap();
         let job = db.create_job(&new_retry_job(project_id)).unwrap();
 
@@ -3604,7 +3624,7 @@ mod tests {
 
         let db = Db::new_in_memory("cmd_retry_missing_registered_path").unwrap();
         db.ensure_schema().unwrap();
-        db.register_project_config(project_id, &config_path)
+        db.insert_project_registration(project_id, &config_path, chrono::Utc::now())
             .unwrap();
         let job = db.create_job(&new_retry_job(project_id)).unwrap();
 

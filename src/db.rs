@@ -2,8 +2,8 @@ use crate::{
     config::Config,
     model::{
         EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, EventRecord, ExistingReason,
-        Job, JobStatus, NewJob, RegisteredProject, ReviewIdentity, ReviewOptions, ReviewRecord,
-        StatusView, SubmitChannel, SubmitStage, WorkKind,
+        Job, JobStatus, NewJob, ProjectHealth, RegisteredProject, ReviewIdentity, ReviewOptions,
+        ReviewRecord, StatusView, SubmitChannel, SubmitStage, SupervisorRecord, WorkKind,
     },
     util::{parse_rfc3339, to_rfc3339},
 };
@@ -21,7 +21,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PruneReport {
@@ -223,6 +223,22 @@ impl Db {
             .db_path()
             .ok_or_else(|| anyhow!("core.db_path must be set when db is not in-memory"))?;
         Ok(Self::new_file(path))
+    }
+
+    /// A second handle on the same database, for work that needs its own
+    /// connection (a `Db` is not `Sync`). Unlike [`Db::from_config`] it never
+    /// resolves a path from the environment.
+    pub fn reopen(&self) -> Result<Self> {
+        let keepalive = match self.keepalive {
+            Some(_) => Some(self.connect()?),
+            None => None,
+        };
+        Ok(Self {
+            path: self.path.clone(),
+            dsn: self.dsn.clone(),
+            open_flags: self.open_flags,
+            keepalive,
+        })
     }
 
     fn connect(&self) -> Result<Connection> {
@@ -1761,76 +1777,366 @@ impl Db {
             .context("invalid created_at in events table")
     }
 
-    /// Register or refresh the on-disk path of a project's `reviewloop.toml`
-    /// (or a legacy global config carrying project settings).
-    ///
-    /// Called by `main::load_runtime` whenever a CLI invocation or daemon
-    /// startup successfully loads a project context, so the registry stays
-    /// up to date without explicit user action. The `(project_id, path)`
-    /// pair lets `cmd_retry` / future fleet-wide commands resolve the right
-    /// per-project config when called from a directory that has none.
-    pub fn register_project_config(&self, project_id: &str, config_path: &Path) -> Result<()> {
+    /// One registry row, if the project was ever registered.
+    pub fn get_registered_project(&self, project_id: &str) -> Result<Option<RegisteredProject>> {
         let conn = self.connect()?;
-        conn.execute(
-            r#"
-            INSERT INTO projects (project_id, config_path, last_seen_at)
-            VALUES (?1, ?2, ?3)
-            ON CONFLICT(project_id) DO UPDATE SET
-                config_path  = excluded.config_path,
-                last_seen_at = excluded.last_seen_at
-            "#,
-            params![
-                project_id,
-                config_path.to_string_lossy(),
-                Utc::now().to_rfc3339(),
-            ],
-        )?;
-        Ok(())
+        conn.query_row(
+            &format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE project_id = ?1"),
+            params![project_id],
+            map_project_row,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     /// Look up the registered config path for a project_id, if any.
     pub fn resolve_project_config_path(&self, project_id: &str) -> Result<Option<PathBuf>> {
+        Ok(self
+            .get_registered_project(project_id)?
+            .map(|project| project.config_path))
+    }
+
+    /// Every registered project, ordered by project_id.
+    pub fn list_registered_projects(&self) -> Result<Vec<RegisteredProject>> {
         let conn = self.connect()?;
-        let path: Option<String> = conn
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PROJECT_COLUMNS} FROM projects ORDER BY project_id"
+        ))?;
+        let rows = stmt.query_map([], map_project_row)?;
+        collect_rows(rows)
+    }
+
+    /// Record a project the CLI found, unless its id is already registered.
+    /// Returns whether a row was inserted. Never enables the project.
+    pub fn insert_project_registration(
+        &self,
+        project_id: &str,
+        config_path: &Path,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let inserted = conn.execute(
+            r#"
+            INSERT INTO projects (project_id, config_path, last_seen_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(project_id) DO NOTHING
+            "#,
+            params![project_id, config_path.to_string_lossy(), to_rfc3339(now)],
+        )?;
+        Ok(inserted == 1)
+    }
+
+    /// Refresh `last_seen_at`, and the stored spelling of the path when it is
+    /// the same file (`config_path` is its canonical form).
+    pub fn touch_project_registration(
+        &self,
+        project_id: &str,
+        config_path: &Path,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE projects SET config_path = ?2, last_seen_at = ?3 WHERE project_id = ?1",
+            params![project_id, config_path.to_string_lossy(), to_rfc3339(now)],
+        )?;
+        Ok(())
+    }
+
+    /// Point a disabled registration at a new config path, but only while it
+    /// still points at `from`. Returns whether the row moved; an enabled
+    /// project never moves this way.
+    pub fn repoint_disabled_project(
+        &self,
+        project_id: &str,
+        from: &Path,
+        to: &Path,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let moved = conn.execute(
+            r#"
+            UPDATE projects SET config_path = ?3, last_seen_at = ?4
+            WHERE project_id = ?1 AND config_path = ?2 AND enabled = 0
+            "#,
+            params![
+                project_id,
+                from.to_string_lossy(),
+                to.to_string_lossy(),
+                to_rfc3339(now)
+            ],
+        )?;
+        Ok(moved == 1)
+    }
+
+    /// Enable `project_id` at `config_path`. `expected` is the path the caller
+    /// checked the registration against (`None`: it was not registered);
+    /// returns `false`, writing nothing, if the row changed since.
+    pub fn enable_project(
+        &self,
+        project_id: &str,
+        config_path: &Path,
+        expected: Option<&Path>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        let current: Option<String> = tx
             .query_row(
                 "SELECT config_path FROM projects WHERE project_id = ?1",
                 params![project_id],
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(path.map(PathBuf::from))
-    }
-
-    /// Every registered project, ordered by project_id.
-    pub fn list_registered_projects(&self) -> Result<Vec<RegisteredProject>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT project_id, config_path, last_seen_at FROM projects ORDER BY project_id",
+        if current.as_deref().map(PathBuf::from).as_deref() != expected {
+            return Ok(false);
+        }
+        let now = to_rfc3339(now);
+        tx.execute(
+            r#"
+            INSERT INTO projects (project_id, config_path, last_seen_at, enabled, enabled_changed_at)
+            VALUES (?1, ?2, ?3, 1, ?3)
+            ON CONFLICT(project_id) DO UPDATE SET
+                config_path        = excluded.config_path,
+                last_seen_at       = excluded.last_seen_at,
+                enabled            = 1,
+                enabled_changed_at = excluded.enabled_changed_at
+            "#,
+            params![project_id, config_path.to_string_lossy(), now],
         )?;
-        let rows = stmt.query_map([], |row| {
-            let last_seen_at: String = row.get(2)?;
-            Ok(RegisteredProject {
-                project_id: row.get(0)?,
-                config_path: PathBuf::from(row.get::<_, String>(1)?),
-                last_seen_at: parse_rfc3339(&last_seen_at)
-                    .map_err(|e| conversion_error(e.to_string()))?,
-            })
-        })?;
-        collect_rows(rows)
+        bump_control_version(&tx)?;
+        insert_event(
+            &tx,
+            Some(project_id),
+            None,
+            "project_enabled",
+            &json!({ "config_path": config_path }),
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
-    /// Remove a stale registry entry. Called when a registered path no
-    /// longer exists on disk so the next CLI invocation in that project
-    /// repo can re-register cleanly.
-    pub fn forget_project_registration(&self, project_id: &str) -> Result<()> {
+    /// Disable a registered project. Returns `None` when it is not
+    /// registered, otherwise whether it was enabled before.
+    pub fn disable_project(&self, project_id: &str, now: DateTime<Utc>) -> Result<Option<bool>> {
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        let Some(was_enabled) = tx
+            .query_row(
+                "SELECT enabled FROM projects WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        tx.execute(
+            "UPDATE projects SET enabled = 0, enabled_changed_at = ?2 WHERE project_id = ?1",
+            params![project_id, to_rfc3339(now)],
+        )?;
+        bump_control_version(&tx)?;
+        if was_enabled {
+            insert_event(&tx, Some(project_id), None, "project_disabled", &json!({}))?;
+        }
+        tx.commit()?;
+        Ok(Some(was_enabled))
+    }
+
+    /// Enable a registered project nobody has enabled or disabled yet: the
+    /// project a single-project daemon install was bound to. Returns whether
+    /// it was enabled now; an explicit earlier decision always wins.
+    pub fn enable_undecided_project(&self, project_id: &str, now: DateTime<Utc>) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        let changed = tx.execute(
+            r#"
+            UPDATE projects SET enabled = 1, enabled_changed_at = ?2
+            WHERE project_id = ?1 AND enabled_changed_at IS NULL
+            "#,
+            params![project_id, to_rfc3339(now)],
+        )?;
+        if changed == 1 {
+            bump_control_version(&tx)?;
+            insert_event(
+                &tx,
+                Some(project_id),
+                None,
+                "project_enabled",
+                &json!({ "source": "legacy_daemon_install" }),
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    /// Record the supervisor's pass over `project_id`: `error` is `None` for a
+    /// clean pass, which clears the previous error.
+    pub fn record_project_health(
+        &self,
+        project_id: &str,
+        now: DateTime<Utc>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let now = to_rfc3339(now);
+        match error {
+            None => conn.execute(
+                r#"
+                UPDATE projects SET last_run_at = ?2, last_ok_at = ?2,
+                    last_error = NULL, last_error_at = NULL
+                WHERE project_id = ?1
+                "#,
+                params![project_id, now],
+            )?,
+            Some(error) => conn.execute(
+                r#"
+                UPDATE projects SET last_run_at = ?2, last_error = ?3, last_error_at = ?2
+                WHERE project_id = ?1
+                "#,
+                params![project_id, now, error],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// Remove a stale, disabled registry entry so the next CLI invocation in
+    /// that project repo can re-register cleanly. Returns whether a row was
+    /// removed: an enabled project keeps its registration (and the
+    /// supervisor reports its missing config) until someone disables it.
+    pub fn forget_project_registration(&self, project_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let removed = conn.execute(
+            "DELETE FROM projects WHERE project_id = ?1 AND enabled = 0",
+            params![project_id],
+        )?;
+        Ok(removed == 1)
+    }
+
+    /// The supervisor control row; all defaults before any supervisor or
+    /// pause wrote it.
+    pub fn supervisor_record(&self) -> Result<SupervisorRecord> {
+        let conn = self.connect()?;
+        Ok(conn
+            .query_row(
+                r#"
+                SELECT control_version, paused_at, pid, state_dir, version, started_at,
+                       heartbeat_at, stopped_at, last_tick_at, last_tick_error, last_tick_error_at
+                FROM supervisor WHERE id = 1
+                "#,
+                [],
+                map_supervisor_row,
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Pause (`true`) or resume the supervisor. Persistent: a restarted
+    /// supervisor stays paused. Returns whether the state changed.
+    pub fn set_supervisor_paused(&self, paused: bool, now: DateTime<Utc>) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        tx.execute("INSERT OR IGNORE INTO supervisor (id) VALUES (1)", [])?;
+        let changed = if paused {
+            tx.execute(
+                "UPDATE supervisor SET paused_at = ?1 WHERE id = 1 AND paused_at IS NULL",
+                params![to_rfc3339(now)],
+            )?
+        } else {
+            tx.execute(
+                "UPDATE supervisor SET paused_at = NULL WHERE id = 1 AND paused_at IS NOT NULL",
+                [],
+            )?
+        };
+        if changed == 1 {
+            bump_control_version(&tx)?;
+            let event = if paused {
+                "supervisor_paused"
+            } else {
+                "supervisor_resumed"
+            };
+            insert_event(&tx, None, None, event, &json!({}))?;
+        }
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    /// Stamp a starting supervisor into the control row, replacing whatever
+    /// a previous one left.
+    pub fn record_supervisor_start(
+        &self,
+        pid: u32,
+        state_dir: &Path,
+        version: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
-            "DELETE FROM projects WHERE project_id = ?1",
-            params![project_id],
+            r#"
+            INSERT INTO supervisor (id, pid, state_dir, version, started_at, heartbeat_at)
+            VALUES (1, ?1, ?2, ?3, ?4, ?4)
+            ON CONFLICT(id) DO UPDATE SET
+                pid                = excluded.pid,
+                state_dir          = excluded.state_dir,
+                version            = excluded.version,
+                started_at         = excluded.started_at,
+                heartbeat_at       = excluded.heartbeat_at,
+                stopped_at         = NULL,
+                last_tick_at       = NULL,
+                last_tick_error    = NULL,
+                last_tick_error_at = NULL
+            "#,
+            params![pid, state_dir.to_string_lossy(), version, to_rfc3339(now)],
         )?;
         Ok(())
     }
 
+    /// Refresh the heartbeat of supervisor `pid`. Returns `false` when the
+    /// row now belongs to another supervisor.
+    pub fn supervisor_heartbeat(&self, pid: u32, now: DateTime<Utc>) -> Result<bool> {
+        let conn = self.connect()?;
+        let updated = conn.execute(
+            "UPDATE supervisor SET heartbeat_at = ?2 WHERE id = 1 AND pid = ?1",
+            params![pid, to_rfc3339(now)],
+        )?;
+        Ok(updated == 1)
+    }
+
+    /// Record a finished supervisor tick; `error` is the tick's machine-level
+    /// failure, if any (per-project failures go to the project rows).
+    pub fn record_supervisor_tick(
+        &self,
+        pid: u32,
+        now: DateTime<Utc>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let now = to_rfc3339(now);
+        match error {
+            None => conn.execute(
+                "UPDATE supervisor SET last_tick_at = ?2, heartbeat_at = ?2 WHERE id = 1 AND pid = ?1",
+                params![pid, now],
+            )?,
+            Some(error) => conn.execute(
+                r#"
+                UPDATE supervisor SET last_tick_at = ?2, heartbeat_at = ?2,
+                    last_tick_error = ?3, last_tick_error_at = ?2
+                WHERE id = 1 AND pid = ?1
+                "#,
+                params![pid, now, error],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// Record that supervisor `pid` shut down cleanly.
+    pub fn record_supervisor_stop(&self, pid: u32, now: DateTime<Utc>) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE supervisor SET stopped_at = ?2 WHERE id = 1 AND pid = ?1",
+            params![pid, to_rfc3339(now)],
+        )?;
+        Ok(())
+    }
     /// Returns the most recent event of a specific type for a project.
     /// Used by `daemon status` to surface the last `tick_failed` event so
     /// operators can see when (and why) the daemon last died.
@@ -2209,10 +2515,34 @@ fn create_tables_if_missing(conn: &Connection) -> Result<()> {
             raw_ref TEXT
         );
 
+        -- enabled_changed_at stays NULL until someone decides; only then may
+        -- the legacy install migration not enable a project.
         CREATE TABLE IF NOT EXISTS projects (
-            project_id   TEXT PRIMARY KEY,
-            config_path  TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL
+            project_id         TEXT PRIMARY KEY,
+            config_path        TEXT NOT NULL,
+            last_seen_at       TEXT NOT NULL,
+            enabled            INTEGER NOT NULL DEFAULT 0,
+            enabled_changed_at TEXT,
+            last_run_at        TEXT,
+            last_ok_at         TEXT,
+            last_error         TEXT,
+            last_error_at      TEXT
+        );
+
+        -- The one machine-wide supervisor control row (id = 1).
+        CREATE TABLE IF NOT EXISTS supervisor (
+            id                 INTEGER PRIMARY KEY CHECK (id = 1),
+            control_version    INTEGER NOT NULL DEFAULT 0,
+            paused_at          TEXT,
+            pid                INTEGER,
+            state_dir          TEXT,
+            version            TEXT,
+            started_at         TEXT,
+            heartbeat_at       TEXT,
+            stopped_at         TEXT,
+            last_tick_at       TEXT,
+            last_tick_error    TEXT,
+            last_tick_error_at TEXT
         );
 
         -- Idempotency keys: each binds to the job its first request resolved
@@ -2252,6 +2582,17 @@ fn migrate_columns(conn: &Connection) -> Result<()> {
     ensure_column_exists(conn, "jobs", "submit_stage", "TEXT")?;
     ensure_column_exists(conn, "jobs", "snapshot_path", "TEXT")?;
     ensure_column_exists(conn, "jobs", "review_options", "TEXT")?;
+    // Existing registrations stay disabled and undecided (enabled_changed_at NULL).
+    ensure_column_exists(conn, "projects", "enabled", "INTEGER NOT NULL DEFAULT 0")?;
+    for column in [
+        "enabled_changed_at",
+        "last_run_at",
+        "last_ok_at",
+        "last_error",
+        "last_error_at",
+    ] {
+        ensure_column_exists(conn, "projects", column, "TEXT")?;
+    }
 
     if column_exists(conn, "jobs", "version_no")? {
         conn.execute(
@@ -2670,6 +3011,64 @@ where
         out.push(row?);
     }
     Ok(out)
+}
+
+const PROJECT_COLUMNS: &str = "project_id, config_path, last_seen_at, enabled, \
+    enabled_changed_at, last_run_at, last_ok_at, last_error, last_error_at";
+
+fn optional_time(row: &rusqlite::Row<'_>, column: &str) -> rusqlite::Result<Option<DateTime<Utc>>> {
+    row.get::<_, Option<String>>(column)?
+        .map(|value| parse_rfc3339(&value))
+        .transpose()
+        .map_err(|e| conversion_error(e.to_string()))
+}
+
+fn map_project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RegisteredProject> {
+    let last_seen_at: String = row.get("last_seen_at")?;
+    Ok(RegisteredProject {
+        project_id: row.get("project_id")?,
+        config_path: PathBuf::from(row.get::<_, String>("config_path")?),
+        last_seen_at: parse_rfc3339(&last_seen_at).map_err(|e| conversion_error(e.to_string()))?,
+        enabled: row.get("enabled")?,
+        enabled_changed_at: optional_time(row, "enabled_changed_at")?,
+        health: ProjectHealth {
+            last_run_at: optional_time(row, "last_run_at")?,
+            last_ok_at: optional_time(row, "last_ok_at")?,
+            last_error: row.get("last_error")?,
+            last_error_at: optional_time(row, "last_error_at")?,
+        },
+    })
+}
+
+fn map_supervisor_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SupervisorRecord> {
+    Ok(SupervisorRecord {
+        control_version: row.get("control_version")?,
+        paused_at: optional_time(row, "paused_at")?,
+        pid: row.get("pid")?,
+        state_dir: row
+            .get::<_, Option<String>>("state_dir")?
+            .map(PathBuf::from),
+        version: row.get("version")?,
+        started_at: optional_time(row, "started_at")?,
+        heartbeat_at: optional_time(row, "heartbeat_at")?,
+        stopped_at: optional_time(row, "stopped_at")?,
+        last_tick_at: optional_time(row, "last_tick_at")?,
+        last_tick_error: row.get("last_tick_error")?,
+        last_tick_error_at: optional_time(row, "last_tick_error_at")?,
+    })
+}
+
+/// Wake a sleeping supervisor: pause, resume, enable and disable all call this
+/// inside their own transaction.
+fn bump_control_version(conn: &Connection) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO supervisor (id, control_version) VALUES (1, 1)
+        ON CONFLICT(id) DO UPDATE SET control_version = control_version + 1
+        "#,
+        [],
+    )?;
+    Ok(())
 }
 
 fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
@@ -3505,60 +3904,146 @@ mod tests {
     fn project_registry_round_trip() {
         let db = Db::new_in_memory("project_registry_test").unwrap();
         db.ensure_schema().unwrap();
+        let now = Utc::now();
 
-        // Empty registry returns None.
         assert!(
             db.resolve_project_config_path("never-seen")
                 .unwrap()
                 .is_none()
         );
 
-        // Register a path.
         let path = std::path::Path::new("/tmp/project-a/reviewloop.toml");
-        db.register_project_config("proj-a", path).unwrap();
+        assert!(db.insert_project_registration("proj-a", path, now).unwrap());
+        let row = db.get_registered_project("proj-a").unwrap().unwrap();
+        assert_eq!(row.config_path, path);
+        assert!(!row.enabled, "registering never enables");
+        assert_eq!(row.enabled_changed_at, None);
+        assert_eq!(row.health, ProjectHealth::default());
+
+        // A second insert never overwrites the registered path.
+        let other = std::path::Path::new("/tmp/project-a-clone/reviewloop.toml");
+        assert!(
+            !db.insert_project_registration("proj-a", other, now)
+                .unwrap()
+        );
         assert_eq!(
             db.resolve_project_config_path("proj-a").unwrap(),
             Some(path.to_path_buf())
         );
 
-        // Re-register with a different path overwrites (eg, repo moved).
-        let new_path = std::path::Path::new("/tmp/project-a-renamed/reviewloop.toml");
-        db.register_project_config("proj-a", new_path).unwrap();
+        // Moving a disabled registration is a compare-and-set on its path.
+        assert!(
+            !db.repoint_disabled_project("proj-a", other, other, now)
+                .unwrap()
+        );
+        assert!(
+            db.repoint_disabled_project("proj-a", path, other, now)
+                .unwrap()
+        );
         assert_eq!(
             db.resolve_project_config_path("proj-a").unwrap(),
-            Some(new_path.to_path_buf())
+            Some(other.to_path_buf())
         );
 
-        // Forget removes the row.
-        db.forget_project_registration("proj-a").unwrap();
+        assert!(db.forget_project_registration("proj-a").unwrap());
         assert!(db.resolve_project_config_path("proj-a").unwrap().is_none());
     }
 
     #[test]
-    fn project_registry_isolates_different_projects() {
-        let db = Db::new_in_memory("project_registry_isolation").unwrap();
+    fn enabled_registrations_neither_move_nor_get_forgotten() {
+        let db = Db::new_in_memory("project_registry_enabled").unwrap();
         db.ensure_schema().unwrap();
+        let now = Utc::now();
+        let path = std::path::Path::new("/tmp/a/reviewloop.toml");
+        let moved = std::path::Path::new("/tmp/b/reviewloop.toml");
 
-        let path_a = std::path::Path::new("/tmp/a/reviewloop.toml");
-        let path_b = std::path::Path::new("/tmp/b/reviewloop.toml");
-        db.register_project_config("a", path_a).unwrap();
-        db.register_project_config("b", path_b).unwrap();
+        assert!(db.enable_project("a", path, None, now).unwrap());
+        // `expected` no longer matches: nothing is written.
+        assert!(!db.enable_project("a", moved, None, now).unwrap());
+        assert!(!db.repoint_disabled_project("a", path, moved, now).unwrap());
+        assert!(!db.forget_project_registration("a").unwrap());
+        let row = db.get_registered_project("a").unwrap().unwrap();
+        assert!(row.enabled);
+        assert_eq!(row.config_path, path);
+        assert!(row.enabled_changed_at.is_some());
 
-        assert_eq!(
-            db.resolve_project_config_path("a").unwrap(),
-            Some(path_a.to_path_buf())
-        );
-        assert_eq!(
-            db.resolve_project_config_path("b").unwrap(),
-            Some(path_b.to_path_buf())
+        assert_eq!(db.disable_project("a", now).unwrap(), Some(true));
+        assert_eq!(db.disable_project("a", now).unwrap(), Some(false));
+        assert_eq!(db.disable_project("missing", now).unwrap(), None);
+        assert!(db.forget_project_registration("a").unwrap());
+    }
+
+    #[test]
+    fn project_health_keeps_the_last_error_until_a_clean_pass() {
+        let db = Db::new_in_memory("project_health").unwrap();
+        db.ensure_schema().unwrap();
+        let path = std::path::Path::new("/tmp/a/reviewloop.toml");
+        db.insert_project_registration("a", path, Utc::now())
+            .unwrap();
+        let first = Utc::now();
+        db.record_project_health("a", first, None).unwrap();
+        let failed = first + ChronoDuration::seconds(30);
+        db.record_project_health("a", failed, Some("config gone"))
+            .unwrap();
+        let health = db.get_registered_project("a").unwrap().unwrap().health;
+        assert_eq!(health.last_run_at, Some(failed));
+        assert_eq!(health.last_ok_at, Some(first));
+        assert_eq!(health.last_error.as_deref(), Some("config gone"));
+        assert_eq!(health.last_error_at, Some(failed));
+
+        let ok = failed + ChronoDuration::seconds(30);
+        db.record_project_health("a", ok, None).unwrap();
+        let health = db.get_registered_project("a").unwrap().unwrap().health;
+        assert_eq!(health.last_ok_at, Some(ok));
+        assert_eq!(health.last_error, None);
+        assert_eq!(health.last_error_at, None);
+    }
+
+    #[test]
+    fn supervisor_row_tracks_pause_and_the_running_supervisor() {
+        let db = Db::new_in_memory("supervisor_row").unwrap();
+        db.ensure_schema().unwrap();
+        assert_eq!(db.supervisor_record().unwrap(), SupervisorRecord::default());
+
+        let now = Utc::now();
+        assert!(db.set_supervisor_paused(true, now).unwrap());
+        assert!(!db.set_supervisor_paused(true, now).unwrap());
+        let paused = db.supervisor_record().unwrap();
+        assert_eq!(paused.paused_at, Some(now));
+        assert_eq!(paused.control_version, 1);
+
+        db.record_supervisor_start(41, std::path::Path::new("/state"), "0.0.0", now)
+            .unwrap();
+        let started = db.supervisor_record().unwrap();
+        assert_eq!(started.pid, Some(41));
+        assert_eq!(started.paused_at, Some(now), "a restart keeps the pause");
+        assert!(db.supervisor_heartbeat(41, now).unwrap());
+        assert!(
+            !db.supervisor_heartbeat(42, now).unwrap(),
+            "only the owner beats"
         );
 
-        // Forgetting one does not touch the other.
-        db.forget_project_registration("a").unwrap();
-        assert!(db.resolve_project_config_path("a").unwrap().is_none());
-        assert_eq!(
-            db.resolve_project_config_path("b").unwrap(),
-            Some(path_b.to_path_buf())
-        );
+        db.record_supervisor_tick(41, now, Some("mailbox down"))
+            .unwrap();
+        db.record_supervisor_tick(41, now, None).unwrap();
+        let ticked = db.supervisor_record().unwrap();
+        assert_eq!(ticked.last_tick_at, Some(now));
+        assert_eq!(ticked.last_tick_error.as_deref(), Some("mailbox down"));
+
+        assert!(db.set_supervisor_paused(false, now).unwrap());
+        db.record_supervisor_stop(41, now).unwrap();
+        let stopped = db.supervisor_record().unwrap();
+        assert_eq!(stopped.paused_at, None);
+        assert_eq!(stopped.stopped_at, Some(now));
+        assert_eq!(stopped.control_version, 2);
+    }
+
+    #[test]
+    fn reopen_shares_the_database() {
+        let db = Db::new_in_memory("reopen_shares").unwrap();
+        db.ensure_schema().unwrap();
+        let other = db.reopen().unwrap();
+        other.set_supervisor_paused(true, Utc::now()).unwrap();
+        assert!(db.supervisor_record().unwrap().paused_at.is_some());
     }
 }

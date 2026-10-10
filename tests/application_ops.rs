@@ -249,9 +249,13 @@ fn list_projects_reports_registry_and_current_project() -> Result<()> {
     let fx = Fixture::new()?;
     let present = fx.tmp.path().join("reviewloop.toml");
     fs::write(&present, "project_id = \"project-ops\"\n")?;
-    fx.db.register_project_config("project-ops", &present)?;
     fx.db
-        .register_project_config("other", &fx.tmp.path().join("gone/reviewloop.toml"))?;
+        .insert_project_registration("project-ops", &present, Utc::now())?;
+    fx.db.insert_project_registration(
+        "other",
+        &fx.tmp.path().join("gone/reviewloop.toml"),
+        Utc::now(),
+    )?;
 
     let projects = fx.ops().list_projects()?;
     let summary: Vec<_> = projects

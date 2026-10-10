@@ -46,6 +46,29 @@ pub struct LoadedConfig {
     pub compat_notice: Option<String>,
 }
 
+/// Machine-wide settings, loaded once per supervisor tick; every project's
+/// config of that tick is built on the same snapshot.
+#[derive(Debug, Clone)]
+pub struct MachineConfig {
+    /// The global settings with no project.
+    pub config: Config,
+    pub global: GlobalConfigFile,
+    pub global_path: Option<PathBuf>,
+    pub legacy_global_path: Option<PathBuf>,
+}
+
+impl MachineConfig {
+    /// The runtime config of the project whose `reviewloop.toml` is at
+    /// `config_path` (canonical), on this machine snapshot.
+    pub fn project(&self, config_path: &Path) -> Result<Config> {
+        Config::project_from(
+            self.global.clone(),
+            self.legacy_global_path.as_deref(),
+            config_path,
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub project_id: String,
@@ -96,19 +119,14 @@ impl Config {
         global.validate()?;
 
         let project = if let Some(path) = discovered_project_path.as_deref() {
-            if legacy_global_path.is_some() {
-                return Err(anyhow!(
-                    "legacy global config {} still carries project-owned fields while project config {} exists. run `reviewloop config migrate-project --project-id <id>` and remove the legacy file",
-                    legacy_global_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default(),
-                    path.display()
-                ));
-            }
-            let project = ProjectConfigFile::load(path)?;
-            project.validate(true)?;
-            project
+            let config = Self::project_from(global, legacy_global_path.as_deref(), path)?;
+            return Ok(LoadedConfig {
+                config,
+                global_path,
+                project_path: discovered_project_path,
+                legacy_global_path,
+                compat_notice: None,
+            });
         } else if let Some(path) = legacy_global_path.as_deref() {
             let legacy = LegacyConfig::load(path)?;
             let project = legacy.project_config();
@@ -132,19 +150,58 @@ impl Config {
             project
         };
 
-        let project_root = discovered_project_path
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf);
-        let config = Self::from_parts(global, project, project_root).with_env_secrets();
+        let config = Self::from_parts(global, project, None).with_env_secrets();
         config.validate_runtime(require_project)?;
         Ok(LoadedConfig {
             config,
             global_path,
-            project_path: discovered_project_path,
+            project_path: None,
             legacy_global_path,
             compat_notice: None,
         })
+    }
+
+    /// The settings the supervisor itself runs on: the global config alone,
+    /// whatever `reviewloop.toml` surrounds the current directory.
+    pub fn load_machine() -> Result<MachineConfig> {
+        let global_path = Self::ensure_global_config_file()?;
+        let legacy_global_path = Self::legacy_global_config_path().filter(|path| path.exists());
+        let global = match global_path.as_deref() {
+            Some(path) => GlobalConfigFile::load(path)?,
+            None => GlobalConfigFile::default(),
+        };
+        global.validate()?;
+        let config =
+            Self::from_parts(global.clone(), ProjectConfigFile::default(), None).with_env_secrets();
+        config.validate_runtime(false)?;
+        Ok(MachineConfig {
+            config,
+            global,
+            global_path,
+            legacy_global_path,
+        })
+    }
+
+    /// A project's runtime config: its `reviewloop.toml` at `path` (whose
+    /// parent is the project root) over the machine's `global` settings.
+    fn project_from(
+        global: GlobalConfigFile,
+        legacy_global_path: Option<&Path>,
+        path: &Path,
+    ) -> Result<Self> {
+        if let Some(legacy) = legacy_global_path {
+            return Err(anyhow!(
+                "legacy global config {} still carries project-owned fields while project config {} exists. run `reviewloop config migrate-project --project-id <id>` and remove the legacy file",
+                legacy.display(),
+                path.display()
+            ));
+        }
+        let project = ProjectConfigFile::load(path)?;
+        project.validate(true)?;
+        let project_root = path.parent().map(Path::to_path_buf);
+        let config = Self::from_parts(global, project, project_root).with_env_secrets();
+        config.validate_runtime(true)?;
+        Ok(config)
     }
 
     pub fn global_config_path() -> Option<PathBuf> {
@@ -751,11 +808,33 @@ fn home_dir_for_security() -> Result<PathBuf> {
 }
 
 fn path_is_within_dir(path: &Path, dir: &Path) -> bool {
-    if let (Ok(canonical_path), Ok(canonical_dir)) = (path.canonicalize(), dir.canonicalize()) {
-        return canonical_path.starts_with(canonical_dir);
-    }
+    resolve_for_security(path).starts_with(resolve_for_security(dir))
+}
 
-    normalize_for_security(path).starts_with(normalize_for_security(dir))
+/// `path` with its longest existing ancestor canonicalized and the rest
+/// normalized, so a file that does not exist yet compares like its directory
+/// (project roots are canonical, while `HOME` may be spelled through a
+/// symlink such as macOS's `/var` -> `/private/var`).
+fn resolve_for_security(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(canonical) = existing.canonicalize() {
+            return normalize_for_security(
+                &missing
+                    .iter()
+                    .rev()
+                    .fold(canonical, |acc, part| acc.join(part)),
+            );
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return normalize_for_security(path),
+        }
+    }
 }
 
 fn normalize_for_security(path: &Path) -> PathBuf {
@@ -883,6 +962,7 @@ impl ProjectConfigFile {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = read_config_file(path)?;
         refuse_project_api_key(path, &raw)?;
+        refuse_machine_settings(path, &raw)?;
         parse_toml(path, &raw)
     }
 
@@ -1084,6 +1164,52 @@ fn refuse_project_api_key(path: &Path, raw: &str) -> Result<()> {
     ))
 }
 
+/// Sections and `[core]` keys every project on the machine shares: one
+/// supervisor runs all projects against one database and state directory,
+/// within one provider budget, and reads one mailbox.
+const MACHINE_SECTIONS: [&str; 5] = ["logging", "polling", "retention", "imap", "gmail_oauth"];
+const MACHINE_CORE_KEYS: [&str; 6] = [
+    "db_path",
+    "state_dir",
+    "max_concurrency",
+    "max_submissions_per_tick",
+    "widget_state_enabled",
+    "widget_state_dir",
+];
+
+/// Refuses a machine-wide setting in a project file by name, instead of the
+/// parser's generic unknown-field error.
+fn refuse_machine_settings(path: &Path, raw: &str) -> Result<()> {
+    // Malformed TOML is reported by the typed parse that follows.
+    let Ok(table) = raw.parse::<toml::Table>() else {
+        return Ok(());
+    };
+    let section = MACHINE_SECTIONS
+        .into_iter()
+        .find(|section| table.contains_key(*section))
+        .map(|section| format!("[{section}]"));
+    let core_key = || {
+        let core = table.get("core")?.as_table()?;
+        MACHINE_CORE_KEYS
+            .into_iter()
+            .find(|key| core.contains_key(*key))
+            .map(|key| format!("core.{key}"))
+    };
+    let Some(setting) = section.or_else(core_key) else {
+        return Ok(());
+    };
+    let global = Config::global_config_path().map_or_else(
+        || format!("~/.config/reviewloop/{GLOBAL_CONFIG_FILE}"),
+        |path| path.display().to_string(),
+    );
+    Err(anyhow!(
+        "project config {} sets {setting}, which is machine-wide: every project shares the \
+         database, state directory, provider budget and mailbox configured in the global config \
+         {global}. remove it from the project config (set it in the global config instead)",
+        path.display()
+    ))
+}
+
 fn save_toml_file<T>(path: &Path, value: &T) -> Result<()>
 where
     T: Serialize,
@@ -1143,6 +1269,9 @@ where
     Ok(())
 }
 
+/// The project config in effect: `explicit_path`, or the nearest
+/// `reviewloop.toml` from the current directory up to the git root. Always
+/// canonical, so the project root and the registry never depend on the cwd.
 fn discover_project_config_path(explicit_path: Option<&Path>) -> Result<Option<PathBuf>> {
     if let Some(path) = explicit_path {
         if let Err(err) = fs::metadata(path) {
@@ -1154,7 +1283,7 @@ fn discover_project_config_path(explicit_path: Option<&Path>) -> Result<Option<P
                 format!("failed to access project config file: {}", path.display())
             });
         }
-        return Ok(Some(path.to_path_buf()));
+        return canonical_config_path(path).map(Some);
     }
 
     let cwd = env::current_dir().context("failed to resolve current working directory")?;
@@ -1164,7 +1293,7 @@ fn discover_project_config_path(explicit_path: Option<&Path>) -> Result<Option<P
     loop {
         let candidate = current.join(PROJECT_CONFIG_FILE);
         if candidate.exists() {
-            return Ok(Some(candidate));
+            return canonical_config_path(&candidate).map(Some);
         }
         if git_root.as_deref() == Some(current) {
             break;
@@ -1176,6 +1305,12 @@ fn discover_project_config_path(explicit_path: Option<&Path>) -> Result<Option<P
     }
 
     Ok(None)
+}
+
+/// The canonical form of a config path: absolute, symlinks resolved.
+pub fn canonical_config_path(path: &Path) -> Result<PathBuf> {
+    fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve project config path {}", path.display()))
 }
 
 pub fn default_project_config_path() -> Result<PathBuf> {
@@ -2455,6 +2590,29 @@ db_path = "db.sqlite"
         cfg.providers.stanford.fallback_script = script.to_string_lossy().to_string();
 
         assert!(cfg.validate_for_foreign_load().is_ok());
+    }
+
+    /// Project roots are canonical; a directory reached through a symlink
+    /// (macOS's `/var` -> `/private/var`) still contains a file that does not
+    /// exist yet, and a `..` cannot climb out of it.
+    #[cfg(unix)]
+    #[test]
+    fn containment_sees_through_symlinked_dirs_for_missing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir_all(real.join("project")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canonical_root = real.join("project").canonicalize().unwrap();
+
+        assert!(super::path_is_within_dir(
+            &canonical_root.join("tools/missing.mjs"),
+            &link
+        ));
+        assert!(!super::path_is_within_dir(
+            &canonical_root.join("missing/../../../escape.mjs"),
+            &link
+        ));
     }
 
     // ──────────────────────────────────────────────────────────────────────
