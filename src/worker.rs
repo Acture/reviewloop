@@ -13,13 +13,11 @@ use crate::{
     fallback::submit_with_node_playwright,
     model::{Job, JobStatus, SubmitChannel, SubmitStage, WorkKind},
     notifier::{self, NotificationKind},
-    panel::render_tick_panel,
     submission_input::{
         JobInput, SNAPSHOT_GC_GRACE, prune_unreferenced_snapshots, resolve_job_input,
     },
     trigger::{run_git_tag_trigger, run_pdf_trigger},
     util::compute_next_poll_at,
-    widget_state,
 };
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
@@ -52,7 +50,7 @@ const POLL_CALL_TIMEOUT: StdDuration = StdDuration::from_secs(5 * 60);
 ///
 /// Falls back to a direct (synchronous) call when invoked outside a tokio
 /// runtime (e.g., in unit tests that call sync worker functions directly).
-fn fire_notification(
+pub(crate) fn fire_notification(
     cfg: &NotificationsConfig,
     kind: NotificationKind,
     paper_id: Option<&str>,
@@ -98,71 +96,6 @@ fn is_terminal_review_generation_failure(body: &str) -> bool {
         .any(|hint| normalized.contains(hint));
 
     has_failure_hint && normalized.contains("contact support")
-}
-
-pub async fn run_daemon(config: &Config, db: &Db, panel: bool) -> Result<()> {
-    info!("daemon started");
-    let scheduler = single_project(config, db);
-    let mut turns = RoundRobin::default();
-    let mut tick: u64 = 0;
-    loop {
-        tick += 1;
-        let report = scheduler
-            .tick(config, &[config], Some(tick), &mut turns)
-            .await;
-        let mut last_tick_error: Option<String> = None;
-
-        if let Err(err) = report.into_result() {
-            let msg = format!("{err:#}");
-            error!(tick, error = %msg, "tick failed");
-            // Persist the failure so `daemon status` can surface it without
-            // tailing the daemon log. The next tick can read this back via
-            // db.most_recent_event_of_type(_, "tick_failed").
-            if let Err(persist_err) = db.add_event(
-                Some(&config.project_id),
-                None,
-                "tick_failed",
-                json!({ "tick": tick, "error": msg.clone() }),
-            ) {
-                // Don't let an event-write failure mask the underlying tick
-                // failure or kill the daemon; log and continue.
-                warn!(
-                    tick,
-                    error = %persist_err,
-                    "failed to persist tick_failed event"
-                );
-            }
-            fire_notification(
-                &config.notifications,
-                NotificationKind::TickError,
-                None,
-                None,
-                Some(&msg),
-            );
-            last_tick_error = Some(msg);
-        }
-
-        if let Some(path) = config.widget_state_path()
-            && let Err(e) = widget_state::build_and_write(config, db, &path)
-        {
-            tracing::warn!(error = %e, "failed to write widget state file");
-        }
-
-        if panel {
-            render_tick_panel(config, db, tick, last_tick_error.as_deref())?;
-        }
-
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("received Ctrl+C, daemon exiting");
-                break;
-            }
-            _ = tokio::time::sleep(StdDuration::from_secs(30)) => {}
-        }
-    }
-
-    info!("daemon stopped");
-    Ok(())
 }
 
 /// One tick of `config`'s project alone, with the live providers and its

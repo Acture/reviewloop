@@ -591,12 +591,7 @@ impl Fleet {
                 format!("%PDF-1.4\n% {id}\n1 0 obj\n<<>>\nendobj\n%%EOF\n"),
             )?;
             let config_path = root.join("reviewloop.toml");
-            fs::write(
-                &config_path,
-                format!(
-                    "project_id = \"{id}\"\n\n[[papers]]\nid = \"{PAPER}\"\npdf_path = \"paper.pdf\"\nbackend = \"stanford\"\n"
-                ),
-            )?;
+            fs::write(&config_path, fleet_project_toml(id, false))?;
             let mut config = fleet_config(id, &state_dir, &db_path);
             config.project_root = Some(root.clone());
             config.papers = vec![PaperConfig {
@@ -679,6 +674,46 @@ impl Fleet {
         let job = self.queue_job(id)?;
         self.db.attach_token_to_job(&job.id, token, next_poll_at)?;
         load_job(&self.db, &job.id)
+    }
+}
+
+/// A fleet project's `reviewloop.toml`: paper [`PAPER`] at `paper.pdf`, the git
+/// trigger off and the PDF trigger as given.
+pub fn fleet_project_toml(project_id: &str, pdf_trigger: bool) -> String {
+    format!(
+        "project_id = \"{project_id}\"\n\n[trigger.git]\nenabled = false\n\n[trigger.pdf]\nenabled = {pdf_trigger}\nauto_submit_on_change = true\n\n[[papers]]\nid = \"{PAPER}\"\npdf_path = \"paper.pdf\"\nbackend = \"stanford\"\n"
+    )
+}
+
+impl Fleet {
+    /// The global config file matching `machine`: what a supervisor of this
+    /// fleet loads every tick.
+    pub fn global(&self) -> reviewloop::config::GlobalConfigFile {
+        let mut global = reviewloop::config::GlobalConfigFile {
+            core: self.machine.core.clone(),
+            polling: self.machine.polling.clone(),
+            retention: self.machine.retention.clone(),
+            imap: None,
+            gmail_oauth: None,
+            ..Default::default()
+        };
+        global.notifications.enabled = false;
+        let stanford = &self.machine.providers.stanford;
+        global.providers.stanford.base_url = stanford.base_url.clone();
+        global.providers.stanford.email = stanford.email.clone();
+        global.providers.stanford.venue = stanford.venue.clone();
+        global.providers.stanford.fallback_mode = stanford.fallback_mode.clone();
+        global
+    }
+
+    pub fn machine_config(&self) -> reviewloop::config::MachineConfig {
+        reviewloop::config::MachineConfig::from_global(self.global())
+            .expect("fleet global config is valid")
+    }
+
+    /// `id`'s config path, canonical (as the registry stores it).
+    pub fn config_path(&self, id: &str) -> PathBuf {
+        fs::canonicalize(&self.project(id).config_path).expect("fleet config exists")
     }
 }
 

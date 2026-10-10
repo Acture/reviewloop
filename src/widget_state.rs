@@ -1,21 +1,27 @@
 //! Widget state snapshot writer for macOS WidgetKit integration.
 //!
-//! Every daemon tick this module builds a small JSON file that a parallel
-//! Swift WidgetKit extension (W2B) reads to render the home-screen widget.
+//! Every supervisor tick writes one small JSON document for the whole
+//! machine, which the Swift WidgetKit extension reads to render the
+//! home-screen widget: every project's jobs, the supervisor's state, and
+//! each registered project's health.
 //!
-//! The JSON schema is frozen and shared with W2B; do **not** change field
-//! names or types without coordinating with the Swift side.
+//! The JSON schema is shared with the Swift side; add fields only, and do
+//! **not** rename or retype existing ones without coordinating (see
+//! `docs/widget-schema.md`).
 //!
 //! ## `completed_today` note
 //! "Completed today" is defined as jobs whose `updated_at` falls on the
 //! current **UTC** calendar date. Local-timezone date is acceptable for V1
 //! (documented here so W2B can decide whether to call it out in the UI).
 
-use crate::{config::Config, db::Db};
+use crate::{
+    db::Db,
+    supervisor::{ProjectState, SupervisorState},
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use std::{fs, io::Write, path::Path};
+use std::{collections::BTreeMap, fs, io::Write, path::Path};
 
 // ---------------------------------------------------------------------------
 // Tick-health thresholds (seconds).  Mirrored from `cmd_daemon_status` so
@@ -53,13 +59,17 @@ pub fn tick_health_label(last_tick_at: Option<DateTime<Utc>>) -> &'static str {
 pub struct WidgetState {
     pub schema_version: u32,
     pub generated_at: String,
+    /// Always `""`: the document covers every project on the machine.
     pub project_id: String,
     pub summary: WidgetSummary,
     pub active_jobs: Vec<WidgetActiveJob>,
     pub recent_failures: Vec<WidgetFailure>,
-    pub last_tick_at: Option<String>,
+    /// The supervisor's latest tick; never null in a written document.
+    pub last_tick_at: String,
     pub last_tick_error: Option<WidgetTickError>,
     pub tick_health: &'static str,
+    pub supervisor: WidgetSupervisor,
+    pub projects: Vec<WidgetProject>,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,6 +81,7 @@ pub struct WidgetSummary {
 
 #[derive(Debug, Serialize)]
 pub struct WidgetActiveJob {
+    pub project_id: String,
     pub paper_id: String,
     pub status: String,
     pub attempt: u32,
@@ -80,6 +91,7 @@ pub struct WidgetActiveJob {
 
 #[derive(Debug, Serialize)]
 pub struct WidgetFailure {
+    pub project_id: String,
     pub paper_id: String,
     pub status: String,
     pub last_error: String,
@@ -90,6 +102,25 @@ pub struct WidgetFailure {
 pub struct WidgetTickError {
     pub at: String,
     pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WidgetSupervisor {
+    pub state: SupervisorState,
+    pub pid: Option<u32>,
+    pub started_at: Option<String>,
+    pub paused_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WidgetProject {
+    pub project_id: String,
+    pub enabled: bool,
+    pub state: ProjectState,
+    pub active_count: usize,
+    pub last_run_at: Option<String>,
+    pub last_ok_at: Option<String>,
+    pub last_error: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -113,51 +144,22 @@ fn fmt_rfc3339(dt: DateTime<Utc>) -> String {
 // Build
 // ---------------------------------------------------------------------------
 
-/// Build a [`WidgetState`] from the current database state.
-pub fn build(config: &Config, db: &Db) -> Result<WidgetState> {
-    let project_id = &config.project_id;
-    let now = Utc::now();
-
-    // --- last tick timestamp & health ---
-    let last_tick_at = db
-        .most_recent_event_created_at(project_id)
-        .context("failed to read last tick timestamp")?;
-    let tick_health = tick_health_label(last_tick_at);
-
-    // --- last tick error (mirrors daemon status logic) ---
-    let last_tick_error: Option<WidgetTickError> = {
-        let ev_opt = db
-            .most_recent_event_of_type(project_id, "tick_failed")
-            .context("failed to read tick_failed events")?;
-        if let Some(ev) = ev_opt {
-            // Only surface the error if it's still the most recent event
-            // (the daemon hasn't recovered since) and it's within 3 minutes.
-            let recovered = last_tick_at
-                .map(|latest| latest > ev.created_at)
-                .unwrap_or(false);
-            let stale = (now - ev.created_at).num_seconds() > 180;
-            if !recovered && !stale {
-                let msg = ev
-                    .payload
-                    .get("error")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("(no error message)")
-                    .to_string();
-                Some(WidgetTickError {
-                    at: fmt_rfc3339(ev.created_at),
-                    message: msg,
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
+/// The machine's document as of `now`, from the database alone.
+pub fn build_fleet(db: &Db, now: DateTime<Utc>) -> Result<WidgetState> {
+    let supervisor = db
+        .supervisor_record()
+        .context("failed to read the supervisor row")?;
+    let last_tick_at = supervisor.last_tick_at.unwrap_or(now);
+    let last_tick_error = supervisor
+        .current_tick_error()
+        .map(|message| WidgetTickError {
+            at: fmt_rfc3339(last_tick_at),
+            message: message.to_string(),
+        });
 
     // --- active jobs (capped at 10, sorted by next_poll_at ASC, None first) ---
     let mut raw_active = db
-        .list_active_jobs_for_project(project_id)
+        .list_active_jobs_all()
         .context("failed to read active jobs")?;
     raw_active.sort_by(|a, b| match (a.next_poll_at, b.next_poll_at) {
         (None, None) => std::cmp::Ordering::Equal,
@@ -165,10 +167,17 @@ pub fn build(config: &Config, db: &Db) -> Result<WidgetState> {
         (Some(_), None) => std::cmp::Ordering::Greater,
         (Some(ta), Some(tb)) => ta.cmp(&tb),
     });
+    let mut active_per_project: BTreeMap<&str, usize> = BTreeMap::new();
+    for job in &raw_active {
+        *active_per_project
+            .entry(job.project_id.as_str())
+            .or_default() += 1;
+    }
     let active_jobs: Vec<WidgetActiveJob> = raw_active
         .iter()
         .take(10)
         .map(|j| WidgetActiveJob {
+            project_id: j.project_id.clone(),
             paper_id: j.paper_id.clone(),
             status: j.status.as_str().to_string(),
             attempt: j.attempt,
@@ -177,16 +186,24 @@ pub fn build(config: &Config, db: &Db) -> Result<WidgetState> {
         })
         .collect();
 
-    // --- recent failures (capped at 5, sorted by occurred_at DESC) ---
-    // list_failed_jobs_for_project already excludes cancellations (W1a filter).
-    let raw_failures = db
-        .list_failed_jobs_for_project(project_id, 5)
+    // --- recent failures (newest 5 across projects, at most 5 per project) ---
+    // The query already excludes cancellations.
+    let mut raw_failures = db
+        .list_failed_jobs_all_per_project(5)
         .context("failed to read failed jobs")?;
+    raw_failures.sort_by_key(|job| std::cmp::Reverse(job.updated_at));
+    let cutoff_24h = now - chrono::Duration::hours(24);
+    let failed_recent_24h = raw_failures
+        .iter()
+        .filter(|j| j.updated_at >= cutoff_24h)
+        .count();
     let recent_failures: Vec<WidgetFailure> = raw_failures
         .iter()
+        .take(5)
         .map(|j| {
             let raw_err = j.last_error.as_deref().unwrap_or("(unknown error)");
             WidgetFailure {
+                project_id: j.project_id.clone(),
                 paper_id: j.paper_id.clone(),
                 status: j.status.as_str().to_string(),
                 last_error: truncate_chars(raw_err, 80).to_string(),
@@ -195,35 +212,54 @@ pub fn build(config: &Config, db: &Db) -> Result<WidgetState> {
         })
         .collect();
 
-    // --- summary counts ---
-    let active_count = raw_active.len();
-
-    let cutoff_24h = now - chrono::Duration::hours(24);
-    let failed_recent_24h = raw_failures
-        .iter()
-        .filter(|j| j.updated_at >= cutoff_24h)
-        .count();
-
     // completed_today: COMPLETED jobs whose updated_at is on today's UTC date.
-    let today_str = now.format("%Y-%m-%d").to_string();
     let completed_today = db
-        .count_completed_today(project_id, &today_str)
+        .count_completed_on(&now.format("%Y-%m-%d").to_string())
         .context("failed to count completed-today jobs")?;
+
+    let projects = db
+        .list_registered_projects()
+        .context("failed to read the project registry")?
+        .into_iter()
+        .map(|project| WidgetProject {
+            enabled: project.enabled,
+            state: ProjectState::of(&project),
+            active_count: active_per_project
+                .get(project.project_id.as_str())
+                .copied()
+                .unwrap_or_default(),
+            last_run_at: project.health.last_run_at.map(fmt_rfc3339),
+            last_ok_at: project.health.last_ok_at.map(fmt_rfc3339),
+            last_error: project
+                .health
+                .last_error
+                .as_deref()
+                .map(|error| truncate_chars(error, 80).to_string()),
+            project_id: project.project_id,
+        })
+        .collect();
 
     Ok(WidgetState {
         schema_version: 1,
         generated_at: fmt_rfc3339(now),
-        project_id: project_id.clone(),
+        project_id: String::new(),
         summary: WidgetSummary {
-            active_count,
+            active_count: raw_active.len(),
             failed_recent_24h,
             completed_today,
         },
         active_jobs,
         recent_failures,
-        last_tick_at: last_tick_at.map(fmt_rfc3339),
+        last_tick_at: fmt_rfc3339(last_tick_at),
         last_tick_error,
-        tick_health,
+        tick_health: tick_health_label(Some(last_tick_at)),
+        supervisor: WidgetSupervisor {
+            state: SupervisorState::of(&supervisor, now),
+            pid: supervisor.pid,
+            started_at: supervisor.started_at.map(fmt_rfc3339),
+            paused_at: supervisor.paused_at.map(fmt_rfc3339),
+        },
+        projects,
     })
 }
 
@@ -299,10 +335,9 @@ pub fn write_atomically(path: &Path, state: &WidgetState) -> Result<()> {
     Ok(())
 }
 
-/// Convenience wrapper: build state from DB and write it atomically.
-pub fn build_and_write(config: &Config, db: &Db, path: &Path) -> Result<()> {
-    let state = build(config, db)?;
-    write_atomically(path, &state)
+/// Build the machine's document and write it atomically to `path`.
+pub fn write_fleet(db: &Db, path: &Path, now: DateTime<Utc>) -> Result<()> {
+    write_atomically(path, &build_fleet(db, now)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +352,8 @@ mod tests {
         db::Db,
         model::{JobPdf, JobStatus, NewJob},
     };
+    use chrono::TimeZone;
+    use std::path::Path;
 
     /// Create a fresh, schema-initialized in-memory DB for each test.
     /// Each test gets a unique name to avoid SQLite shared-cache collisions.
@@ -324,13 +361,6 @@ mod tests {
         let db = Db::new_in_memory(name).expect("new_in_memory");
         db.ensure_schema().expect("ensure_schema");
         db
-    }
-
-    fn default_config_for(project_id: &str) -> Config {
-        Config {
-            project_id: project_id.to_string(),
-            ..Config::default()
-        }
     }
 
     /// Create a job in the given status with an optional last_error.
@@ -373,126 +403,158 @@ mod tests {
     }
 
     #[test]
-    fn build_with_in_memory_db_produces_valid_schema() {
-        let db = make_db("widget-schema");
-        let cfg = default_config_for("test-proj");
+    fn fleet_document_covers_every_project_and_the_supervisor() {
+        let db = make_db("widget-fleet");
+        let now = Utc::now();
+        db.insert_project_registration("alpha", Path::new("/repos/alpha/reviewloop.toml"), now)
+            .unwrap();
+        db.enable_project(
+            "alpha",
+            Path::new("/repos/alpha/reviewloop.toml"),
+            Some(Path::new("/repos/alpha/reviewloop.toml")),
+            now,
+        )
+        .unwrap();
+        db.record_project_health("alpha", now, Some("pdf trigger: boom"))
+            .unwrap();
+        db.insert_project_registration("beta", Path::new("/repos/beta/reviewloop.toml"), now)
+            .unwrap();
+        db.record_supervisor_start(7, Path::new("/state"), "0.0.0", now)
+            .unwrap();
+        db.record_supervisor_tick(7, now, Some("email token ingestion: offline"))
+            .unwrap();
 
-        // 1 Processing job
-        make_job(&db, "test-proj", "paper-a", JobStatus::Processing, None);
-        // 2 Failed jobs (non-cancellation)
+        make_job(&db, "alpha", "main", JobStatus::Processing, None);
+        make_job(&db, "beta", "main", JobStatus::Queued, None);
         make_job(
             &db,
-            "test-proj",
-            "paper-b",
-            JobStatus::Failed,
-            Some("review generation failed"),
-        );
-        make_job(
-            &db,
-            "test-proj",
-            "paper-c",
+            "beta",
+            "draft",
             JobStatus::Failed,
             Some("network timeout"),
         );
-        // 1 cancelled — must be excluded from recent_failures
+        // A cancellation is not a failure.
         make_job(
             &db,
-            "test-proj",
-            "paper-d",
+            "beta",
+            "old",
             JobStatus::Failed,
             Some("cancelled by user"),
         );
-        // 1 Completed today
-        make_job(&db, "test-proj", "paper-e", JobStatus::Completed, None);
+        make_job(&db, "alpha", "done", JobStatus::Completed, None);
 
-        let state = build(&cfg, &db).expect("build");
-
+        let state = build_fleet(&db, now).expect("build");
         assert_eq!(state.schema_version, 1);
-        assert_eq!(state.project_id, "test-proj");
-
-        // active_count = 1 (Processing)
-        assert_eq!(state.summary.active_count, 1);
-        assert_eq!(state.active_jobs.len(), 1);
-        assert_eq!(state.active_jobs[0].paper_id, "paper-a");
-        assert_eq!(state.active_jobs[0].status, "PROCESSING");
-
-        // recent_failures: 2 non-cancellation failures; cancelled excluded
-        assert_eq!(state.recent_failures.len(), 2);
-        let failure_papers: Vec<&str> = state
-            .recent_failures
+        assert_eq!(state.project_id, "");
+        assert_eq!(state.summary.active_count, 2);
+        assert_eq!(state.summary.failed_recent_24h, 1);
+        assert_eq!(state.summary.completed_today, 1);
+        let active: Vec<(&str, &str)> = state
+            .active_jobs
             .iter()
-            .map(|f| f.paper_id.as_str())
+            .map(|job| (job.project_id.as_str(), job.paper_id.as_str()))
             .collect();
-        assert!(
-            !failure_papers.contains(&"paper-d"),
-            "cancelled job must be excluded from recent_failures"
+        assert!(active.contains(&("alpha", "main")) && active.contains(&("beta", "main")));
+        assert_eq!(state.recent_failures.len(), 1);
+        assert_eq!(state.recent_failures[0].project_id, "beta");
+
+        assert_eq!(state.supervisor.state, SupervisorState::Running);
+        assert_eq!(state.supervisor.pid, Some(7));
+        assert_eq!(state.tick_health, "normal");
+        assert_eq!(
+            state
+                .last_tick_error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("email token ingestion: offline")
         );
 
-        // completed_today = 1
-        assert_eq!(state.summary.completed_today, 1);
+        let projects: Vec<(&str, bool, ProjectState, usize)> = state
+            .projects
+            .iter()
+            .map(|p| (p.project_id.as_str(), p.enabled, p.state, p.active_count))
+            .collect();
+        assert_eq!(
+            projects,
+            [
+                ("alpha", true, ProjectState::Error, 1),
+                ("beta", false, ProjectState::Disabled, 1),
+            ]
+        );
+        assert_eq!(
+            state.projects[0].last_error.as_deref(),
+            Some("pdf trigger: boom")
+        );
+    }
 
-        // failed_recent_24h = 2 (the two real failures are fresh)
-        assert_eq!(state.summary.failed_recent_24h, 2);
-
-        // tick_health is unknown (no events logged for this project)
-        assert_eq!(state.tick_health, "unknown");
-
-        // no tick error
-        assert!(state.last_tick_error.is_none());
+    /// The Swift widget decodes `last_tick_at` as a non-optional date, so a
+    /// written document always carries one, even before the first tick.
+    #[test]
+    fn last_tick_at_is_never_null() {
+        let db = make_db("widget-no-tick");
+        let now = Utc.with_ymd_and_hms(2026, 10, 10, 8, 0, 0).unwrap();
+        let state = build_fleet(&db, now).expect("build");
+        assert_eq!(state.last_tick_at, "2026-10-10T08:00:00Z");
+        assert_eq!(state.supervisor.state, SupervisorState::Stopped);
+        let json = serde_json::to_value(&state).unwrap();
+        assert!(json["last_tick_at"].is_string());
+        assert_eq!(json["projects"], serde_json::json!([]));
     }
 
     #[test]
     fn widget_state_v1_serializes_to_documented_shape() {
-        use chrono::TimeZone;
-
+        let at = |h, m, s| fmt_rfc3339(Utc.with_ymd_and_hms(2026, 5, 6, h, m, s).unwrap());
         let state = WidgetState {
             schema_version: 1,
-            generated_at: fmt_rfc3339(chrono::Utc.with_ymd_and_hms(2026, 5, 6, 12, 0, 0).unwrap()),
-            project_id: "test-proj".to_string(),
+            generated_at: at(12, 0, 0),
+            project_id: String::new(),
             summary: WidgetSummary {
                 active_count: 2,
                 failed_recent_24h: 1,
                 completed_today: 3,
             },
             active_jobs: vec![WidgetActiveJob {
+                project_id: "thesis".to_string(),
                 paper_id: "paper-a".to_string(),
                 status: "PROCESSING".to_string(),
                 attempt: 2,
-                next_poll_at: Some(fmt_rfc3339(
-                    chrono::Utc.with_ymd_and_hms(2026, 5, 6, 12, 5, 0).unwrap(),
-                )),
-                started_at: Some(fmt_rfc3339(
-                    chrono::Utc.with_ymd_and_hms(2026, 5, 6, 11, 50, 0).unwrap(),
-                )),
+                next_poll_at: Some(at(12, 5, 0)),
+                started_at: Some(at(11, 50, 0)),
             }],
             recent_failures: vec![WidgetFailure {
+                project_id: "thesis".to_string(),
                 paper_id: "paper-b".to_string(),
                 status: "FAILED".to_string(),
                 last_error: "rate limit exceeded".to_string(),
-                occurred_at: fmt_rfc3339(
-                    chrono::Utc.with_ymd_and_hms(2026, 5, 6, 11, 55, 0).unwrap(),
-                ),
+                occurred_at: at(11, 55, 0),
             }],
-            last_tick_at: Some(fmt_rfc3339(
-                chrono::Utc
-                    .with_ymd_and_hms(2026, 5, 6, 11, 59, 50)
-                    .unwrap(),
-            )),
+            last_tick_at: at(11, 59, 50),
             last_tick_error: Some(WidgetTickError {
-                at: fmt_rfc3339(
-                    chrono::Utc
-                        .with_ymd_and_hms(2026, 5, 6, 11, 59, 55)
-                        .unwrap(),
-                ),
-                message: "daemon lost connection".to_string(),
+                at: at(11, 59, 50),
+                message: "email token ingestion: offline".to_string(),
             }),
             tick_health: "normal",
+            supervisor: WidgetSupervisor {
+                state: SupervisorState::Running,
+                pid: Some(4242),
+                started_at: Some(at(9, 0, 0)),
+                paused_at: None,
+            },
+            projects: vec![WidgetProject {
+                project_id: "thesis".to_string(),
+                enabled: true,
+                state: ProjectState::Ok,
+                active_count: 2,
+                last_run_at: Some(at(11, 59, 50)),
+                last_ok_at: Some(at(11, 59, 50)),
+                last_error: None,
+            }],
         };
         let json = serde_json::to_string_pretty(&state).expect("serialise");
         let expected = r#"{
   "schema_version": 1,
   "generated_at": "2026-05-06T12:00:00Z",
-  "project_id": "test-proj",
+  "project_id": "",
   "summary": {
     "active_count": 2,
     "failed_recent_24h": 1,
@@ -500,6 +562,7 @@ mod tests {
   },
   "active_jobs": [
     {
+      "project_id": "thesis",
       "paper_id": "paper-a",
       "status": "PROCESSING",
       "attempt": 2,
@@ -509,6 +572,7 @@ mod tests {
   ],
   "recent_failures": [
     {
+      "project_id": "thesis",
       "paper_id": "paper-b",
       "status": "FAILED",
       "last_error": "rate limit exceeded",
@@ -517,26 +581,45 @@ mod tests {
   ],
   "last_tick_at": "2026-05-06T11:59:50Z",
   "last_tick_error": {
-    "at": "2026-05-06T11:59:55Z",
-    "message": "daemon lost connection"
+    "at": "2026-05-06T11:59:50Z",
+    "message": "email token ingestion: offline"
   },
-  "tick_health": "normal"
+  "tick_health": "normal",
+  "supervisor": {
+    "state": "running",
+    "pid": 4242,
+    "started_at": "2026-05-06T09:00:00Z",
+    "paused_at": null
+  },
+  "projects": [
+    {
+      "project_id": "thesis",
+      "enabled": true,
+      "state": "ok",
+      "active_count": 2,
+      "last_run_at": "2026-05-06T11:59:50Z",
+      "last_ok_at": "2026-05-06T11:59:50Z",
+      "last_error": null
+    }
+  ]
 }"#;
         assert_eq!(
             json, expected,
-            "widget JSON shape changed; bump schema_version and update docs/widget-schema.md"
+            "widget JSON shape changed; update docs/widget-schema.md (bump schema_version for a breaking change)"
+        );
+        let documented = include_str!("../docs/widget-schema.md");
+        assert!(
+            documented.contains(expected),
+            "docs/widget-schema.md must show this exact sample document"
         );
     }
 
     #[test]
     fn write_atomically_round_trips() {
         let db = make_db("widget-roundtrip");
-        let cfg = default_config_for("rtrip");
-        let state = build(&cfg, &db).expect("build");
-
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("widget-state.json");
-        write_atomically(&path, &state).expect("write_atomically");
+        write_fleet(&db, &path, Utc::now()).expect("write_fleet");
 
         let raw = std::fs::read_to_string(&path).expect("read back");
         let v: serde_json::Value = serde_json::from_str(&raw).expect("parse json");
@@ -552,6 +635,8 @@ mod tests {
             "last_tick_at",
             "last_tick_error",
             "tick_health",
+            "supervisor",
+            "projects",
         ] {
             assert!(v.get(key).is_some(), "missing key: {key}");
         }
@@ -572,12 +657,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let db = make_db("widget-mode");
-        let cfg = default_config_for("mode-test");
-        let state = build(&cfg, &db).expect("build");
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("widget-state.json");
 
-        write_atomically(&path, &state).expect("write_atomically");
+        write_fleet(&db, &path, Utc::now()).expect("write_fleet");
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "widget state must be 0o600 after write");
