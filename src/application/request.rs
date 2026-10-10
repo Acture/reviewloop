@@ -172,3 +172,22 @@ pub struct CancelRequest {
     pub job: JobRef,
     pub reason: Option<String>,
 }
+
+/// Enable the context's project for the machine supervisor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnableProjectRequest {
+    /// The `reviewloop.toml` the context config was loaded from; it must
+    /// declare the context's project.
+    pub config_path: std::path::PathBuf,
+    /// Move the registration even when it points at another config that
+    /// still declares this project (another clone or worktree).
+    pub replace: bool,
+}
+
+/// Stop the machine supervisor from running a project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisableProjectRequest {
+    /// The project to disable; `None` is the context's project. Its config
+    /// need not load, so a broken or deleted project can still be disabled.
+    pub project_id: Option<String>,
+}
