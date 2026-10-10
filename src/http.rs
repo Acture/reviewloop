@@ -164,7 +164,8 @@ impl RoundRobinProxyMiddleware {
 
 /// Describe a failed request with its cause chain but without the request URL, which
 /// can carry secrets: a review token in the path, a presigned signature in the query.
-/// The URL is replaced by its origin.
+/// The URL is replaced by its origin, as is any other URL a cause names (a redirect
+/// target, say).
 pub fn describe_error(
     err: &(dyn std::error::Error + 'static),
     url: Option<&reqwest::Url>,
@@ -176,10 +177,11 @@ pub fn describe_error(
         text.push_str(&cause.to_string());
         source = cause.source();
     }
-    match url {
+    let text = match url {
         Some(url) => text.replace(url.as_str(), &url.origin().ascii_serialization()),
         None => text,
-    }
+    };
+    redact_url_paths(&text)
 }
 
 /// Reduce every parenthesised URL in `text` to its origin, the way [`describe_error`]
@@ -357,6 +359,17 @@ mod tests {
             text.len() > "error sending request for url (http://127.0.0.1:9)".len(),
             "the cause must follow: {text}"
         );
+    }
+
+    /// A cause can name a URL other than the request's (a redirect target, say).
+    #[test]
+    fn describe_error_drops_the_path_of_every_url_in_the_cause_chain() {
+        let err = std::io::Error::other(
+            "redirected to (https://paperreview.ai/api/review/tok-nested-123)",
+        );
+        let text = describe_error(&err, None);
+        assert!(!text.contains("tok-nested-123"), "{text}");
+        assert!(text.contains("(https://paperreview.ai)"), "{text}");
     }
 
     #[test]
