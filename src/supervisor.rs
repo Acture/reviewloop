@@ -131,6 +131,68 @@ impl ProjectState {
     }
 }
 
+/// Whether a project's queued and submitted jobs move without a caller
+/// running them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerAvailability {
+    /// A running supervisor runs the project.
+    Ready,
+    /// No config of the project was ever loaded on this machine.
+    ProjectNotRegistered,
+    /// Registered, but not enabled for the supervisor.
+    ProjectDisabled,
+    /// No supervisor is running.
+    SupervisorStopped,
+    /// The supervisor is paused.
+    SupervisorPaused,
+    /// The supervisor runs the project, but its last pass failed.
+    ProjectFailing,
+}
+
+impl WorkerAvailability {
+    pub fn of(
+        record: &SupervisorRecord,
+        project: Option<&RegisteredProject>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let Some(project) = project else {
+            return Self::ProjectNotRegistered;
+        };
+        if !project.enabled {
+            return Self::ProjectDisabled;
+        }
+        match SupervisorState::of(record, now) {
+            SupervisorState::Stopped => Self::SupervisorStopped,
+            SupervisorState::Paused => Self::SupervisorPaused,
+            SupervisorState::Running if project.health.last_error.is_some() => Self::ProjectFailing,
+            SupervisorState::Running => Self::Ready,
+        }
+    }
+
+    pub fn is_ready(self) -> bool {
+        self == Self::Ready
+    }
+
+    /// What happens to `project_id`'s queued and submitted jobs now, and how
+    /// to change it, for people.
+    pub fn describe(self, project_id: &str) -> String {
+        match self {
+            Self::Ready => format!(
+                "the supervisor runs project {project_id}: queued jobs are submitted and submitted ones polled automatically"
+            ),
+            Self::ProjectNotRegistered | Self::ProjectDisabled => format!(
+                "project {project_id} is not enabled, so nothing submits or polls its jobs automatically; enable it with `reviewloop project enable` in its repository"
+            ),
+            Self::SupervisorStopped => "no supervisor is running, so nothing submits or polls jobs automatically; start it with `reviewloop daemon install` (macOS) or `reviewloop daemon run`".to_string(),
+            Self::SupervisorPaused => "the supervisor is paused, so nothing is submitted or polled until `reviewloop daemon resume`".to_string(),
+            Self::ProjectFailing => format!(
+                "the supervisor's last pass over project {project_id} failed (see `reviewloop daemon status`); queued jobs may not move until that is fixed"
+            ),
+        }
+    }
+}
+
 /// Exclusive right to supervise one state directory, held until dropped
 /// (or the process dies).
 #[derive(Debug)]

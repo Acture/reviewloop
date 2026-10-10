@@ -108,6 +108,25 @@ pub enum OpError {
         available: Vec<String>,
     },
 
+    /// Enabling would take a project's registration from another live
+    /// config, or give a config a second enabled project.
+    #[error("{message}")]
+    ProjectConflict {
+        project_id: String,
+        /// The config the registration points at (live, declaring the project).
+        registered_path: Option<String>,
+        /// The config the request named.
+        requested_path: String,
+        /// The other project already enabled from `requested_path`.
+        enabled_as: Option<String>,
+        message: String,
+    },
+
+    #[error(
+        "project {project_id} is not registered; load its config once (for example `reviewloop status` in its repository), or check the id with list_projects"
+    )]
+    ProjectNotRegistered { project_id: String },
+
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -184,6 +203,8 @@ impl OpError {
             OpError::InvalidState { .. } => "invalid_state",
             OpError::ReviewNotAvailable { .. } => "review_not_available",
             OpError::SectionNotFound { .. } => "section_not_found",
+            OpError::ProjectConflict { .. } => "project_conflict",
+            OpError::ProjectNotRegistered { .. } => "project_not_registered",
             OpError::Internal(_) => "internal",
         }
     }
@@ -254,6 +275,18 @@ impl OpError {
             }
             OpError::SectionNotFound { .. } => {
                 "request one of the available sections, or the markdown part".to_string()
+            }
+            OpError::ProjectConflict {
+                enabled_as: Some(other),
+                ..
+            } => format!(
+                "disable project {other} first (`reviewloop project disable --project-id {other}`), then enable this one"
+            ),
+            OpError::ProjectConflict { .. } => {
+                "keep one copy per project_id, or move the registration here with `reviewloop project enable --replace` (enable_project with replace)".to_string()
+            }
+            OpError::ProjectNotRegistered { .. } => {
+                "check the id with list_projects; a project registers when its config is first loaded".to_string()
             }
             OpError::Internal(_) => return None,
         };
@@ -327,6 +360,19 @@ impl OpError {
                 section,
                 available,
             } => json!({ "job_id": job_id, "section": section, "available": available }),
+            OpError::ProjectConflict {
+                project_id,
+                registered_path,
+                requested_path,
+                enabled_as,
+                ..
+            } => json!({
+                "project_id": project_id,
+                "registered_path": registered_path,
+                "requested_path": requested_path,
+                "enabled_as": enabled_as,
+            }),
+            OpError::ProjectNotRegistered { project_id } => json!({ "project_id": project_id }),
         }
     }
 
