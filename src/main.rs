@@ -2454,6 +2454,25 @@ async fn cmd_submit(
     Ok(())
 }
 
+/// Move `run`'s job on while no supervisor runs its project: the mailbox
+/// (when the job may get its token by email), then the job's own submit or
+/// poll when due. Nothing else of the project is touched.
+async fn drive_run_job(
+    config: &Config,
+    db: &Db,
+    job_id: &str,
+    waits_for_token_email: bool,
+) -> Result<()> {
+    let job = db
+        .get_job(job_id)?
+        .ok_or_else(|| anyhow!("job no longer exists: {job_id}"))?;
+    if waits_for_token_email && job.token.is_none() && job.status == JobStatus::Submitted {
+        reviewloop::email::poll_imap_if_enabled(config, db).await?;
+    }
+    reviewloop::worker::advance_job(config, db, &reviewloop::worker::LiveBackends, job_id).await?;
+    Ok(())
+}
+
 /// How long `run` keeps waiting for a token email to settle a submission whose
 /// outcome is unknown before it exits with the reconcile hint.
 const UNCERTAIN_EMAIL_GRACE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
@@ -2518,11 +2537,22 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
     let submit_attempt = submit_now(&config, &db, &job_id).await?;
 
     if !args.quiet {
-        match submit_attempt {
-            Attempt::Ran => println!("Submitted job {} for paper_id={paper_id}", job_id),
-            Attempt::NotClaimed => println!(
+        let after = db
+            .get_job(&job_id)?
+            .ok_or_else(|| anyhow!("job no longer exists: {}", job_id))?;
+        match (submit_attempt, after.status) {
+            (Attempt::NotClaimed, _) => println!(
                 "Job {} for paper_id={paper_id} is being submitted by another reviewloop worker",
                 job_id
+            ),
+            (Attempt::Ran, JobStatus::Processing) => {
+                println!("Submitted job {} for paper_id={paper_id}", job_id)
+            }
+            (Attempt::Ran, status) => println!(
+                "Job {} for paper_id={paper_id} is {}: {}",
+                job_id,
+                status.as_str(),
+                after.last_error.as_deref().unwrap_or("(no details)")
             ),
         }
     }
@@ -2537,12 +2567,44 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
         });
     let mut uncertain_since: Option<std::time::Instant> = None;
 
-    // Foreground polling loop.
+    // Foreground loop: show the job every few seconds. While a supervisor
+    // runs this project it does the work and `run` only watches; otherwise
+    // `run` moves this job alone, by its own schedule, at the supervisor's
+    // cadence. Decided again every round, so a supervisor that stops or
+    // starts mid-run is followed.
     let start = std::time::Instant::now();
     let is_tty = std::io::stdout().is_terminal();
+    let mut driving: Option<bool> = None;
+    let mut last_drive: Option<std::time::Instant> = None;
     loop {
-        if let Err(e) = reviewloop::worker::run_tick(&config, &db).await {
-            warn!("run: tick error: {e:#}");
+        let supervised = ReviewOps::new(&config, &db)
+            .get_worker_status()?
+            .project
+            .is_some_and(|project| project.availability.is_ready());
+        if driving != Some(!supervised) {
+            if !args.quiet {
+                if is_tty && driving.is_some() {
+                    println!();
+                }
+                if supervised {
+                    eprintln!(
+                        "note: the supervisor runs this project; `run` only watches job {job_id}"
+                    );
+                } else {
+                    eprintln!(
+                        "note: no supervisor runs this project; `run` checks job {job_id} itself by its schedule until it finishes"
+                    );
+                }
+            }
+            driving = Some(!supervised);
+        }
+        if !supervised
+            && last_drive.is_none_or(|at| at.elapsed() >= reviewloop::supervisor::TICK_INTERVAL)
+        {
+            last_drive = Some(std::time::Instant::now());
+            if let Err(e) = drive_run_job(&config, &db, &job_id, waits_for_token_email).await {
+                warn!("run: {e:#}");
+            }
         }
 
         let updated = db

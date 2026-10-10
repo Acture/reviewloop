@@ -11,7 +11,7 @@ use common::{Answer, Fleet, FleetBackends, MockBackend, load_job, ready_review, 
 use reviewloop::{
     backend::BackendError,
     model::JobStatus,
-    worker::{RoundRobin, Scheduler, TickBudget, TickReport},
+    worker::{self, Attempt, RoundRobin, Scheduler, TickBudget, TickReport},
 };
 use std::{
     collections::BTreeMap,
@@ -253,5 +253,54 @@ async fn stop_ends_provider_work_for_the_rest_of_the_tick() -> Result<()> {
     assert_eq!(report.submits_sent, 1);
     assert_eq!(report.polls_sent, 0);
     assert_eq!(backends.callers("submit"), ["a"]);
+    Ok(())
+}
+
+/// `reviewloop run` without a supervisor: its job alone, never ahead of
+/// the job's schedule, never another job of the project or the machine.
+#[tokio::test]
+async fn advance_job_moves_only_its_job_by_its_schedule() -> Result<()> {
+    let fleet = Fleet::new(&["mine", "other"])?;
+    let backends = FleetBackends::new(accepting_backend());
+    let mine = fleet.queue_job("mine")?;
+    let sibling = fleet.queue_job("mine")?;
+    let elsewhere = fleet.queue_job("other")?;
+    let config = fleet.config("mine");
+
+    assert_eq!(
+        worker::advance_job(config, &fleet.db, &backends, &mine.id).await?,
+        Attempt::Ran
+    );
+    let submitted = load_job(&fleet.db, &mine.id)?;
+    assert_eq!(submitted.status, JobStatus::Processing);
+    assert!(submitted.next_poll_at.expect("scheduled") > Utc::now());
+    // Not due yet: nothing is sent.
+    assert_eq!(
+        worker::advance_job(config, &fleet.db, &backends, &mine.id).await?,
+        Attempt::NotClaimed
+    );
+    assert_eq!(backends.mock.fetch_count(), 0);
+
+    fleet
+        .db
+        .pull_poll_forward(&mine.id, Utc::now() - Duration::seconds(1))?;
+    assert_eq!(
+        worker::advance_job(config, &fleet.db, &backends, &mine.id).await?,
+        Attempt::Ran
+    );
+    assert_eq!(load_job(&fleet.db, &mine.id)?.status, JobStatus::Completed);
+    assert_eq!(backends.callers("submit"), ["mine"]);
+    assert_eq!(load_job(&fleet.db, &sibling.id)?.status, JobStatus::Queued);
+    assert_eq!(
+        load_job(&fleet.db, &elsewhere.id)?.status,
+        JobStatus::Queued
+    );
+
+    // Another project's job is refused, not run with this config.
+    assert!(
+        worker::advance_job(config, &fleet.db, &backends, &elsewhere.id)
+            .await
+            .is_err()
+    );
     Ok(())
 }
