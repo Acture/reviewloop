@@ -549,3 +549,261 @@ pub fn ready_review() -> ReviewFetchResult {
         raw_json: review_json(),
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// Several projects on one machine (OSS-338)
+// ---------------------------------------------------------------------------------------
+
+/// One project of a [`Fleet`]: its own root, `reviewloop.toml` and paper PDF.
+pub struct FleetProject {
+    pub config: Config,
+    pub root: PathBuf,
+    pub config_path: PathBuf,
+    pub pdf_path: PathBuf,
+}
+
+/// Several projects sharing one state dir and database, as on one machine.
+/// `machine` carries the shared settings with no project.
+pub struct Fleet {
+    pub tmp: TempDir,
+    pub state_dir: PathBuf,
+    pub db: Db,
+    pub machine: Config,
+    pub projects: Vec<FleetProject>,
+}
+
+impl Fleet {
+    /// Projects `ids`, each with paper [`PAPER`] (distinct bytes per project),
+    /// triggers and the widget off, the same settings as [`Ctx::new`].
+    pub fn new(ids: &[&str]) -> Result<Self> {
+        let tmp = tempfile::tempdir()?;
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir)?;
+        let db_path = state_dir.join("reviewloop.db");
+        let machine = fleet_config("", &state_dir, &db_path);
+        let mut projects = Vec::new();
+        for id in ids {
+            let root = tmp.path().join("repos").join(id);
+            fs::create_dir_all(&root)?;
+            let pdf_path = root.join("paper.pdf");
+            fs::write(
+                &pdf_path,
+                format!("%PDF-1.4\n% {id}\n1 0 obj\n<<>>\nendobj\n%%EOF\n"),
+            )?;
+            let config_path = root.join("reviewloop.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    "project_id = \"{id}\"\n\n[[papers]]\nid = \"{PAPER}\"\npdf_path = \"paper.pdf\"\nbackend = \"stanford\"\n"
+                ),
+            )?;
+            let mut config = fleet_config(id, &state_dir, &db_path);
+            config.project_root = Some(root.clone());
+            config.papers = vec![PaperConfig {
+                id: PAPER.to_string(),
+                pdf_path: pdf_path.to_string_lossy().to_string(),
+                backend: "stanford".to_string(),
+                venue: None,
+            }];
+            projects.push(FleetProject {
+                config,
+                root,
+                config_path,
+                pdf_path,
+            });
+        }
+        let db = Db::new_file(db_path);
+        db.ensure_schema()?;
+        Ok(Self {
+            tmp,
+            state_dir,
+            db,
+            machine,
+            projects,
+        })
+    }
+
+    pub fn project(&self, id: &str) -> &FleetProject {
+        self.projects
+            .iter()
+            .find(|project| project.config.project_id == id)
+            .unwrap_or_else(|| panic!("no fleet project {id}"))
+    }
+
+    pub fn config(&self, id: &str) -> &Config {
+        &self.project(id).config
+    }
+
+    pub fn configs(&self) -> Vec<&Config> {
+        self.projects
+            .iter()
+            .map(|project| &project.config)
+            .collect()
+    }
+
+    /// Set the machine-wide provider budget on every config.
+    pub fn set_budget(&mut self, max_submissions_per_tick: usize, max_concurrency: usize) {
+        for config in std::iter::once(&mut self.machine)
+            .chain(self.projects.iter_mut().map(|project| &mut project.config))
+        {
+            config.core.max_submissions_per_tick = max_submissions_per_tick;
+            config.core.max_concurrency = max_concurrency;
+        }
+    }
+
+    /// A QUEUED job of `id`'s paper with a pinned snapshot.
+    pub fn queue_job(&self, id: &str) -> Result<Job> {
+        let project = self.project(id);
+        self.db.create_job(&NewJob {
+            project_id: id.to_string(),
+            paper_id: PAPER.to_string(),
+            backend: "stanford".to_string(),
+            pdf: JobPdf::Pinned(prepare_input(&self.state_dir, &project.pdf_path)?),
+            status: JobStatus::Queued,
+            email: EMAIL.to_string(),
+            venue: project.config.providers.stanford.venue.clone(),
+            review_options: Default::default(),
+            git_tag: None,
+            git_commit: None,
+            next_poll_at: None,
+        })
+    }
+
+    /// A PROCESSING job of `id` holding `token`, due at `next_poll_at`.
+    pub fn processing_job(
+        &self,
+        id: &str,
+        token: &str,
+        next_poll_at: DateTime<Utc>,
+    ) -> Result<Job> {
+        let job = self.queue_job(id)?;
+        self.db.attach_token_to_job(&job.id, token, next_poll_at)?;
+        load_job(&self.db, &job.id)
+    }
+}
+
+/// [`Ctx::new`]'s settings for `project_id` on a shared state dir and database.
+fn fleet_config(project_id: &str, state_dir: &Path, db_path: &Path) -> Config {
+    let mut config = Config {
+        project_id: project_id.to_string(),
+        ..Config::default()
+    };
+    config.core.state_dir = state_dir.to_string_lossy().to_string();
+    config.core.db_path = db_path.to_string_lossy().to_string();
+    config.core.widget_state_enabled = false;
+    config.polling.schedule_minutes = vec![10, 20, 40, 60];
+    config.polling.jitter_percent = 0;
+    config.trigger.git.enabled = false;
+    config.trigger.pdf.enabled = false;
+    config.imap = None;
+    config.gmail_oauth = None;
+    config.notifications.enabled = false;
+    config.providers.stanford.base_url = "http://127.0.0.1:9".to_string();
+    config.providers.stanford.email = EMAIL.to_string();
+    config.providers.stanford.venue = Some("ICLR".to_string());
+    config.providers.stanford.fallback_mode = "disabled".to_string();
+    config
+}
+
+/// One provider call a [`FleetBackends`] backend made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCall {
+    pub project_id: String,
+    pub kind: &'static str,
+}
+
+/// A [`BackendFactory`](reviewloop::worker::BackendFactory) whose backends all
+/// answer from one shared [`MockBackend`] and log which project called.
+#[derive(Default)]
+pub struct FleetBackends {
+    pub mock: std::sync::Arc<MockBackend>,
+    calls: std::sync::Arc<Mutex<Vec<ProviderCall>>>,
+    /// Projects whose backend cannot be built (a broken provider setting).
+    broken: Mutex<BTreeSet<String>>,
+}
+
+impl FleetBackends {
+    pub fn new(mock: MockBackend) -> Self {
+        Self {
+            mock: std::sync::Arc::new(mock),
+            ..Self::default()
+        }
+    }
+
+    pub fn break_project(&self, project_id: &str) {
+        self.broken
+            .lock()
+            .expect("broken set poisoned")
+            .insert(project_id.to_string());
+    }
+
+    pub fn calls(&self) -> Vec<ProviderCall> {
+        self.calls.lock().expect("call log poisoned").clone()
+    }
+
+    /// The projects that called, in order, for calls of `kind`.
+    pub fn callers(&self, kind: &str) -> Vec<String> {
+        self.calls()
+            .into_iter()
+            .filter(|call| call.kind == kind)
+            .map(|call| call.project_id)
+            .collect()
+    }
+
+    pub fn clear(&self) {
+        self.calls.lock().expect("call log poisoned").clear();
+    }
+}
+
+impl reviewloop::worker::BackendFactory for FleetBackends {
+    fn build(&self, config: &Config, _db: &Db, _backend: &str) -> Result<Box<dyn ReviewBackend>> {
+        if self
+            .broken
+            .lock()
+            .expect("broken set poisoned")
+            .contains(&config.project_id)
+        {
+            anyhow::bail!("mock: no backend for project {}", config.project_id);
+        }
+        Ok(Box::new(LoggedBackend {
+            project_id: config.project_id.clone(),
+            mock: std::sync::Arc::clone(&self.mock),
+            calls: std::sync::Arc::clone(&self.calls),
+        }))
+    }
+}
+
+struct LoggedBackend {
+    project_id: String,
+    mock: std::sync::Arc<MockBackend>,
+    calls: std::sync::Arc<Mutex<Vec<ProviderCall>>>,
+}
+
+impl LoggedBackend {
+    fn log(&self, kind: &'static str) {
+        self.calls
+            .lock()
+            .expect("call log poisoned")
+            .push(ProviderCall {
+                project_id: self.project_id.clone(),
+                kind,
+            });
+    }
+}
+
+#[async_trait]
+impl ReviewBackend for LoggedBackend {
+    fn name(&self) -> &'static str {
+        "mock"
+    }
+
+    async fn submit(&self, req: SubmitRequest) -> SubmitResult {
+        self.log("submit");
+        self.mock.submit(req).await
+    }
+
+    async fn fetch_review(&self, token: &str) -> FetchResult {
+        self.log("fetch");
+        self.mock.fetch_review(token).await
+    }
+}
