@@ -12,6 +12,7 @@ pub mod model;
 pub mod notifier;
 pub mod oauth;
 pub mod panel;
+pub mod registry;
 pub mod submission_input;
 pub mod token;
 pub mod trigger;
