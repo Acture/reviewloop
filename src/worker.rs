@@ -25,6 +25,7 @@ use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
 use std::{
+    collections::{BTreeMap, VecDeque},
     fs,
     future::Future,
     io::Write,
@@ -101,12 +102,17 @@ fn is_terminal_review_generation_failure(body: &str) -> bool {
 
 pub async fn run_daemon(config: &Config, db: &Db, panel: bool) -> Result<()> {
     info!("daemon started");
+    let scheduler = single_project(config, db);
+    let mut turns = RoundRobin::default();
     let mut tick: u64 = 0;
     loop {
         tick += 1;
+        let report = scheduler
+            .tick(config, &[config], Some(tick), &mut turns)
+            .await;
         let mut last_tick_error: Option<String> = None;
 
-        if let Err(err) = run_tick_internal(config, db, Some(tick)).await {
+        if let Err(err) = report.into_result() {
             let msg = format!("{err:#}");
             error!(tick, error = %msg, "tick failed");
             // Persist the failure so `daemon status` can surface it without
@@ -136,6 +142,12 @@ pub async fn run_daemon(config: &Config, db: &Db, panel: bool) -> Result<()> {
             last_tick_error = Some(msg);
         }
 
+        if let Some(path) = config.widget_state_path()
+            && let Err(e) = widget_state::build_and_write(config, db, &path)
+        {
+            tracing::warn!(error = %e, "failed to write widget state file");
+        }
+
         if panel {
             render_tick_panel(config, db, tick, last_tick_error.as_deref())?;
         }
@@ -153,51 +165,13 @@ pub async fn run_daemon(config: &Config, db: &Db, panel: bool) -> Result<()> {
     Ok(())
 }
 
+/// One tick of `config`'s project alone, with the live providers and its
+/// configured budget.
 pub async fn run_tick(config: &Config, db: &Db) -> Result<()> {
-    run_tick_internal(config, db, None).await
-}
-
-async fn run_tick_internal(config: &Config, db: &Db, tick: Option<u64>) -> Result<()> {
-    // NOTE: span is entered with `.entered()`. Span context is carried across
-    // the sync portions of this function but will not propagate through .await
-    // boundaries in called async fns — each of those enters its own span.
-    let _span = tracing::info_span!(
-        "run_tick",
-        tick = tick.unwrap_or(0),
-        project_id = %config.project_id
-    )
-    .entered();
-
-    run_git_tag_trigger(config, db)?;
-    run_pdf_trigger(config, db)?;
-
-    let email_polled_jobs = poll_imap_if_enabled(config, db).await?;
-
-    mark_timeouts(config, db)?;
-    recover_stale_leases(config, db)?;
-    process_submissions(config, db).await?;
-    process_polls(config, db).await?;
-
-    // Immediately poll any jobs that just received a token via email ingestion,
-    // rather than waiting for the next 30-second tick.
-    for job in email_polled_jobs {
-        if let Some(fresh) = db.get_job(&job.id)?
-            && fresh.status == JobStatus::Processing
-            && fresh.token.is_some()
-        {
-            poll_job(config, db, &fresh.id).await?;
-        }
-    }
-
-    prune_retention(config, db, tick)?;
-
-    if let Some(path) = config.widget_state_path() {
-        if let Err(e) = widget_state::build_and_write(config, db, &path) {
-            tracing::warn!(error = %e, "failed to write widget state file");
-        }
-    }
-
-    Ok(())
+    single_project(config, db)
+        .tick(config, &[config], None, &mut RoundRobin::default())
+        .await
+        .into_result()
 }
 
 /// Outcome of a by-id worker entry point.
@@ -237,64 +211,366 @@ pub fn recover_stale_leases(config: &Config, db: &Db) -> Result<()> {
     Ok(())
 }
 
+/// Submit `config`'s ready jobs within its budget.
 pub async fn process_submissions(config: &Config, db: &Db) -> Result<()> {
-    let per_tick_budget = usize::min(
-        config.core.max_concurrency,
-        config.core.max_submissions_per_tick,
-    );
-    for job in db.list_ready_queued(&config.project_id, per_tick_budget, Utc::now())? {
-        // Another process may have claimed or rescheduled it since the listing.
-        let Some(lease) = db.claim_job(
-            &job.id,
+    let mut report = TickReport::new(&[config]);
+    single_project(config, db)
+        .submit_round(&[config], &mut None, &mut report)
+        .await;
+    report.into_result()
+}
+
+/// Poll `config`'s due jobs within its budget.
+pub async fn process_polls(config: &Config, db: &Db) -> Result<()> {
+    let mut report = TickReport::new(&[config]);
+    single_project(config, db)
+        .poll_round(&[config], &mut None, &mut report)
+        .await;
+    report.into_result()
+}
+
+/// A scheduler for `config`'s project alone: live providers, its configured
+/// budget, never stopped early.
+fn single_project<'a>(config: &Config, db: &'a Db) -> Scheduler<'a> {
+    Scheduler {
+        db,
+        backends: &LiveBackends,
+        budget: TickBudget::from_config(config),
+        stop: &never,
+    }
+}
+
+fn never() -> bool {
+    false
+}
+
+/// Builds the backend a job is sent to. [`LiveBackends`] is the real one;
+/// tests inject fakes to watch what the scheduler sends where.
+pub trait BackendFactory {
+    fn build(&self, config: &Config, db: &Db, backend: &str) -> Result<Box<dyn ReviewBackend>>;
+}
+
+/// The configured providers, through [`build_backend`].
+pub struct LiveBackends;
+
+impl BackendFactory for LiveBackends {
+    fn build(&self, config: &Config, db: &Db, backend: &str) -> Result<Box<dyn ReviewBackend>> {
+        build_backend(config, backend, Some(db), Some(&config.project_id))
+    }
+}
+
+/// Provider calls one tick may make: one machine-wide allowance shared by
+/// every project and both providers, so adding projects never adds load.
+/// Calls are sequential, since no provider documents a rate limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TickBudget {
+    pub submits: usize,
+    pub polls: usize,
+}
+
+impl TickBudget {
+    /// `core.max_submissions_per_tick` (never above `core.max_concurrency`)
+    /// submissions and `core.max_concurrency` polls per tick.
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            submits: usize::min(
+                config.core.max_concurrency,
+                config.core.max_submissions_per_tick,
+            ),
+            polls: config.core.max_concurrency,
+        }
+    }
+}
+
+/// Where submissions and polls resume next tick, so projects take turns
+/// across ticks instead of the first project in line taking every slot.
+#[derive(Debug, Clone, Default)]
+pub struct RoundRobin {
+    last_submit: Option<String>,
+    last_poll: Option<String>,
+}
+
+impl RoundRobin {
+    /// `projects` by id, starting after the project served last.
+    fn order<'c>(last: Option<&str>, projects: &[&'c Config]) -> Vec<&'c Config> {
+        let mut ordered = projects.to_vec();
+        ordered.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+        let start = last
+            .and_then(|last| {
+                ordered
+                    .iter()
+                    .position(|config| config.project_id.as_str() > last)
+            })
+            .unwrap_or(0);
+        ordered.rotate_left(start);
+        ordered
+    }
+}
+
+/// What one tick did.
+#[derive(Debug, Clone, Default)]
+pub struct TickReport {
+    /// Every project of the tick, with the errors its steps hit; empty for a
+    /// clean pass. One project's errors never stop another project's work.
+    pub projects: BTreeMap<String, Vec<String>>,
+    /// Failures of machine-wide steps (the mailbox, retention).
+    pub machine_errors: Vec<String>,
+    /// Submissions and polls that reached a provider.
+    pub submits_sent: usize,
+    pub polls_sent: usize,
+    /// Provider work stopped before the budget was spent (the supervisor
+    /// was paused or is shutting down).
+    pub stopped_early: bool,
+}
+
+impl TickReport {
+    fn new(projects: &[&Config]) -> Self {
+        Self {
+            projects: projects
+                .iter()
+                .map(|config| (config.project_id.clone(), Vec::new()))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    fn fail(&mut self, project_id: &str, step: &str, err: anyhow::Error) {
+        let message = format!("{step}: {err:#}");
+        error!(project_id, step, error = %message, "project step failed");
+        self.projects
+            .entry(project_id.to_string())
+            .or_default()
+            .push(message);
+    }
+
+    /// Every error of the tick, machine-wide ones first.
+    pub fn errors(&self) -> Vec<String> {
+        self.machine_errors
+            .iter()
+            .cloned()
+            .chain(self.projects.values().flatten().cloned())
+            .collect()
+    }
+
+    /// `Err` with every error of the tick, if there was any.
+    pub fn into_result(self) -> Result<()> {
+        let errors = self.errors();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(errors.join("; ")))
+        }
+    }
+}
+
+/// A project's local, provider-free work step.
+type ProjectStep = fn(&Config, &Db) -> Result<()>;
+
+/// What a scheduled tick works with.
+pub struct Scheduler<'a> {
+    pub db: &'a Db,
+    pub backends: &'a dyn BackendFactory,
+    pub budget: TickBudget,
+    /// Checked before every provider call; `true` ends provider work for the
+    /// rest of the tick (a pause or a shutdown request).
+    pub stop: &'a dyn Fn() -> bool,
+}
+
+impl Scheduler<'_> {
+    /// One tick over `projects` with `machine`'s machine-wide settings:
+    /// per-project triggers and recovery, the shared mailbox, then
+    /// submissions and polls taking turns across projects within one budget,
+    /// then retention (every `prune_every_ticks`th `number`ed tick; `None`
+    /// prunes now). Every project and step fails on its own.
+    pub async fn tick(
+        &self,
+        machine: &Config,
+        projects: &[&Config],
+        number: Option<u64>,
+        turns: &mut RoundRobin,
+    ) -> TickReport {
+        let mut report = TickReport::new(projects);
+        for config in RoundRobin::order(turns.last_submit.as_deref(), projects) {
+            self.maintain(config, &mut report);
+        }
+        // The mailbox is machine-wide: polled once, its tokens bound in any
+        // project. Bound jobs are due now and wait for the poll round below.
+        if let Err(err) = poll_imap_if_enabled(machine, self.db).await {
+            let message = format!("email token ingestion: {err:#}");
+            error!(error = %message, "machine step failed");
+            report.machine_errors.push(message);
+        }
+        report.submits_sent = self
+            .submit_round(projects, &mut turns.last_submit, &mut report)
+            .await;
+        report.polls_sent = self
+            .poll_round(projects, &mut turns.last_poll, &mut report)
+            .await;
+        if let Err(err) = prune_retention(machine, self.db, number) {
+            let message = format!("retention: {err:#}");
+            error!(error = %message, "machine step failed");
+            report.machine_errors.push(message);
+        }
+        report
+    }
+
+    /// The project's local work: triggers enqueue, timeouts and lease
+    /// recovery settle. No provider is contacted.
+    fn maintain(&self, config: &Config, report: &mut TickReport) {
+        let _span = tracing::info_span!("maintain", project_id = %config.project_id).entered();
+        let steps: [(&str, ProjectStep); 4] = [
+            ("git tag trigger", run_git_tag_trigger),
+            ("pdf trigger", run_pdf_trigger),
+            ("timeouts", mark_timeouts),
+            ("lease recovery", recover_stale_leases),
+        ];
+        for (step, run) in steps {
+            if let Err(err) = run(config, self.db) {
+                report.fail(&config.project_id, step, err);
+            }
+        }
+    }
+
+    /// Submit ready jobs, one claimed job per project per turn, until the
+    /// budget is spent. Returns the submissions that reached a provider.
+    pub async fn submit_round(
+        &self,
+        projects: &[&Config],
+        last_served: &mut Option<String>,
+        report: &mut TickReport,
+    ) -> usize {
+        let now = Utc::now();
+        let mut queues = Vec::new();
+        for config in RoundRobin::order(last_served.as_deref(), projects) {
+            match self
+                .db
+                .list_ready_queued(&config.project_id, self.budget.submits, now)
+            {
+                Ok(jobs) => queues.push((config, VecDeque::from(jobs))),
+                Err(err) => report.fail(&config.project_id, "listing ready jobs", err),
+            }
+        }
+        let mut sent = 0;
+        while sent < self.budget.submits && queues.iter().any(|(_, queue)| !queue.is_empty()) {
+            for (config, queue) in &mut queues {
+                if sent == self.budget.submits {
+                    break;
+                }
+                while let Some(job) = queue.pop_front() {
+                    if (self.stop)() {
+                        report.stopped_early = true;
+                        return sent;
+                    }
+                    match self.submit_ready(config, &job.id).await {
+                        // Taken or changed since the listing: try the next one.
+                        Ok(None) => continue,
+                        Ok(Some(dispatched)) => {
+                            if dispatched {
+                                sent += 1;
+                                *last_served = Some(config.project_id.clone());
+                            }
+                            break;
+                        }
+                        Err(err) => {
+                            report.fail(&config.project_id, "submission", err);
+                            queue.clear();
+                        }
+                    }
+                }
+            }
+        }
+        sent
+    }
+
+    /// Claim and submit one listed job. `None` when another worker got it
+    /// first or it changed; otherwise whether anything reached the provider.
+    async fn submit_ready(&self, config: &Config, job_id: &str) -> Result<Option<bool>> {
+        let Some(lease) = self.db.claim_job(
+            job_id,
             WorkKind::Submit,
             ClaimTiming::WhenDue,
             Utc::now(),
             SUBMIT_LEASE_TTL,
         )?
         else {
-            continue;
+            return Ok(None);
         };
-        let backend = match build_backend(
-            config,
-            &lease.job.backend,
-            Some(db),
-            Some(&config.project_id),
-        ) {
+        let backend = match self.backends.build(config, self.db, &lease.job.backend) {
             Ok(backend) => backend,
-            Err(err) => return Err(abandon_claim(db, &lease, err)),
+            Err(err) => return Err(abandon_claim(self.db, &lease, err)),
         };
-        submit_leased(config, db, lease, backend.as_ref()).await?;
+        submit_leased(config, self.db, lease, backend.as_ref())
+            .await
+            .map(Some)
     }
 
-    Ok(())
-}
+    /// Poll due jobs the same way as [`Scheduler::submit_round`]. Returns the
+    /// polls that reached a provider.
+    pub async fn poll_round(
+        &self,
+        projects: &[&Config],
+        last_served: &mut Option<String>,
+        report: &mut TickReport,
+    ) -> usize {
+        let now = Utc::now();
+        let mut queues = Vec::new();
+        for config in RoundRobin::order(last_served.as_deref(), projects) {
+            match self
+                .db
+                .list_due_processing(&config.project_id, self.budget.polls, now)
+            {
+                Ok(jobs) => queues.push((config, VecDeque::from(jobs))),
+                Err(err) => report.fail(&config.project_id, "listing due polls", err),
+            }
+        }
+        let mut sent = 0;
+        while sent < self.budget.polls && queues.iter().any(|(_, queue)| !queue.is_empty()) {
+            for (config, queue) in &mut queues {
+                if sent == self.budget.polls {
+                    break;
+                }
+                while let Some(job) = queue.pop_front() {
+                    if (self.stop)() {
+                        report.stopped_early = true;
+                        return sent;
+                    }
+                    match self.poll_due(config, &job.id).await {
+                        Ok(false) => continue,
+                        Ok(true) => {
+                            sent += 1;
+                            *last_served = Some(config.project_id.clone());
+                            break;
+                        }
+                        Err(err) => {
+                            report.fail(&config.project_id, "poll", err);
+                            queue.clear();
+                        }
+                    }
+                }
+            }
+        }
+        sent
+    }
 
-pub async fn process_polls(config: &Config, db: &Db) -> Result<()> {
-    let jobs =
-        db.list_due_processing(&config.project_id, config.core.max_concurrency, Utc::now())?;
-    for job in jobs {
-        let Some(lease) = db.claim_job(
-            &job.id,
+    /// Claim and poll one listed job; `false` when it was not claimable.
+    async fn poll_due(&self, config: &Config, job_id: &str) -> Result<bool> {
+        let Some(lease) = self.db.claim_job(
+            job_id,
             WorkKind::Poll,
             ClaimTiming::WhenDue,
             Utc::now(),
             POLL_LEASE_TTL,
         )?
         else {
-            continue;
+            return Ok(false);
         };
-        let backend = match build_backend(
-            config,
-            &lease.job.backend,
-            Some(db),
-            Some(&config.project_id),
-        ) {
+        let backend = match self.backends.build(config, self.db, &lease.job.backend) {
             Ok(backend) => backend,
-            Err(err) => return Err(abandon_claim(db, &lease, err)),
+            Err(err) => return Err(abandon_claim(self.db, &lease, err)),
         };
-        poll_leased(config, db, lease, backend.as_ref()).await?;
+        poll_leased(config, self.db, lease, backend.as_ref()).await?;
+        Ok(true)
     }
-    Ok(())
 }
 
 /// Submit one QUEUED job now, ignoring its cooldown (explicit CLI action).
@@ -475,12 +751,14 @@ fn pinned_input(config: &Config, db: &Db, job: &Job) -> Result<Option<PathBuf>> 
     }
 }
 
+/// Submit a claimed job. Returns whether anything was sent to a provider: a
+/// job whose input is refused, or whose lease is lost first, sends nothing.
 async fn submit_leased(
     config: &Config,
     db: &Db,
     mut lease: Lease,
     backend: &dyn ReviewBackend,
-) -> Result<()> {
+) -> Result<bool> {
     // NOTE: span is entered here; context is carried through sync code but
     // not propagated across .await points (pragmatic trade-off over a full
     // async body rewrite — still provides structured context on function entry).
@@ -495,12 +773,12 @@ async fn submit_leased(
 
     let plan = match SubmitPlan::prepare(config, db, &lease.job) {
         Ok(Some(plan)) => plan,
-        Ok(None) => return Ok(()),
+        Ok(None) => return Ok(false),
         Err(err) => return Err(abandon_claim(db, &lease, err)),
     };
     match preflight(config, db, &lease, &plan.request.pdf_path) {
         Ok(true) => {}
-        Ok(false) => return Ok(()),
+        Ok(false) => return Ok(false),
         Err(err) => return Err(abandon_claim(db, &lease, err)),
     }
 
@@ -511,7 +789,7 @@ async fn submit_leased(
         SUBMIT_LEASE_TTL,
     )? {
         warn!(job_id = %lease.job.id, "submit lease lost before dispatch; nothing sent");
-        return Ok(());
+        return Ok(false);
     }
 
     let progress = plan.request.progress.clone();
@@ -519,7 +797,7 @@ async fn submit_leased(
         channel: SubmitChannel::Primary,
         progress: &progress,
     };
-    match bounded_submit(backend.submit(plan.request)).await {
+    let outcome = match bounded_submit(backend.submit(plan.request)).await {
         Ok(receipt) => accept_receipt(config, db, &lease, &receipt, SubmitChannel::Primary),
         Err(BackendError::OutcomeUnknown(detail)) => {
             mark_uncertain(config, db, &lease, primary, &detail)
@@ -541,7 +819,8 @@ async fn submit_leased(
             }
             None => fail_submit(db, &lease, primary, err),
         },
-    }
+    };
+    outcome.map(|()| true)
 }
 
 /// Which route a dispatch took and the step it reached, for its outcome event.
