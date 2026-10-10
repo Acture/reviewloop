@@ -609,8 +609,9 @@ desk_rejection_enabled = true       # the default
   minimum quality, prompt injection) before the review; default `true`.
   `false` always yields a full, scored review. A project value overrides the
   global one.
-- `credit_budget`: optional, global config only. The credits bought for the
-  organisation; `reviewloop cspaper usage` estimates the remainder from it.
+- `monthly_allowance`: optional, global config only. Reviews per billing month
+  the organisation expects to use (e.g. the volume agreed with CSPaper);
+  `reviewloop cspaper usage` reports what is left of it.
 
 The project file holds only the review choices:
 
@@ -649,43 +650,43 @@ the flat `core.review_timeout_hours`. `reviewloop run` does not wait for a
 token email on an uncertain CSPaper submission; it stops at once with exit
 code 2.
 
-### Local usage
+### Usage
 
-CSPaper bills 1 credit per review; API submissions are assumed to cost the
-same as reviews on its site. After a CSPaper submission, `submit` and `run`
-print what this machine has used so far, and `reviewloop status` repeats it
-for a project with CSPaper papers:
+CSPaper bills organisation API keys by usage, not with credits: it sets the
+platform account up by hand and invoices monthly for the reviews actually run,
+at a rate scoped to the agreed volume ([Platform APIs](https://cspaper.org/articles/platform-apis)).
+Its web Usage page needs a browser login, and no API returns a quota or
+balance, so reviewloop counts reviews per billing month (UTC) itself.
 
-```text
-CSPaper usage from this machine: 3 completed, 1 in progress, 1 ended without a review (est. 5 credit(s) at 1 per review); 1 uncertain submission(s) may also have been charged
-```
-
-The count is local: every CSPaper job in the state database that holds a
-CSPaper job id (including imported ones), across all projects, since the key
-is machine-level, split into completed, in progress (accepted, still being
-reviewed) and ended without a review (provider failure, timeout, cancel).
-All three count toward the credit estimate. Uncertain submissions are listed
-separately: jobs parked `UNCERTAIN`, and jobs whose submission outcome was
-unknown before they were cancelled or resubmitted with `retry --force` (those
-are known from job events, kept for `retention.events_days`, default 30). It
-is an estimate, not CSPaper's balance.
-
-For the whole organisation, `reviewloop cspaper usage` reads CSPaper's own job
-list with the API key (read-only, no credits used) and splits it into jobs
-this machine's reviewloop submitted (matched by job id) and jobs from other
-clients such as the web playground or other tools:
+`reviewloop cspaper usage [--month YYYY-MM] [--json]` reads CSPaper's job list
+for the organisation with the API key (read-only, not usage) and splits the
+month's reviews into those this machine's reviewloop tracks (matched by
+CSPaper job id: submitted, or attached with `import-token`) and those from
+other clients such as the web playground or other tools:
 
 ```text
-CSPaper organisation jobs (all clients): 12 (9 completed, 1 in progress, 2 failed)
-  via reviewloop on this machine: 7
+CSPaper organisation reviews in 2026-10 (UTC), all clients: 12 (9 completed, 1 in progress, 2 failed)
+  via reviewloop on this machine (submitted or imported): 7
   via other clients: 5
-Credits: est. 12 used at 1 per review; budget 50, est. 38 remaining
+  monthly allowance 50, 38 left
+All months: 140 reviews, 96 via reviewloop on this machine
+CSPaper reviews from this machine in 2026-10: 6 completed, 1 in progress
 ```
 
-CSPaper publishes no balance API (its web Usage page counts jobs and needs a
-browser login), so the remainder comes from the credits you bought: set
-`credit_budget` under `[providers.cspaper]` in the global config. Without it
-the report says the remainder is unknown. `--json` prints the same numbers.
+"Left" needs `monthly_allowance` under `[providers.cspaper]` in the global
+config, e.g. the volume agreed with CSPaper; without it the report says none
+is set. Failed reviews are counted too, since whether CSPaper bills them is
+not published. The month comes from each job's `created` time; a report notes
+jobs without one, and a job list that could not be read to the end.
+
+After a CSPaper submission, `submit` and `run` print the last line above (this
+machine's reviews this month, from the local database across projects), and
+`reviewloop status` repeats it for a project with CSPaper papers. It splits
+reviews into completed, in progress and ended without a review, and lists
+uncertain submissions separately: jobs parked `UNCERTAIN`, and jobs whose
+submission outcome was unknown before they were cancelled (also while their
+upload was in flight) or resubmitted with `retry --force`. The latter are known
+from job events, kept for `retention.events_days` (default 30).
 
 ### Errors and outcomes
 

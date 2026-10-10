@@ -344,11 +344,14 @@ enum EmailCommand {
 
 #[derive(Debug, Subcommand)]
 enum CspaperCommand {
-    /// Credit usage: the organisation's CSPaper jobs from every client (read
-    /// from CSPaper's job list, which costs no credits), how many this
-    /// machine's reviewloop submitted, and the estimated remainder against
-    /// `providers.cspaper.credit_budget`.
+    /// Reviews used per billing month (CSPaper invoices API keys monthly by
+    /// usage): the organisation's reviews from every client, read from
+    /// CSPaper's job list; how many this machine's reviewloop tracks; and what
+    /// is left of `providers.cspaper.monthly_allowance`.
     Usage {
+        /// Billing month as YYYY-MM (UTC); defaults to the current month.
+        #[arg(long)]
+        month: Option<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -619,12 +622,13 @@ async fn run() -> Result<()> {
                 EmailCommand::Status => cmd_email_status(&config),
             }
         }
-        Command::Cspaper { command } => {
-            let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
-            match command {
-                CspaperCommand::Usage { json } => cmd_cspaper_usage(&config, &db, json).await,
+        Command::Cspaper { command } => match command {
+            CspaperCommand::Usage { month, json } => {
+                // JSON owns stdout, so logs go to stderr whatever logging.output says.
+                let (config, db) = load_runtime(config_override.as_deref(), json, false)?;
+                cmd_cspaper_usage(&config, &db, month.as_deref(), json).await
             }
-        }
+        },
         Command::SelfUpdate {
             method,
             yes,
@@ -1967,46 +1971,53 @@ async fn cmd_submit(
     print_provider_usage(db, &job.backend)
 }
 
-/// The organisation's CSPaper usage from CSPaper's job list, split into this
-/// machine's reviewloop jobs and other clients, with the estimated remainder.
-async fn cmd_cspaper_usage(config: &Config, db: &Db, as_json: bool) -> Result<()> {
+/// The organisation's CSPaper reviews in a billing month, from CSPaper's job
+/// list, split into this machine's reviewloop jobs and other clients, with
+/// what is left of the monthly allowance.
+async fn cmd_cspaper_usage(
+    config: &Config,
+    db: &Db,
+    month: Option<&str>,
+    as_json: bool,
+) -> Result<()> {
+    let month = match month {
+        Some(raw) => cspaper::BillingMonth::parse(raw)
+            .ok_or_else(|| anyhow!("--month must be YYYY-MM, got {raw:?}"))?,
+        None => cspaper::BillingMonth::containing(Utc::now()),
+    };
     let listed = cspaper::CspaperBackend::from_config(config)?
         .list_jobs()
         .await
         .context("failed to read CSPaper's job list")?;
-    let org = cspaper::summarize(&listed.jobs, &db.provider_tokens(cspaper::BACKEND)?);
-    let local = db.provider_usage(cspaper::BACKEND)?;
-    let budget = config.providers.cspaper.credit_budget;
+    let report = cspaper::summarize(&listed, &db.provider_tokens(cspaper::BACKEND)?, month);
+    let local = db.provider_usage(cspaper::BACKEND, Some(month.range()))?;
+    let allowance = config.providers.cspaper.monthly_allowance;
     if as_json {
-        let used = org.estimated_credits();
         let payload = json!({
-            "organisation": org,
-            "via_other_clients": org.via_other_clients(),
-            "list_truncated": listed.truncated,
+            "report": report,
+            "via_other_clients": report.in_month.via_other_clients(),
+            "monthly_allowance": allowance,
+            "left": cspaper::allowance_left(&report, allowance),
             "local": local,
-            "credits": {
-                "per_review": cspaper::ESTIMATED_CREDITS_PER_REVIEW,
-                "estimated_used": used,
-                "budget": budget,
-                "estimated_remaining": budget.map(|budget| budget as i64 - used as i64),
-            },
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
-    println!(
-        "{}",
-        cspaper::org_usage_report(&org, listed.truncated, budget)
-    );
-    println!("{}", cspaper::usage_note(local));
+    println!("{}", cspaper::org_usage_report(&report, allowance));
+    println!("{}", cspaper::usage_note(local, month));
     Ok(())
 }
 
 /// After a submission to a provider that bills per review, say what this
-/// machine has used so far. Local and estimated; see `cspaper::usage_note`.
+/// machine's reviewloop has had accepted this billing month (local count; see
+/// `cspaper::usage_note`).
 fn print_provider_usage(db: &Db, backend: &str) -> Result<()> {
     if backend == cspaper::BACKEND {
-        println!("{}", cspaper::usage_note(db.provider_usage(backend)?));
+        let month = cspaper::BillingMonth::containing(Utc::now());
+        println!(
+            "{}",
+            cspaper::usage_note(db.provider_usage(backend, Some(month.range()))?, month)
+        );
     }
     Ok(())
 }

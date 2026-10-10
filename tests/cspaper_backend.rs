@@ -2043,9 +2043,18 @@ async fn org_usage_pages_the_job_list_and_matches_reviewloop_jobs() -> Result<()
         .list_jobs()
         .await?;
 
-    assert!(!listed.truncated);
+    assert!(!listed.incomplete);
     assert_eq!(listed.jobs.len(), 53);
-    let usage = cspaper::summarize(&listed.jobs, &ctx.db.provider_tokens(cspaper::BACKEND)?);
+    let report = cspaper::summarize(
+        &listed,
+        &ctx.db.provider_tokens(cspaper::BACKEND)?,
+        cspaper::BillingMonth::parse("2026-10").context("month")?,
+    );
+    assert_eq!(
+        report.all_time, report.in_month,
+        "every listed job is from 2026-10"
+    );
+    let usage = report.in_month;
     assert_eq!(usage.total, 53);
     assert_eq!(usage.completed, 14);
     assert_eq!(usage.in_progress, 26);
@@ -2074,6 +2083,7 @@ async fn org_usage_pages_the_job_list_and_matches_reviewloop_jobs() -> Result<()
     Ok(())
 }
 
+/// Stopping is all it can do, but the result must not claim to be complete.
 #[tokio::test]
 async fn org_usage_stops_when_the_server_ignores_offset() -> Result<()> {
     let ctx = TestContext::start().await?;
@@ -2086,7 +2096,7 @@ async fn org_usage_stops_when_the_server_ignores_offset() -> Result<()> {
         .await?;
 
     assert_eq!(listed.jobs.len(), 50, "a repeated page adds nothing");
-    assert!(!listed.truncated);
+    assert!(listed.incomplete);
     assert_eq!(ctx.mock().received(LIST).len(), 2);
     Ok(())
 }

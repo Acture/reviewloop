@@ -103,17 +103,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   template before anything is enqueued. Git tag and PDF change triggers skip
   such a paper with a `provider_not_configured` event (once per paper and
   setting per process) and leave the tag unprocessed until it is configured.
-- **`reviewloop cspaper usage`** — reads CSPaper's organisation job list
-  with the API key (read-only, paged, no credits used) and reports the
-  organisation's jobs by status, how many this machine's reviewloop submitted
-  (matched by job id) versus other clients, and the estimated credits used.
-  CSPaper has no balance API, so the remainder is estimated against
-  `providers.cspaper.credit_budget` (global config). `--json` for scripts.
+- **`reviewloop cspaper usage`** — CSPaper invoices organisation API keys
+  monthly by usage (no credits, no balance API), so the command counts
+  reviews per billing month (UTC, `--month YYYY-MM`) from CSPaper's
+  organisation job list (read with the API key, paged): by status, via this
+  machine's reviewloop (matched by job id) versus other clients, and what is
+  left of `providers.cspaper.monthly_allowance` (global config). `--json`
+  for scripts.
 - **Local CSPaper usage** — after a CSPaper submission, `submit` and `run`
-  print this machine's CSPaper reviews as completed, in progress and ended
-  without a review (est. 1 credit each) plus uncertain submissions; `status`
-  repeats it for CSPaper projects. The count comes from the local database,
-  across projects (`Db::provider_usage`).
+  print this machine's CSPaper reviews this month as completed, in progress
+  and ended without a review, plus uncertain submissions (also ones cancelled
+  mid-upload or resubmitted with `retry --force`); `status` repeats it.
 - **`daemon install` key check** — warns when a CSPaper project's key is not
   in the global config: launchd does not pass the shell's
   `REVIEWLOOP_CSPAPER_API_KEY` to the daemon.

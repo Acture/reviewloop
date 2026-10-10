@@ -512,7 +512,7 @@ impl Config {
                         .cspaper
                         .desk_rejection_enabled
                         .unwrap_or(global.providers.cspaper.desk_rejection_enabled),
-                    credit_budget: global.providers.cspaper.credit_budget,
+                    monthly_allowance: global.providers.cspaper.monthly_allowance,
                 },
             },
             papers,
@@ -1526,8 +1526,9 @@ pub struct CspaperProviderConfig {
     /// global. A paper's `venue` overrides it; see [`Config::venue_for`].
     pub agent_id: Option<String>,
     pub desk_rejection_enabled: bool,
-    /// Credits bought for the organisation (global config only).
-    pub credit_budget: Option<u64>,
+    /// Reviews per billing month the organisation expects to use (global
+    /// config only).
+    pub monthly_allowance: Option<u64>,
 }
 
 impl Default for CspaperProviderConfig {
@@ -1538,7 +1539,7 @@ impl Default for CspaperProviderConfig {
             api_key: None,
             agent_id: None,
             desk_rejection_enabled: global.desk_rejection_enabled,
-            credit_budget: None,
+            monthly_allowance: None,
         }
     }
 }
@@ -1591,10 +1592,12 @@ pub struct GlobalCspaperProviderConfig {
     /// prompt injection) before the review. The provider default is `true`;
     /// `false` always yields a full, scored review.
     pub desk_rejection_enabled: bool,
-    /// Credits bought for the organisation. CSPaper publishes no balance
-    /// API, so `reviewloop cspaper usage` estimates the remainder from this.
+    /// Reviews per billing month the organisation expects to use, e.g. the
+    /// volume agreed with CSPaper. CSPaper invoices API keys monthly by usage
+    /// and publishes no quota or balance, so `reviewloop cspaper usage`
+    /// reports what is left of this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credit_budget: Option<u64>,
+    pub monthly_allowance: Option<u64>,
 }
 
 impl Default for GlobalCspaperProviderConfig {
@@ -1604,7 +1607,7 @@ impl Default for GlobalCspaperProviderConfig {
             api_key: None,
             agent_id: None,
             desk_rejection_enabled: true,
-            credit_budget: None,
+            monthly_allowance: None,
         }
     }
 }
@@ -2757,27 +2760,27 @@ db_path = "db.sqlite"
     }
 
     #[test]
-    fn credit_budget_is_global_only() {
+    fn monthly_allowance_is_global_only() {
         let tmp = TempDir::new().expect("tempdir");
         let path = write_config(
             &tmp,
             "config.toml",
-            "[providers.cspaper]\ncredit_budget = 50\n",
+            "[providers.cspaper]\nmonthly_allowance = 50\n",
         );
         let global = GlobalConfigFile::load(&path).expect("global budget");
-        assert_eq!(global.providers.cspaper.credit_budget, Some(50));
+        assert_eq!(global.providers.cspaper.monthly_allowance, Some(50));
         let cfg = Config::merge_for_tests(global, project_with(vec![]));
-        assert_eq!(cfg.providers.cspaper.credit_budget, Some(50));
-        assert_eq!(Config::default().providers.cspaper.credit_budget, None);
+        assert_eq!(cfg.providers.cspaper.monthly_allowance, Some(50));
+        assert_eq!(Config::default().providers.cspaper.monthly_allowance, None);
 
         let path = write_config(
             &tmp,
             "reviewloop.toml",
-            "project_id = \"p\"\n[providers.cspaper]\ncredit_budget = 50\n",
+            "project_id = \"p\"\n[providers.cspaper]\nmonthly_allowance = 50\n",
         );
         assert!(
             ProjectConfigFile::load(&path).is_err(),
-            "the budget belongs to the organisation"
+            "the allowance belongs to the organisation"
         );
     }
 
