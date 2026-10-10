@@ -1323,10 +1323,22 @@ fn discover_project_config_path(explicit_path: Option<&Path>) -> Result<Option<P
     Ok(None)
 }
 
-/// The canonical form of a config path: absolute, symlinks resolved.
+/// The canonical form of a config path: absolute, with its directory's
+/// symlinks resolved but the file name kept, so a `reviewloop.toml` that is
+/// itself a symlink keeps the repository it sits in as its project root.
 pub fn canonical_config_path(path: &Path) -> Result<PathBuf> {
-    fs::canonicalize(path)
-        .with_context(|| format!("failed to resolve project config path {}", path.display()))
+    fs::metadata(path)
+        .with_context(|| format!("failed to resolve project config path {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("project config path {} names no file", path.display()))?;
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let dir = fs::canonicalize(dir)
+        .with_context(|| format!("failed to resolve project config path {}", path.display()))?;
+    Ok(dir.join(file_name))
 }
 
 pub fn default_project_config_path() -> Result<PathBuf> {
@@ -2628,6 +2640,27 @@ db_path = "db.sqlite"
         cfg.providers.stanford.fallback_script = script.to_string_lossy().to_string();
 
         assert!(cfg.validate_for_foreign_load().is_ok());
+    }
+
+    /// A `reviewloop.toml` symlinked into a repository (from a dotfiles repo,
+    /// say) belongs to the repository it sits in, not to its target.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_project_file_keeps_its_own_directory_as_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("dotfiles");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&shared).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(shared.join("reviewloop.toml"), "project_id = \"p\"\n").unwrap();
+        std::os::unix::fs::symlink(shared.join("reviewloop.toml"), repo.join("reviewloop.toml"))
+            .unwrap();
+
+        let path = super::canonical_config_path(&repo.join("reviewloop.toml")).unwrap();
+        assert_eq!(path, repo.canonicalize().unwrap().join("reviewloop.toml"));
+        let machine = super::MachineConfig::from_global(GlobalConfigFile::default()).unwrap();
+        let config = machine.project(&path).unwrap();
+        assert_eq!(config.project_root, Some(repo.canonicalize().unwrap()));
     }
 
     /// Project roots are canonical; a directory reached through a symlink

@@ -304,3 +304,35 @@ async fn advance_job_moves_only_its_job_by_its_schedule() -> Result<()> {
     );
     Ok(())
 }
+
+/// A poll whose local work fails after the provider answered (here: the
+/// artifact directory cannot be created) still spends budget, so it cannot
+/// push the machine past `max_concurrency` calls per tick.
+#[tokio::test]
+async fn a_call_that_fails_after_reaching_the_provider_spends_budget() -> Result<()> {
+    let mut fleet = Fleet::new(&["a", "b"])?;
+    fleet.set_budget(2, 2);
+    let backends = FleetBackends::new(accepting_backend());
+    let past = Utc::now() - Duration::minutes(1);
+    let broken = fleet.processing_job("a", "tok-a", past)?;
+    for n in 0..4 {
+        fleet.processing_job("b", &format!("tok-b{n}"), past)?;
+    }
+    let artifacts = fleet.state_dir.join("artifacts");
+    std::fs::create_dir_all(&artifacts)?;
+    std::fs::write(artifacts.join(&broken.id), "not a directory")?;
+
+    let mut turns = RoundRobin::default();
+    for number in 1..=2 {
+        backends.clear();
+        let report = tick(&fleet, &backends, &mut turns, number).await;
+        assert_eq!(report.polls_sent, 2, "tick {number}");
+        assert_eq!(
+            backends.callers("fetch").len(),
+            2,
+            "tick {number}: {:?}",
+            backends.calls()
+        );
+    }
+    Ok(())
+}

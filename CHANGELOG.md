@@ -139,7 +139,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- **Registry (OSS-338)** — config paths are stored canonical. A second live
+- **Registry (OSS-338)** — config paths are stored canonical (the directory
+  resolved, so a symlinked `reviewloop.toml` keeps its own repository as the
+  project root). A second live
   config declaring a registered `project_id` (another clone or worktree) no
   longer takes the registration over: commands there print one note, and
   `project enable --replace` moves it explicitly. A disabled registration
@@ -150,10 +152,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `[retention]`, `[logging]`, `[imap]`, `[gmail_oauth]`), pointing at the
   global config, instead of failing as an unknown field.
 - **Mail tokens bind machine-wide** — the mailbox is read once per tick and a
-  token is bound to the job holding it, else the newest tokenless open job
-  of its backend, in any project. Jobs awaiting approval are no longer
-  candidates. Bound jobs are polled in the tick's budgeted poll round instead
-  of immediately.
+  token is bound to the job holding it, else the newest SUBMITTED job without
+  a receipt of its backend, in any project. Jobs that were never sent (queued
+  or awaiting approval) are no longer candidates; an approval-pending one used
+  to abort every tick while its mail stayed unread. Bound jobs are polled in
+  the tick's budgeted poll round instead of immediately.
 - **`reviewloop run` follows its job** — it no longer runs a full project
   tick every 5 seconds (triggers, every due job of the project, mailbox,
   retention, widget). While a supervisor runs the project it only watches;
@@ -161,7 +164,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   due, every 30 seconds.
 - **`daemon install`** installs the machine-wide service: it refuses
   `--config`, keeps the project an older single-project install was bound to
-  enabled (and enables nothing else), and pins `XDG_CONFIG_HOME` /
+  enabled at that config (and enables nothing else; the binding also wins
+  over a registration that last saw another clone, unless someone already
+  enabled or disabled the project), and pins `XDG_CONFIG_HOME` /
   `REVIEWLOOP_STATE_DIR` when the shell sets them, so the service uses the
   same global config and database as the shell. `daemon status` warns when
   they differ.
@@ -330,7 +335,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   machine, so N projects see N times fewer submissions per tick than N
   separate daemons sent.
 - `daemon pause` no longer unloads the launchd service. A service paused by
-  an earlier version is reloaded by `daemon resume`.
+  an earlier version is reloaded by `daemon resume` (when no supervisor is
+  running elsewhere).
+- An older `reviewloop` on the same database can no longer move or delete an
+  enabled project's registration: triggers turn those writes into no-ops.
 - `daemon status --json` changed shape: `supervisor`, `tick_health`,
   `service`, `budget`, `current_project`, `projects[]` (with `active_jobs`),
   `unregistered_active_jobs`, `gmail_oauth_status`, `proxy_health`.

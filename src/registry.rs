@@ -58,10 +58,12 @@ impl ConfigFileState {
     }
 }
 
-/// Whether two config paths name the same file. Paths that no longer resolve
-/// compare as written.
+/// Whether two config paths name the same config, in canonical form (see
+/// [`canonical_config_path`]): two repositories symlinking one file are two
+/// configs, since each has its own project root. Paths that no longer
+/// resolve compare as written.
 pub fn same_config_file(a: &Path, b: &Path) -> bool {
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
+    match (canonical_config_path(a), canonical_config_path(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }
@@ -111,7 +113,7 @@ pub fn register_seen(
         return Ok(Registration::Inserted);
     };
     if same_config_file(&row.config_path, config_path) {
-        db.touch_project_registration(project_id, config_path, now)?;
+        db.touch_project_registration(project_id, &row.config_path, config_path, now)?;
         return Ok(Registration::Refreshed);
     }
     let state = ConfigFileState::probe(&row.config_path);
@@ -402,20 +404,6 @@ mod tests {
         );
         // Decided now, so the legacy install migration leaves it alone.
         assert!(fx.row("p").enabled_changed_at.is_some());
-        assert!(!fx.db.enable_undecided_project("p", Utc::now()).unwrap());
-        assert!(!fx.row("p").enabled);
-    }
-
-    #[test]
-    fn the_legacy_migration_enables_only_undecided_projects() {
-        let fx = Fixture::new();
-        let path = fx.config("a", "p");
-        register_seen(&fx.db, "p", &path, Utc::now()).unwrap();
-        assert!(fx.db.enable_undecided_project("p", Utc::now()).unwrap());
-        assert!(fx.row("p").enabled);
-        disable(&fx.db, "p", Utc::now()).unwrap();
-        // A later start with the old plist must not undo the disable.
-        assert!(!fx.db.enable_undecided_project("p", Utc::now()).unwrap());
         assert!(!fx.row("p").enabled);
     }
 

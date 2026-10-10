@@ -400,11 +400,12 @@ async fn a_database_supervised_from_another_state_dir_is_refused() -> Result<()>
     let fleet = Fleet::new(&["p"])?;
     let backends = FleetBackends::new(accepting_backend());
     let load = || Ok(fleet.machine_config());
-    fleet.db.record_supervisor_start(
+    fleet.db.claim_supervisor(
         1,
         &fleet.tmp.path().join("other-state"),
         "0.0.0",
         Utc::now(),
+        |_| false,
     )?;
 
     let err = supervisor(&fleet, &backends, &load)
@@ -494,7 +495,10 @@ fn migrating_a_single_project_install_enables_only_its_project() -> Result<()> {
         &fleet.project("bound").config_path,
         Utc::now(),
     )?;
-    assert_eq!((id.as_str(), adoption), ("bound", LegacyAdoption::Enabled));
+    assert_eq!(
+        (id.as_str(), adoption),
+        ("bound", LegacyAdoption::Enabled { moved_from: None })
+    );
     let enabled: Vec<String> = fleet
         .db
         .list_registered_projects()?
@@ -525,10 +529,11 @@ fn migrating_a_single_project_install_enables_only_its_project() -> Result<()> {
     Ok(())
 }
 
-/// The binding names one file, but the project is registered at another
-/// live file (a second clone): nothing is enabled implicitly.
+/// Before OSS-338 the registry kept whichever clone loaded last, so the row
+/// can point at another worktree than the one the daemon was bound to. The
+/// undecided registration follows the explicit binding; a decided one stays.
 #[test]
-fn a_binding_to_a_duplicate_clone_enables_nothing() -> Result<()> {
+fn the_binding_wins_over_an_undecided_registration_of_another_clone() -> Result<()> {
     let fleet = Fleet::new(&["p"])?;
     let machine = fleet.machine_config();
     let clone = fleet.tmp.path().join("clone");
@@ -538,19 +543,92 @@ fn a_binding_to_a_duplicate_clone_enables_nothing() -> Result<()> {
         fleet_project_toml("p", false),
     )?;
     fs::copy(&fleet.project("p").pdf_path, clone.join("paper.pdf"))?;
-    registry::register_seen(&fleet.db, "p", &fleet.config_path("p"), Utc::now())?;
+    let clone_config = fs::canonicalize(clone.join("reviewloop.toml"))?;
+    registry::register_seen(&fleet.db, "p", &clone_config, Utc::now())?;
 
     let (_, adoption) = adopt_legacy_binding(
         &fleet.db,
         &machine,
-        &clone.join("reviewloop.toml"),
+        &fleet.project("p").config_path,
         Utc::now(),
     )?;
-    assert!(
-        matches!(adoption, LegacyAdoption::Conflict(_)),
-        "{adoption:?}"
+    assert_eq!(
+        adoption,
+        LegacyAdoption::Enabled {
+            moved_from: Some(clone_config.clone())
+        }
     );
-    assert!(!fleet.db.get_registered_project("p")?.expect("row").enabled);
+    let row = fleet.db.get_registered_project("p")?.expect("row");
+    assert!(row.enabled);
+    assert_eq!(row.config_path, fleet.config_path("p"));
+
+    // Once decided, a binding to the other clone changes nothing.
+    let (_, again) = adopt_legacy_binding(&fleet.db, &machine, &clone_config, Utc::now())?;
+    assert_eq!(again, LegacyAdoption::AlreadyDecided { enabled: true });
+    assert_eq!(
+        fleet
+            .db
+            .get_registered_project("p")?
+            .expect("row")
+            .config_path,
+        fleet.config_path("p")
+    );
+    Ok(())
+}
+
+/// A tick that cannot load the global config is reported once (event and
+/// tick error) and kept in the widget; a clean stop marks the widget stopped.
+#[tokio::test]
+async fn a_machine_failure_is_reported_and_a_stop_reaches_the_widget() -> Result<()> {
+    let mut fleet = Fleet::new(&["p"])?;
+    let widget_dir = fleet.tmp.path().join("widget");
+    fleet.machine.core.widget_state_enabled = true;
+    fleet.machine.core.widget_state_dir = Some(widget_dir.to_string_lossy().to_string());
+    let backends = FleetBackends::new(accepting_backend());
+    let loads = AtomicUsize::new(0);
+    let load = || {
+        if loads.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(fleet.machine_config())
+        } else {
+            anyhow::bail!("global config: invalid TOML at line 3")
+        }
+    };
+    let mut sup = supervisor(&fleet, &backends, &load);
+    sup.interval = StdDuration::from_millis(20);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let widget = || -> Option<serde_json::Value> {
+        serde_json::from_str(&fs::read_to_string(widget_dir.join("widget-state.json")).ok()?).ok()
+    };
+
+    let (result, ()) = tokio::join!(
+        sup.run(async move {
+            let _ = stopped.await;
+        }),
+        async {
+            wait_until(|| {
+                widget().is_some_and(|doc| {
+                    doc["last_tick_error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("invalid TOML"))
+                })
+            })
+            .await;
+            // Several failing ticks pass before the stop.
+            wait_until(|| loads.load(Ordering::SeqCst) >= 4).await;
+            let _ = stop.send(());
+        }
+    );
+    result?;
+    let failures = fleet.db.list_recent_events_of_type("", "tick_failed", 10)?;
+    assert_eq!(failures.len(), 1, "one event per new error, not per tick");
+    assert!(
+        fleet
+            .db
+            .supervisor_record()?
+            .current_tick_error()
+            .is_some_and(|error| error.contains("invalid TOML"))
+    );
+    assert_eq!(widget().expect("widget")["supervisor"]["state"], "stopped");
     Ok(())
 }
 

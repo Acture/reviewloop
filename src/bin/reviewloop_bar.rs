@@ -488,12 +488,14 @@ fn pause_resume_items(
         SupervisorState::Paused => " (paused)",
         SupervisorState::Stopped => " (not running)",
     };
+    // Reloading the service only helps when nothing supervises; beside a
+    // running supervisor the reloaded one would be refused in a loop.
     let service_unloaded = matches!(service, Some(DaemonState { loaded: false, .. }));
     (
         format!("Pause daemon{note}"),
         format!("Resume daemon{note}"),
         !view.paused,
-        view.paused || service_unloaded,
+        view.paused || (service_unloaded && view.state == SupervisorState::Stopped),
     )
 }
 
@@ -1117,6 +1119,10 @@ mod tests {
         let (_, _, can_pause, can_resume) =
             pause_resume_items(view(SupervisorState::Stopped, false), unloaded);
         assert!(can_pause && can_resume);
+        // ...but not beside a supervisor running outside launchd.
+        let (_, _, _, can_resume) =
+            pause_resume_items(view(SupervisorState::Running, false), unloaded);
+        assert!(!can_resume);
 
         let (_, _, can_pause, can_resume) = pause_resume_items(None, loaded);
         assert!(!can_pause && !can_resume);

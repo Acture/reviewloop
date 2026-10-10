@@ -1294,15 +1294,24 @@ fn report_legacy_adoption(db: &Db, machine: &reviewloop::config::MachineConfig, 
     use reviewloop::supervisor::{LegacyAdoption, adopt_legacy_binding};
 
     match adopt_legacy_binding(db, machine, bound, Utc::now()) {
-        Ok((project_id, LegacyAdoption::Enabled)) => eprintln!(
-            "note: the daemon was installed for project {project_id} alone; the supervisor now runs every enabled project, and {project_id} is enabled. Other registered projects stay disabled until `reviewloop project enable`."
-        ),
+        Ok((project_id, LegacyAdoption::Enabled { moved_from })) => {
+            eprintln!(
+                "note: the daemon was installed for project {project_id} alone; the supervisor now runs every enabled project, and {project_id} is enabled at {}. Other registered projects stay disabled until `reviewloop project enable`.",
+                bound.display()
+            );
+            if let Some(from) = moved_from {
+                eprintln!(
+                    "note: project {project_id} was registered at {}; the daemon's binding moved it",
+                    from.display()
+                );
+            }
+        }
         Ok((project_id, LegacyAdoption::AlreadyDecided { enabled })) => info!(
             project_id,
             enabled, "the daemon's --config names a project whose enablement is already decided"
         ),
-        Ok((project_id, LegacyAdoption::Conflict(conflict))) => {
-            eprintln!("warning: not enabling project {project_id} for the supervisor: {conflict}")
+        Ok((project_id, LegacyAdoption::Conflict(why))) => {
+            eprintln!("warning: not enabling project {project_id} for the supervisor: {why}")
         }
         Err(err) => eprintln!(
             "warning: the daemon was bound to {}, which no longer loads ({err:#}); the supervisor runs without it",
@@ -1426,13 +1435,17 @@ fn cmd_daemon_resume(db: &Db) -> Result<()> {
     } else {
         println!("Supervisor was not paused.");
     }
+    let stopped =
+        SupervisorState::of(&db.supervisor_record()?, Utc::now()) == SupervisorState::Stopped;
+    // Only when nothing supervises: a second supervisor (say beside a
+    // foreground `daemon run`) would be refused and relaunched in a loop.
     #[cfg(target_os = "macos")]
-    if launchd::plist_path()?.exists() && !launchd::is_loaded()? {
+    if stopped && launchd::plist_path()?.exists() && !launchd::is_loaded()? {
         launchd::bootstrap(&launchd::plist_path()?)?;
         println!("Reloaded the launchd service {}.", launchd::LABEL);
         return Ok(());
     }
-    if SupervisorState::of(&db.supervisor_record()?, Utc::now()) == SupervisorState::Stopped {
+    if stopped {
         println!(
             "note: no supervisor is running; start one with `reviewloop daemon install` (macOS) or `reviewloop daemon run`."
         );
@@ -3254,9 +3267,9 @@ fn load_effective_config_for_job(db: &Db, job: &reviewloop::model::Job) -> Resul
     match load_runtime_for_path(&config_path) {
         Ok(config) => Ok(config),
         Err(err) if error_chain_contains_not_found(&err) => {
-            // Self-heal: forget the stale row so the next CLI call from the
-            // moved repo can re-register cleanly.
-            let _ = db.forget_project_registration(&job.project_id);
+            // The next CLI call from the moved repo re-registers it there (a
+            // disabled registration follows a stale path; an enabled one
+            // keeps its explicit decision until `project enable` moves it).
             anyhow::bail!(
                 "project '{}' cannot be located — its config file used to be at {} but that path no longer exists.\n\n\
                  To fix:\n\
@@ -4213,10 +4226,15 @@ mod tests {
             msg.contains("no longer exists") || msg.contains("not found"),
             "got: {msg}"
         );
-        assert!(
-            db.resolve_project_config_path(project_id)
-                .unwrap()
-                .is_none()
+
+        // Loading the config from its new location moves the registration.
+        let moved = config_path.with_file_name("moved.toml");
+        write_project_config(&moved, project_id);
+        let moved = fs::canonicalize(&moved).unwrap();
+        reviewloop::registry::register_seen(&db, project_id, &moved, chrono::Utc::now()).unwrap();
+        assert_eq!(
+            db.resolve_project_config_path(project_id).unwrap(),
+            Some(moved)
         );
     }
 
@@ -4414,7 +4432,7 @@ mod tests {
                 .unwrap();
             db.insert_project_registration("idle", Path::new("/repos/idle/reviewloop.toml"), now)
                 .unwrap();
-            db.record_supervisor_start(77, Path::new("/state"), "test", now)
+            db.claim_supervisor(77, Path::new("/state"), "test", now, |_| false)
                 .unwrap();
             db.create_job(&make_job("main", JobStatus::Processing, 1))
                 .unwrap();

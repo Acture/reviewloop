@@ -419,7 +419,7 @@ mod tests {
             .unwrap();
         db.insert_project_registration("beta", Path::new("/repos/beta/reviewloop.toml"), now)
             .unwrap();
-        db.record_supervisor_start(7, Path::new("/state"), "0.0.0", now)
+        db.claim_supervisor(7, Path::new("/state"), "0.0.0", now, |_| false)
             .unwrap();
         db.record_supervisor_tick(7, now, Some("email token ingestion: offline"))
             .unwrap();

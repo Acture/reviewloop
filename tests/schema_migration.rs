@@ -1207,9 +1207,6 @@ fn v5_database_keeps_registered_projects_disabled_and_undecided() -> Result<()> 
         "migration must not write events"
     );
 
-    // The bound project of an old single-project install can still be enabled once.
-    assert!(db.enable_undecided_project(PROJECT, Utc::now())?);
-    assert!(!db.enable_undecided_project(PROJECT, Utc::now())?);
     for job in LEGACY_ROWS {
         assert_legacy_row_intact(&load_job(&db, job.id)?, job)?;
     }
@@ -1243,5 +1240,73 @@ fn old_registry_upserts_still_work_on_a_v6_database() -> Result<()> {
         .context("old-style upsert registered nothing")?;
     assert!(!project.enabled);
     assert_eq!(project.enabled_changed_at, None);
+    Ok(())
+}
+
+/// A pre-OSS-338 binary on a v6 database: its registry upsert and stale-row
+/// delete become no-ops on an enabled project, so an explicit enable is
+/// never moved or dropped behind the supervisor's back. Disabled rows behave
+/// as that binary expects.
+#[test]
+fn old_binaries_cannot_move_or_drop_an_enabled_project() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().join("reviewloop.db");
+    let db = Db::new_file(path.clone());
+    db.ensure_schema()?;
+    let now = Utc::now();
+    let home = Path::new("/repos/enabled/reviewloop.toml");
+    db.enable_project(PROJECT, home, None, now)?;
+    db.insert_project_registration(
+        OTHER_PROJECT,
+        Path::new("/repos/other/reviewloop.toml"),
+        now,
+    )?;
+
+    let old_upsert = |project_id: &str, config_path: &str| -> Result<()> {
+        Connection::open(&path)?.execute(
+            r#"
+            INSERT INTO projects (project_id, config_path, last_seen_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(project_id) DO UPDATE SET
+                config_path  = excluded.config_path,
+                last_seen_at = excluded.last_seen_at
+            "#,
+            params![project_id, config_path, now.to_rfc3339()],
+        )?;
+        Ok(())
+    };
+    let old_delete = |project_id: &str| -> Result<()> {
+        Connection::open(&path)?.execute(
+            "DELETE FROM projects WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        Ok(())
+    };
+
+    old_upsert(PROJECT, "/repos/worktree/reviewloop.toml")?;
+    old_delete(PROJECT)?;
+    let enabled = db.get_registered_project(PROJECT)?.context("kept")?;
+    assert!(enabled.enabled);
+    assert_eq!(enabled.config_path, home);
+
+    old_upsert(OTHER_PROJECT, "/repos/moved/reviewloop.toml")?;
+    assert_eq!(
+        db.resolve_project_config_path(OTHER_PROJECT)?,
+        Some(PathBuf::from("/repos/moved/reviewloop.toml"))
+    );
+    old_delete(OTHER_PROJECT)?;
+    assert!(db.get_registered_project(OTHER_PROJECT)?.is_none());
+
+    // The supervisor's own decisions still move and release it.
+    db.enable_project(
+        PROJECT,
+        Path::new("/repos/new/reviewloop.toml"),
+        Some(home),
+        now,
+    )?;
+    assert_eq!(
+        db.resolve_project_config_path(PROJECT)?,
+        Some(PathBuf::from("/repos/new/reviewloop.toml"))
+    );
     Ok(())
 }

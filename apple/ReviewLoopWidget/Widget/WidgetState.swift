@@ -56,15 +56,19 @@ extension WidgetState {
 
 extension WidgetState {
     struct ActiveJob: Codable, Identifiable {
+        /// Absent in documents written before the supervisor (OSS-338).
+        let projectId: String?
         let paperId: String
         let status: String
         let attempt: Int
         let nextPollAt: Date?
         let startedAt: Date?
 
-        var id: String { paperId }
+        /// Paper ids repeat across projects in one document.
+        var id: String { "\(projectId ?? "")/\(paperId)" }
 
         enum CodingKeys: String, CodingKey {
+            case projectId = "project_id"
             case paperId = "paper_id"
             case status
             case attempt
@@ -78,14 +82,18 @@ extension WidgetState {
 
 extension WidgetState {
     struct Failure: Codable, Identifiable {
+        /// Absent in documents written before the supervisor (OSS-338).
+        let projectId: String?
         let paperId: String
         let status: String
         let lastError: String
         let occurredAt: Date
 
-        var id: String { paperId }
+        /// Paper ids repeat across projects in one document.
+        var id: String { "\(projectId ?? "")/\(paperId)" }
 
         enum CodingKeys: String, CodingKey {
+            case projectId = "project_id"
             case paperId = "paper_id"
             case status
             case lastError = "last_error"

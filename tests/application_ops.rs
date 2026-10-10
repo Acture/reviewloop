@@ -410,7 +410,7 @@ fn worker_status_follows_the_supervisor_and_the_project() -> Result<()> {
 
     let now = Utc::now();
     fx.db
-        .record_supervisor_start(99, fx.tmp.path(), "test", now)?;
+        .claim_supervisor(99, fx.tmp.path(), "test", now, |_| false)?;
     assert_eq!(fx.availability()?, WorkerAvailability::Ready);
 
     fx.db.set_supervisor_paused(true, now)?;
