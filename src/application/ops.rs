@@ -14,6 +14,7 @@ use super::{
 };
 use crate::{
     artifact::render_summary_markdown,
+    backend::input::{InputVerdict, input_policy},
     config::{Config, PaperConfig},
     db::{CancelOutcome, Db, Requeue},
     email_account::resolve_submission_email,
@@ -160,13 +161,28 @@ impl<'a> ReviewOps<'a> {
         } else {
             String::new()
         };
+        // Pinned before enqueueing, so coverage, the request key and the provider's
+        // input limits all see the bytes every submission of the job will upload.
+        let pinned = prepare_input(&self.config.state_dir(), pdf_path)?;
+        let notices = match input_policy(&paper.backend) {
+            Some(policy) => match policy.check(&pinned.snapshot_path)? {
+                InputVerdict::Accepted { notices, .. } => notices,
+                // The unreferenced snapshot is removed by snapshot garbage collection.
+                InputVerdict::Rejected { reason } => {
+                    return Err(OpError::InputRejected {
+                        paper_id: paper.id.clone(),
+                        backend: paper.backend.clone(),
+                        reason,
+                    });
+                }
+            },
+            None => Vec::new(),
+        };
         let job = NewJob {
             project_id: project_id.to_string(),
             paper_id: paper.id.clone(),
             backend: paper.backend.clone(),
-            // Pinned before enqueueing, so coverage and the request key see the
-            // bytes every submission of the job will upload.
-            pdf: JobPdf::Pinned(prepare_input(&self.config.state_dir(), pdf_path)?),
+            pdf: JobPdf::Pinned(pinned),
             status: match request.approval {
                 Approval::Granted => JobStatus::Queued,
                 Approval::Required => JobStatus::PendingApproval,
@@ -178,7 +194,7 @@ impl<'a> ReviewOps<'a> {
             git_commit: None,
             next_poll_at: None,
         };
-        let input = ManuscriptInput::new(&job);
+        let input = ManuscriptInput::new(&job, notices);
 
         let outcome = self
             .db

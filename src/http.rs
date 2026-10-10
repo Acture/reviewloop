@@ -107,7 +107,7 @@ impl reqwest_middleware::Middleware for RoundRobinProxyMiddleware {
                 Err(e) if is_transient_proxy_error(&e) => {
                     warn!(
                         proxy_index = idx,
-                        error = %e,
+                        error = %describe_error(&e, e.url()),
                         attempt = attempt + 1,
                         total_proxies = n,
                         "proxy attempt failed; trying next proxy"
@@ -131,7 +131,7 @@ impl reqwest_middleware::Middleware for RoundRobinProxyMiddleware {
         );
         let last = last_err
             .expect("loop ran at least once and last_err is set on every transient failure");
-        self.emit_failover_event(n - 1, n, Some(&last.to_string()));
+        self.emit_failover_event(n - 1, n, Some(&describe_error(&last, last.url())));
         Err(reqwest_middleware::Error::Reqwest(last))
     }
 }
@@ -160,6 +160,43 @@ impl RoundRobinProxyMiddleware {
             warn!(error = %e, "failed to write proxy_failover event to db");
         }
     }
+}
+
+/// Describe a failed request with its cause chain but without the request URL, which
+/// can carry secrets: a review token in the path, a presigned signature in the query.
+/// The URL is replaced by its origin, as is any other URL a cause names (a redirect
+/// target, say).
+pub fn describe_error(
+    err: &(dyn std::error::Error + 'static),
+    url: Option<&reqwest::Url>,
+) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    let text = match url {
+        Some(url) => text.replace(url.as_str(), &url.origin().ascii_serialization()),
+        None => text,
+    };
+    redact_url_paths(&text)
+}
+
+/// Reduce every parenthesised URL in `text` to its origin, the way [`describe_error`]
+/// does for new errors. For text recorded before that, such as an older `proxy_failover`
+/// error: reqwest writes the full request URL, review token included.
+pub fn redact_url_paths(text: &str) -> String {
+    let url_re = regex::Regex::new(r"\((https?://[^\s)]+)\)").expect("valid URL regex");
+    url_re
+        .replace_all(text, |captures: &regex::Captures<'_>| {
+            let origin = reqwest::Url::parse(&captures[1])
+                .map(|url| url.origin().ascii_serialization())
+                .unwrap_or_else(|_| "[redacted]".to_string());
+            format!("({origin})")
+        })
+        .into_owned()
 }
 
 /// Heuristic for "this looks like the proxy itself misbehaved, retry on a
@@ -304,6 +341,50 @@ mod tests {
             .build()
             .expect("build multipart request");
         assert!(request.try_clone().is_none());
+    }
+
+    #[tokio::test]
+    async fn describe_error_keeps_the_cause_and_drops_the_url_path() {
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:9/api/review/tok-secret-describe?X-Amz-Signature=sig")
+            .send()
+            .await
+            .expect_err("nothing listens on the discard port");
+        let text = describe_error(&err, err.url());
+        assert!(!text.contains("tok-secret-describe"), "{text}");
+        assert!(!text.contains("X-Amz-Signature"), "{text}");
+        assert!(text.contains("http://127.0.0.1:9"), "{text}");
+        assert!(text.starts_with("error sending request"), "{text}");
+        assert!(
+            text.len() > "error sending request for url (http://127.0.0.1:9)".len(),
+            "the cause must follow: {text}"
+        );
+    }
+
+    /// A cause can name a URL other than the request's (a redirect target, say).
+    #[test]
+    fn describe_error_drops_the_path_of_every_url_in_the_cause_chain() {
+        let err = std::io::Error::other(
+            "redirected to (https://paperreview.ai/api/review/tok-nested-123)",
+        );
+        let text = describe_error(&err, None);
+        assert!(!text.contains("tok-nested-123"), "{text}");
+        assert!(text.contains("(https://paperreview.ai)"), "{text}");
+    }
+
+    #[test]
+    fn redact_url_paths_keeps_only_the_origin_of_recorded_urls() {
+        assert_eq!(
+            redact_url_paths(
+                "error sending request for url (https://paperreview.ai/api/review/tok-legacy-123)"
+            ),
+            "error sending request for url (https://paperreview.ai)"
+        );
+        assert_eq!(
+            redact_url_paths("a (http://127.0.0.1:9/x?sig=1) and (https://h.example/y/tok)"),
+            "a (http://127.0.0.1:9) and (https://h.example)"
+        );
+        assert_eq!(redact_url_paths("no url here"), "no url here");
     }
 
     #[test]

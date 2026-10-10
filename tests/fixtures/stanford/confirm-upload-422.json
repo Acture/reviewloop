@@ -1,0 +1,1 @@
+{"detail":[{"type":"missing","loc":["body","s3_key"],"msg":"Field required","input":null},{"type":"missing","loc":["body","email"],"msg":"Field required","input":null}]}

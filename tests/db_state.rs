@@ -505,14 +505,11 @@ fn mark_timeouts_moves_old_processing_jobs_to_timeout() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn mark_timeouts_scales_with_pdf_pages_for_stanford() -> Result<()> {
+/// A PROCESSING Stanford job on a synthetic `pages`-page PDF, started `hours` ago,
+/// after one timeout sweep (base timeout 48 h).
+fn stanford_job_after_timeout_sweep(pages: usize, hours: i64) -> Result<JobStatus> {
     let ctx = DbTestContext::new()?;
-    let mut synthetic_pdf = String::from("%PDF-1.4\n");
-    for _ in 0..10 {
-        synthetic_pdf.push_str("<< /Type /Page >>\n");
-    }
-    synthetic_pdf.push_str("%%EOF\n");
+    let synthetic_pdf = format!("%PDF-1.4\n{}%%EOF\n", "<< /Type /Page >>\n".repeat(pages));
     fs::write(&ctx.config.papers[0].pdf_path, synthetic_pdf.as_bytes())?;
 
     let job = ctx.create_job(JobStatus::Queued)?;
@@ -520,16 +517,32 @@ fn mark_timeouts_scales_with_pdf_pages_for_stanford() -> Result<()> {
         .attach_token_to_job(&job.id, "token-scale", Utc::now() - Duration::minutes(1))?;
 
     let conn = rusqlite::Connection::open(&ctx.db.path)?;
-    let started = (Utc::now() - Duration::hours(25)).to_rfc3339();
+    let started = (Utc::now() - Duration::hours(hours)).to_rfc3339();
     conn.execute(
         "UPDATE jobs SET started_at = ?1, created_at = ?1, updated_at = ?1 WHERE id = ?2",
         params![started, job.id],
     )?;
 
     worker::mark_timeouts(&ctx.config, &ctx.db)?;
-    let updated = ctx.db.get_job(&job.id)?.context("missing timed out job")?;
-    assert_eq!(updated.status, JobStatus::Timeout);
+    Ok(ctx.db.get_job(&job.id)?.context("missing job")?.status)
+}
 
+/// Review time is set by the provider's queue, not the paper's length, so every
+/// Stanford job gets the configured timeout (48 h) whatever its page count.
+#[test]
+fn mark_timeouts_uses_the_configured_timeout_whatever_the_page_count() -> Result<()> {
+    for pages in [0, 3, 10, 40] {
+        assert_eq!(
+            stanford_job_after_timeout_sweep(pages, 47)?,
+            JobStatus::Processing,
+            "{pages} pages"
+        );
+        assert_eq!(
+            stanford_job_after_timeout_sweep(pages, 49)?,
+            JobStatus::Timeout,
+            "{pages} pages"
+        );
+    }
     Ok(())
 }
 

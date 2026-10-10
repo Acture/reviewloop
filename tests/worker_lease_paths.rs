@@ -958,3 +958,130 @@ async fn receipt_kept_on_cancelled_job_resumes_through_retry() -> Result<()> {
     assert_eq!(backend.submit_count(), 1);
     Ok(())
 }
+
+/// OSS-352: a receipt the database cannot save goes to a private recovery file, and the
+/// token never appears in the error that reaches the daemon log and notifications.
+#[tokio::test]
+async fn unsaved_receipt_goes_to_a_private_recovery_file_not_the_log() -> Result<()> {
+    const TOKEN: &str = "tok-unsaved-0123456789";
+    let ctx = Ctx::new()?;
+    let job = ctx.create_queued_job()?;
+    let backend = MockBackend::default().on_submit(|| Answer::OnRelease(Ok(receipt(TOKEN))));
+
+    let (attempt, broken) = with_deadline(async {
+        tokio::join!(
+            worker::submit_job_with_backend(&ctx.config, &ctx.db, &job.id, &backend),
+            async {
+                backend.entered.notified().await;
+                // The receipt's event insert now fails, which rolls back the whole save.
+                let broken = ctx
+                    .conn()
+                    .and_then(|conn| Ok(conn.execute_batch("DROP TABLE events")?));
+                backend.release.notify_one();
+                broken
+            }
+        )
+    })
+    .await?;
+    broken?;
+
+    let message = format!("{:#}", attempt.expect_err("saving the receipt must fail"));
+    assert!(
+        !message.contains(TOKEN),
+        "token leaked into the error: {message}"
+    );
+    let recovery_dir = ctx.config.state_dir().join("recovery");
+    let files: Vec<_> = std::fs::read_dir(&recovery_dir)?.collect::<std::io::Result<_>>()?;
+    assert_eq!(files.len(), 1, "{files:?}");
+    let path = files[0].path();
+    assert!(
+        message.contains(&path.display().to_string()),
+        "the error must point at the recovery file: {message}"
+    );
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    assert_eq!(saved["token"], TOKEN);
+    assert_eq!(saved["job_id"], job.id.as_str());
+    assert_eq!(saved["channel"], "primary");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path)?.permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    Ok(())
+}
+
+/// When neither the database nor the state dir can keep a receipt, the token goes to the
+/// daemon log alone: the returned error reaches notifications, `daemon status` and the
+/// widget, so it must not carry the token.
+#[tokio::test]
+async fn receipt_that_cannot_be_kept_anywhere_still_stays_out_of_the_error() -> Result<()> {
+    const TOKEN: &str = "tok-nowhere-0123456789";
+    let ctx = Ctx::new()?;
+    let job = ctx.create_queued_job()?;
+    // A file where the recovery directory should go makes the recovery write fail.
+    std::fs::write(ctx.config.state_dir().join("recovery"), b"not a directory")?;
+    let backend = MockBackend::default().on_submit(|| Answer::OnRelease(Ok(receipt(TOKEN))));
+
+    let (attempt, broken) = with_deadline(async {
+        tokio::join!(
+            worker::submit_job_with_backend(&ctx.config, &ctx.db, &job.id, &backend),
+            async {
+                backend.entered.notified().await;
+                let broken = ctx
+                    .conn()
+                    .and_then(|conn| Ok(conn.execute_batch("DROP TABLE events")?));
+                backend.release.notify_one();
+                broken
+            }
+        )
+    })
+    .await?;
+    broken?;
+
+    let message = format!("{:#}", attempt.expect_err("saving the receipt must fail"));
+    assert!(
+        !message.contains(TOKEN),
+        "token leaked into the error: {message}"
+    );
+    assert!(message.contains("daemon log"), "{message}");
+    Ok(())
+}
+
+/// `meta.json` names the route that produced the receipt, even when an earlier attempt
+/// of the job went through the fallback.
+#[tokio::test]
+async fn archive_names_the_route_of_the_receipt_not_an_earlier_fallback_attempt() -> Result<()> {
+    let ctx = Ctx::new()?;
+    let job = ctx.create_queued_job()?;
+    // As left by a fallback dispatch whose outcome was unknown, then requeued.
+    ctx.conn()?.execute(
+        "UPDATE jobs SET fallback_used = 1 WHERE id = ?1",
+        params![job.id],
+    )?;
+    let backend = MockBackend::default()
+        .on_submit(|| Answer::Now(Ok(receipt("tok-primary"))))
+        .on_fetch(|| Answer::Now(Ok(ready_review())));
+
+    assert_eq!(
+        worker::submit_job_with_backend(&ctx.config, &ctx.db, &job.id, &backend).await?,
+        Attempt::Ran
+    );
+    assert!(!ctx.job(&job.id)?.fallback_used);
+    assert_eq!(
+        worker::poll_job_with_backend(&ctx.config, &ctx.db, &job.id, &backend).await?,
+        Attempt::Ran
+    );
+    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        ctx.config
+            .state_dir()
+            .join("artifacts")
+            .join(&job.id)
+            .join("meta.json"),
+    )?)?;
+    assert_eq!(meta["submission"]["channel"], "primary");
+    assert_eq!(meta["submission"]["provider_venue"], "ICLR");
+    Ok(())
+}

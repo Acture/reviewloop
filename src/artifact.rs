@@ -1,14 +1,17 @@
-use crate::model::Job;
+use crate::{backend::ProviderSource, model::Job};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 use std::{fs, path::Path};
 
+/// Write `review.json` (the provider's reply, verbatim), `review.md` (its summary) and
+/// `meta.json` (where it came from and which submission it answers) for `job`.
 pub fn write_review_artifacts(
     state_dir: &Path,
     job: &Job,
     token: &str,
     raw_json: &Value,
+    source: &ProviderSource,
 ) -> Result<(String, String, String)> {
     let artifact_dir = state_dir.join("artifacts").join(&job.id);
     fs::create_dir_all(&artifact_dir)
@@ -38,6 +41,18 @@ pub fn write_review_artifacts(
         // The bytes actually uploaded; null for a job submitted before
         // snapshots existed, whose uploaded version was never pinned.
         "snapshot_path": job.snapshot_path,
+        "provider": source,
+        "submission": {
+            "channel": if job.fallback_used { "fallback" } else { "primary" },
+            "venue": job.venue,
+            "version_no": job.version_no,
+            "round_no": job.round_no,
+            "submitted_at": job.started_at.map(|at| at.to_rfc3339()),
+            "provider_submission_date": raw_json.get("submission_date"),
+            // The venue the provider says it reviewed for; `venue` above is the one the
+            // job recorded, null when the configured venue was sent instead.
+            "provider_venue": raw_json.get("venue"),
+        },
     }))?;
 
     let review_json_path = artifact_dir.join("review.json");
@@ -64,8 +79,17 @@ pub fn render_summary_markdown(raw_json: &Value) -> String {
     if let Some(venue) = raw_json.get("venue").and_then(Value::as_str) {
         out.push_str(&format!("- **Venue**: {venue}\n"));
     }
-    if let Some(score) = raw_json.get("numerical_score") {
-        out.push_str(&format!("- **Estimated Score**: {score}\n"));
+    if let Some(date) = raw_json.get("submission_date").and_then(Value::as_str) {
+        out.push_str(&format!("- **Submitted**: {date}\n"));
+    }
+    // The provider fits its score to ICLR 2025 reviews and only reports it for ICLR.
+    if let Some(score) = raw_json
+        .get("numerical_score")
+        .filter(|score| !score.is_null())
+    {
+        out.push_str(&format!(
+            "- **Estimated Score**: {score}/10 (ICLR-calibrated)\n"
+        ));
     }
     out.push('\n');
 
@@ -132,6 +156,24 @@ mod tests {
         assert!(md.contains("## Summary"));
         assert!(md.contains("Good summary"));
         assert!(md.contains("## Strengths"));
+    }
+
+    #[test]
+    fn renders_submission_date_and_calibrated_score() {
+        let md = render_summary_markdown(&json!({
+            "title": "A Paper",
+            "submission_date": "2026-10-09T15:30:00",
+            "numerical_score": 6.2,
+            "sections": { "summary": "ok" }
+        }));
+        assert!(md.contains("- **Submitted**: 2026-10-09T15:30:00"), "{md}");
+        assert!(
+            md.contains("- **Estimated Score**: 6.2/10 (ICLR-calibrated)"),
+            "{md}"
+        );
+
+        let unscored = render_summary_markdown(&json!({ "numerical_score": null, "content": "x" }));
+        assert!(!unscored.contains("Estimated Score"), "{unscored}");
     }
 
     #[test]

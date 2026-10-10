@@ -6,6 +6,7 @@ use reviewloop::application::{
     RetryRequest, ReviewOps, ReviewRequest, require_project,
 };
 use reviewloop::artifact::write_review_artifacts;
+use reviewloop::backend::ProviderSource;
 use reviewloop::config::{
     Config, GlobalConfigFile, LegacyConfig, PaperConfigFile, ProjectConfigFile,
     default_project_config_path,
@@ -1535,7 +1536,11 @@ fn cmd_daemon_status(config: Option<&Config>, db: Option<&Db>, as_json: bool) ->
                     json!({
                         "id": ev.id,
                         "created_at": ev.created_at.to_rfc3339(),
-                        "payload": ev.payload,
+                        // Older failovers recorded the full request URL, token included.
+                        "payload": reviewloop::application::map_strings(
+                            ev.payload.clone(),
+                            &reviewloop::http::redact_url_paths,
+                        ),
                     })
                 })
                 .collect();
@@ -2395,6 +2400,12 @@ fn cmd_status(
     require_project(config)?;
     let state_dir = config.state_dir();
     let all_rows = db.list_status_views(&config.project_id, paper_id)?;
+    // Collected before `--active` drops finished jobs, whose events are still shown.
+    let all_tokens: Vec<String> = all_rows
+        .iter()
+        .filter_map(|row| row.token.clone())
+        .collect();
+    let hidden: Vec<&str> = all_tokens.iter().map(String::as_str).collect();
 
     // Active filter: keep only non-terminal statuses.
     const NON_TERMINAL: &[&str] = &["PENDING_APPROVAL", "QUEUED", "SUBMITTED", "PROCESSING"];
@@ -2415,13 +2426,13 @@ fn cmd_status(
                 "papers": [{
                     "paper_id": paper_id,
                     "rows": rows.iter().map(|row| status_row_json(row, show_token, Some(&state_dir))).collect::<Vec<_>>(),
-                    "timeline": timeline_json(&rows, &events, show_token, Some(&state_dir)),
+                    "timeline": timeline_json(&rows, &events, show_token, Some(&state_dir), &hidden),
                 }],
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
             return Ok(());
         }
-        render_timeline_text(config, paper_id, &rows, &events, show_token);
+        render_timeline_text(config, paper_id, &rows, &events, show_token, &hidden);
         return Ok(());
     }
 
@@ -2443,7 +2454,7 @@ fn cmd_status(
                 json!({
                     "paper_id": pid,
                     "rows": group_rows.iter().map(|r| status_row_json(r, show_token, Some(&state_dir))).collect::<Vec<_>>(),
-                    "timeline": timeline_json(group_rows, &events, show_token, Some(&state_dir)),
+                    "timeline": timeline_json(group_rows, &events, show_token, Some(&state_dir), &hidden),
                 })
             })
             .collect();
@@ -2489,8 +2500,8 @@ fn cmd_status(
                 token = token_str,
                 next_poll = next_poll_str,
             );
-            if let Some(err) = row.last_error.as_deref() {
-                let truncated = if err.len() > 80 { &err[..80] } else { err };
+            if let Some(err) = shown_error(row, show_token) {
+                let truncated: String = err.chars().take(80).collect();
                 println!("    error: {truncated}");
             }
             if row.status == "COMPLETED" {
@@ -2712,7 +2723,13 @@ async fn cmd_complete(
         .token
         .clone()
         .unwrap_or_else(|| format!("manual:{}", job.id));
-    let (_, summary_md, _) = write_review_artifacts(&config.state_dir(), &job, &token, &raw_json)?;
+    let source = ProviderSource {
+        backend: job.backend.clone(),
+        name: "manual".to_string(),
+        base_url: source_url.clone(),
+    };
+    let (_, summary_md, _) =
+        write_review_artifacts(&config.state_dir(), &job, &token, &raw_json, &source)?;
     db.upsert_review(&job.id, &token, &raw_json.to_string(), &summary_md)?;
     // user override: manual completion may move jobs out of terminal states.
     db.update_job_state_unchecked(
@@ -2815,6 +2832,67 @@ fn maybe_record_manual_poll_override(
     Ok(())
 }
 
+/// Every token status may print: `hidden` (the tokens of every job, including those
+/// `--active` leaves out of `rows`), the rows' own, and those recorded in events, which
+/// also hold tokens an import replaced.
+fn known_tokens<'a>(
+    rows: &'a [StatusView],
+    events: &'a [EventRecord],
+    hidden: &[&'a str],
+) -> Vec<&'a str> {
+    fn collect<'v>(value: &'v Value, out: &mut Vec<&'v str>) {
+        match value {
+            Value::Object(fields) => {
+                for (key, item) in fields {
+                    match item {
+                        Value::String(token) if key == "token" || key.ends_with("_token") => {
+                            out.push(token)
+                        }
+                        item => collect(item, out),
+                    }
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| collect(item, out)),
+            _ => {}
+        }
+    }
+    let mut tokens: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row.token.as_deref())
+        .chain(hidden.iter().copied())
+        .collect();
+    events
+        .iter()
+        .for_each(|event| collect(&event.payload, &mut tokens));
+    tokens
+}
+
+/// An event payload as status shows it: tokens and request URLs redacted unless
+/// `show_token`.
+fn shown_payload(payload: &Value, tokens: &[&str], show_token: bool) -> Value {
+    if show_token {
+        payload.clone()
+    } else {
+        reviewloop::application::map_strings(
+            reviewloop::application::redact_value(payload.clone(), tokens),
+            &reviewloop::http::redact_url_paths,
+        )
+    }
+}
+
+/// A job's last error as status shows it: its token and request URLs redacted unless
+/// `show_token`.
+fn shown_error(row: &StatusView, show_token: bool) -> Option<String> {
+    let error = row.last_error.as_deref()?;
+    if show_token {
+        return Some(error.to_string());
+    }
+    let tokens: Vec<&str> = row.token.as_deref().into_iter().collect();
+    Some(reviewloop::http::redact_url_paths(
+        &reviewloop::application::redact_text(error, &tokens),
+    ))
+}
+
 fn status_row_json(row: &StatusView, show_token: bool, state_dir: Option<&Path>) -> Value {
     let artifact_dir = if row.status == "COMPLETED" {
         state_dir.map(|dir| dir.join("artifacts").join(&row.id).display().to_string())
@@ -2834,7 +2912,7 @@ fn status_row_json(row: &StatusView, show_token: bool, state_dir: Option<&Path>)
         "started_at": row.started_at.map(|value| value.to_rfc3339()),
         "next_poll_at": row.next_poll_at.map(|value| value.to_rfc3339()),
         "updated_at": row.updated_at.to_rfc3339(),
-        "last_error": row.last_error,
+        "last_error": shown_error(row, show_token),
         "pdf_hash": row.pdf_hash,
         "git_tag": row.git_tag,
         "git_commit": row.git_commit,
@@ -2854,7 +2932,9 @@ fn timeline_json(
     events: &[EventRecord],
     show_token: bool,
     state_dir: Option<&Path>,
+    hidden: &[&str],
 ) -> Vec<Value> {
+    let tokens = known_tokens(rows, events, hidden);
     let mut entries = Vec::new();
     for row in rows {
         entries.push(json!({
@@ -2869,7 +2949,7 @@ fn timeline_json(
             "created_at": event.created_at.to_rfc3339(),
             "event_type": event.event_type,
             "job_id": event.job_id,
-            "payload": event.payload,
+            "payload": shown_payload(&event.payload, &tokens, show_token),
         }));
     }
     entries.sort_by(|left, right| {
@@ -2886,6 +2966,7 @@ fn render_timeline_text(
     rows: &[StatusView],
     events: &[EventRecord],
     show_token: bool,
+    hidden: &[&str],
 ) {
     if rows.is_empty() && events.is_empty() {
         println!(
@@ -2899,6 +2980,7 @@ fn render_timeline_text(
         "Paper timeline: {} (project_id={})",
         paper_id, config.project_id
     );
+    let tokens = known_tokens(rows, events, hidden);
     let mut grouped: std::collections::BTreeMap<(u32, u32), Vec<Value>> =
         std::collections::BTreeMap::new();
 
@@ -2947,7 +3029,7 @@ fn render_timeline_text(
                 "kind": "event",
                 "created_at": event.created_at.to_rfc3339(),
                 "event_type": event.event_type,
-                "payload": event.payload,
+                "payload": shown_payload(&event.payload, &tokens, show_token),
                 "job_id": event.job_id,
             }));
     }
@@ -3920,6 +4002,113 @@ mod tests {
             db
         }
 
+        /// Default status output never shows a provider token: rows mask it and event
+        /// payloads and errors redact it. `--show-token` reveals it.
+        #[test]
+        fn status_output_redacts_tokens_unless_shown() {
+            let project_id = "redact_proj";
+            let token = "tok-secret-redact-0123456789";
+            let db = make_db_with_jobs(project_id, &["p1"]);
+            let job_id = db.list_status_views(project_id, Some("p1")).unwrap()[0]
+                .id
+                .clone();
+            db.attach_token_to_job(&job_id, token, chrono::Utc::now())
+                .unwrap();
+            db.add_event(
+                Some(project_id),
+                Some(&job_id),
+                "review_completed",
+                serde_json::json!({ "token": token }),
+            )
+            .unwrap();
+            db.add_event(
+                Some(project_id),
+                Some(&job_id),
+                "poll_error",
+                serde_json::json!({ "error": format!("network error: GET /api/review/{token}") }),
+            )
+            .unwrap();
+            db.update_job_state(
+                &job_id,
+                JobStatus::Processing,
+                None,
+                None,
+                Some(Some(format!("network error: GET /api/review/{token}"))),
+            )
+            .unwrap();
+            let rows = db.list_status_views(project_id, Some("p1")).unwrap();
+            let events = db.list_timeline_events(project_id, "p1").unwrap();
+
+            let hidden = serde_json::json!({
+                "rows": rows.iter().map(|r| status_row_json(r, false, None)).collect::<Vec<Value>>(),
+                "timeline": timeline_json(&rows, &events, false, None, &[]),
+            })
+            .to_string();
+            assert!(!hidden.contains(token), "{hidden}");
+            assert!(hidden.contains("[redacted]"), "{hidden}");
+
+            let shown =
+                serde_json::to_string(&timeline_json(&rows, &events, true, None, &[])).unwrap();
+            assert!(shown.contains(token));
+        }
+
+        /// `status --active` drops finished jobs from the rows but still prints their
+        /// events; their tokens stay hidden, as does a token an import replaced.
+        #[test]
+        fn status_output_redacts_tokens_of_jobs_outside_the_rows() {
+            let project_id = "redact_active_proj";
+            let finished = "tok-finished-0123456789";
+            let replaced = "tok-replaced-0123456789";
+            let db = make_db_with_jobs(project_id, &["p1", "p1"]);
+            let ids: Vec<String> = db
+                .list_status_views(project_id, Some("p1"))
+                .unwrap()
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+            let (done_id, active_id) = (&ids[0], &ids[1]);
+            db.attach_token_to_job(done_id, finished, chrono::Utc::now())
+                .unwrap();
+            db.add_event(
+                Some(project_id),
+                Some(done_id),
+                "poll_error",
+                serde_json::json!({ "error": format!("GET /api/review/{finished} failed") }),
+            )
+            .unwrap();
+            db.update_job_state(done_id, JobStatus::Completed, None, Some(None), None)
+                .unwrap();
+            db.add_event(
+                Some(project_id),
+                Some(active_id),
+                "token_imported",
+                serde_json::json!({ "source": "manual", "token": replaced }),
+            )
+            .unwrap();
+            db.add_event(
+                Some(project_id),
+                Some(active_id),
+                "poll_error",
+                serde_json::json!({ "error": format!("GET /api/review/{replaced} failed") }),
+            )
+            .unwrap();
+
+            // As cmd_status does: tokens from every row, then the `--active` filter.
+            let all = db.list_status_views(project_id, Some("p1")).unwrap();
+            let hidden: Vec<&str> = all.iter().filter_map(|row| row.token.as_deref()).collect();
+            let active: Vec<_> = all
+                .iter()
+                .filter(|row| row.status != "COMPLETED")
+                .cloned()
+                .collect();
+            let events = db.list_timeline_events(project_id, "p1").unwrap();
+            let shown =
+                serde_json::to_string(&timeline_json(&active, &events, false, None, &hidden))
+                    .unwrap();
+            assert!(!shown.contains(finished), "{shown}");
+            assert!(!shown.contains(replaced), "{shown}");
+        }
+
         /// Both single-paper and multi-paper `--json` output share the same
         /// root shape: `{"project_id": ..., "papers": [{paper_id, rows, timeline}]}`.
         #[test]
@@ -3945,7 +4134,7 @@ mod tests {
                     serde_json::json!({
                         "paper_id": pid,
                         "rows": group_rows.iter().map(|r| status_row_json(r, false, None)).collect::<Vec<Value>>(),
-                        "timeline": timeline_json(group_rows, &events, false, None),
+                        "timeline": timeline_json(group_rows, &events, false, None, &[]),
                     })
                 })
                 .collect();
@@ -3966,7 +4155,7 @@ mod tests {
                 "papers": [{
                     "paper_id": "p1",
                     "rows": rows_one.iter().map(|r| status_row_json(r, false, None)).collect::<Vec<Value>>(),
-                    "timeline": timeline_json(&rows_one, &events_one, false, None),
+                    "timeline": timeline_json(&rows_one, &events_one, false, None, &[]),
                 }],
             });
 
@@ -4029,7 +4218,7 @@ mod tests {
                     serde_json::json!({
                         "paper_id": pid,
                         "rows": group_rows.iter().map(|r| status_row_json(r, false, None)).collect::<Vec<Value>>(),
-                        "timeline": timeline_json(group_rows, &events, false, None),
+                        "timeline": timeline_json(group_rows, &events, false, None, &[]),
                     })
                 })
                 .collect();
@@ -4046,7 +4235,7 @@ mod tests {
                 "papers": [{
                     "paper_id": "alpha",
                     "rows": rows_one.iter().map(|r| status_row_json(r, false, None)).collect::<Vec<Value>>(),
-                    "timeline": timeline_json(&rows_one, &events_one, false, None),
+                    "timeline": timeline_json(&rows_one, &events_one, false, None, &[]),
                 }],
             });
 

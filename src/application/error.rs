@@ -46,6 +46,14 @@ pub enum OpError {
     #[error("{detail}")]
     SubmitterEmailUnavailable { backend: String, detail: String },
 
+    /// The provider would refuse the paper's PDF (size, format); nothing was enqueued.
+    #[error("{backend} cannot review paper {paper_id}: {reason}")]
+    InputRejected {
+        paper_id: String,
+        backend: String,
+        reason: String,
+    },
+
     /// A setting the paper's provider needs (its API key, or the review
     /// template) is not configured.
     #[error("{message}")]
@@ -168,6 +176,7 @@ impl OpError {
             OpError::PaperNotFound { .. } => "paper_not_found",
             OpError::PdfNotFound { .. } => "pdf_not_found",
             OpError::SubmitterEmailUnavailable { .. } => "submitter_email_unavailable",
+            OpError::InputRejected { .. } => "input_rejected",
             OpError::ProviderNotConfigured { .. } => "provider_not_configured",
             OpError::JobNotFound { .. } => "job_not_found",
             OpError::NoEligibleJob { .. } => "no_eligible_job",
@@ -203,6 +212,9 @@ impl OpError {
             ),
             OpError::SubmitterEmailUnavailable { .. } => {
                 "set providers.stanford.email in ~/.config/reviewloop/config.toml or run `reviewloop email login --provider google`".to_string()
+            }
+            OpError::InputRejected { .. } => {
+                "fix the PDF as the message says (for example compress it or move the appendix out), then request the review again".to_string()
             }
             OpError::ProviderNotConfigured { setting: "api_key", .. } => format!(
                 "set providers.cspaper.api_key in ~/.config/reviewloop/config.toml or export {}; the key never goes in reviewloop.toml",
@@ -276,6 +288,9 @@ impl OpError {
                 json!({ "paper_id": paper_id, "path": path })
             }
             OpError::SubmitterEmailUnavailable { backend, .. } => json!({ "backend": backend }),
+            OpError::InputRejected {
+                paper_id, backend, ..
+            } => json!({ "paper_id": paper_id, "backend": backend }),
             OpError::ProviderNotConfigured {
                 backend, setting, ..
             } => json!({ "backend": backend, "setting": setting }),

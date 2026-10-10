@@ -29,8 +29,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   taken at enqueue, stored owner-only (0o600 files, 0o700 directories on Unix)
   at `<state_dir>/snapshots/<sha256>/<file name>`.
   Editing or deleting the source, or repointing the paper in config, after
-  enqueue no longer changes what is submitted: the primary submit, the Node
-  fallback and the timeout page count all read the snapshot, re-verified
+  enqueue no longer changes what is submitted: the primary submit and the Node
+  fallback both read the snapshot, re-verified
   against the job's hash before every upload. `submission_input::prepare_input`
   returns the `PreparedInput` that enqueue callers pass as `JobPdf::Pinned`.
   Schema v3 adds `jobs.snapshot_path`; `meta.json` records it.
@@ -55,6 +55,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   codes with recovery hints, and what later issues still own.
 - `Db::get_review`, `Db::review_completed_at`, `Db::list_project_jobs` and
   `Db::list_registered_projects` (read-only).
+- **Stanford Agentic Reviewer contract** (`docs/providers/stanford.md`) — the
+  `paperreview.ai` API as checked on 2026-10-09, with sanitized fixtures in
+  `tests/fixtures/stanford/` marked observed or inferred, and the open
+  real-service acceptance run.
+- **Submit steps are identified** — submit outcome events (`submit_failed`,
+  `submit_rate_limited`, `submit_outcome_unknown`, `submit_failed_needs_manual`)
+  carry `channel` and the `step` reached: `upload_init`, `upload` or `confirm`.
+- **PDF preflight** — a PDF over the provider's 10 MiB limit, or one without a
+  `%PDF-` header, is refused at enqueue (`input_rejected`) and, for jobs from
+  triggers, before dispatch (`FAILED_NEEDS_MANUAL`, event
+  `submit_input_rejected`); nothing is sent and the fallback does not run.
+  PDFs with more pages than the provider reviews (15) get a notice
+  (`ManuscriptInput.notices`, event `submit_input_notice`).
+- **Review provenance** — `meta.json` adds `provider` (`backend`, `name`,
+  `base_url`) and `submission` (`channel`, `venue`, `version_no`, `round_no`,
+  `submitted_at`, `provider_submission_date`); `review.md` shows the submission
+  date and the score as `x/10 (ICLR-calibrated)`.
 
 - **CSPaper backend (OSS-353)** — `backend = "cspaper"` submits to the
   CSPaper Agentic Review API (`POST /api/platform/review`, polled at
@@ -157,6 +174,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   outcome.
 - **`import-token --job-id`** attaches a token to a named job; the reconcile
   hint for an uncertain submission uses it.
+- **Stanford requests are bounded per step** — upload-init 30 s, upload 5 min,
+  confirm 5 min, one poll 2 min — so a stuck step is reported as that step. A
+  timed-out upload step fails definitively instead of waiting out the 20-minute
+  dispatch bound as an unknown outcome.
+- **Provider errors show FastAPI's `detail`** (`email: Field required`) instead
+  of the raw JSON body.
+- **A `200` review reply without `sections` or `content` is not a review**: the
+  job keeps polling instead of completing with an empty review.
+- **The Stanford review timeout no longer scales with page count**: every job
+  gets `core.review_timeout_hours` (48 h). The provider says processing time
+  follows its load, a premature `TIMEOUT` is terminal, and the scaling never
+  applied to pdfTeX/XeTeX/LuaTeX output, whose pages were not counted.
+- **Fallback script reports in the primary's terms** — it takes `--filename`
+  (the primary's upload name), watches the form's requests, and reports
+  `stage`, `status`, `rate_limited` and `retry_after_secs`. A rate limit
+  requeues the job with the fallback still available; a 4xx answer is a
+  definitive rejection; `submitted` turns true only once `confirm-upload` is
+  sent.
+- **A receipt the database cannot save** is written to
+  `<state_dir>/recovery/receipt-<job_id>-<time>.json` (mode `0600`); the error
+  names the file instead of carrying the token. If that write fails too, the
+  token goes to one daemon log line, never into the error.
+- **PDF page counts include pages in compressed object streams**, which pdfTeX,
+  XeTeX and LuaTeX write by default. Those PDFs used to count 0 pages, so they
+  never got the coverage notice.
+- **The fallback reads the receipt from confirm-upload's reply**, ignores
+  analytics beacons, and reports a 2xx confirm with `success: false` as
+  `rejected`; a fallback answer for any step but `confirm`, once confirm was
+  sent, never settles the outcome. A receipt is reported as a success even when
+  the page never shows it, and a refusal without a readable reason names the
+  step that answered.
+- **`meta.json` names the route that produced the receipt** (a primary receipt
+  after an earlier fallback attempt is `primary`) and adds `provider_venue`.
 
 - **Request identity includes review options** — coverage and request keys
   compare the new `review_options` (CSPaper's `desk_rejection_enabled`)
@@ -229,6 +279,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Review tokens no longer leak into default output** — request errors are
+  described without their URL (the Stanford review URL and the CSPaper job URL
+  carry the token, presigned uploads carry a signature), so `last_error`,
+  events, logs and notifications stay token-free; `reviewloop status` redacts
+  tokens in event payloads and errors unless `--show-token`.
+- `reviewloop status` no longer panics truncating a non-ASCII error.
+- A presigned upload answering 429 is rate limited (requeued after `Retry-After`)
+  instead of a definitive failure that started the fallback.
+- A confirm-upload reply with a blank token is no receipt: the outcome is
+  unknown instead of a job that fails on its first poll.
+- `status --active` hides the tokens of the jobs it leaves out; `daemon status
+  --json` hides request URLs in older `proxy_failover` payloads.
 - Git commands for a project repository ignore `GIT_DIR` / `GIT_INDEX_FILE`
   inherited from the environment. Run from a git hook (the pre-commit quality
   gate), the git trigger and its tests used to act on the repository being

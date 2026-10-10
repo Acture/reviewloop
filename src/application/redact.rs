@@ -3,7 +3,7 @@ use serde_json::Value;
 pub(crate) const REDACTED: &str = "[redacted]";
 
 /// Replace every occurrence of each non-empty token in `text`.
-pub(crate) fn redact_text(text: &str, tokens: &[&str]) -> String {
+pub fn redact_text(text: &str, tokens: &[&str]) -> String {
     tokens
         .iter()
         .filter(|token| !token.is_empty())
@@ -12,9 +12,14 @@ pub(crate) fn redact_text(text: &str, tokens: &[&str]) -> String {
         })
 }
 
-/// Redact `tokens` inside every string and object key of `value`, and
-/// replace the value of every object key named `token`.
-pub(crate) fn redact_value(value: Value, tokens: &[&str]) -> Value {
+/// Whether an object key names a token: `token` itself or a `*_token` field.
+fn is_token_key(key: &str) -> bool {
+    key == "token" || key.ends_with("_token")
+}
+
+/// Redact `tokens` inside every string and object key of `value`, and replace
+/// the string value of every token field (`token`, `*_token`).
+pub fn redact_value(value: Value, tokens: &[&str]) -> Value {
     match value {
         Value::String(text) => Value::String(redact_text(&text, tokens)),
         Value::Array(items) => Value::Array(
@@ -26,13 +31,33 @@ pub(crate) fn redact_value(value: Value, tokens: &[&str]) -> Value {
         Value::Object(map) => Value::Object(
             map.into_iter()
                 .map(|(key, item)| {
-                    let item = if key == "token" {
-                        Value::String(REDACTED.to_string())
-                    } else {
-                        redact_value(item, tokens)
+                    let item = match item {
+                        Value::String(_) if is_token_key(&key) => {
+                            Value::String(REDACTED.to_string())
+                        }
+                        item => redact_value(item, tokens),
                     };
                     (redact_text(&key, tokens), item)
                 })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Apply `rewrite` to every string in `value`.
+pub fn map_strings(value: Value, rewrite: &impl Fn(&str) -> String) -> Value {
+    match value {
+        Value::String(text) => Value::String(rewrite(&text)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| map_strings(item, rewrite))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, item)| (key, map_strings(item, rewrite)))
                 .collect(),
         ),
         other => other,
@@ -60,6 +85,17 @@ mod tests {
                 "nested": [{"note": "[redacted] twice [redacted]"}, 7],
                 "by_[redacted]": true,
             })
+        );
+    }
+
+    #[test]
+    fn redacts_suffixed_token_fields_but_keeps_their_non_string_values() {
+        assert_eq!(
+            redact_value(
+                json!({ "existing_token": "old", "token": null, "has_token": true }),
+                &[]
+            ),
+            json!({ "existing_token": "[redacted]", "token": null, "has_token": true })
         );
     }
 

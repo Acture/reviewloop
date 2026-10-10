@@ -1,0 +1,16 @@
+{
+  "title": "A Sanitized Example Paper",
+  "venue": "ICLR",
+  "submission_date": "2026-10-09T15:30:00",
+  "numerical_score": 6.2,
+  "has_feedback": false,
+  "content": "## Summary\nThe paper studies ...\n\n## Strengths\n- ...\n\n## Weaknesses\n- ...",
+  "sections": {
+    "summary": "The paper studies ...",
+    "strengths": "- ...",
+    "weaknesses": "- ...",
+    "detailed_comments": "- ...",
+    "questions": "- ...",
+    "assessment": "..."
+  }
+}

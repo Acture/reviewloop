@@ -624,7 +624,10 @@ async fn missing_fallback_script_fails_definitively_and_retry_reuses_fallback() 
         ["primary", "fallback"]
     );
     let events = ctx.events(&job.id)?;
-    assert_eq!(events[2].payload, json!({ "reason": expected_error }));
+    assert_eq!(
+        events[2].payload,
+        json!({ "reason": expected_error, "channel": "fallback" })
+    );
 
     ctx.db.requeue(&job.id, Utc::now())?;
     let requeued = assert_requeued(&ctx, &job.id, Utc::now())?;

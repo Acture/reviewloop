@@ -26,6 +26,7 @@ use super::{
     BackendError, ReviewBackend, ReviewFetchResult, SubmitReceipt, SubmitRequest, parse_retry_after,
 };
 use crate::config::{CSPAPER_API_KEY_ENV, CspaperProviderConfig, Redacted};
+use crate::http::describe_error;
 use crate::model::ReviewOptions;
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, LOCATION};
@@ -34,6 +35,7 @@ use reqwest_middleware::ClientWithMiddleware;
 use serde_json::{Map, Value, json};
 
 pub const BACKEND: &str = "cspaper";
+pub const PROVIDER_NAME: &str = "CSPaper Agentic Review";
 /// Review option carrying the desk-rejection setting; see
 /// [`crate::config::Config::review_options_for`].
 pub const DESK_REJECTION_ENABLED: &str = "desk_rejection_enabled";
@@ -170,10 +172,12 @@ impl ReviewBackend for CspaperBackend {
             .await
             .map_err(|e| {
                 // Only a failed connect proves nothing reached the provider.
+                // Described without the URL, as for every request (see `describe_error`).
+                let cause = describe_error(&e, e.url());
                 if e.is_connect() {
-                    BackendError::Network(e.to_string())
+                    BackendError::Network(cause)
                 } else {
-                    BackendError::OutcomeUnknown(format!("CSPaper submit got no response: {e}"))
+                    BackendError::OutcomeUnknown(format!("CSPaper submit got no response: {cause}"))
                 }
             })?;
 
@@ -248,7 +252,8 @@ impl ReviewBackend for CspaperBackend {
             .header(API_KEY_HEADER, api_key)
             .send()
             .await
-            .map_err(|e| BackendError::Network(e.to_string()))?;
+            // The URL holds the job id, the job's token: describe the error without it.
+            .map_err(|e| BackendError::Network(describe_error(&e, e.url())))?;
 
         let status = resp.status();
         let (retry_after, location) = response_meta(resp.headers());

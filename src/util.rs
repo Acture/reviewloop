@@ -64,13 +64,51 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Upper bound on the inflated size of one object stream, against decompression bombs.
+const MAX_OBJECT_STREAM_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Estimate a PDF's page count without a PDF parser: count its `/Type /Page` objects,
+/// including those kept in Flate-compressed object streams, where pdfTeX, XeTeX and
+/// LuaTeX put them by default. Returns 0 when no page object is found.
 pub fn estimate_pdf_page_count(path: &Path) -> Result<usize> {
-    // Heuristic for page counting without pulling a full PDF parser.
-    // Works for typical PDFs where page objects contain `/Type /Page`.
     let bytes =
         std::fs::read(path).with_context(|| format!("failed to read file: {}", path.display()))?;
     let page_re = Regex::new(r"/Type\s*/Page\b").expect("valid PDF page regex");
-    Ok(page_re.find_iter(&bytes).count())
+    let object_stream_re = Regex::new(r"/Type\s*/ObjStm\b").expect("valid object stream regex");
+    let compressed: usize = object_stream_re
+        .find_iter(&bytes)
+        .filter_map(|found| inflate_object_stream(&bytes, found.start()))
+        .map(|content| page_re.find_iter(&content).count())
+        .sum();
+    Ok(page_re.find_iter(&bytes).count() + compressed)
+}
+
+/// The inflated content of the stream object whose dictionary holds the byte at `at`,
+/// or `None` when it is not Flate-encoded or cannot be read.
+fn inflate_object_stream(bytes: &[u8], at: usize) -> Option<Vec<u8>> {
+    let find = |haystack: &[u8], needle: &[u8]| {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    };
+    // The dictionary runs from the object header (`N G obj`) to the `stream` keyword.
+    let dict_start = bytes[..at]
+        .windows(3)
+        .rposition(|window| window == b"obj")
+        .unwrap_or(0);
+    let stream_at = at + find(&bytes[at..], b"stream")?;
+    find(&bytes[dict_start..stream_at], b"/FlateDecode")?;
+    let mut data = &bytes[stream_at + b"stream".len()..];
+    data = data
+        .strip_prefix(b"\r\n")
+        .or_else(|| data.strip_prefix(b"\n"))
+        .unwrap_or(data);
+    let mut content = Vec::new();
+    flate2::read::ZlibDecoder::new(data)
+        .take(MAX_OBJECT_STREAM_BYTES)
+        .read_to_end(&mut content)
+        .ok()?;
+    Some(content)
 }
 
 pub fn to_rfc3339(ts: DateTime<Utc>) -> String {
@@ -141,6 +179,15 @@ mod tests {
     #[test]
     fn parse_rfc3339_rejects_invalid_value() {
         assert!(parse_rfc3339("not-a-timestamp").is_err());
+    }
+
+    /// pdfTeX, XeTeX and LuaTeX keep page objects in compressed object streams by
+    /// default; the fixture is `tests/fixtures/pdf/pdftex-16-pages.tex` built by pdfTeX.
+    #[test]
+    fn estimate_pdf_page_count_reads_pages_in_compressed_object_streams() {
+        let pdf = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pdf/pdftex-16-pages.pdf");
+        assert_eq!(estimate_pdf_page_count(&pdf).expect("count pages"), 16);
     }
 
     #[test]

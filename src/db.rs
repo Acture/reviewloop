@@ -713,7 +713,7 @@ impl Db {
                 JobStatus::Processing.as_str()
             );
         }
-        write_receipt(&tx, &current, token, next_poll_at)?;
+        write_receipt(&tx, &current, token, next_poll_at, None)?;
         tx.commit()?;
         Ok(())
     }
@@ -997,7 +997,13 @@ impl Db {
         };
 
         if held_by(&job, &lease.owner, now) && job.status.can_transition(JobStatus::Processing) {
-            write_receipt(&tx, &job, token, next_poll_at)?;
+            write_receipt(
+                &tx,
+                &job,
+                token,
+                next_poll_at,
+                Some(channel == SubmitChannel::Fallback),
+            )?;
             let event_type = match channel {
                 SubmitChannel::Primary => "submitted",
                 SubmitChannel::Fallback => "submitted_via_fallback",
@@ -1033,7 +1039,10 @@ impl Db {
                 "UPDATE jobs SET token = ?2, started_at = COALESCE(started_at, ?3) WHERE id = ?1",
                 params![job.id, token, to_rfc3339(now)],
             )?;
-            let mut write = RowWrite::new(job.status, LeaseColumns::Clear);
+            let mut write = RowWrite {
+                fallback_used: Some(channel == SubmitChannel::Fallback),
+                ..RowWrite::new(job.status, LeaseColumns::Clear)
+            };
             if job.status == JobStatus::Submitted {
                 let with_token = Job {
                     token: Some(token.to_string()),
@@ -2049,11 +2058,15 @@ fn write_row(conn: &Connection, current: &Job, write: RowWrite<'_>) -> Result<()
 }
 
 /// Move a job to PROCESSING with its receipt token, releasing any lease.
+/// Move `current` to PROCESSING with `token`. `fallback_used` records the route that
+/// produced the receipt when it is known; once a job holds a token the flag no longer
+/// guards a rerun (the job is polled, never resubmitted), so it names that route.
 fn write_receipt(
     conn: &Connection,
     current: &Job,
     token: &str,
     next_poll_at: DateTime<Utc>,
+    fallback_used: Option<bool>,
 ) -> Result<()> {
     write_row(
         conn,
@@ -2063,6 +2076,7 @@ fn write_receipt(
             next_poll_at: Some(Some(next_poll_at)),
             last_error: Some(None),
             submit_stage: Some(None),
+            fallback_used,
             ..RowWrite::new(JobStatus::Processing, LeaseColumns::Clear)
         },
     )?;
