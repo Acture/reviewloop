@@ -325,7 +325,7 @@ async fn crash_after_dispatch_parks_uncertain_and_is_never_resubmitted() -> Resu
 
     // Reconciliation: both token intake paths still find the parked job.
     let email_target = other
-        .find_latest_open_job_without_token(PROJECT, "stanford")?
+        .find_latest_open_job_without_token("stanford")?
         .context("email ingestion must find the uncertain job")?;
     assert_eq!(email_target.id, job.id);
     let import_target = other

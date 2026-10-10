@@ -67,12 +67,10 @@ fn extract_match(
     })
 }
 
-fn bind_matches(
-    db: &Db,
-    project_id: &str,
-    source: &str,
-    matches: Vec<EmailMatch>,
-) -> Result<Vec<Job>> {
+/// Bind tokens from the machine's mailbox to jobs in any project: the job that
+/// already holds the token, else the newest tokenless open job of its backend.
+/// Returns the jobs whose state changed.
+fn bind_matches(db: &Db, source: &str, matches: Vec<EmailMatch>) -> Result<Vec<Job>> {
     let mut seen_tokens = HashSet::new();
     let mut affected: Vec<Job> = Vec::new();
 
@@ -87,7 +85,7 @@ fn bind_matches(
             Some(&format!("{source}_unseen")),
         )?;
 
-        if let Some(existing_job) = db.find_job_by_token(project_id, &matched.token)? {
+        if let Some(existing_job) = db.find_job_by_token(&matched.token)? {
             if should_nudge_poll_now(existing_job.status) {
                 db.update_job_state(
                     &existing_job.id,
@@ -130,7 +128,7 @@ fn bind_matches(
         if !crate::backend::tokens_arrive_by_email(&matched.backend) {
             continue;
         }
-        if let Some(job) = db.find_latest_open_job_without_token(project_id, &matched.backend)? {
+        if let Some(job) = db.find_latest_open_job_without_token(&matched.backend)? {
             let next_poll = Utc::now();
             db.attach_token_to_job(&job.id, &matched.token, next_poll)?;
             db.add_event(
@@ -190,7 +188,7 @@ mod imap_impl {
             .await
             .context("IMAP polling task failed to join")??;
 
-        bind_matches(db, &config.project_id, "imap", matches)
+        bind_matches(db, "imap", matches)
     }
 
     fn poll_once_blocking(imap_cfg: &ImapConfig) -> Result<Vec<EmailMatch>> {
@@ -379,10 +377,11 @@ mod gmail_impl {
                     hint = GMAIL_REAUTH_HINT,
                     "Gmail token refresh failed; run `reviewloop email login` to re-authenticate."
                 );
-                // Surface the failure as a db event so `daemon status` can
-                // highlight it without requiring the user to check logs.
+                // Surface the failure as a machine-level db event (the mailbox
+                // is machine-wide) so `daemon status` can highlight it without
+                // requiring the user to check logs.
                 let _ = db.add_event(
-                    Some(&config.project_id),
+                    None,
                     None,
                     "gmail_oauth_refresh_failed",
                     json!({"error": err.to_string(), "hint": GMAIL_REAUTH_HINT}),
@@ -392,7 +391,7 @@ mod gmail_impl {
             Err(err) => return Err(err),
         };
 
-        bind_matches(db, &config.project_id, "gmail", matches)
+        bind_matches(db, "gmail", matches)
     }
 
     pub(super) async fn load_daemon_gmail_access_token(
@@ -614,7 +613,7 @@ pub fn token_ingestion_active(config: &Config) -> Result<bool> {
 }
 
 pub async fn poll_imap_if_enabled(config: &Config, db: &Db) -> Result<Vec<Job>> {
-    let span = tracing::info_span!("poll_imap_if_enabled", project_id = %config.project_id);
+    let span = tracing::info_span!("poll_imap_if_enabled");
     async move {
         #[allow(unused_mut)]
         let mut affected = gmail_impl::poll_gmail_if_enabled(config, db).await?;
@@ -873,7 +872,7 @@ mod tests {
         assert!(result.expect("poll ok").is_empty());
         assert_eq!(provider.refresh_calls(), 1);
         let ev = db
-            .most_recent_event_of_type(&config.project_id, "gmail_oauth_refresh_failed")
+            .most_recent_event_of_type("", "gmail_oauth_refresh_failed")
             .expect("db query")
             .expect("expected gmail_oauth_refresh_failed event");
         assert!(
@@ -917,7 +916,6 @@ mod tests {
 
         super::bind_matches(
             &db,
-            "project-email",
             "gmail",
             vec![super::EmailMatch {
                 backend: "stanford".to_string(),
@@ -968,7 +966,6 @@ mod tests {
 
         super::bind_matches(
             &db,
-            "project-email",
             "gmail",
             vec![super::EmailMatch {
                 backend: "stanford".to_string(),
@@ -981,6 +978,57 @@ mod tests {
         assert_eq!(updated.status, JobStatus::Completed);
         assert_eq!(updated.attempt, 3);
         assert_eq!(updated.next_poll_at, Some(far_future));
+    }
+
+    /// The mailbox is machine-wide: a token binds to the newest tokenless job of
+    /// its backend in any project, never to one still awaiting approval (which
+    /// was never sent, and whose status cannot take a token).
+    #[test]
+    fn email_tokens_bind_across_projects_but_not_to_unapproved_jobs() {
+        let db = Db::new_in_memory("email_cross_project").expect("in-memory db");
+        db.ensure_schema().expect("ensure schema");
+        let new_job = |project_id: &str, status: JobStatus| NewJob {
+            project_id: project_id.to_string(),
+            paper_id: "main".to_string(),
+            backend: "stanford".to_string(),
+            pdf: JobPdf::Unpinned {
+                pdf_path: "paper.pdf".to_string(),
+                pdf_hash: format!("hash-{project_id}"),
+            },
+            status,
+            email: "user@example.com".to_string(),
+            venue: None,
+            review_options: Default::default(),
+            git_tag: None,
+            git_commit: None,
+            next_poll_at: None,
+        };
+        let older = db
+            .create_job(&new_job("project-a", JobStatus::Queued))
+            .expect("create job");
+        let newer = db
+            .create_job(&new_job("project-b", JobStatus::Submitted))
+            .expect("create job");
+        let unapproved = db
+            .create_job(&new_job("project-c", JobStatus::PendingApproval))
+            .expect("create job");
+
+        let affected = super::bind_matches(
+            &db,
+            "gmail",
+            vec![super::EmailMatch {
+                backend: "stanford".to_string(),
+                token: "tok_cross".to_string(),
+            }],
+        )
+        .expect("an unapproved job must not abort binding");
+
+        let affected_ids: Vec<&str> = affected.iter().map(|job| job.id.as_str()).collect();
+        assert_eq!(affected_ids, [newer.id.as_str()]);
+        let token_of = |id: &str| db.get_job(id).expect("get job").expect("job").token;
+        assert_eq!(token_of(&newer.id).as_deref(), Some("tok_cross"));
+        assert_eq!(token_of(&older.id), None);
+        assert_eq!(token_of(&unapproved.id), None);
     }
 
     /// CSPaper hands its job_id back in the submit response and sends no
@@ -1037,7 +1085,6 @@ mod tests {
 
         let affected = super::bind_matches(
             &db,
-            "project-email",
             "gmail",
             vec![
                 cspaper_match,
@@ -1112,7 +1159,7 @@ mod tests {
         assert!(result.unwrap().is_empty());
 
         let ev = db
-            .most_recent_event_of_type(&config.project_id, "gmail_oauth_refresh_failed")
+            .most_recent_event_of_type("", "gmail_oauth_refresh_failed")
             .expect("db query")
             .expect("expected gmail_oauth_refresh_failed event");
         assert!(

@@ -1419,27 +1419,24 @@ impl Db {
         .map_err(Into::into)
     }
 
-    pub fn find_latest_open_job_without_token(
-        &self,
-        project_id: &str,
-        backend: &str,
-    ) -> Result<Option<Job>> {
+    /// The newest job of `backend`, in any project, that could take a token
+    /// arriving by email. The mailbox is machine-wide, so a token is bound
+    /// wherever its job lives. A job awaiting approval was never sent and
+    /// cannot take a token.
+    pub fn find_latest_open_job_without_token(&self, backend: &str) -> Result<Option<Job>> {
         let conn = self.connect()?;
         conn.query_row(
             r#"
             SELECT *
             FROM jobs
-            WHERE project_id = ?1
-              AND backend = ?2
+            WHERE backend = ?1
               AND token IS NULL
-              AND status IN (?3, ?4, ?5, ?6)
+              AND status IN (?2, ?3, ?4)
             ORDER BY created_at DESC
             LIMIT 1
             "#,
             params![
-                project_id,
                 backend,
-                JobStatus::PendingApproval.as_str(),
                 JobStatus::Queued.as_str(),
                 JobStatus::Submitted.as_str(),
                 JobStatus::Processing.as_str()
@@ -1450,11 +1447,12 @@ impl Db {
         .map_err(Into::into)
     }
 
-    pub fn find_job_by_token(&self, project_id: &str, token: &str) -> Result<Option<Job>> {
+    /// The job, in any project, that holds `token`.
+    pub fn find_job_by_token(&self, token: &str) -> Result<Option<Job>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT * FROM jobs WHERE project_id = ?1 AND token = ?2 LIMIT 1",
-            params![project_id, token],
+            "SELECT * FROM jobs WHERE token = ?1 LIMIT 1",
+            params![token],
             map_job_row,
         )
         .optional()
