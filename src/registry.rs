@@ -191,6 +191,17 @@ pub fn enable(
         });
     }
     let existing = projects.iter().find(|row| row.project_id == project_id);
+    // Already enabled here: nothing to decide, and its health stays.
+    if let Some(row) = existing
+        && row.enabled
+        && same_config_file(&row.config_path, config_path)
+    {
+        db.touch_project_registration(project_id, &row.config_path, config_path, now)?;
+        return Ok(Enabled {
+            already: true,
+            moved_from: None,
+        });
+    }
     let mut moved_from = None;
     if let Some(row) = existing
         && !same_config_file(&row.config_path, config_path)
@@ -374,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn enable_reports_an_already_enabled_project() {
+    fn enable_reports_an_already_enabled_project_and_keeps_its_health() {
         let fx = Fixture::new();
         let path = fx.config("a", "p");
         assert!(
@@ -382,11 +393,19 @@ mod tests {
                 .unwrap()
                 .already
         );
+        fx.db.record_project_health("p", Utc::now(), None).unwrap();
+        let before = fx.row("p");
         assert!(
             enable(&fx.db, "p", &path, false, Utc::now())
                 .unwrap()
                 .already
         );
+        let after = fx.row("p");
+        assert_eq!(
+            after.health, before.health,
+            "a no-op enable keeps the last pass"
+        );
+        assert_eq!(after.enabled_changed_at, before.enabled_changed_at);
     }
 
     #[test]
