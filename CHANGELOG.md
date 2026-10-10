@@ -107,7 +107,72 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   in the global config: launchd does not pass the shell's
   `REVIEWLOOP_CSPAPER_API_KEY` to the daemon.
 
+- **Machine supervisor for explicitly enabled projects (OSS-338)** —
+  `reviewloop daemon run` (the launchd service on macOS) is one supervisor
+  for the machine instead of a daemon bound to one project. It runs the
+  triggers, queue, polls, timeouts and lease recovery of every project you
+  enable, and nothing else: loading a config only registers it.
+  - `reviewloop project list [--json]`, `project enable [--replace]
+    [--project-id]`, `project disable [--project-id]`.
+  - One supervisor per state dir (an OS lock on `supervisor.lock`, released
+    with its process) and per database; a second one is refused naming the
+    holder's pid.
+  - One provider budget for the machine: `max_submissions_per_tick`
+    submissions and `max_concurrency` polls per tick, shared by every project
+    and both providers, sequential, projects taking turns. A project whose
+    config stops loading, or whose step or request fails, fails alone and
+    reports it in its health; one `tick_failed` event and notification per
+    new error, not per tick.
+  - `daemon pause` / `daemon resume` set a persistent flag: the paused
+    supervisor stays loaded but runs no triggers and contacts no provider, a
+    request in flight finishes, and a restart stays paused. Pause, resume,
+    enable and disable take effect within 2 seconds.
+  - `daemon status [--json]` works on every platform: supervisor state from
+    its heartbeat, the launchd service, the budget, every registered project
+    with its health and active jobs, and jobs no supervisor runs.
+- **Worker availability** — the operations gain `get_worker_status`,
+  `enable_project` and `disable_project` (error codes `project_conflict`,
+  `project_not_registered`); `ProjectView` gains `enabled`, `state` and the
+  supervisor's last pass. `submit`, `approve`, `retry`, `import-token` and
+  `status` say whether anything will move the job without you, separately
+  from its queue state.
+
 ### Changed
+
+- **Registry (OSS-338)** — config paths are stored canonical. A second live
+  config declaring a registered `project_id` (another clone or worktree) no
+  longer takes the registration over: commands there print one note, and
+  `project enable --replace` moves it explicitly. A disabled registration
+  still follows its project when the registered file is gone or now declares
+  another id; an enabled one never moves implicitly.
+- **Machine-wide settings are refused in `reviewloop.toml`** by name
+  (`core.db_path`, `core.state_dir`, the provider budget, `[polling]`,
+  `[retention]`, `[logging]`, `[imap]`, `[gmail_oauth]`), pointing at the
+  global config, instead of failing as an unknown field.
+- **Mail tokens bind machine-wide** — the mailbox is read once per tick and a
+  token is bound to the job holding it, else the newest tokenless open job
+  of its backend, in any project. Jobs awaiting approval are no longer
+  candidates. Bound jobs are polled in the tick's budgeted poll round instead
+  of immediately.
+- **`reviewloop run` follows its job** — it no longer runs a full project
+  tick every 5 seconds (triggers, every due job of the project, mailbox,
+  retention, widget). While a supervisor runs the project it only watches;
+  otherwise it submits or polls its own job when the job's schedule makes it
+  due, every 30 seconds.
+- **`daemon install`** installs the machine-wide service: it refuses
+  `--config`, keeps the project an older single-project install was bound to
+  enabled (and enables nothing else), and pins `XDG_CONFIG_HOME` /
+  `REVIEWLOOP_STATE_DIR` when the shell sets them, so the service uses the
+  same global config and database as the shell. `daemon status` warns when
+  they differ.
+- **Widget snapshot covers the machine** — one document per tick from the
+  supervisor: every project's jobs (each tagged `project_id`), plus
+  `supervisor` and `projects` (additive; `schema_version` stays 1).
+  `project_id` is `""` and `last_tick_at` is never null.
+- **Menu bar** — Pause/Resume follow the supervisor's pause flag, so Resume
+  is reachable after Pause (it used to unload the service).
+- Minimum supported Rust is 1.89 (the locked dependencies already needed
+  1.88).
 
 - **Coverage includes the venue.** A job covers a request with the same
   manuscript hash, backend, venue and version key; the same manuscript for a
@@ -251,6 +316,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Upgrade notes
 
+- Schema version 6 adds `projects.enabled`, `enabled_changed_at` and the
+  health columns (`last_run_at`, `last_ok_at`, `last_error`,
+  `last_error_at`), and the single-row `supervisor` table. Existing
+  registrations migrate disabled.
+- **Enable your projects.** After upgrading, the supervisor runs only enabled
+  projects. A launchd service installed by an earlier version (bound with
+  `--config`) keeps its project enabled on first start; run
+  `reviewloop project enable` in every other repository it should run, and
+  `reviewloop daemon install` once to rewrite the service.
+- **Less provider load with several projects.** The per-tick limits used to
+  apply to each running daemon or `run` loop; they are now one budget for the
+  machine, so N projects see N times fewer submissions per tick than N
+  separate daemons sent.
+- `daemon pause` no longer unloads the launchd service. A service paused by
+  an earlier version is reloaded by `daemon resume`.
+- `daemon status --json` changed shape: `supervisor`, `tick_health`,
+  `service`, `budget`, `current_project`, `projects[]` (with `active_jobs`),
+  `unregistered_active_jobs`, `gmail_oauth_status`, `proxy_health`.
+- New event types: `project_enabled`, `project_disabled`,
+  `supervisor_paused`, `supervisor_resumed`; `tick_failed` is written once
+  per new error of a project (or of the machine, project `""`), and
+  `gmail_oauth_refresh_failed` is machine-level (project `""`).
+- New error codes: `project_conflict`, `project_not_registered`.
+
 - Schema version 4 adds `jobs.lease_owner`, `jobs.lease_expires_at` and
   `jobs.submit_stage` (migrated automatically from v1, v2 or v3).
 - Jobs left `SUBMITTED` by earlier versions are marked `UNCERTAIN` on the
@@ -278,6 +367,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   of the global config instead of resetting it.
 
 ### Fixed
+
+- `reviewloop daemon run --panel false`, which `daemon install` writes into
+  the launchd plist, parses again: `--panel` took no value, so the installed
+  service exited at start.
+- A project-relative `fallback_script` (the default) no longer fails the
+  HOME check when a project outside HOME is loaded from the registry.
+- A missing PDF or provider setting of paper `main` in one project no longer
+  silences the same warning for another project's paper `main`.
 
 - **Review tokens no longer leak into default output** — request errors are
   described without their URL (the Stanford review URL and the CSPaper job URL
