@@ -25,6 +25,10 @@ use reviewloop::{
         Approval, OpError, RequestDisposition, RequestOrigin, ReviewOps, ReviewPart, ReviewQuery,
         ReviewRequest, ReviewRequestOutcome,
     },
+    backend::{
+        BackendError,
+        cspaper::{self, CspaperBackend},
+    },
     config::{Config, PaperConfig, Redacted},
     db::{ClaimTiming, Db, Lease, LeaseRecovery},
     model::{ExistingReason, Job, JobPdf, JobStatus, NewJob, ReviewOptions, SubmitStage, WorkKind},
@@ -79,6 +83,8 @@ const REVIEWS_PATH: &str = "/api/platform/reviews";
 const API_KEY_HEADER: &str = "x-api-key";
 const SUBMIT: &str = "submit";
 const POLL: &str = "poll";
+/// The organisation job list (`GET /api/platform/reviews`).
+const LIST: &str = "list";
 /// Any request outside the two API routes.
 const OTHER: &str = "other";
 /// Upper bound on any wait on the worker or the mock; the worker's own dispatch timeout
@@ -479,6 +485,14 @@ impl MockServer {
                 any(
                     |State(state): State<Arc<MockState>>, req: Request| async move {
                         state.serve(SUBMIT, req).await
+                    },
+                ),
+            )
+            .route(
+                REVIEWS_PATH,
+                any(
+                    |State(state): State<Arc<MockState>>, req: Request| async move {
+                        state.serve(LIST, req).await
                     },
                 ),
             )
@@ -1974,5 +1988,131 @@ async fn unreachable_poll_never_records_the_job_id() -> Result<()> {
         "token leaked: {}",
         poll_error.payload
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// Organisation usage: CSPaper's job list
+// ---------------------------------------------------------------------------------------
+
+/// A page of the organisation job list in the documented shape.
+fn job_page(jobs: impl IntoIterator<Item = (String, &'static str)>) -> Reply {
+    let data: Vec<Value> = jobs
+        .into_iter()
+        .map(|(id, status)| {
+            json!({
+                "id": id,
+                "status": status,
+                "agent_id": AGENT,
+                "created": "2026-10-09T12:00:00Z",
+                "paper_meta": {"filename": "paper.pdf", "title": TITLE, "authors": []},
+            })
+        })
+        .collect();
+    Reply::json(StatusCode::OK, &json!({"status": 200, "data": data}))
+}
+
+fn org_job(n: usize) -> String {
+    format!("org-job-{n:04}")
+}
+
+/// A local cspaper job that holds `token`, as one this machine submitted.
+fn submitted_locally(ctx: &TestContext, token: &str) -> Result<()> {
+    let job = ctx.insert_job(Some(AGENT))?;
+    ctx.db.attach_token_to_job(&job.id, token, Utc::now())?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn org_usage_pages_the_job_list_and_matches_reviewloop_jobs() -> Result<()> {
+    let ctx = TestContext::start().await?;
+    submitted_locally(&ctx, &org_job(1))?;
+    submitted_locally(&ctx, &org_job(51))?;
+    // A local job CSPaper does not list (e.g. another organisation's key).
+    submitted_locally(&ctx, "elsewhere-0001")?;
+    let status = |n: usize| match n % 4 {
+        0 => "COMPLETED",
+        1 => "PROCESSING",
+        2 => "FAILED",
+        _ => "PENDING",
+    };
+    ctx.reply(LIST, job_page((0..50).map(|n| (org_job(n), status(n)))));
+    ctx.reply(LIST, job_page((50..53).map(|n| (org_job(n), status(n)))));
+
+    let listed = CspaperBackend::from_config(&ctx.config)?
+        .list_jobs()
+        .await?;
+
+    assert!(!listed.incomplete);
+    assert_eq!(listed.jobs.len(), 53);
+    let report = cspaper::summarize(
+        &listed,
+        &ctx.db.provider_tokens(cspaper::BACKEND)?,
+        cspaper::BillingMonth::parse("2026-10").context("month")?,
+    );
+    assert_eq!(
+        report.all_time, report.in_month,
+        "every listed job is from 2026-10"
+    );
+    let usage = report.in_month;
+    assert_eq!(usage.total, 53);
+    assert_eq!(usage.completed, 14);
+    assert_eq!(usage.in_progress, 26);
+    assert_eq!(usage.failed, 13);
+    assert_eq!(usage.via_reviewloop, 2);
+    assert_eq!(usage.via_other_clients(), 51);
+
+    let requests = ctx.mock().received(LIST);
+    let queries: Vec<_> = requests.iter().map(|request| request.uri.clone()).collect();
+    assert_eq!(
+        queries,
+        [
+            format!("{REVIEWS_PATH}?limit=50&offset=0"),
+            format!("{REVIEWS_PATH}?limit=50&offset=50"),
+        ]
+    );
+    assert!(requests.iter().all(|request| request.method == Method::GET));
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.api_key() == Some(SECRET))
+    );
+    ctx.mock().assert_key_confined(SECRET);
+    // Listing is read-only: nothing was submitted or polled.
+    assert_eq!(ctx.calls(), [0, 0, 0]);
+    Ok(())
+}
+
+/// Stopping is all it can do, but the result must not claim to be complete.
+#[tokio::test]
+async fn org_usage_stops_when_the_server_ignores_offset() -> Result<()> {
+    let ctx = TestContext::start().await?;
+    let page = || job_page((0..50).map(|n| (org_job(n), "COMPLETED")));
+    ctx.reply(LIST, page());
+    ctx.reply(LIST, page());
+
+    let listed = CspaperBackend::from_config(&ctx.config)?
+        .list_jobs()
+        .await?;
+
+    assert_eq!(listed.jobs.len(), 50, "a repeated page adds nothing");
+    assert!(listed.incomplete);
+    assert_eq!(ctx.mock().received(LIST).len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn org_usage_with_a_refused_key_is_an_auth_error() -> Result<()> {
+    let ctx = TestContext::start().await?;
+    ctx.mock().accept_only(OTHER_ORG_KEY);
+
+    let err = CspaperBackend::from_config(&ctx.config)?
+        .list_jobs()
+        .await
+        .expect_err("refused key");
+
+    assert!(matches!(err, BackendError::Auth(_)), "{err}");
+    assert!(err.to_string().contains("Invalid API Key"), "{err}");
+    assert!(!err.to_string().contains(SECRET), "{err}");
     Ok(())
 }

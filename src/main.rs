@@ -7,6 +7,7 @@ use reviewloop::application::{
 };
 use reviewloop::artifact::write_review_artifacts;
 use reviewloop::backend::ProviderSource;
+use reviewloop::backend::cspaper;
 use reviewloop::config::{
     Config, GlobalConfigFile, LegacyConfig, PaperConfigFile, ProjectConfigFile,
     default_project_config_path,
@@ -179,6 +180,11 @@ enum Command {
         #[command(subcommand)]
         command: EmailCommand,
     },
+    /// CSPaper provider tools.
+    Cspaper {
+        #[command(subcommand)]
+        command: CspaperCommand,
+    },
     /// Update the reviewloop binary to the latest release.
     SelfUpdate {
         #[arg(long, value_enum, default_value_t = UpdateMethod::Auto)]
@@ -334,6 +340,21 @@ enum EmailCommand {
     },
     /// Show which email accounts are configured and their auth status.
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum CspaperCommand {
+    /// Reviews used per billing month (CSPaper invoices API keys monthly by
+    /// usage): the organisation's reviews from every client, read from
+    /// CSPaper's job list; how many this machine's reviewloop tracks; and what
+    /// is left of `providers.cspaper.monthly_allowance`.
+    Usage {
+        /// Billing month as YYYY-MM (UTC); defaults to the current month.
+        #[arg(long)]
+        month: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 /// Argument group for commands that accept either `--job-id` or `--paper-id`.
@@ -601,6 +622,13 @@ async fn run() -> Result<()> {
                 EmailCommand::Status => cmd_email_status(&config),
             }
         }
+        Command::Cspaper { command } => match command {
+            CspaperCommand::Usage { month, json } => {
+                // JSON owns stdout, so logs go to stderr whatever logging.output says.
+                let (config, db) = load_runtime(config_override.as_deref(), json, false)?;
+                cmd_cspaper_usage(&config, &db, month.as_deref(), json).await
+            }
+        },
         Command::SelfUpdate {
             method,
             yes,
@@ -1940,6 +1968,57 @@ async fn cmd_submit(
             submitted.last_error.as_deref().unwrap_or("(no details)")
         );
     }
+    print_provider_usage(db, &job.backend)
+}
+
+/// The organisation's CSPaper reviews in a billing month, from CSPaper's job
+/// list, split into this machine's reviewloop jobs and other clients, with
+/// what is left of the monthly allowance.
+async fn cmd_cspaper_usage(
+    config: &Config,
+    db: &Db,
+    month: Option<&str>,
+    as_json: bool,
+) -> Result<()> {
+    let month = match month {
+        Some(raw) => cspaper::BillingMonth::parse(raw)
+            .ok_or_else(|| anyhow!("--month must be YYYY-MM, got {raw:?}"))?,
+        None => cspaper::BillingMonth::containing(Utc::now()),
+    };
+    let listed = cspaper::CspaperBackend::from_config(config)?
+        .list_jobs()
+        .await
+        .context("failed to read CSPaper's job list")?;
+    let report = cspaper::summarize(&listed, &db.provider_tokens(cspaper::BACKEND)?, month);
+    let local = db.provider_usage(cspaper::BACKEND, Some(month.range()))?;
+    let allowance = config.providers.cspaper.monthly_allowance;
+    if as_json {
+        let payload = json!({
+            "report": report,
+            "via_other_clients": report.in_month.via_other_clients(),
+            "monthly_allowance": allowance,
+            "left": cspaper::allowance_left(&report, allowance),
+            "local": local,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+    println!("{}", cspaper::org_usage_report(&report, allowance));
+    println!("{}", cspaper::usage_note(local, month));
+    Ok(())
+}
+
+/// After a submission to a provider that bills per review, say what this
+/// machine's reviewloop has had accepted this billing month (local count; see
+/// `cspaper::usage_note`).
+fn print_provider_usage(db: &Db, backend: &str) -> Result<()> {
+    if backend == cspaper::BACKEND {
+        let month = cspaper::BillingMonth::containing(Utc::now());
+        println!(
+            "{}",
+            cspaper::usage_note(db.provider_usage(backend, Some(month.range()))?, month)
+        );
+    }
     Ok(())
 }
 
@@ -2008,7 +2087,10 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
 
     if !args.quiet {
         match submit_attempt {
-            Attempt::Ran => println!("Submitted job {} for paper_id={paper_id}", job_id),
+            Attempt::Ran => {
+                println!("Submitted job {} for paper_id={paper_id}", job_id);
+                print_provider_usage(&db, &backend)?;
+            }
             Attempt::NotClaimed => println!(
                 "Job {} for paper_id={paper_id} is being submitted by another reviewloop worker",
                 job_id
@@ -2262,7 +2344,7 @@ fn daemon_cspaper_key_warning(config: &Config, global_path: &Path) -> Result<Opt
     let uses_cspaper = config
         .papers
         .iter()
-        .any(|paper| paper.backend == reviewloop::backend::cspaper::BACKEND);
+        .any(|paper| paper.backend == cspaper::BACKEND);
     let key_in_file = GlobalConfigFile::load(global_path)?
         .providers
         .cspaper
@@ -2433,7 +2515,7 @@ fn cmd_status(
             return Ok(());
         }
         render_timeline_text(config, paper_id, &rows, &events, show_token, &hidden);
-        return Ok(());
+        return print_status_usage(config, db, &rows);
     }
 
     if as_json {
@@ -2468,7 +2550,7 @@ fn cmd_status(
 
     if rows.is_empty() {
         println!("No jobs found.");
-        return Ok(());
+        return print_status_usage(config, db, &rows);
     }
 
     // Group rows by paper_id, ordered alphabetically (BTreeMap).
@@ -2511,6 +2593,21 @@ fn cmd_status(
         }
     }
 
+    print_status_usage(config, db, &rows)
+}
+
+/// The text views of `status` end with the CSPaper usage line when the project
+/// uses CSPaper (JSON output stays unchanged).
+fn print_status_usage(config: &Config, db: &Db, rows: &[StatusView]) -> Result<()> {
+    let uses_cspaper = config
+        .papers
+        .iter()
+        .any(|paper| paper.backend == cspaper::BACKEND)
+        || rows.iter().any(|row| row.backend == cspaper::BACKEND);
+    if uses_cspaper {
+        println!();
+        print_provider_usage(db, cspaper::BACKEND)?;
+    }
     Ok(())
 }
 

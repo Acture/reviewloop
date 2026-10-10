@@ -4,7 +4,7 @@ use reviewloop::{
     backend::cspaper,
     config::{Config, PaperConfig},
     db::Db,
-    model::{Job, JobPdf, JobStatus, NewJob, ReviewIdentity, ReviewOptions},
+    model::{Job, JobPdf, JobStatus, NewJob, ProviderUsage, ReviewIdentity, ReviewOptions},
     util::sha256_file,
     worker,
 };
@@ -993,5 +993,150 @@ fn failed_job_lists_keep_cspaper_review_options() -> Result<()> {
         );
         assert!(find(&stanford.id)?.review_options.is_empty(), "{query}");
     }
+    Ok(())
+}
+
+#[test]
+fn provider_usage_splits_cspaper_submissions_by_stage_across_projects() -> Result<()> {
+    let ctx = DbTestContext::new()?;
+    let options = || desk_rejection(true);
+    let conn = rusqlite::Connection::open(&ctx.db.path)?;
+    let set = |id: &str, assignment: &str| -> Result<()> {
+        conn.execute(
+            &format!("UPDATE jobs SET {assignment} WHERE id = ?1"),
+            params![id],
+        )?;
+        Ok(())
+    };
+    let accepted = |project: &str, hash: &str, token: &str| -> Result<Job> {
+        let job = ctx.create_cspaper_job(project, JobStatus::Queued, hash, options())?;
+        ctx.db.attach_token_to_job(&job.id, token, Utc::now())?;
+        Ok(job)
+    };
+
+    // In progress: a receipt, still PROCESSING.
+    accepted("proj-a", "hash-u1", "856f388c-0001")?;
+    // Completed, in another project: the key is machine-level, so it counts.
+    let completed = accepted("proj-b", "hash-u2", "856f388c-0002")?;
+    set(&completed.id, "status = 'COMPLETED'")?;
+    // Accepted, then the provider reported the review failed.
+    let ended = accepted("proj-a", "hash-u3", "856f388c-0003")?;
+    set(&ended.id, "status = 'FAILED_NEEDS_MANUAL'")?;
+    // Outcome unknown: no receipt, parked UNCERTAIN.
+    let uncertain = ctx.create_cspaper_job("proj-a", JobStatus::Submitted, "hash-u4", options())?;
+    set(&uncertain.id, "submit_stage = 'UNCERTAIN'")?;
+    // Never sent: queued, or refused before a receipt.
+    ctx.create_cspaper_job("proj-a", JobStatus::Queued, "hash-u5", options())?;
+    ctx.create_cspaper_job("proj-a", JobStatus::Failed, "hash-u6", options())?;
+    // Other backends never count.
+    let stanford = ctx.create_job_with_project_and_hash("proj-a", JobStatus::Queued, "hash-u7")?;
+    ctx.db
+        .attach_token_to_job(&stanford.id, "stanford-token-0001", Utc::now())?;
+
+    let usage = ctx.db.provider_usage(cspaper::BACKEND, None)?;
+    assert_eq!(
+        usage,
+        ProviderUsage {
+            completed: 1,
+            in_progress: 1,
+            ended: 1,
+            uncertain: 1,
+        }
+    );
+    assert_eq!(usage.accepted(), 3);
+
+    // History keeps a possibly charged dispatch counted after its stage is gone.
+    let event = |job: &Job, kind: &str| {
+        ctx.db
+            .add_event(Some(&job.project_id), Some(&job.id), kind, json!({}))
+    };
+    // Unknown outcome, then cancelled: the stage is cleared, CSPaper may still hold it.
+    let cancelled = ctx.create_cspaper_job("proj-a", JobStatus::Failed, "hash-h1", options())?;
+    event(&cancelled, "submit_dispatched")?;
+    event(&cancelled, "submit_outcome_unknown")?;
+    // Unknown outcome, then `retry --force` accepted: the first dispatch stays uncertain.
+    let resent = accepted("proj-a", "hash-h2", "856f388c-0004")?;
+    event(&resent, "submit_dispatched")?;
+    event(&resent, "submit_outcome_unknown")?;
+    event(&resent, "submit_dispatched")?;
+    // Unknown outcome settled by importing its job id: accepted, not uncertain.
+    let imported = ctx.create_cspaper_job("proj-a", JobStatus::Submitted, "hash-h3", options())?;
+    event(&imported, "submit_dispatched")?;
+    event(&imported, "submit_outcome_unknown")?;
+    ctx.db
+        .attach_token_to_job(&imported.id, "856f388c-0005", Utc::now())?;
+
+    assert_eq!(
+        ctx.db.provider_usage(cspaper::BACKEND, None)?,
+        ProviderUsage {
+            completed: 1,
+            in_progress: 3,
+            ended: 1,
+            uncertain: 3,
+        }
+    );
+    assert_eq!(
+        ctx.db.provider_usage("unknown", None)?,
+        ProviderUsage::default()
+    );
+    Ok(())
+}
+
+#[test]
+fn provider_usage_counts_a_cancel_during_dispatch_and_filters_by_period() -> Result<()> {
+    let ctx = DbTestContext::new()?;
+    let options = || desk_rejection(true);
+    let conn = rusqlite::Connection::open(&ctx.db.path)?;
+    let event = |job: &Job, kind: &str, payload: serde_json::Value| {
+        ctx.db
+            .add_event(Some(&job.project_id), Some(&job.id), kind, payload)
+    };
+    let accepted_at = |hash: &str, token: &str, at: &str| -> Result<Job> {
+        let job = ctx.create_cspaper_job("proj-a", JobStatus::Queued, hash, options())?;
+        ctx.db.attach_token_to_job(&job.id, token, Utc::now())?;
+        conn.execute(
+            "UPDATE jobs SET started_at = ?2 WHERE id = ?1",
+            params![job.id, at],
+        )?;
+        Ok(job)
+    };
+
+    // Cancelled while the upload was in flight: CSPaper may hold it.
+    let in_flight = ctx.create_cspaper_job("proj-a", JobStatus::Failed, "hash-c1", options())?;
+    event(&in_flight, "submit_dispatched", json!({}))?;
+    event(
+        &in_flight,
+        "cancelled",
+        json!({"previous_status": "SUBMITTED", "previous_submit_stage": "DISPATCHED"}),
+    )?;
+    // Cancelled before anything was sent: nothing to count.
+    let claimed = ctx.create_cspaper_job("proj-a", JobStatus::Failed, "hash-c2", options())?;
+    event(
+        &claimed,
+        "cancelled",
+        json!({"previous_status": "QUEUED", "previous_submit_stage": "CLAIMED"}),
+    )?;
+    assert_eq!(
+        ctx.db.provider_usage(cspaper::BACKEND, None)?,
+        ProviderUsage {
+            uncertain: 1,
+            ..ProviderUsage::default()
+        }
+    );
+
+    // A billing month keeps jobs accepted in it.
+    accepted_at("hash-p1", "856f388c-0101", "2026-10-05T10:00:00+00:00")?;
+    accepted_at("hash-p2", "856f388c-0102", "2026-09-30T23:59:59+00:00")?;
+    accepted_at("hash-p3", "856f388c-0103", "2026-11-01T00:00:00+00:00")?;
+    let october = cspaper::BillingMonth::parse("2026-10").context("month")?;
+    let in_october = ctx
+        .db
+        .provider_usage(cspaper::BACKEND, Some(october.range()))?;
+    assert_eq!(in_october.in_progress, 1);
+    assert_eq!(
+        ctx.db.provider_usage(cspaper::BACKEND, None)?.in_progress,
+        3,
+        "no period counts every month"
+    );
     Ok(())
 }

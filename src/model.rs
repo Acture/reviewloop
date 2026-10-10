@@ -781,6 +781,27 @@ fn describe_mismatches(mismatches: &[FieldMismatch]) -> String {
         .join("; ")
 }
 
+/// What this machine has sent a provider. Accepted submissions (a stored
+/// receipt) are split by where the review stands; `uncertain` counts jobs
+/// with a dispatch whose outcome is unknown and was never settled by a
+/// receipt (see `Db::provider_usage`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ProviderUsage {
+    pub completed: u64,
+    /// Accepted and still being reviewed.
+    pub in_progress: u64,
+    /// Accepted, then ended without a review: provider failure, timeout,
+    /// cancel, unknown job.
+    pub ended: u64,
+    pub uncertain: u64,
+}
+
+impl ProviderUsage {
+    pub fn accepted(&self) -> u64 {
+        self.completed + self.in_progress + self.ended
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusView {
     pub id: String,

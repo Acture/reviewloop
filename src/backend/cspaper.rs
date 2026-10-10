@@ -25,14 +25,17 @@
 use super::{
     BackendError, ReviewBackend, ReviewFetchResult, SubmitReceipt, SubmitRequest, parse_retry_after,
 };
-use crate::config::{CSPAPER_API_KEY_ENV, CspaperProviderConfig, Redacted};
-use crate::http::describe_error;
-use crate::model::ReviewOptions;
+use crate::config::{CSPAPER_API_KEY_ENV, Config, CspaperProviderConfig, Redacted};
+use crate::http::{Redirects, describe_error};
+use crate::model::{ProviderUsage, ReviewOptions};
 use async_trait::async_trait;
+use chrono::{DateTime, Datelike, TimeZone, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, LOCATION};
 use reqwest::{Response, StatusCode, multipart};
 use reqwest_middleware::ClientWithMiddleware;
+use serde::Serialize;
 use serde_json::{Map, Value, json};
+use std::collections::HashSet;
 
 pub const BACKEND: &str = "cspaper";
 pub const PROVIDER_NAME: &str = "CSPaper Agentic Review";
@@ -289,6 +292,359 @@ impl ReviewBackend for CspaperBackend {
             .map_err(|e| BackendError::Schema(format!("invalid CSPaper job payload: {e}")))?;
         interpret_job(token, payload)
     }
+}
+
+/// Page size for the organisation job list: CSPaper's documented default.
+const LIST_PAGE_SIZE: usize = 50;
+/// Pages read for one usage report at most (10 000 jobs).
+const MAX_LIST_PAGES: usize = 200;
+
+/// A CSPaper billing period. CSPaper invoices platform API keys monthly by
+/// usage ("Platform APIs", cspaper.org, July 2026); months are taken in UTC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BillingMonth {
+    year: i32,
+    month: u32,
+}
+
+impl BillingMonth {
+    pub fn containing(at: DateTime<Utc>) -> Self {
+        Self {
+            year: at.year(),
+            month: at.month(),
+        }
+    }
+
+    /// Exactly `YYYY-MM`.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (year, month) = raw.trim().split_once('-')?;
+        let digits =
+            |part: &str, len: usize| part.len() == len && part.bytes().all(|b| b.is_ascii_digit());
+        if !digits(year, 4) || !digits(month, 2) {
+            return None;
+        }
+        let month = Self {
+            year: year.parse().ok()?,
+            month: month.parse().ok()?,
+        };
+        month.start_opt().map(|_| month)
+    }
+
+    fn start_opt(self) -> Option<DateTime<Utc>> {
+        Utc.with_ymd_and_hms(self.year, self.month, 1, 0, 0, 0)
+            .single()
+    }
+
+    pub fn start(self) -> DateTime<Utc> {
+        self.start_opt()
+            .expect("a parsed or derived month has a first day")
+    }
+
+    fn next(self) -> Self {
+        if self.month == 12 {
+            Self {
+                year: self.year + 1,
+                month: 1,
+            }
+        } else {
+            Self {
+                year: self.year,
+                month: self.month + 1,
+            }
+        }
+    }
+
+    /// `[start, end)` of the month.
+    pub fn range(self) -> (DateTime<Utc>, DateTime<Utc>) {
+        (self.start(), self.next().start())
+    }
+
+    pub fn contains(self, at: DateTime<Utc>) -> bool {
+        let (start, end) = self.range();
+        start <= at && at < end
+    }
+}
+
+impl std::fmt::Display for BillingMonth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:04}-{:02}", self.year, self.month)
+    }
+}
+
+/// One job from CSPaper's organisation-scoped job list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteJob {
+    pub id: String,
+    pub status: String,
+    /// When CSPaper created the job; `None` when the entry has no parseable
+    /// `created`.
+    pub created: Option<DateTime<Utc>>,
+}
+
+/// The organisation's job list as far as it was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteJobList {
+    pub jobs: Vec<RemoteJob>,
+    /// The list may hold more than was read: paging stopped at
+    /// [`MAX_LIST_PAGES`], or the server repeated a page.
+    pub incomplete: bool,
+}
+
+impl CspaperBackend {
+    /// The adapter for read-only calls made outside the worker.
+    pub fn from_config(config: &Config) -> anyhow::Result<Self> {
+        let client = crate::http::build_client(config, None, None, Redirects::Refuse)?;
+        Ok(Self::new(&config.providers.cspaper, client))
+    }
+
+    /// Every job of the key's organisation, from any client (reviewloop, the
+    /// web playground, other tools). Read-only: listing is not usage.
+    pub async fn list_jobs(&self) -> Result<RemoteJobList, BackendError> {
+        let api_key = self.api_key_header()?;
+        let mut seen = HashSet::new();
+        let mut jobs = Vec::new();
+        for page in 0..MAX_LIST_PAGES {
+            let offset = page * LIST_PAGE_SIZE;
+            let resp = self
+                .client
+                .get(self.endpoint(&format!(
+                    "{REVIEWS_PATH}?limit={LIST_PAGE_SIZE}&offset={offset}"
+                )))
+                .header(API_KEY_HEADER, api_key.clone())
+                .send()
+                .await
+                .map_err(|e| BackendError::Network(describe_error(&e, e.url())))?;
+            let status = resp.status();
+            let (retry_after, location) = response_meta(resp.headers());
+            if !status.is_success() {
+                let body = read_body(resp).await;
+                return Err(match status {
+                    StatusCode::TOO_MANY_REQUESTS => BackendError::RateLimited {
+                        message: format!(
+                            "CSPaper rate limited the job list: {}",
+                            self.quote(&body)
+                        ),
+                        retry_after,
+                    },
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                        self.auth_error(status, &body)
+                    }
+                    status if status.is_server_error() => BackendError::Server {
+                        status: status.as_u16(),
+                        body: self.quote(&body),
+                    },
+                    status if status.is_redirection() => {
+                        redirect_error(status, location.as_deref())
+                    }
+                    status => BackendError::Schema(format!(
+                        "unexpected status {status} when listing CSPaper jobs: {}",
+                        self.quote(&body)
+                    )),
+                });
+            }
+            let payload = resp
+                .json::<Value>()
+                .await
+                .map_err(|e| BackendError::Schema(format!("invalid CSPaper job list: {e}")))?;
+            let batch = parse_job_list(&payload)?;
+            let received = batch.len();
+            let before = jobs.len();
+            jobs.extend(batch.into_iter().filter(|job| seen.insert(job.id.clone())));
+            if received < LIST_PAGE_SIZE {
+                return Ok(RemoteJobList {
+                    jobs,
+                    incomplete: false,
+                });
+            }
+            // A full page with nothing new: the server ignores `offset`, so
+            // the rest of the list cannot be read.
+            if jobs.len() == before {
+                return Ok(RemoteJobList {
+                    jobs,
+                    incomplete: true,
+                });
+            }
+        }
+        Ok(RemoteJobList {
+            jobs,
+            incomplete: true,
+        })
+    }
+}
+
+fn parse_job_list(payload: &Value) -> Result<Vec<RemoteJob>, BackendError> {
+    let items = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| BackendError::Schema("CSPaper job list has no data array".into()))?;
+    items
+        .iter()
+        .map(|item| {
+            let field = |name: &str| {
+                item.get(name)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        BackendError::Schema(format!("CSPaper job list entry has no {name}"))
+                    })
+            };
+            Ok(RemoteJob {
+                id: field("id")?,
+                status: field("status")?.trim().to_ascii_uppercase(),
+                created: item
+                    .get("created")
+                    .and_then(Value::as_str)
+                    .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+                    .map(|at| at.with_timezone(&Utc)),
+            })
+        })
+        .collect()
+}
+
+/// CSPaper reviews of the organisation, split by status and by whether this
+/// machine's reviewloop tracks them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct OrgUsage {
+    pub total: u64,
+    pub completed: u64,
+    pub in_progress: u64,
+    pub failed: u64,
+    /// Statuses this adapter does not know.
+    pub other: u64,
+    /// Jobs whose id is the token of a reviewloop job on this machine: ones
+    /// it submitted, and ones attached with `import-token`.
+    pub via_reviewloop: u64,
+}
+
+impl OrgUsage {
+    pub fn via_other_clients(&self) -> u64 {
+        self.total - self.via_reviewloop
+    }
+}
+
+/// The organisation's usage in `month` and overall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct OrgUsageReport {
+    #[serde(serialize_with = "month_str")]
+    pub month: BillingMonth,
+    pub in_month: OrgUsage,
+    pub all_time: OrgUsage,
+    /// Jobs without a creation date: in `all_time` only.
+    pub undated: u64,
+    pub list_incomplete: bool,
+}
+
+fn month_str<S: serde::Serializer>(month: &BillingMonth, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&month.to_string())
+}
+
+pub fn summarize(
+    listed: &RemoteJobList,
+    local_job_ids: &HashSet<String>,
+    month: BillingMonth,
+) -> OrgUsageReport {
+    let count = |usage: &mut OrgUsage, job: &RemoteJob| {
+        usage.total += 1;
+        match job.status.as_str() {
+            "COMPLETED" => usage.completed += 1,
+            "PENDING" | "PROCESSING" => usage.in_progress += 1,
+            "FAILED" => usage.failed += 1,
+            _ => usage.other += 1,
+        }
+        if local_job_ids.contains(&job.id) {
+            usage.via_reviewloop += 1;
+        }
+    };
+    let mut report = OrgUsageReport {
+        month,
+        in_month: OrgUsage::default(),
+        all_time: OrgUsage::default(),
+        undated: 0,
+        list_incomplete: listed.incomplete,
+    };
+    for job in &listed.jobs {
+        count(&mut report.all_time, job);
+        match job.created {
+            Some(created) if month.contains(created) => count(&mut report.in_month, job),
+            Some(_) => {}
+            None => report.undated += 1,
+        }
+    }
+    report
+}
+
+fn status_breakdown(usage: &OrgUsage) -> String {
+    let mut statuses = vec![
+        format!("{} completed", usage.completed),
+        format!("{} in progress", usage.in_progress),
+    ];
+    if usage.failed > 0 {
+        statuses.push(format!("{} failed", usage.failed));
+    }
+    if usage.other > 0 {
+        statuses.push(format!("{} other", usage.other));
+    }
+    statuses.join(", ")
+}
+
+/// Reviews left in `month` under a monthly allowance, negative when over.
+pub fn allowance_left(report: &OrgUsageReport, allowance: Option<u64>) -> Option<i64> {
+    allowance.map(|allowance| allowance as i64 - report.in_month.total as i64)
+}
+
+/// The `reviewloop cspaper usage` report. CSPaper publishes no balance or
+/// quota for API keys, so what is left comes from the monthly allowance set
+/// in `providers.cspaper.monthly_allowance`.
+pub fn org_usage_report(report: &OrgUsageReport, allowance: Option<u64>) -> String {
+    let month = &report.in_month;
+    let left = match (allowance, allowance_left(report, allowance)) {
+        (Some(allowance), Some(left)) if left >= 0 => {
+            format!("monthly allowance {allowance}, {left} left")
+        }
+        (Some(allowance), Some(left)) => {
+            format!("monthly allowance {allowance}, {} over", -left)
+        }
+        _ => "no monthly allowance set (providers.cspaper.monthly_allowance in the global config, e.g. the volume agreed with CSPaper)".to_string(),
+    };
+    let mut text = format!(
+        "CSPaper organisation reviews in {} (UTC), all clients: {} ({})\n  via reviewloop on this machine (submitted or imported): {}\n  via other clients: {}\n  {left}\nAll months: {} reviews, {} via reviewloop on this machine",
+        report.month,
+        month.total,
+        status_breakdown(month),
+        month.via_reviewloop,
+        month.via_other_clients(),
+        report.all_time.total,
+        report.all_time.via_reviewloop,
+    );
+    if report.undated > 0 {
+        text.push_str(&format!(
+            "\n({} job(s) without a creation date are counted in all months only)",
+            report.undated
+        ));
+    }
+    if report.list_incomplete {
+        text.push_str("\n(CSPaper's job list could not be read to the end; the counts may be low)");
+    }
+    text
+}
+
+/// One-line local usage summary for the CLI: what this machine's reviewloop
+/// has had accepted in `month`, and uncertain submissions that may count too.
+pub fn usage_note(usage: ProviderUsage, month: BillingMonth) -> String {
+    let mut note = format!(
+        "CSPaper reviews from this machine in {month}: {} completed, {} in progress",
+        usage.completed, usage.in_progress
+    );
+    if usage.ended > 0 {
+        note.push_str(&format!(", {} ended without a review", usage.ended));
+    }
+    if usage.uncertain > 0 {
+        note.push_str(&format!(
+            "; {} uncertain submission(s) may also count",
+            usage.uncertain
+        ));
+    }
+    note
 }
 
 fn response_meta(headers: &HeaderMap) -> (Option<chrono::Duration>, Option<String>) {
@@ -588,6 +944,180 @@ mod tests {
             assert!(
                 matches!(interpret_job(JOB, payload), Err(BackendError::Schema(_))),
                 "{case}"
+            );
+        }
+    }
+
+    fn month(raw: &str) -> BillingMonth {
+        BillingMonth::parse(raw).expect("valid month")
+    }
+
+    fn at(raw: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(raw)
+            .expect("valid timestamp")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn usage_note_splits_reviews_by_stage_and_flags_uncertain_ones() {
+        let quiet = usage_note(
+            ProviderUsage {
+                completed: 3,
+                in_progress: 1,
+                ..ProviderUsage::default()
+            },
+            month("2026-10"),
+        );
+        assert_eq!(
+            quiet,
+            "CSPaper reviews from this machine in 2026-10: 3 completed, 1 in progress"
+        );
+        let busy = usage_note(
+            ProviderUsage {
+                completed: 1,
+                in_progress: 0,
+                ended: 2,
+                uncertain: 1,
+            },
+            month("2026-10"),
+        );
+        assert_eq!(
+            busy,
+            "CSPaper reviews from this machine in 2026-10: 1 completed, 0 in progress, 2 ended without a review; 1 uncertain submission(s) may also count"
+        );
+    }
+
+    #[test]
+    fn billing_months_parse_and_bound_in_utc() {
+        let october = month("2026-10");
+        assert_eq!(october.to_string(), "2026-10");
+        assert_eq!(
+            october.range(),
+            (at("2026-10-01T00:00:00Z"), at("2026-11-01T00:00:00Z"))
+        );
+        assert!(october.contains(at("2026-10-31T23:59:59Z")));
+        assert!(!october.contains(at("2026-11-01T00:00:00Z")));
+        // Early on 1 November in UTC+2 is still October in UTC.
+        assert!(october.contains(at("2026-11-01T01:30:00+02:00")));
+        assert_eq!(month("2026-12").range().1, at("2027-01-01T00:00:00Z"));
+        assert_eq!(
+            BillingMonth::containing(at("2026-02-14T08:00:00Z")),
+            month("2026-02")
+        );
+        for bad in ["2026-13", "2026-0", "26-10", "2026/10", "", "2026-10-01"] {
+            assert!(BillingMonth::parse(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    fn remote(id: &str, status: &str, created: Option<&str>) -> RemoteJob {
+        RemoteJob {
+            id: id.to_string(),
+            status: status.to_string(),
+            created: created.map(at),
+        }
+    }
+
+    fn listed(jobs: Vec<RemoteJob>, incomplete: bool) -> RemoteJobList {
+        RemoteJobList { jobs, incomplete }
+    }
+
+    #[test]
+    fn org_usage_counts_the_month_and_all_months_by_status_and_client() {
+        let oct = Some("2026-10-05T10:00:00Z");
+        let sep = Some("2026-09-30T23:00:00Z");
+        let jobs = vec![
+            remote("a", "COMPLETED", oct),
+            remote("b", "COMPLETED", oct),
+            remote("c", "PROCESSING", oct),
+            remote("d", "PENDING", oct),
+            remote("e", "FAILED", oct),
+            remote("f", "ARCHIVED", oct),
+            remote("g", "COMPLETED", sep),
+            remote("h", "COMPLETED", None),
+        ];
+        let local: HashSet<String> = ["a", "c", "g", "zz"].map(str::to_string).into();
+        let report = summarize(&listed(jobs, false), &local, month("2026-10"));
+        assert_eq!(
+            report.in_month,
+            OrgUsage {
+                total: 6,
+                completed: 2,
+                in_progress: 2,
+                failed: 1,
+                other: 1,
+                via_reviewloop: 2,
+            }
+        );
+        assert_eq!(report.in_month.via_other_clients(), 4);
+        assert_eq!(report.all_time.total, 8);
+        assert_eq!(report.all_time.via_reviewloop, 3);
+        assert_eq!(report.undated, 1);
+        assert!(!report.list_incomplete);
+    }
+
+    #[test]
+    fn org_usage_report_shows_what_is_left_of_the_monthly_allowance() {
+        let jobs = (0..12)
+            .map(|n| {
+                let status = match n {
+                    0..=8 => "COMPLETED",
+                    9 => "PROCESSING",
+                    _ => "FAILED",
+                };
+                remote(&format!("j{n}"), status, Some("2026-10-05T10:00:00Z"))
+            })
+            .collect();
+        let local: HashSet<String> = (0..7).map(|n| format!("j{n}")).collect();
+        let report = summarize(&listed(jobs, false), &local, month("2026-10"));
+        assert_eq!(
+            org_usage_report(&report, Some(50)),
+            "CSPaper organisation reviews in 2026-10 (UTC), all clients: 12 (9 completed, 1 in progress, 2 failed)\n  via reviewloop on this machine (submitted or imported): 7\n  via other clients: 5\n  monthly allowance 50, 38 left\nAll months: 12 reviews, 7 via reviewloop on this machine"
+        );
+        assert_eq!(allowance_left(&report, Some(50)), Some(38));
+        assert!(org_usage_report(&report, Some(10)).contains("monthly allowance 10, 2 over"),);
+        assert_eq!(allowance_left(&report, Some(10)), Some(-2));
+        assert_eq!(allowance_left(&report, None), None);
+        let unset = org_usage_report(&report, None);
+        assert!(unset.contains("no monthly allowance set"), "{unset}");
+        assert!(
+            unset.contains("providers.cspaper.monthly_allowance"),
+            "{unset}"
+        );
+        assert!(!unset.to_lowercase().contains("credit"), "{unset}");
+
+        let partial = summarize(
+            &listed(vec![remote("x", "COMPLETED", None)], true),
+            &local,
+            month("2026-10"),
+        );
+        let text = org_usage_report(&partial, None);
+        assert!(text.contains("1 job(s) without a creation date"), "{text}");
+        assert!(text.ends_with("the counts may be low)"), "{text}");
+    }
+
+    #[test]
+    fn job_list_entries_need_an_id_and_a_status() {
+        let listed = parse_job_list(&json!({"status": 200, "data": [
+            {"id": "a", "status": "completed", "agent_id": "ICLR_main_2026_1", "created": "2025-01-01T00:00:00Z"},
+            {"id": "b", "status": "PENDING", "created": "not a date"},
+        ]}))
+        .unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                remote("a", "COMPLETED", Some("2025-01-01T00:00:00Z")),
+                remote("b", "PENDING", None),
+            ]
+        );
+        for payload in [
+            json!({"status": 200}),
+            json!({"status": 200, "data": {"id": "a"}}),
+            json!({"status": 200, "data": [{"id": "a"}]}),
+            json!({"status": 200, "data": [{"status": "COMPLETED"}]}),
+        ] {
+            assert!(
+                matches!(parse_job_list(&payload), Err(BackendError::Schema(_))),
+                "{payload}"
             );
         }
     }
