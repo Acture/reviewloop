@@ -456,7 +456,7 @@ fn latest_open_job_without_token_prefers_newest() -> Result<()> {
 
     let got = ctx
         .db
-        .find_latest_open_job_without_token(&ctx.config.project_id, "stanford")?
+        .find_latest_open_job_without_token("stanford")?
         .context("expected an open job")?;
 
     assert_ne!(older.id, newer.id);
@@ -555,7 +555,7 @@ fn find_job_by_token_returns_bound_job() -> Result<()> {
 
     let found = ctx
         .db
-        .find_job_by_token(&ctx.config.project_id, "tok-by-token")?
+        .find_job_by_token("tok-by-token")?
         .context("expected token-bound job")?;
     assert_eq!(found.id, job.id);
     assert_eq!(found.token.as_deref(), Some("tok-by-token"));

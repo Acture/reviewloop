@@ -87,22 +87,24 @@ pub fn run_git_tag_trigger(config: &Config, db: &Db) -> Result<()> {
     Ok(())
 }
 
-// Per-process set of paper IDs for which a missing-PDF warning has already
-// been emitted.  We log the warning and write the `pdf_missing` event only
-// once per paper per process lifetime (option b from the design notes) to
-// avoid spamming the event table every 30-second tick.
+// Per-process set of `(project, paper)` pairs for which a missing-PDF warning
+// has already been emitted.  We log the warning and write the `pdf_missing`
+// event only once per paper per process lifetime (option b from the design
+// notes) to avoid spamming the event table every 30-second tick. Keyed by
+// project too: one supervisor runs every project, and papers of different
+// projects often share an id (`main`).
 //
 // Trade-off: if the file reappears and then goes missing again without a
 // daemon restart, the second disappearance will be silent.  Acceptable given
 // the use-case (reorganised repo); a `daemon stop && daemon start` resets the
 // set.
-static PDF_MISSING_WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static PDF_MISSING_WARNED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
 
-// Per-process set of `(paper, setting)` pairs already reported as missing a
-// provider setting, so a misconfigured paper is reported once instead of on
-// every tick (same trade-off as `PDF_MISSING_WARNED`).
-static PROVIDER_UNCONFIGURED_WARNED: OnceLock<Mutex<HashSet<(String, &'static str)>>> =
-    OnceLock::new();
+// Per-process set of `(project, paper, setting)` triples already reported as
+// missing a provider setting, so a misconfigured paper is reported once
+// instead of on every tick (same trade-off as `PDF_MISSING_WARNED`).
+type UnconfiguredKey = (String, String, &'static str);
+static PROVIDER_UNCONFIGURED_WARNED: OnceLock<Mutex<HashSet<UnconfiguredKey>>> = OnceLock::new();
 
 /// Whether `paper` cannot be reviewed yet because its provider lacks a
 /// setting. A trigger skips such a paper instead of enqueueing a job that
@@ -118,7 +120,7 @@ fn provider_unconfigured(
     };
     let guard = PROVIDER_UNCONFIGURED_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
     let mut seen = guard.lock().unwrap_or_else(|e| e.into_inner());
-    if seen.insert((paper.id.clone(), setting)) {
+    if seen.insert((config.project_id.clone(), paper.id.clone(), setting)) {
         warn!(
             paper_id = %paper.id,
             backend = %paper.backend,
@@ -156,7 +158,7 @@ pub fn run_pdf_trigger(config: &Config, db: &Db) -> Result<()> {
         if !path.exists() {
             let guard = PDF_MISSING_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
             let mut seen = guard.lock().unwrap_or_else(|e| e.into_inner());
-            if seen.insert(paper.id.clone()) {
+            if seen.insert((config.project_id.clone(), paper.id.clone())) {
                 tracing::warn!(
                     paper_id = %paper.id,
                     path = %paper.pdf_path,
@@ -699,6 +701,46 @@ mod tests {
             db.list_status_views(&config.project_id, Some("main"))?
                 .is_empty()
         );
+        Ok(())
+    }
+
+    /// One supervisor runs every project in one process: a missing PDF of
+    /// paper `main` in one project must not silence the same paper id in
+    /// another project.
+    #[test]
+    fn pdf_missing_is_reported_per_project() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir)?;
+        let db = Db::new(&state_dir);
+        db.ensure_schema()?;
+        let paper_id = "oss338-shared-paper-id";
+
+        for project_id in ["oss338-project-a", "oss338-project-b"] {
+            let mut config = Config {
+                project_id: project_id.to_string(),
+                ..Config::default()
+            };
+            config.core.state_dir = state_dir.to_string_lossy().to_string();
+            config.trigger.pdf.enabled = true;
+            config.providers.stanford.email = "test@example.edu".to_string();
+            config.papers = vec![PaperConfig {
+                id: paper_id.to_string(),
+                pdf_path: tmp
+                    .path()
+                    .join(format!("{project_id}.pdf"))
+                    .to_string_lossy()
+                    .to_string(),
+                backend: "stanford".to_string(),
+                venue: None,
+            }];
+            run_pdf_trigger(&config, &db)?;
+            assert!(
+                db.most_recent_event_of_type(project_id, "pdf_missing")?
+                    .is_some(),
+                "{project_id} got no pdf_missing event"
+            );
+        }
         Ok(())
     }
 
