@@ -202,7 +202,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **The fallback reads the receipt from confirm-upload's reply**, ignores
   analytics beacons, and reports a 2xx confirm with `success: false` as
   `rejected`; a fallback answer for any step but `confirm`, once confirm was
-  sent, never settles the outcome.
+  sent, never settles the outcome. A receipt is reported as a success even when
+  the page never shows it, and a refusal without a readable reason names the
+  step that answered.
 - **`meta.json` names the route that produced the receipt** (a primary receipt
   after an earlier fallback attempt is `primary`) and adds `provider_venue`.
 

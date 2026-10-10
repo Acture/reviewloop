@@ -18,6 +18,7 @@ import { realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 
 const RANK = { upload_init: 1, upload: 2, confirm: 3 };
+const STEP_NAMES = { upload_init: 'get-upload-url', upload: 'the upload', confirm: 'confirm-upload' };
 
 /** What the page did, from its network traffic. */
 export function newFacts() {
@@ -87,7 +88,9 @@ export function classify(facts, error) {
     return { success: true, token: reply.token, stage, submitted: true };
   }
   const report = { success: false, stage, submitted: facts.confirmSent };
-  let message = facts.dialog ?? reply?.detail ?? facts.confirmFailed;
+  let message = facts.dialog ?? reply?.detail ?? facts.confirmFailed
+    // An answer without a readable reason (an S3 error page, an HTML gateway page).
+    ?? (reply ? `${STEP_NAMES[stage]} answered ${reply.status}` : null);
   if (reply) {
     report.status = reply.status;
     if (reply.status === 429) {
@@ -214,17 +217,15 @@ async function main(facts) {
 const entry = process.argv[1];
 if (entry && realpathSync(entry) === fileURLToPath(import.meta.url)) {
   const facts = newFacts();
-  main(facts)
-    .then((report) => {
-      if (report.success) {
-        console.log(JSON.stringify(report));
-      } else {
-        console.error(JSON.stringify(report));
-        process.exit(1);
-      }
-    })
-    .catch((error) => {
-      console.error(JSON.stringify(classify(facts, error)));
+  // A receipt is a success however the run ended: the page may never show the token
+  // confirm-upload returned (a redesign, a broken script), and the wait then times out.
+  const emit = (report) => {
+    if (report.success) {
+      console.log(JSON.stringify(report));
+    } else {
+      console.error(JSON.stringify(report));
       process.exit(1);
-    });
+    }
+  };
+  main(facts).then(emit, (error) => emit(classify(facts, error)));
 }

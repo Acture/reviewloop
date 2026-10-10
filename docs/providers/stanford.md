@@ -211,11 +211,19 @@ from confirm-upload's reply, not from the page, which renders a missing one as
 
 `submitted` turns true when the page sends `confirm-upload`; after that, an answer
 reported for any other step never settles the outcome. The fallback needs Node.js
-and Playwright (`npm i playwright && npx playwright install chromium`). Its tracking and
-classification are tested by replaying page traffic, analytics beacons included, through
-the shipped functions (`shipped_fallback_script_classifies_outcomes_like_the_primary`);
-the browser run itself was checked with Playwright against a mock of the page and is not
-part of CI.
+and Playwright (`npm i playwright && npx playwright install chromium`). A receipt
+counts even when the page never shows it.
+
+CI covers the script without a browser: page traffic, analytics beacons included, is
+replayed through its exported functions
+(`shipped_fallback_script_classifies_outcomes_like_the_primary`), and the whole script
+runs through the worker against a stand-in `playwright` package
+(`shipped_fallback_script_keeps_a_receipt_…`, `…_names_the_step_that_refused`). On
+2026-10-10 it was also run with real Playwright (1.57, headless Chromium) against the
+saved live page, its real `upload.js` and `gtag.js`, with every request answered
+locally. All ten outcomes (success, upload-init 429, S3 403, confirm 422/5xx/dropped,
+`success: false`, a token-less 200, confirm 429, a custom venue) reported as above,
+including with analytics beacons fired during and after each step.
 
 ## Tests
 

@@ -1564,7 +1564,7 @@ async fn shipped_fallback_script_classifies_outcomes_like_the_primary() -> Resul
   run([['req', ...BEACON], ['res', ...BEACON, 204], ['req', ...INIT], ['res', ...INIT, 429, { detail: 'slow down' }, 120], ['req', ...BEACON], ['res', ...BEACON, 204]]),
   run([...OK_INIT, ['req', ...S3], ['res', ...S3, 403]]),
   run([...UPLOADED, ['req', ...CONFIRM], ['res', ...CONFIRM, 422, { detail: [{ loc: ['body', 'email'], msg: 'Field required' }] }], ['req', ...BEACON], ['res', ...BEACON, 403]]),
-  run([...UPLOADED, ['req', ...CONFIRM], ['res', ...CONFIRM, 502, { detail: 'upstream' }], ['req', ...BEACON], ['res', ...BEACON, 204]]),
+  run([...UPLOADED, ['req', ...CONFIRM], ['res', ...CONFIRM, 502, null], ['req', ...BEACON], ['res', ...BEACON, 204]]),
   run([...UPLOADED, ['req', ...CONFIRM], ['req', ...BEACON], ['res', ...BEACON, 403]]),
   run([...UPLOADED, ['req', ...CONFIRM], ['res', ...CONFIRM, 200, { success: false, message: 'duplicate paper' }]]),
   run([...UPLOADED, ['req', ...CONFIRM], ['res', ...CONFIRM, 200, { success: true, message: 'ok' }]]),
@@ -1600,6 +1600,7 @@ async fn shipped_fallback_script_classifies_outcomes_like_the_primary() -> Resul
     assert_eq!(upload_refused["submitted"], false, "{upload_refused}");
     assert_eq!(upload_refused["stage"], "upload");
     assert_eq!(upload_refused["status"], 403);
+    assert_eq!(upload_refused["error"], "the upload answered 403");
 
     assert_eq!(confirm_invalid["submitted"], true, "{confirm_invalid}");
     assert_eq!(confirm_invalid["stage"], "confirm");
@@ -1609,6 +1610,8 @@ async fn shipped_fallback_script_classifies_outcomes_like_the_primary() -> Resul
     assert_eq!(confirm_5xx["stage"], "confirm", "{confirm_5xx}");
     assert_eq!(confirm_5xx["status"], 502);
     assert!(confirm_5xx.get("rejected").is_none(), "{confirm_5xx}");
+    // An HTML gateway page has no JSON detail; the report still says who answered.
+    assert_eq!(confirm_5xx["error"], "confirm-upload answered 502");
 
     assert_eq!(confirm_silent["submitted"], true, "{confirm_silent}");
     assert_eq!(confirm_silent["stage"], "confirm");
@@ -1698,4 +1701,92 @@ async fn fallback_client_error_attributed_to_an_earlier_step_after_confirm_stays
         "beacon refused",
     )
     .await
+}
+
+/// Arm the shipped fallback script, run under node with a fake `playwright` package
+/// whose page replays `scenario` (`[stage, status, body]` exchanges) and never shows a
+/// result. The primary is rejected so the fallback runs. `None` without node.
+async fn submit_through_shipped_script(scenario: Value) -> Result<Option<(TestContext, Job)>> {
+    if !node_available() {
+        eprintln!("skipped: node is not available");
+        return Ok(None);
+    }
+    let mut ctx = TestContext::start().await?;
+    let dir = ctx.tmp.path().join("shipped-fallback");
+    let package = dir.join("node_modules/playwright");
+    fs::create_dir_all(&package)?;
+    fs::write(
+        package.join("package.json"),
+        r#"{"name":"playwright","type":"module","exports":"./index.mjs"}"#,
+    )?;
+    fs::write(
+        package.join("index.mjs"),
+        include_str!("fixtures/fallback/fake-playwright.mjs"),
+    )?;
+    fs::write(package.join("scenario.json"), scenario.to_string())?;
+    let script = dir.join("paperreview_fallback.mjs");
+    fs::write(&script, include_str!("../tools/paperreview_fallback.mjs"))?;
+    ctx.use_fallback_script(&script);
+    ctx.mock().push(
+        GET_UPLOAD,
+        Step::Reply(Reply::json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "detail": "forced primary failure" }),
+        )),
+    );
+    let job = ctx.create_queued_job()?;
+    assert_eq!(ctx.submit(&job).await?, Attempt::Ran);
+    Ok(Some((ctx, job)))
+}
+
+fn upload_target() -> Value {
+    json!(["upload_init", 200, {
+        "success": true,
+        "presigned_url": "https://bucket.example/",
+        "s3_key": "k",
+        "presigned_fields": {}
+    }])
+}
+
+/// confirm-upload returned a receipt but the page never showed it (say, a redesign):
+/// the token is still accepted instead of being reported as a failure.
+#[tokio::test]
+async fn shipped_fallback_script_keeps_a_receipt_the_page_never_shows() -> Result<()> {
+    let Some((ctx, job)) = submit_through_shipped_script(json!([
+        upload_target(),
+        ["upload", 204, null],
+        ["confirm", 200, { "success": true, "token": "tok-fake-silent", "message": "ok" }],
+    ]))
+    .await?
+    else {
+        return Ok(());
+    };
+    let submitted = ctx.job(&job.id)?;
+    assert_eq!(
+        submitted.status,
+        JobStatus::Processing,
+        "{:?}",
+        submitted.last_error
+    );
+    assert_eq!(submitted.token.as_deref(), Some("tok-fake-silent"));
+    assert!(submitted.fallback_used);
+    let events = ctx.events(&job.id)?;
+    assert_eq!(event_types(&events)[2..], ["submitted_via_fallback"]);
+    Ok(())
+}
+
+/// A refused upload is definitive, and the report says which step refused it.
+#[tokio::test]
+async fn shipped_fallback_script_names_the_step_that_refused() -> Result<()> {
+    let Some((ctx, job)) =
+        submit_through_shipped_script(json!([upload_target(), ["upload", 403, null],])).await?
+    else {
+        return Ok(());
+    };
+    let failed = ctx.job(&job.id)?;
+    assert_eq!(failed.status, JobStatus::FailedNeedsManual);
+    assert!(!failed.fallback_used);
+    assert_contains(failed.last_error.as_deref(), "the upload answered 403");
+    assert_eq!(last_step(&ctx.events(&job.id)?), Some("upload"));
+    Ok(())
 }
