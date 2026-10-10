@@ -501,11 +501,18 @@ impl Supervisor<'_> {
                     .supervisor_record()
                     .map_or(true, |record| record.paused_at.is_some())
         };
+        // A project disabled mid-tick sends nothing more.
+        let runs = |config: &Config| {
+            self.db
+                .get_registered_project(&config.project_id)
+                .is_ok_and(|row| row.is_some_and(|row| row.enabled))
+        };
         let scheduler = Scheduler {
             db: self.db,
             backends: self.backends,
             budget: TickBudget::from_config(&machine.config),
             stop: &stop,
+            runs: &runs,
         };
         let mut report = scheduler
             .tick(&machine.config, &configs, Some(number), &mut memory.turns)

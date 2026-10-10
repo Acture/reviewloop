@@ -20,7 +20,7 @@ use crate::{
     util::compute_next_poll_at,
 };
 use anyhow::{Context, Result};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -171,11 +171,16 @@ fn single_project<'a>(config: &Config, db: &'a Db) -> Scheduler<'a> {
         backends: &LiveBackends,
         budget: TickBudget::from_config(config),
         stop: &never,
+        runs: &always,
     }
 }
 
 fn never() -> bool {
     false
+}
+
+fn always(_: &Config) -> bool {
+    true
 }
 
 /// Builds the backend a job is sent to. [`LiveBackends`] is the real one;
@@ -332,6 +337,9 @@ pub struct Scheduler<'a> {
     /// Checked before every provider call; `true` ends provider work for the
     /// rest of the tick (a pause or a shutdown request).
     pub stop: &'a dyn Fn() -> bool,
+    /// Checked before each provider call for a project; `false` ends that
+    /// project's provider work for the tick (it was disabled meanwhile).
+    pub runs: &'a dyn Fn(&Config) -> bool,
 }
 
 impl Scheduler<'_> {
@@ -419,6 +427,10 @@ impl Scheduler<'_> {
                         report.stopped_early = true;
                         return sent;
                     }
+                    if !(self.runs)(config) {
+                        queue.clear();
+                        break;
+                    }
                     let calls = AtomicUsize::new(0);
                     let result = self.submit_ready(config, &job.id, &calls).await;
                     // A submission that reached the provider spends budget,
@@ -499,6 +511,10 @@ impl Scheduler<'_> {
                         report.stopped_early = true;
                         return sent;
                     }
+                    if !(self.runs)(config) {
+                        queue.clear();
+                        break;
+                    }
                     let calls = AtomicUsize::new(0);
                     let result = self.poll_due(config, &job.id, &calls).await;
                     if calls.load(Ordering::SeqCst) > 0 {
@@ -541,16 +557,19 @@ impl Scheduler<'_> {
     }
 }
 
-/// Move one job on by its own schedule: submit it when it is QUEUED and
-/// due, poll it when it is PROCESSING and due. What `reviewloop run` does for
-/// its job while no supervisor runs the project: never more than the job's
-/// schedule allows, and never another job.
+/// Move one job on by its own schedule: time it out when its review timeout
+/// passed, submit it when it is QUEUED and due, poll it when it is PROCESSING
+/// and due. What `reviewloop run` does for its job while no supervisor runs
+/// the project: never more than the job's schedule allows, and never another
+/// job.
 pub async fn advance_job(
     config: &Config,
     db: &Db,
     backends: &dyn BackendFactory,
     job_id: &str,
 ) -> Result<Attempt> {
+    let job = project_job(config, db, job_id)?;
+    time_out_if_overdue(config, db, &job, Utc::now())?;
     let job = project_job(config, db, job_id)?;
     let (kind, ttl) = match job.status {
         JobStatus::Queued => (WorkKind::Submit, SUBMIT_LEASE_TTL),
@@ -1620,45 +1639,48 @@ fn abandon_claim(db: &Db, lease: &Lease, err: anyhow::Error) -> anyhow::Error {
 
 pub fn mark_timeouts(config: &Config, db: &Db) -> Result<()> {
     let now = Utc::now();
-
     for job in db.list_processing_jobs(&config.project_id)? {
-        let timeout = review_timeout(config);
-        let reference_start = job.started_at.unwrap_or(job.created_at);
-        if now - reference_start < timeout {
-            continue;
-        }
-        // Claiming first lets a poll in flight finish; if the job is still PROCESSING
-        // afterwards, the next tick times it out.
-        let Some(lease) = db.claim_job(
-            &job.id,
-            WorkKind::Poll,
-            ClaimTiming::Now,
-            now,
-            POLL_LEASE_TTL,
-        )?
-        else {
-            continue;
-        };
-        let change = JobChange {
-            status: JobStatus::Timeout,
-            attempt: Some(job.attempt),
-            next_poll_at: Some(None),
-            last_error: Some(Some("review timed out".to_string())),
-            submit_stage: None,
-            fallback_used: None,
-        };
-        if finish(db, &lease, &change, "timeout", json!({}))? {
-            fire_notification(
-                &config.notifications,
-                NotificationKind::Timeout,
-                Some(&job.paper_id),
-                Some(&job.id),
-                None,
-            );
-            warn!(job_id = %job.id, "job timed out");
-        }
+        time_out_if_overdue(config, db, &job, now)?;
     }
+    Ok(())
+}
 
+/// Move a PROCESSING job whose review timeout has passed to TIMEOUT.
+fn time_out_if_overdue(config: &Config, db: &Db, job: &Job, now: DateTime<Utc>) -> Result<()> {
+    let reference_start = job.started_at.unwrap_or(job.created_at);
+    if job.status != JobStatus::Processing || now - reference_start < review_timeout(config) {
+        return Ok(());
+    }
+    // Claiming first lets a poll in flight finish; if the job is still PROCESSING
+    // afterwards, the next tick times it out.
+    let Some(lease) = db.claim_job(
+        &job.id,
+        WorkKind::Poll,
+        ClaimTiming::Now,
+        now,
+        POLL_LEASE_TTL,
+    )?
+    else {
+        return Ok(());
+    };
+    let change = JobChange {
+        status: JobStatus::Timeout,
+        attempt: Some(job.attempt),
+        next_poll_at: Some(None),
+        last_error: Some(Some("review timed out".to_string())),
+        submit_stage: None,
+        fallback_used: None,
+    };
+    if finish(db, &lease, &change, "timeout", json!({}))? {
+        fire_notification(
+            &config.notifications,
+            NotificationKind::Timeout,
+            Some(&job.paper_id),
+            Some(&job.id),
+            None,
+        );
+        warn!(job_id = %job.id, "job timed out");
+    }
     Ok(())
 }
 

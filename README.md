@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Acture/reviewloop/actions/workflows/ci.yml/badge.svg)](https://github.com/Acture/reviewloop/actions/workflows/ci.yml)
 [![Release](https://github.com/Acture/reviewloop/actions/workflows/release.yml/badge.svg)](https://github.com/Acture/reviewloop/actions/workflows/release.yml)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/github/license/Acture/reviewloop)](LICENSE)
 
 > A production-minded Rust CLI/daemon for AI paper review submission and retrieval: `paperreview.ai` (Stanford) and CSPaper Agentic Review.
