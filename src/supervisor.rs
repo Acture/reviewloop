@@ -27,7 +27,7 @@ use crate::{
     model::{RegisteredProject, SupervisorRecord},
     notifier::NotificationKind,
     panel,
-    registry::{self, EnableError},
+    registry::{self, EnableError, same_config_file},
     widget_state,
     worker::{BackendFactory, RoundRobin, Scheduler, TickBudget, TickReport, fire_notification},
 };
@@ -319,32 +319,50 @@ pub fn adopt_legacy_binding(
     config_path: &Path,
     now: DateTime<Utc>,
 ) -> Result<(String, LegacyAdoption)> {
-    let path = canonical_config_path(config_path)?;
-    let config = machine.project(&path).with_context(|| {
-        format!(
-            "failed to load the project the daemon install was bound to ({})",
-            path.display()
-        )
-    })?;
-    let project_id = config.project_id;
-    if let Some(row) = db.get_registered_project(&project_id)?
-        && row.enabled_changed_at.is_some()
-    {
-        return Ok((
-            project_id,
-            LegacyAdoption::AlreadyDecided {
-                enabled: row.enabled,
-            },
-        ));
-    }
-    let adoption = match registry::enable(db, &project_id, &path, true, now) {
-        Ok(enabled) => LegacyAdoption::Enabled {
+    let bound = canonical_config_path(config_path)?;
+    let project_id = machine
+        .project(&bound)
+        .with_context(|| {
+            format!(
+                "failed to load the project the daemon install was bound to ({})",
+                bound.display()
+            )
+        })?
+        .project_id;
+    // Older installs wrote the fully resolved path into the plist; when the
+    // registration names the same file through a symlink in the repository,
+    // that spelling (and its project root) is the project's.
+    let path = match db.get_registered_project(&project_id)? {
+        Some(row)
+            if !same_config_file(&row.config_path, &bound)
+                && resolves_to(&row.config_path, &bound) =>
+        {
+            canonical_config_path(&row.config_path)?
+        }
+        _ => bound,
+    };
+    let adoption = match registry::enable_if_undecided(db, &project_id, &path, now) {
+        Ok(Some(enabled)) => LegacyAdoption::Enabled {
             moved_from: enabled.moved_from,
+        },
+        Ok(None) => LegacyAdoption::AlreadyDecided {
+            enabled: db
+                .get_registered_project(&project_id)?
+                .is_some_and(|row| row.enabled),
         },
         Err(err @ EnableError::FileEnabledAs { .. }) => LegacyAdoption::Conflict(err.to_string()),
         Err(err) => return Err(err.into()),
     };
     Ok((project_id, adoption))
+}
+
+/// Whether `path` resolves, through every symlink, to the same file as
+/// `target`.
+fn resolves_to(path: &Path, target: &Path) -> bool {
+    match (std::fs::canonicalize(path), std::fs::canonicalize(target)) {
+        (Ok(path), Ok(target)) => path == target,
+        _ => false,
+    }
 }
 
 /// What one supervisor tick did.
@@ -365,6 +383,17 @@ pub struct SupervisorMemory {
     /// The last machine config that loaded, for reporting a tick that could
     /// not load one (its notifications and widget path).
     last_machine: Option<Config>,
+}
+
+/// Another live supervisor took this database's control row (this one's
+/// heartbeat went stale, say across a long sleep): two must not run it.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "supervisor {other_pid} (state dir {other_state_dir}) now supervises this database; exiting so only one runs it"
+)]
+pub struct Displaced {
+    pub other_pid: u32,
+    pub other_state_dir: String,
 }
 
 /// The global config moved the database or state directory away from the
@@ -450,7 +479,7 @@ impl Supervisor<'_> {
             let control = self.control_version();
             match self.tick_once(pid, number, &mut memory, &stopping).await {
                 Ok(_) => {}
-                Err(err) if err.is::<StorageMoved>() => {
+                Err(err) if err.is::<StorageMoved>() || err.is::<Displaced>() => {
                     error!(error = %format!("{err:#}"), "supervisor stopping");
                     result = Err(err);
                     break;
@@ -552,6 +581,18 @@ impl Supervisor<'_> {
     /// (`pid`) claimed the control row.
     fn ensure_same_storage(&self, machine: &MachineConfig, pid: u32) -> Result<()> {
         let record = self.db.supervisor_record()?;
+        if let Some(other_pid) = record.pid.filter(|other| *other != pid)
+            && SupervisorState::of(&record, Utc::now()) != SupervisorState::Stopped
+        {
+            return Err(Displaced {
+                other_pid,
+                other_state_dir: record
+                    .state_dir
+                    .as_deref()
+                    .map_or_else(|| "unknown".to_string(), |dir| dir.display().to_string()),
+            }
+            .into());
+        }
         let state_dir = machine.config.state_dir();
         let db_moved = machine
             .config
@@ -622,8 +663,13 @@ impl Supervisor<'_> {
     ) -> Result<()> {
         if error.is_some() && error != memory.machine_error {
             let message = error.as_deref().unwrap_or_default();
-            self.db
-                .add_event(None, None, "tick_failed", json!({ "error": message }))?;
+            // The database may be what failed: notify regardless.
+            if let Err(err) =
+                self.db
+                    .add_event(None, None, "tick_failed", json!({ "error": message }))
+            {
+                warn!(error = %err, "failed to record the tick_failed event");
+            }
             fire_notification(
                 notifications,
                 NotificationKind::TickError,

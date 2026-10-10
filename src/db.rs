@@ -21,7 +21,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PruneReport {
@@ -1831,20 +1831,34 @@ impl Db {
         to: &Path,
         now: DateTime<Utc>,
     ) -> Result<bool> {
-        let conn = self.connect()?;
-        let updated = conn.execute(
-            r#"
-            UPDATE projects SET config_path = ?3, last_seen_at = ?4
-            WHERE project_id = ?1 AND config_path = ?2
-            "#,
-            params![
-                project_id,
-                from.to_string_lossy(),
-                to.to_string_lossy(),
-                to_rfc3339(now)
-            ],
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        let Some(enabled) = tx
+            .query_row(
+                "SELECT enabled FROM projects WHERE project_id = ?1 AND config_path = ?2",
+                params![project_id, from.to_string_lossy()],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        // The caller checked both spellings name one file, so an enabled
+        // row may take the new one: released first, past the guard against
+        // moving an enabled project, and restored in the same write.
+        tx.execute(
+            "UPDATE projects SET enabled = 0 WHERE project_id = ?1",
+            params![project_id],
         )?;
-        Ok(updated == 1)
+        tx.execute(
+            r#"
+            UPDATE projects SET config_path = ?2, last_seen_at = ?3, enabled = ?4
+            WHERE project_id = ?1
+            "#,
+            params![project_id, to.to_string_lossy(), to_rfc3339(now), enabled],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Point a disabled registration at a new config path, but only while it
@@ -1875,25 +1889,31 @@ impl Db {
 
     /// Enable `project_id` at `config_path`, starting its health afresh.
     /// `expected` is the path the caller checked the registration against
-    /// (`None`: it was not registered); returns `false`, writing nothing, if
-    /// the row changed since.
+    /// (`None`: it was not registered); `undecided_only` also requires that
+    /// nobody enabled or disabled it yet. Returns `false`, writing nothing,
+    /// when the row no longer matches.
     pub fn enable_project(
         &self,
         project_id: &str,
         config_path: &Path,
         expected: Option<&Path>,
+        undecided_only: bool,
         now: DateTime<Utc>,
     ) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = begin_immediate(&mut conn)?;
-        let current: Option<String> = tx
+        let current: Option<(String, Option<String>)> = tx
             .query_row(
-                "SELECT config_path FROM projects WHERE project_id = ?1",
+                "SELECT config_path, enabled_changed_at FROM projects WHERE project_id = ?1",
                 params![project_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if current.as_deref().map(PathBuf::from).as_deref() != expected {
+        let decided = current
+            .as_ref()
+            .is_some_and(|(_, changed_at)| changed_at.is_some());
+        let current_path = current.map(|(path, _)| PathBuf::from(path));
+        if current_path.as_deref() != expected || (undecided_only && decided) {
             return Ok(false);
         }
         let now = to_rfc3339(now);
@@ -3960,9 +3980,9 @@ mod tests {
         let path = std::path::Path::new("/tmp/a/reviewloop.toml");
         let moved = std::path::Path::new("/tmp/b/reviewloop.toml");
 
-        assert!(db.enable_project("a", path, None, now).unwrap());
+        assert!(db.enable_project("a", path, None, false, now).unwrap());
         // `expected` no longer matches: nothing is written.
-        assert!(!db.enable_project("a", moved, None, now).unwrap());
+        assert!(!db.enable_project("a", moved, None, false, now).unwrap());
         assert!(!db.repoint_disabled_project("a", path, moved, now).unwrap());
         let row = db.get_registered_project("a").unwrap().unwrap();
         assert!(row.enabled);
@@ -4000,6 +4020,42 @@ mod tests {
         assert_eq!(health.last_error_at, None);
     }
 
+    /// Refreshing an enabled row to a new spelling of the same file (the
+    /// caller checked that) passes the guard and updates `last_seen_at`.
+    #[test]
+    fn an_enabled_registration_takes_a_new_spelling_of_its_file() {
+        let db = Db::new_in_memory("touch_enabled_spelling").unwrap();
+        db.ensure_schema().unwrap();
+        let old = std::path::Path::new("/Users/me/code/repo/reviewloop.toml");
+        let new = std::path::Path::new("/Volumes/X/code/repo/reviewloop.toml");
+        let then = Utc::now() - ChronoDuration::hours(1);
+        db.enable_project("a", old, None, false, then).unwrap();
+        let now = Utc::now();
+        assert!(db.touch_project_registration("a", old, new, now).unwrap());
+        let row = db.get_registered_project("a").unwrap().unwrap();
+        assert_eq!(row.config_path, new);
+        assert_eq!(row.last_seen_at, now);
+        assert!(row.enabled, "still enabled");
+        // A stale `from` changes nothing.
+        assert!(!db.touch_project_registration("a", old, old, now).unwrap());
+    }
+
+    #[test]
+    fn an_undecided_only_enable_never_overrides_a_decision() {
+        let db = Db::new_in_memory("enable_undecided_only").unwrap();
+        db.ensure_schema().unwrap();
+        let path = std::path::Path::new("/repo/reviewloop.toml");
+        let now = Utc::now();
+        db.insert_project_registration("a", path, now).unwrap();
+        db.disable_project("a", now).unwrap();
+        assert!(!db.enable_project("a", path, Some(path), true, now).unwrap());
+        assert!(!db.get_registered_project("a").unwrap().unwrap().enabled);
+        assert!(
+            db.enable_project("a", path, Some(path), false, now)
+                .unwrap()
+        );
+    }
+
     /// A re-enabled project starts afresh: an error from before it was
     /// disabled no longer reports it as failing.
     #[test]
@@ -4008,11 +4064,12 @@ mod tests {
         db.ensure_schema().unwrap();
         let path = std::path::Path::new("/tmp/a/reviewloop.toml");
         let now = Utc::now();
-        db.enable_project("a", path, None, now).unwrap();
+        db.enable_project("a", path, None, false, now).unwrap();
         db.record_project_health("a", now, Some("config gone"))
             .unwrap();
         db.disable_project("a", now).unwrap();
-        db.enable_project("a", path, Some(path), now).unwrap();
+        db.enable_project("a", path, Some(path), false, now)
+            .unwrap();
         let row = db.get_registered_project("a").unwrap().unwrap();
         assert_eq!(row.health, ProjectHealth::default());
     }

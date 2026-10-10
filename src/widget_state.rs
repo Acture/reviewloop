@@ -412,6 +412,7 @@ mod tests {
             "alpha",
             Path::new("/repos/alpha/reviewloop.toml"),
             Some(Path::new("/repos/alpha/reviewloop.toml")),
+            false,
             now,
         )
         .unwrap();

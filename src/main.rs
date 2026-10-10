@@ -4477,7 +4477,7 @@ mod tests {
             db.ensure_schema().unwrap();
             let now = Utc::now();
             let path = Path::new("/repos/proj/reviewloop.toml");
-            db.enable_project("proj", path, None, now).unwrap();
+            db.enable_project("proj", path, None, false, now).unwrap();
             db.record_project_health("proj", now, Some("pdf trigger: gone"))
                 .unwrap();
             db.insert_project_registration("idle", Path::new("/repos/idle/reviewloop.toml"), now)

@@ -1323,12 +1323,20 @@ fn discover_project_config_path(explicit_path: Option<&Path>) -> Result<Option<P
     Ok(None)
 }
 
-/// The canonical form of a config path: absolute, with its directory's
-/// symlinks resolved but the file name kept, so a `reviewloop.toml` that is
-/// itself a symlink keeps the repository it sits in as its project root.
+/// The canonical form of a config path: absolute, symlinks and the on-disk
+/// spelling resolved. A `reviewloop.toml` that is itself a symlink keeps its
+/// own name in its resolved directory, so it keeps the repository it sits in
+/// as its project root.
 pub fn canonical_config_path(path: &Path) -> Result<PathBuf> {
-    fs::metadata(path)
-        .with_context(|| format!("failed to resolve project config path {}", path.display()))?;
+    let context = || format!("failed to resolve project config path {}", path.display());
+    if !fs::symlink_metadata(path)
+        .with_context(context)?
+        .file_type()
+        .is_symlink()
+    {
+        return fs::canonicalize(path).with_context(context);
+    }
+    fs::metadata(path).with_context(context)?;
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow!("project config path {} names no file", path.display()))?;
@@ -2661,6 +2669,22 @@ db_path = "db.sqlite"
         let machine = super::MachineConfig::from_global(GlobalConfigFile::default()).unwrap();
         let config = machine.project(&path).unwrap();
         assert_eq!(config.project_root, Some(repo.canonicalize().unwrap()));
+    }
+
+    /// On a case-insensitive volume (macOS default) a differently cased
+    /// spelling of the file names the same config.
+    #[test]
+    fn canonical_paths_take_the_on_disk_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("reviewloop.toml");
+        fs::write(&path, "project_id = \"p\"\n").unwrap();
+        let upper = tmp.path().join("REVIEWLOOP.TOML");
+        if upper.exists() {
+            assert_eq!(
+                super::canonical_config_path(&upper).unwrap(),
+                super::canonical_config_path(&path).unwrap()
+            );
+        }
     }
 
     /// Project roots are canonical; a directory reached through a symlink

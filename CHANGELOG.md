@@ -323,10 +323,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Upgrade notes
 
-- Schema version 6 adds `projects.enabled`, `enabled_changed_at` and the
+- Schema version 7 adds `projects.enabled`, `enabled_changed_at` and the
   health columns (`last_run_at`, `last_ok_at`, `last_error`,
-  `last_error_at`), and the single-row `supervisor` table. Existing
-  registrations migrate disabled.
+  `last_error_at`), the single-row `supervisor` table, and the triggers that
+  guard enabled registrations. Existing registrations migrate disabled.
 - **Enable your projects.** After upgrading, the supervisor runs only enabled
   projects. A launchd service installed by an earlier version (bound with
   `--config`) keeps its project enabled on first start; run
