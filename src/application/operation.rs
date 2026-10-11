@@ -11,10 +11,13 @@ pub enum Operation {
     ApproveJob,
     RetryJob,
     CancelJob,
+    GetWorkerStatus,
+    EnableProject,
+    DisableProject,
 }
 
 impl Operation {
-    pub const ALL: [Operation; 9] = [
+    pub const ALL: [Operation; 12] = [
         Operation::ListProjects,
         Operation::ListPapers,
         Operation::RequestReview,
@@ -24,6 +27,9 @@ impl Operation {
         Operation::ApproveJob,
         Operation::RetryJob,
         Operation::CancelJob,
+        Operation::GetWorkerStatus,
+        Operation::EnableProject,
+        Operation::DisableProject,
     ];
 
     /// The MCP tool name, which is also the name of the
@@ -39,6 +45,9 @@ impl Operation {
             Operation::ApproveJob => "approve_job",
             Operation::RetryJob => "retry_job",
             Operation::CancelJob => "cancel_job",
+            Operation::GetWorkerStatus => "get_worker_status",
+            Operation::EnableProject => "enable_project",
+            Operation::DisableProject => "disable_project",
         }
     }
 
@@ -51,6 +60,7 @@ impl Operation {
                 | Operation::GetJob
                 | Operation::ListJobs
                 | Operation::GetReview
+                | Operation::GetWorkerStatus
         )
     }
 }

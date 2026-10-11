@@ -5,15 +5,17 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use reviewloop::{
     application::{
-        Approval, CancelRequest, Eligibility, JobListQuery, JobPhase, JobRef, OpError, Operation,
-        RequestDisposition, RequestOrigin, RetryAction, RetryRequest, ReviewOps, ReviewPart,
-        ReviewQuery, ReviewRequest, ReviewRequestOutcome,
+        Approval, CancelRequest, DisableProjectRequest, Eligibility, EnableProjectRequest,
+        JobListQuery, JobPhase, JobRef, OpError, Operation, ProjectEnablement, RequestDisposition,
+        RequestOrigin, RetryAction, RetryRequest, ReviewOps, ReviewPart, ReviewQuery,
+        ReviewRequest, ReviewRequestOutcome,
     },
     artifact::write_review_artifacts,
     backend::{cspaper, provider_source},
     config::{CSPAPER_API_KEY_ENV, Config, PaperConfig, Redacted},
     db::Db,
     model::{EnqueueConflict, ExistingReason, Job, JobPdf, JobStatus, NewJob},
+    supervisor::{ProjectState, SupervisorState, WorkerAvailability},
     util::sha256_file,
 };
 use serde::Serialize;
@@ -249,9 +251,13 @@ fn list_projects_reports_registry_and_current_project() -> Result<()> {
     let fx = Fixture::new()?;
     let present = fx.tmp.path().join("reviewloop.toml");
     fs::write(&present, "project_id = \"project-ops\"\n")?;
-    fx.db.register_project_config("project-ops", &present)?;
     fx.db
-        .register_project_config("other", &fx.tmp.path().join("gone/reviewloop.toml"))?;
+        .insert_project_registration("project-ops", &present, Utc::now())?;
+    fx.db.insert_project_registration(
+        "other",
+        &fx.tmp.path().join("gone/reviewloop.toml"),
+        Utc::now(),
+    )?;
 
     let projects = fx.ops().list_projects()?;
     let summary: Vec<_> = projects
@@ -262,6 +268,168 @@ fn list_projects_reports_registry_and_current_project() -> Result<()> {
         summary,
         vec![("other", false, false), ("project-ops", true, true)]
     );
+    Ok(())
+}
+
+// ---- supervisor enablement (OSS-338) ----
+
+impl Fixture {
+    /// A `reviewloop.toml` in `dir` declaring `project_id`.
+    fn project_file(&self, dir: &str, project_id: &str) -> Result<std::path::PathBuf> {
+        let dir = self.tmp.path().join(dir);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("reviewloop.toml");
+        fs::write(&path, format!("project_id = \"{project_id}\"\n"))?;
+        Ok(path)
+    }
+
+    fn enable(&self, config_path: &Path, replace: bool) -> Result<ProjectEnablement, OpError> {
+        self.ops().enable_project(&EnableProjectRequest {
+            config_path: config_path.to_path_buf(),
+            replace,
+        })
+    }
+
+    fn availability(&self) -> Result<WorkerAvailability> {
+        Ok(self
+            .ops()
+            .get_worker_status()?
+            .project
+            .expect("scoped context")
+            .availability)
+    }
+}
+
+#[test]
+fn enable_and_disable_change_only_what_the_supervisor_runs() -> Result<()> {
+    let fx = Fixture::new()?;
+    let path = fx.project_file("repo", "project-ops")?;
+    let job = fx.request(false, Approval::Granted)?.job;
+
+    let enabled = fx.enable(&path, false)?;
+    assert!(enabled.changed);
+    assert!(enabled.project.enabled);
+    assert_eq!(enabled.project.state, ProjectState::Pending);
+    assert_eq!(
+        enabled.project.config_path,
+        fs::canonicalize(&path)?.display().to_string()
+    );
+    assert_eq!(
+        enabled.worker.project.expect("project").availability,
+        WorkerAvailability::SupervisorStopped
+    );
+    assert!(
+        !fx.enable(&path, false)?.changed,
+        "enabling twice changes nothing"
+    );
+
+    let disabled = fx
+        .ops()
+        .disable_project(&DisableProjectRequest { project_id: None })?;
+    assert!(disabled.changed);
+    assert!(!disabled.project.enabled);
+    assert_eq!(fx.availability()?, WorkerAvailability::ProjectDisabled);
+    assert!(
+        !fx.ops()
+            .disable_project(&DisableProjectRequest { project_id: None })?
+            .changed
+    );
+    // Jobs are not touched.
+    assert_eq!(fx.ops().get_job(&job.job_id)?.status, JobStatus::Queued);
+    Ok(())
+}
+
+#[test]
+fn enable_never_takes_a_live_registration_without_replace() -> Result<()> {
+    let fx = Fixture::new()?;
+    let first = fx.project_file("first", "project-ops")?;
+    let second = fx.project_file("second", "project-ops")?;
+    fx.enable(&first, false)?;
+
+    let err = fx.enable(&second, false).unwrap_err();
+    assert_eq!(err.code(), "project_conflict", "{err}");
+    let details = err.view().details;
+    assert_eq!(
+        details["registered_path"],
+        fs::canonicalize(&first)?.display().to_string()
+    );
+    assert_eq!(
+        fx.ops().list_projects()?[0].config_path,
+        fs::canonicalize(&first)?.display().to_string()
+    );
+
+    let moved = fx.enable(&second, true)?;
+    assert_eq!(
+        moved.moved_from,
+        Some(fs::canonicalize(&first)?.display().to_string())
+    );
+    assert_eq!(
+        moved.project.config_path,
+        fs::canonicalize(&second)?.display().to_string()
+    );
+    Ok(())
+}
+
+#[test]
+fn enable_requires_the_config_to_declare_the_project() -> Result<()> {
+    let fx = Fixture::new()?;
+    let other = fx.project_file("other", "someone-else")?;
+    let err = fx.enable(&other, false).unwrap_err();
+    assert_eq!(err.code(), "invalid_request", "{err}");
+    let missing = fx.enable(&fx.tmp.path().join("missing/reviewloop.toml"), false);
+    assert_eq!(missing.unwrap_err().code(), "invalid_request");
+    Ok(())
+}
+
+#[test]
+fn disabling_an_unknown_project_is_reported() -> Result<()> {
+    let fx = Fixture::new()?;
+    let err = fx
+        .ops()
+        .disable_project(&DisableProjectRequest {
+            project_id: Some("nobody".into()),
+        })
+        .unwrap_err();
+    assert_eq!(err.code(), "project_not_registered");
+    assert_eq!(err.view().details, json!({ "project_id": "nobody" }));
+    Ok(())
+}
+
+/// Queue state and worker availability are reported separately: a queued
+/// job only moves on its own when this says `ready`.
+#[test]
+fn worker_status_follows_the_supervisor_and_the_project() -> Result<()> {
+    let fx = Fixture::new()?;
+    assert_eq!(fx.availability()?, WorkerAvailability::ProjectNotRegistered);
+    let status = fx.ops().get_worker_status()?;
+    assert_eq!(status.supervisor.state, SupervisorState::Stopped);
+
+    let path = fx.project_file("repo", "project-ops")?;
+    fx.enable(&path, false)?;
+    assert_eq!(fx.availability()?, WorkerAvailability::SupervisorStopped);
+
+    let now = Utc::now();
+    fx.db
+        .claim_supervisor(99, fx.tmp.path(), "test", now, |_| false)?;
+    assert_eq!(fx.availability()?, WorkerAvailability::Ready);
+
+    fx.db.set_supervisor_paused(true, now)?;
+    assert_eq!(fx.availability()?, WorkerAvailability::SupervisorPaused);
+    fx.db.set_supervisor_paused(false, now)?;
+
+    fx.db
+        .record_project_health("project-ops", now, Some("pdf trigger: boom"))?;
+    let status = fx.ops().get_worker_status()?;
+    let project = status.project.expect("scoped");
+    assert_eq!(project.availability, WorkerAvailability::ProjectFailing);
+    assert_eq!(project.last_error.as_deref(), Some("pdf trigger: boom"));
+    assert_eq!(status.supervisor.state, SupervisorState::Running);
+    assert_eq!(status.supervisor.pid, Some(99));
+
+    // An unscoped context (the menu bar) sees the supervisor only.
+    let unscoped = Config::default();
+    let status = ReviewOps::new(&unscoped, &fx.db).get_worker_status()?;
+    assert!(status.project.is_none());
     Ok(())
 }
 
@@ -1375,7 +1543,8 @@ fn operations_map_to_unique_documented_tools() -> Result<()> {
             "list_papers",
             "get_job",
             "list_jobs",
-            "get_review"
+            "get_review",
+            "get_worker_status"
         ]
     );
     Ok(())
@@ -1514,6 +1683,16 @@ fn every_error_code_is_documented_with_a_view() -> Result<()> {
             job_id: "j".into(),
             section: "s".into(),
             available: vec![],
+        },
+        OpError::ProjectConflict {
+            project_id: "p".into(),
+            registered_path: Some("/a/reviewloop.toml".into()),
+            requested_path: "/b/reviewloop.toml".into(),
+            enabled_as: None,
+            message: "m".into(),
+        },
+        OpError::ProjectNotRegistered {
+            project_id: "p".into(),
         },
         OpError::Internal(anyhow::anyhow!("disk full")),
     ];

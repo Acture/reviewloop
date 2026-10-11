@@ -1,5 +1,6 @@
-//! Schema migrations up to the current version: the lease columns (v4, OSS-337) and
-//! review options (v5, OSS-353) land on older databases without disturbing existing rows,
+//! Schema migrations up to the current version: the lease columns (v4, OSS-337),
+//! review options (v5, OSS-353) and project enablement, the supervisor row and the
+//! registry guard triggers (v6-v7, OSS-338) land on older databases without disturbing existing rows,
 //! legacy SUBMITTED rows are settled as UNCERTAIN instead of being resubmitted, concurrent
 //! migrations do not collide, and the lease primitives work on a freshly created database.
 
@@ -29,7 +30,7 @@ const LEASE_COLUMNS: [&str; 3] = ["lease_owner", "lease_expires_at", "submit_sta
 /// Added by schema v5 (OSS-353).
 const REVIEW_OPTIONS_COLUMN: &str = "review_options";
 /// Schema version written by this build (`SCHEMA_VERSION` in src/db.rs).
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 /// `create_tables_if_missing` + `create_indexes` as of schema v1 (commit 4aeff29),
 /// verbatim: `jobs` has no lease columns.
@@ -1149,5 +1150,198 @@ fn v4_database_gains_review_options_and_replays_pre_upgrade_request_keys() -> Re
     let jobs: i64 =
         Connection::open(&path)?.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))?;
     assert_eq!(jobs, LEGACY_ROWS.len() as i64, "nothing new was enqueued");
+    Ok(())
+}
+
+/// A schema-v5 database (OSS-353): v4 plus `jobs.review_options`; the
+/// `projects` table still has only its three original columns.
+fn build_v5_database(path: &Path) -> Result<()> {
+    build_v4_database(path)?;
+    let conn = Connection::open(path)?;
+    conn.execute_batch(&format!(
+        "ALTER TABLE jobs ADD COLUMN {REVIEW_OPTIONS_COLUMN} TEXT"
+    ))?;
+    conn.pragma_update(None, "user_version", 5)?;
+    Ok(())
+}
+
+/// Registry rows from before OSS-338 come through disabled and undecided:
+/// nothing starts running until someone enables it, and the one-time
+/// migration of a single-project daemon install may still enable its project.
+#[test]
+fn v5_database_keeps_registered_projects_disabled_and_undecided() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().join("reviewloop.db");
+    build_v5_database(&path)?;
+    let seen_at = "2026-05-01T10:00:00+00:00";
+    {
+        let conn = Connection::open(&path)?;
+        for (project_id, config_path) in [
+            (PROJECT, "/repos/legacy/reviewloop.toml"),
+            (OTHER_PROJECT, "/repos/other/reviewloop.toml"),
+        ] {
+            conn.execute(
+                "INSERT INTO projects (project_id, config_path, last_seen_at) VALUES (?1, ?2, ?3)",
+                params![project_id, config_path, seen_at],
+            )?;
+        }
+    }
+
+    let db = Db::new_file(path.clone());
+    db.ensure_schema()?;
+
+    assert_eq!(user_version(&path)?, CURRENT_SCHEMA_VERSION);
+    let projects = db.list_registered_projects()?;
+    assert_eq!(projects.len(), 2);
+    for project in &projects {
+        assert!(!project.enabled, "{}: migrated enabled", project.project_id);
+        assert_eq!(project.enabled_changed_at, None, "{}", project.project_id);
+        assert_eq!(project.health, Default::default(), "{}", project.project_id);
+        assert_eq!(project.last_seen_at.to_rfc3339(), seen_at);
+    }
+    assert_eq!(db.supervisor_record()?, Default::default());
+    assert!(
+        db.list_timeline_events(PROJECT, PAPER)?
+            .iter()
+            .all(|event| !event.event_type.starts_with("project_")),
+        "migration must not write events"
+    );
+
+    for job in LEGACY_ROWS {
+        assert_legacy_row_intact(&load_job(&db, job.id)?, job)?;
+    }
+    Ok(())
+}
+
+/// A pre-OSS-338 binary still upserts registrations with only the original
+/// three columns; the defaults keep that working on a v6 database.
+#[test]
+fn old_registry_upserts_still_work_on_a_v6_database() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().join("reviewloop.db");
+    let db = Db::new_file(path.clone());
+    db.ensure_schema()?;
+    Connection::open(&path)?.execute(
+        r#"
+        INSERT INTO projects (project_id, config_path, last_seen_at)
+        VALUES (?1, ?2, ?3)
+        ON CONFLICT(project_id) DO UPDATE SET
+            config_path  = excluded.config_path,
+            last_seen_at = excluded.last_seen_at
+        "#,
+        params![
+            PROJECT,
+            "/repos/legacy/reviewloop.toml",
+            Utc::now().to_rfc3339()
+        ],
+    )?;
+    let project = db
+        .get_registered_project(PROJECT)?
+        .context("old-style upsert registered nothing")?;
+    assert!(!project.enabled);
+    assert_eq!(project.enabled_changed_at, None);
+    Ok(())
+}
+
+/// A pre-OSS-338 binary on a v6 database: its registry upsert and stale-row
+/// delete become no-ops on an enabled project, so an explicit enable is
+/// never moved or dropped behind the supervisor's back. Disabled rows behave
+/// as that binary expects.
+#[test]
+fn old_binaries_cannot_move_or_drop_an_enabled_project() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().join("reviewloop.db");
+    let db = Db::new_file(path.clone());
+    db.ensure_schema()?;
+    let now = Utc::now();
+    let home = Path::new("/repos/enabled/reviewloop.toml");
+    db.enable_project(PROJECT, home, None, false, now)?;
+    db.insert_project_registration(
+        OTHER_PROJECT,
+        Path::new("/repos/other/reviewloop.toml"),
+        now,
+    )?;
+
+    let old_upsert = |project_id: &str, config_path: &str| -> Result<()> {
+        Connection::open(&path)?.execute(
+            r#"
+            INSERT INTO projects (project_id, config_path, last_seen_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(project_id) DO UPDATE SET
+                config_path  = excluded.config_path,
+                last_seen_at = excluded.last_seen_at
+            "#,
+            params![project_id, config_path, now.to_rfc3339()],
+        )?;
+        Ok(())
+    };
+    let old_delete = |project_id: &str| -> Result<()> {
+        Connection::open(&path)?.execute(
+            "DELETE FROM projects WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        Ok(())
+    };
+
+    old_upsert(PROJECT, "/repos/worktree/reviewloop.toml")?;
+    old_delete(PROJECT)?;
+    let enabled = db.get_registered_project(PROJECT)?.context("kept")?;
+    assert!(enabled.enabled);
+    assert_eq!(enabled.config_path, home);
+
+    old_upsert(OTHER_PROJECT, "/repos/moved/reviewloop.toml")?;
+    assert_eq!(
+        db.resolve_project_config_path(OTHER_PROJECT)?,
+        Some(PathBuf::from("/repos/moved/reviewloop.toml"))
+    );
+    old_delete(OTHER_PROJECT)?;
+    assert!(db.get_registered_project(OTHER_PROJECT)?.is_none());
+
+    // The supervisor's own decisions still move and release it.
+    db.enable_project(
+        PROJECT,
+        Path::new("/repos/new/reviewloop.toml"),
+        Some(home),
+        false,
+        now,
+    )?;
+    assert_eq!(
+        db.resolve_project_config_path(PROJECT)?,
+        Some(PathBuf::from("/repos/new/reviewloop.toml"))
+    );
+    Ok(())
+}
+
+/// A v6 database from a pre-release build of OSS-338 has the registry
+/// columns but not the guard triggers; opening it adds them.
+#[test]
+fn v6_database_gains_the_registry_guard_triggers() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().join("reviewloop.db");
+    Db::new_file(path.clone()).ensure_schema()?;
+    let triggers = |path: &Path| -> Result<i64> {
+        Ok(Connection::open(path)?.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'projects_keep_enabled_%'",
+            [],
+            |row| row.get(0),
+        )?)
+    };
+    assert_eq!(triggers(&path)?, 2);
+    {
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(
+            "DROP TRIGGER projects_keep_enabled_path; DROP TRIGGER projects_keep_enabled_rows;",
+        )?;
+        conn.pragma_update(None, "user_version", 6)?;
+    }
+    assert_eq!(
+        triggers(&path)?,
+        0,
+        "test setup: a v6 file without triggers"
+    );
+
+    Db::new_file(path.clone()).ensure_schema()?;
+    assert_eq!(user_version(&path)?, CURRENT_SCHEMA_VERSION);
+    assert_eq!(triggers(&path)?, 2);
     Ok(())
 }
