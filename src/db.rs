@@ -2,8 +2,8 @@ use crate::{
     config::Config,
     model::{
         EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, EventRecord, ExistingReason,
-        Job, JobStatus, NewJob, RegisteredProject, ReviewIdentity, ReviewOptions, ReviewRecord,
-        StatusView, SubmitChannel, SubmitStage, WorkKind,
+        Job, JobStatus, NewJob, ProviderUsage, RegisteredProject, ReviewIdentity, ReviewOptions,
+        ReviewRecord, StatusView, SubmitChannel, SubmitStage, WorkKind,
     },
     util::{parse_rfc3339, to_rfc3339},
 };
@@ -1701,6 +1701,92 @@ impl Db {
             map_job_row,
         )?;
         collect_rows(rows)
+    }
+
+    /// Submissions `backend` has accepted or may have accepted, over every
+    /// project in this database: provider credentials are machine-level, so
+    /// usage is too. A job holding a token counts as accepted, wherever the
+    /// token came from, and is split by status.
+    ///
+    /// A job counts as uncertain when it is parked UNCERTAIN without a token,
+    /// or when its history has a dispatch of unknown outcome that no receipt
+    /// settled (a token arriving with no newer `submit_dispatched`): a
+    /// `submit_outcome_unknown`, or a cancel while DISPATCHED. Cancel and
+    /// `retry --force` clear the stage but do not withdraw what the provider
+    /// may hold. History lasts as long as `retention.events_days`.
+    ///
+    /// `period` (`[start, end)`) keeps jobs accepted in it, or enqueued in it
+    /// when they never got a receipt.
+    pub fn provider_usage(
+        &self,
+        backend: &str,
+        period: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    ) -> Result<ProviderUsage> {
+        let conn = self.connect()?;
+        let (start, end) = period
+            .map(|(start, end)| (Some(to_rfc3339(start)), Some(to_rfc3339(end))))
+            .unwrap_or_default();
+        let count = |row: &rusqlite::Row<'_>, index: usize| -> rusqlite::Result<u64> {
+            Ok(row.get::<_, i64>(index)? as u64)
+        };
+        conn.query_row(
+            r#"
+            SELECT COALESCE(SUM(token IS NOT NULL AND status = ?2), 0),
+                   COALESCE(SUM(token IS NOT NULL AND status IN (?3, ?4)), 0),
+                   COALESCE(SUM(token IS NOT NULL AND status NOT IN (?2, ?3, ?4)), 0),
+                   COALESCE(SUM(
+                       (token IS NULL AND submit_stage = ?5)
+                       OR EXISTS (
+                           SELECT 1 FROM events unknown
+                           WHERE unknown.job_id = jobs.id
+                             AND (unknown.event_type = 'submit_outcome_unknown'
+                                  OR (unknown.event_type = 'cancelled'
+                                      AND json_extract(unknown.payload_json, '$.previous_submit_stage') = ?6))
+                             AND (jobs.token IS NULL OR EXISTS (
+                                 SELECT 1 FROM events later
+                                 WHERE later.job_id = jobs.id
+                                   AND later.event_type = 'submit_dispatched'
+                                   AND later.id > unknown.id
+                             ))
+                       )
+                   ), 0)
+            FROM jobs
+            WHERE backend = ?1
+              AND (?7 IS NULL OR julianday(COALESCE(started_at, created_at)) >= julianday(?7))
+              AND (?8 IS NULL OR julianday(COALESCE(started_at, created_at)) < julianday(?8))
+            "#,
+            params![
+                backend,
+                JobStatus::Completed.as_str(),
+                JobStatus::Processing.as_str(),
+                JobStatus::Submitted.as_str(),
+                SubmitStage::Uncertain.as_str(),
+                SubmitStage::Dispatched.as_str(),
+                start,
+                end,
+            ],
+            |row| {
+                Ok(ProviderUsage {
+                    completed: count(row, 0)?,
+                    in_progress: count(row, 1)?,
+                    ended: count(row, 2)?,
+                    uncertain: count(row, 3)?,
+                })
+            },
+        )
+        .map_err(Into::into)
+    }
+
+    /// Provider references (tokens) of every `backend` job in this database,
+    /// across projects: matches the provider's own job list to reviewloop.
+    pub fn provider_tokens(&self, backend: &str) -> Result<HashSet<String>> {
+        let conn = self.connect()?;
+        let mut stmt =
+            conn.prepare("SELECT token FROM jobs WHERE backend = ?1 AND token IS NOT NULL")?;
+        let tokens = stmt
+            .query_map(params![backend], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        Ok(tokens)
     }
 
     /// Fleet-wide: recent failures across all projects, capped per project.
