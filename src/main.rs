@@ -1322,10 +1322,10 @@ fn report_legacy_adoption(db: &Db, machine: &reviewloop::config::MachineConfig, 
     use reviewloop::supervisor::{LegacyAdoption, adopt_legacy_binding};
 
     match adopt_legacy_binding(db, machine, bound, Utc::now()) {
-        Ok((project_id, LegacyAdoption::Enabled { moved_from })) => {
+        Ok((project_id, LegacyAdoption::Enabled { path, moved_from })) => {
             eprintln!(
                 "note: the daemon was installed for project {project_id} alone; the supervisor now runs every enabled project, and {project_id} is enabled at {}. Other registered projects stay disabled until `reviewloop project enable`.",
-                bound.display()
+                path.display()
             );
             if let Some(from) = moved_from {
                 eprintln!(

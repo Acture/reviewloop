@@ -497,7 +497,13 @@ fn migrating_a_single_project_install_enables_only_its_project() -> Result<()> {
     )?;
     assert_eq!(
         (id.as_str(), adoption),
-        ("bound", LegacyAdoption::Enabled { moved_from: None })
+        (
+            "bound",
+            LegacyAdoption::Enabled {
+                path: fleet.config_path("bound"),
+                moved_from: None
+            }
+        )
     );
     let enabled: Vec<String> = fleet
         .db
@@ -555,6 +561,7 @@ fn the_binding_wins_over_an_undecided_registration_of_another_clone() -> Result<
     assert_eq!(
         adoption,
         LegacyAdoption::Enabled {
+            path: fleet.config_path("p"),
             moved_from: Some(clone_config.clone())
         }
     );
@@ -688,13 +695,59 @@ fn a_binding_to_a_symlink_target_keeps_the_link() -> Result<()> {
 
     let target = fs::canonicalize(dotfiles.join("reviewloop.toml"))?;
     let (_, adoption) = adopt_legacy_binding(&fleet.db, &machine, &target, Utc::now())?;
-    assert_eq!(adoption, LegacyAdoption::Enabled { moved_from: None });
+    assert_eq!(
+        adoption,
+        LegacyAdoption::Enabled {
+            path: link.clone(),
+            moved_from: None
+        }
+    );
     let row = fleet.db.get_registered_project("p")?.expect("row");
     assert!(row.enabled);
     assert_eq!(row.config_path, link);
     assert_eq!(
         machine.project(&row.config_path)?.project_root.as_deref(),
         link.parent()
+    );
+    Ok(())
+}
+
+/// A binding that is itself a symlink (a hand-written `--config <link>`)
+/// stays as given, even when the registration is another link to the same
+/// file: two repositories symlinking one file are two configs.
+#[cfg(unix)]
+#[test]
+fn a_binding_that_is_a_link_wins_over_another_link_to_the_same_file() -> Result<()> {
+    let fleet = Fleet::new(&["p"])?;
+    let machine = fleet.machine_config();
+    let shared = fleet.tmp.path().join("dotfiles/reviewloop.toml");
+    fs::create_dir_all(shared.parent().expect("parent"))?;
+    let first = fleet.project("p").config_path.clone();
+    fs::rename(&first, &shared)?;
+    std::os::unix::fs::symlink(&shared, &first)?;
+    let second_repo = fleet.tmp.path().join("second");
+    fs::create_dir_all(&second_repo)?;
+    fs::copy(&fleet.project("p").pdf_path, second_repo.join("paper.pdf"))?;
+    std::os::unix::fs::symlink(&shared, second_repo.join("reviewloop.toml"))?;
+    let first = reviewloop::config::canonical_config_path(&first)?;
+    let second = reviewloop::config::canonical_config_path(&second_repo.join("reviewloop.toml"))?;
+    registry::register_seen(&fleet.db, "p", &first, Utc::now())?;
+
+    let (_, adoption) = adopt_legacy_binding(&fleet.db, &machine, &second, Utc::now())?;
+    assert_eq!(
+        adoption,
+        LegacyAdoption::Enabled {
+            path: second.clone(),
+            moved_from: Some(first)
+        }
+    );
+    assert_eq!(
+        fleet
+            .db
+            .get_registered_project("p")?
+            .expect("row")
+            .config_path,
+        second
     );
     Ok(())
 }

@@ -297,9 +297,12 @@ fn load_enabled_project(machine: &MachineConfig, row: &RegisteredProject) -> Res
 /// What became of the project a single-project daemon install was bound to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LegacyAdoption {
-    /// Nobody had decided yet: it is enabled now, at the bound config, and
-    /// keeps running.
-    Enabled { moved_from: Option<PathBuf> },
+    /// Nobody had decided yet: it is enabled now, at `path` (the bound
+    /// config), and keeps running.
+    Enabled {
+        path: PathBuf,
+        moved_from: Option<PathBuf>,
+    },
     /// Someone already enabled or disabled it; that decision stands.
     AlreadyDecided { enabled: bool },
     /// The bound config already backs another enabled project; nothing was
@@ -329,13 +332,14 @@ pub fn adopt_legacy_binding(
             )
         })?
         .project_id;
-    // Older installs wrote the fully resolved path into the plist; when the
-    // registration names the same file through a symlink in the repository,
-    // that spelling (and its project root) is the project's.
+    // Older installs wrote the fully resolved path into the plist. When the
+    // binding is that resolved target and the registration reaches it
+    // through a symlink in the repository, the link (and its project root)
+    // is the project's. A binding that is itself a link stays as given.
     let path = match db.get_registered_project(&project_id)? {
         Some(row)
             if !same_config_file(&row.config_path, &bound)
-                && resolves_to(&row.config_path, &bound) =>
+                && std::fs::canonicalize(&row.config_path).is_ok_and(|target| target == bound) =>
         {
             canonical_config_path(&row.config_path)?
         }
@@ -343,6 +347,7 @@ pub fn adopt_legacy_binding(
     };
     let adoption = match registry::enable_if_undecided(db, &project_id, &path, now) {
         Ok(Some(enabled)) => LegacyAdoption::Enabled {
+            path,
             moved_from: enabled.moved_from,
         },
         Ok(None) => LegacyAdoption::AlreadyDecided {
@@ -354,15 +359,6 @@ pub fn adopt_legacy_binding(
         Err(err) => return Err(err.into()),
     };
     Ok((project_id, adoption))
-}
-
-/// Whether `path` resolves, through every symlink, to the same file as
-/// `target`.
-fn resolves_to(path: &Path, target: &Path) -> bool {
-    match (std::fs::canonicalize(path), std::fs::canonicalize(target)) {
-        (Ok(path), Ok(target)) => path == target,
-        _ => false,
-    }
 }
 
 /// What one supervisor tick did.
