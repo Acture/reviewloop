@@ -259,7 +259,8 @@ reviewloop approve --job-id <job-id>
 reviewloop import-token (--paper-id main | --job-id <job-id>) --token <token> [--source email]
 reviewloop check [--job-id <job-id> | --paper-id <paper-id>] [--all-processing]
 reviewloop status [--paper-id main] [--json] [--show-token] [--active]
-reviewloop retry --job-id <job-id> [--force]  # (was --override-rate-limit, deprecated since vNext)
+reviewloop retry (--job-id <job-id> | --paper-id <id> [--include-failed]) [--now]
+reviewloop retry --all-failed
 reviewloop complete --job-id <job-id> [--summary-text <text> | --summary-url <url> | --empty-summary] [--score <value>]
 reviewloop config init
 reviewloop config init project --project-id <id> [--project-root <path>] [--force]
@@ -290,6 +291,23 @@ key returns the job it first resolved to, even after that job has finished
 (until retention prunes it), and reusing the key for a different manuscript,
 venue or review options fails with a conflict naming the existing job. Use a
 new key for each new review round.
+
+`retry` re-queues a failed or stalled job. By default the job joins the end of
+the queue and the supervisor submits it in turn, within the machine's
+submission budget; a job the provider already accepted (it has a receipt
+token) is polled again on the polling schedule instead, its review timeout
+restarted. `--now` attempts the submission or poll once, right away, in the
+`retry` process itself, clearing any cooldown; it polls only a `PROCESSING`
+job, so retry a `TIMEOUT` or `FAILED` job that has a receipt token without it.
+`approve` also puts a job at the end of the queue.
+`retry --all-failed` retries, oldest first, every `FAILED` or `TIMEOUT` job of
+the current project that is the newest job of its paper and backend, each the
+default way: jobs without a receipt token join the end of the queue in their
+order, and jobs with one (every `TIMEOUT` job) are polled again on schedule.
+It lists the jobs it skips with the reason: cancelled, `FAILED_NEEDS_MANUAL`
+(its last error says how to recover: fix the cause and `retry --job-id`, or
+request a new review with `submit --force`), or superseded by a newer job of
+the same paper and backend, which it names.
 
 `self-update` only replaces the executable. It does not delete:
 - global config (`~/.config/reviewloop/config.toml`)
@@ -324,9 +342,10 @@ VS Code (`.vscode/mcp.json`):
   `reviewloop --config <path> mcp`); every tool except `list_projects` also
   takes a `project_id` from `list_projects`.
 - Agent requests wait in `PENDING_APPROVAL` until `approve_job`, so sending a
-  manuscript to the provider is a separate, visible step; a retry that would
-  send it again waits for `approve_job` too. Start the server with
-  `--approval granted` to queue them at once.
+  manuscript to the provider is a separate, visible step. A retry queues a job
+  that was approved and then failed, timed out or stalled again directly; a
+  cancelled or hand-completed job waits for `approve_job` again. Start the
+  server with `--approval granted` to queue requests at once.
 - Tools only read and change local state; the supervisor (`reviewloop project
   watch`, `reviewloop daemon install`) submits and polls. Failures come back
   as tool errors with a stable `code` and a `recovery` hint. Tokens are never
@@ -384,7 +403,7 @@ The submit stage is persisted before anything is sent:
   provider gives an idempotency guarantee. `reviewloop status` shows the
   reason; settle it by letting email ingestion attach the token (Stanford
   only), running `reviewloop import-token --job-id <id> --token <token>`,
-  resubmitting explicitly with `reviewloop retry --job-id <id> --force`, or
+  resubmitting explicitly with `reviewloop retry --job-id <id> --now`, or
   `reviewloop cancel --job-id <id>`. CSPaper sends no email; see
   [Reconciling an uncertain CSPaper submission](#reconciling-an-uncertain-cspaper-submission).
 
@@ -765,7 +784,7 @@ machine's reviews this month, from the local database across projects), and
 reviews into completed, in progress and ended without a review, and lists
 uncertain submissions separately: jobs parked `UNCERTAIN`, and jobs whose
 submission outcome was unknown before they were cancelled (also while their
-upload was in flight) or resubmitted with `retry --force`. The latter are known
+upload was in flight) or resubmitted with `retry`. The latter are known
 from job events, kept for `retention.events_days` (default 30).
 
 ### Errors and outcomes
@@ -789,7 +808,7 @@ Polling:
 | `COMPLETED` | `COMPLETED`, artifacts written | Read the review. |
 | `FAILED` | `FAILED_NEEDS_MANUAL` with CSPaper's `failed_reason`, and a notification | Polling again gives the same answer, so `retry` does not help: request a new review with `reviewloop submit --paper-id <paper> --force` (`--force` because an earlier review of the same manuscript would otherwise be returned instead). |
 | 404 / 410 (unknown job, or one owned by another organisation's key) | `FAILED` (`invalid token`) | Check the job id and the key's organisation. A `FAILED` job cannot take a new token, so attach the right one to a new job: `reviewloop import-token --paper-id <paper> --token <cspaper job_id>`. |
-| 401 / 403, 429, 5xx, or an unexpected payload | stays `PROCESSING`, polled again on the schedule (429: after `Retry-After`) | Fix the key if it was refused; the job times out after `core.review_timeout_hours` otherwise. |
+| 401 / 403, 429, 5xx, or an unexpected payload | stays `PROCESSING`, polled again on the schedule (429: after `Retry-After`) | Fix the key if it was refused; the job times out after `core.review_timeout_hours` otherwise, and `reviewloop retry --job-id <job>` then polls it again with the timeout restarted. |
 
 ### Reconciling an uncertain CSPaper submission
 
@@ -803,7 +822,7 @@ exit code 2, and no email will settle it. Settle it by hand:
 2. If it is there, attach its job id:
    `reviewloop import-token --job-id <id> --token <cspaper job_id>`.
    ReviewLoop polls it at once and continues normally.
-3. If it is not there, resubmit with `reviewloop retry --job-id <id> --force`.
+3. If it is not there, resubmit with `reviewloop retry --job-id <id> --now`.
    This may create a duplicate review if CSPaper did receive the first one.
 4. Or stop tracking it with `reviewloop cancel --job-id <id>`; a review
    CSPaper already created is not withdrawn.

@@ -29,8 +29,10 @@ const OTHER_PROJECT: &str = "project-other";
 const LEASE_COLUMNS: [&str; 3] = ["lease_owner", "lease_expires_at", "submit_stage"];
 /// Added by schema v5 (OSS-353).
 const REVIEW_OPTIONS_COLUMN: &str = "review_options";
+/// Added by schema v8: the review timeout restarts at a retry that resumes polling.
+const POLLING_RESTARTED_AT_COLUMN: &str = "polling_restarted_at";
 /// Schema version written by this build (`SCHEMA_VERSION` in src/db.rs).
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 /// `create_tables_if_missing` + `create_indexes` as of schema v1 (commit 4aeff29),
 /// verbatim: `jobs` has no lease columns.
@@ -353,11 +355,15 @@ fn raw_review_options(path: &Path, job_id: &str) -> Result<Option<String>> {
     )?)
 }
 
-/// Each column added after v1 that the current schema needs (the lease columns and
-/// review options) exists exactly once, as a nullable TEXT column with no default.
+/// Each column added after v1 that the current schema needs (the lease columns,
+/// review options and the polling restart) exists exactly once, as a nullable TEXT
+/// column with no default.
 fn assert_current_columns(path: &Path) -> Result<()> {
     let columns = jobs_columns(path)?;
-    for column in LEASE_COLUMNS.into_iter().chain([REVIEW_OPTIONS_COLUMN]) {
+    for column in LEASE_COLUMNS
+        .into_iter()
+        .chain([REVIEW_OPTIONS_COLUMN, POLLING_RESTARTED_AT_COLUMN])
+    {
         let matches: Vec<&ColumnInfo> = columns.iter().filter(|c| c.name == column).collect();
         assert_eq!(matches.len(), 1, "jobs.{column} must exist exactly once");
         let info = matches[0];

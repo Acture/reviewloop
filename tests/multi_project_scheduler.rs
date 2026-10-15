@@ -9,6 +9,7 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use common::{Answer, Fleet, FleetBackends, MockBackend, load_job, ready_review, receipt};
 use reviewloop::{
+    application::{Approval, JobRef, RetryRequest, ReviewOps},
     backend::BackendError,
     model::JobStatus,
     worker::{self, Attempt, RoundRobin, Scheduler, TickBudget, TickReport},
@@ -16,6 +17,7 @@ use reviewloop::{
 use std::{
     collections::BTreeMap,
     sync::atomic::{AtomicUsize, Ordering},
+    time::Duration as StdDuration,
 };
 
 fn accepting_backend() -> MockBackend {
@@ -391,5 +393,49 @@ async fn a_project_that_stops_running_mid_tick_sends_nothing_more() -> Result<()
     assert!(report.errors().is_empty(), "{:?}", report.errors());
     assert_eq!(backends.callers("submit"), ["kept"]);
     assert_eq!(load_job(&fleet.db, &dropped.id)?.status, JobStatus::Queued);
+    Ok(())
+}
+
+/// A retried job joins the end of the queue: a tick with room for one
+/// submission sends the job that was already waiting, the next tick the
+/// retried one, although it is older.
+#[tokio::test]
+async fn a_retried_job_is_submitted_after_the_jobs_already_waiting() -> Result<()> {
+    let mut fleet = Fleet::new(&["p"])?;
+    fleet.set_budget(1, 1);
+    let backends = FleetBackends::new(accepting_backend());
+    let old = fleet.queue_job("p")?;
+    fleet.db.update_job_state(
+        &old.id,
+        JobStatus::Failed,
+        Some(1),
+        None,
+        Some(Some("connection refused".to_string())),
+    )?;
+    std::thread::sleep(StdDuration::from_millis(5));
+    let waiting = fleet.queue_job("p")?;
+    std::thread::sleep(StdDuration::from_millis(5));
+    ReviewOps::new(fleet.config("p"), &fleet.db).retry_job(&RetryRequest {
+        job: JobRef::Id(old.id.clone()),
+        jump_queue: false,
+        include_failed: false,
+        caller_executes: false,
+        approval: Approval::Granted,
+    })?;
+
+    let mut turns = RoundRobin::default();
+    let report = tick(&fleet, &backends, &mut turns, 1).await;
+    assert!(report.errors().is_empty(), "{:?}", report.errors());
+    assert_eq!(report.submits_sent, 1);
+    assert_eq!(
+        load_job(&fleet.db, &waiting.id)?.status,
+        JobStatus::Processing
+    );
+    assert_eq!(load_job(&fleet.db, &old.id)?.status, JobStatus::Queued);
+
+    let report = tick(&fleet, &backends, &mut turns, 2).await;
+    assert!(report.errors().is_empty(), "{:?}", report.errors());
+    assert_eq!(report.submits_sent, 1);
+    assert_eq!(load_job(&fleet.db, &old.id)?.status, JobStatus::Processing);
     Ok(())
 }

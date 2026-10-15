@@ -327,6 +327,7 @@ mod tests {
             version_key: pdf_hash.to_string(),
             attempt: 0,
             started_at: None,
+            polling_restarted_at: None,
             next_poll_at: None,
             last_error: None,
             fallback_used: false,

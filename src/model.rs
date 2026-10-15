@@ -367,6 +367,7 @@ mod tests {
             version_key: "hash-a".to_string(),
             attempt: 1,
             started_at: None,
+            polling_restarted_at: None,
             next_poll_at: None,
             last_error: None,
             fallback_used: false,
@@ -384,7 +385,7 @@ mod tests {
         for expected in [
             "CSPaper sends no email",
             "`reviewloop import-token --job-id job-1 --token <cspaper job_id>`",
-            "`reviewloop retry --job-id job-1 --force`",
+            "`reviewloop retry --job-id job-1 --now`",
             "`reviewloop cancel --job-id job-1`",
         ] {
             assert!(hint.contains(expected), "missing {expected:?}: {hint}");
@@ -405,6 +406,30 @@ mod tests {
             with_token.reconcile_hint(),
             "a receipt token is saved; run `reviewloop retry --job-id job-1` to resume polling"
         );
+    }
+
+    #[test]
+    fn only_rows_that_were_queued_prove_approval() {
+        use JobStatus::*;
+        let row = |status: JobStatus, last_error: Option<&str>| Job {
+            status,
+            last_error: last_error.map(str::to_string),
+            ..tokenless_job("stanford")
+        };
+        for status in [Queued, Submitted, Processing, FailedNeedsManual, Timeout] {
+            assert!(row(status, None).proves_approval(), "{status:?}");
+        }
+        assert!(row(Failed, None).proves_approval());
+        assert!(row(Failed, Some("upload failed: 500")).proves_approval());
+        assert!(row(Failed, Some("cancelled by users' request")).proves_approval());
+        for cancelled in ["cancelled by user", "cancelled by user: wrong draft"] {
+            assert!(
+                !row(Failed, Some(cancelled)).proves_approval(),
+                "{cancelled}"
+            );
+        }
+        assert!(!row(PendingApproval, None).proves_approval());
+        assert!(!row(Completed, None).proves_approval());
     }
 }
 
@@ -436,6 +461,10 @@ pub struct Job {
     pub version_key: String,
     pub attempt: u32,
     pub started_at: Option<DateTime<Utc>>,
+    /// When a retry last sent this job, holding a receipt token, back to
+    /// polling. The review timeout counts from it, else from `started_at`,
+    /// which keeps the receipt time (CSPaper usage is counted by it).
+    pub polling_restarted_at: Option<DateTime<Utc>>,
     pub next_poll_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub fallback_used: bool,
@@ -447,7 +476,58 @@ pub struct Job {
     pub updated_at: DateTime<Utc>,
 }
 
+/// `last_error` prefix of a cancelled job, alone or followed by `: <reason>`.
+/// The widget and the failure lists in [`Db`](crate::db::Db) filter on it.
+pub const CANCELLED_BY_USER: &str = "cancelled by user";
+
+/// Whether `last_error` is a cancellation's ([`CANCELLED_BY_USER`]).
+pub fn is_cancellation(last_error: &str) -> bool {
+    last_error
+        .strip_prefix(CANCELLED_BY_USER)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+}
+
 impl Job {
+    /// Whether the row proves the job was approved for sending: it is QUEUED,
+    /// or in a status only reached after QUEUED (SUBMITTED, PROCESSING,
+    /// FAILED_NEEDS_MANUAL, TIMEOUT, or FAILED other than by a cancel), even
+    /// when nothing was sent (a rejected or blocked input). A cancel also ends
+    /// PENDING_APPROVAL jobs and `complete` may finish one, so a cancelled or
+    /// COMPLETED row proves nothing, nor does any other status, including one
+    /// added later.
+    pub fn proves_approval(&self) -> bool {
+        match self.status {
+            JobStatus::Failed => !self.last_error.as_deref().is_some_and(is_cancellation),
+            status => matches!(
+                status,
+                JobStatus::Queued
+                    | JobStatus::Submitted
+                    | JobStatus::Processing
+                    | JobStatus::FailedNeedsManual
+                    | JobStatus::Timeout
+            ),
+        }
+    }
+
+    /// Whether a retry can act on the job right away instead of joining the
+    /// queue (`retry --now`, `retry_job` with `jump_queue`): a job with a
+    /// receipt token only while PROCESSING, when it can be polled; one without
+    /// when it is QUEUED, SUBMITTED, FAILED, FAILED_NEEDS_MANUAL or TIMEOUT.
+    pub fn can_jump_queue(&self) -> bool {
+        if self.token.is_some() {
+            self.status == JobStatus::Processing
+        } else {
+            matches!(
+                self.status,
+                JobStatus::Queued
+                    | JobStatus::Submitted
+                    | JobStatus::Failed
+                    | JobStatus::FailedNeedsManual
+                    | JobStatus::Timeout
+            )
+        }
+    }
+
     /// How an operator settles a submission whose outcome is unknown.
     pub fn reconcile_hint(&self) -> String {
         if self.token.is_some() {
@@ -458,12 +538,12 @@ impl Job {
         }
         if self.backend == crate::backend::cspaper::BACKEND {
             return format!(
-                "not resubmitted automatically; CSPaper sends no email, so look for this paper in the CSPaper review list (https://cspaper.org/platform/review) and run `reviewloop import-token --job-id {} --token <cspaper job_id>`, or `reviewloop retry --job-id {} --force` to resubmit anyway (may duplicate), or `reviewloop cancel --job-id {}`",
+                "not resubmitted automatically; CSPaper sends no email, so look for this paper in the CSPaper review list (https://cspaper.org/platform/review) and run `reviewloop import-token --job-id {} --token <cspaper job_id>`, or `reviewloop retry --job-id {} --now` to resubmit anyway (may duplicate), or `reviewloop cancel --job-id {}`",
                 self.id, self.id, self.id
             );
         }
         format!(
-            "not resubmitted automatically; once the review email arrives run `reviewloop import-token --job-id {} --token <token>`, or `reviewloop retry --job-id {} --force` to resubmit anyway (may duplicate), or `reviewloop cancel --job-id {}`",
+            "not resubmitted automatically; once the review email arrives run `reviewloop import-token --job-id {} --token <token>`, or `reviewloop retry --job-id {} --now` to resubmit anyway (may duplicate), or `reviewloop cancel --job-id {}`",
             self.id, self.id, self.id
         )
     }

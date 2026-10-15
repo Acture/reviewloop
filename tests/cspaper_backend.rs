@@ -71,12 +71,8 @@ const JOB_ID: &str = "856f388c-d5cd-4409-b3bf-3e0c8279dc49";
 const TITLE: &str = "A Study of Agentic Peer Review";
 const DESK_REJECTION: &str = "desk_rejection_enabled";
 /// Every reconcile hint for a CSPaper submission without a receipt names these.
-const CSPAPER_RECONCILE_HINTS: [&str; 4] = [
-    "CSPaper sends no email",
-    "import-token",
-    "--force",
-    "cancel",
-];
+const CSPAPER_RECONCILE_HINTS: [&str; 4] =
+    ["CSPaper sends no email", "import-token", "--now", "cancel"];
 
 const SUBMIT_PATH: &str = "/api/platform/review";
 const REVIEWS_PATH: &str = "/api/platform/reviews";

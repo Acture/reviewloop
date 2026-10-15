@@ -78,7 +78,7 @@ const CONTRACT: [(&str, &[&str], Hints); 12] = [
             "job_id",
             "paper_id",
             "include_failed",
-            "force",
+            "jump_queue",
             "project_id",
         ],
         (false, false, false, true),
@@ -546,20 +546,60 @@ async fn an_agent_requests_approves_cancels_and_retries_a_review() -> Result<()>
     assert_eq!(cancelled["job"]["phase"], "cancelled");
     assert_eq!(cancelled["job"]["terminal"], true);
 
-    // Submitting again sends the manuscript again: back to approval.
+    // A cancel proves no approval (it also ends pending jobs), so submitting
+    // the job again goes back to approval, even ahead of the queue.
     let retried = session
         .ok(
             "retry_job",
-            json!({"paper_id": "main", "include_failed": true}),
+            json!({"paper_id": "main", "include_failed": true, "jump_queue": true}),
         )
         .await?;
     assert_eq!(retried["action"], "awaiting_approval");
     assert_eq!(retried["previous_status"], "FAILED");
     assert_eq!(retried["job"]["status"], "PENDING_APPROVAL");
+    assert_eq!(
+        retried["job"]["last_error"],
+        "retried; awaiting approval to submit it again"
+    );
     let approved = session
         .ok("approve_job", json!({"paper_id": "main"}))
         .await?;
     assert_eq!(approved["job"]["status"], "QUEUED");
+
+    // A job that failed at the provider was approved before it was sent: a
+    // retry queues it again directly.
+    let db = machine.db()?;
+    let pdf_path = repo.join("paper.pdf");
+    let failed = db.create_job(&NewJob {
+        project_id: "thesis".to_string(),
+        paper_id: "main".to_string(),
+        backend: "stanford".to_string(),
+        pdf: JobPdf::Unpinned {
+            pdf_path: pdf_path.display().to_string(),
+            pdf_hash: "an-earlier-draft".to_string(),
+        },
+        status: JobStatus::Queued,
+        email: "agent@example.edu".to_string(),
+        venue: None,
+        review_options: Default::default(),
+        git_tag: None,
+        git_commit: None,
+        next_poll_at: None,
+    })?;
+    db.update_job_state(
+        &failed.id,
+        JobStatus::Failed,
+        Some(1),
+        None,
+        Some(Some("primary submit error: upstream 502".to_string())),
+    )?;
+    let requeued = session
+        .ok("retry_job", json!({"job_id": failed.id}))
+        .await?;
+    assert_eq!(requeued["action"], "submission_queued");
+    assert_eq!(requeued["previous_status"], "FAILED");
+    assert_eq!(requeued["job"]["status"], "QUEUED");
+    assert_eq!(requeued["job"]["last_error"], Value::Null);
 
     let watched = session.ok("watch_project", json!({})).await?;
     assert_eq!(watched["project"]["watched"], true);
@@ -867,7 +907,7 @@ async fn an_explicit_null_reads_as_an_omitted_argument() -> Result<()> {
     let pending = session
         .err(
             "retry_job",
-            json!({"job_id": jobs["jobs"][0]["job_id"], "paper_id": null, "include_failed": null, "force": null}),
+            json!({"job_id": jobs["jobs"][0]["job_id"], "paper_id": null, "include_failed": null, "jump_queue": null}),
         )
         .await?;
     assert_eq!(pending["code"], "invalid_state", "{pending}");

@@ -2,8 +2,8 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use reviewloop::application::{
-    Approval, CancelRequest, Eligibility, JobRef, OpError, RequestOrigin, RetryAction,
-    RetryRequest, ReviewOps, ReviewRequest, require_project,
+    Approval, CancelRequest, Eligibility, JobRef, OpError, Operation, RequestOrigin, RetryAction,
+    RetryRequest, ReviewOps, ReviewRequest, SkipReason, require_project,
 };
 use reviewloop::artifact::write_review_artifacts;
 use reviewloop::backend::ProviderSource;
@@ -145,8 +145,17 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
-    /// Re-queue a failed or stalled job for another attempt. Use --force to
-    /// clear any cooldown. Accepts --job-id or --paper-id.
+    /// Re-queue a failed or stalled job for another attempt. Accepts --job-id
+    /// or --paper-id, or --all-failed for the project's latest failed jobs.
+    ///
+    /// By default the job joins the end of the queue and the machine
+    /// supervisor submits it in turn, within the machine's submission budget;
+    /// a job the provider already accepted (it has a receipt token) is polled
+    /// again on the polling schedule instead, its review timeout restarted.
+    /// With --now, this command attempts the submission or poll once, right
+    /// away, in this process, clearing any cooldown. --now polls only a
+    /// PROCESSING job: retry a TIMEOUT or FAILED job that has a receipt token
+    /// without it.
     ///
     /// When using --paper-id, only active jobs (QUEUED, SUBMITTED, PROCESSING)
     /// are matched by default. This avoids ambiguity when multiple failed jobs
@@ -154,18 +163,25 @@ enum Command {
     /// --include-failed to also consider FAILED, FAILED_NEEDS_MANUAL, and TIMEOUT
     /// jobs. If multiple failed jobs match, you'll get a candidate list and must
     /// use --job-id to pick one explicitly.
+    ///
+    /// --all-failed retries, oldest first, every FAILED or TIMEOUT job of the
+    /// current project that is the newest job of its paper and backend, each
+    /// the default way (no --now). It skips, and lists with the reason,
+    /// cancelled jobs, FAILED_NEEDS_MANUAL jobs (their last error says how to
+    /// recover: a fix and a retry by --job-id, or a new review) and jobs
+    /// superseded by a newer job.
     Retry {
         #[command(flatten)]
-        job_ref: JobOrPaperRef,
-        /// Force immediate retry, clearing any pending cooldown / rate-limit wait.
-        #[arg(long, default_value_t = false)]
-        force: bool,
-        /// Deprecated alias for --force. Will be removed in a future release.
-        #[arg(long, default_value_t = false, hide = true)]
-        override_rate_limit: bool,
+        target: RetryTarget,
+        /// Attempt the job once right away, in this process, instead of
+        /// joining the end of the queue; clears any cooldown. A job with a
+        /// receipt token is polled only while PROCESSING: retry a TIMEOUT or
+        /// FAILED one without --now.
+        #[arg(long, default_value_t = false, conflicts_with = "all_failed")]
+        now: bool,
         /// Also consider FAILED, FAILED_NEEDS_MANUAL, and TIMEOUT jobs when
         /// resolving --paper-id. By default only active jobs are matched.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, conflicts_with = "all_failed")]
         include_failed: bool,
     },
     /// Mark a job as completed and optionally attach a summary or score.
@@ -448,6 +464,32 @@ impl JobOrPaperRef {
     }
 }
 
+/// Argument group for `retry`: exactly one of `--job-id`, `--paper-id` or
+/// `--all-failed`.
+#[derive(Debug, Args, Clone)]
+#[group(required = true, multiple = false)]
+struct RetryTarget {
+    #[arg(long)]
+    job_id: Option<String>,
+    #[arg(long)]
+    paper_id: Option<String>,
+    /// Retry every FAILED or TIMEOUT job of the current project that is the
+    /// newest job of its paper and backend.
+    #[arg(long)]
+    all_failed: bool,
+}
+
+impl RetryTarget {
+    /// The job to retry; `None` for `--all-failed`.
+    fn into_job_ref(self) -> Option<JobRef> {
+        match (self.job_id, self.paper_id) {
+            (Some(job_id), _) => Some(JobRef::Id(job_id)),
+            (None, Some(paper_id)) => Some(JobRef::Paper(paper_id)),
+            (None, None) => None,
+        }
+    }
+}
+
 /// Arguments for `reviewloop run <pdf-path>`.
 #[derive(Debug, Args)]
 struct RunArgs {
@@ -641,21 +683,15 @@ async fn run() -> Result<()> {
             cmd_cancel(&config, &db, &job_ref.into_job_ref(), reason.as_deref())
         }
         Command::Retry {
-            job_ref,
-            force,
-            override_rate_limit,
+            target,
+            now,
             include_failed,
         } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
-            cmd_retry(
-                &config,
-                &db,
-                &job_ref.into_job_ref(),
-                force,
-                override_rate_limit,
-                include_failed,
-            )
-            .await
+            match target.into_job_ref() {
+                Some(job_ref) => cmd_retry(&config, &db, &job_ref, now, include_failed).await,
+                None => cmd_retry_all_failed(&config, &db),
+            }
         }
         Command::Complete {
             job_ref,
@@ -3335,20 +3371,15 @@ fn format_elapsed(started: chrono::DateTime<Utc>, now: chrono::DateTime<Utc>) ->
     format!("{}d{}h", secs / 86_400, (secs % 86_400) / 3600)
 }
 
+/// `retry`: re-queue the job at the end of the queue, or with `now` attempt it
+/// right away in this process.
 async fn cmd_retry(
     config: &Config,
     db: &Db,
     job_ref: &JobRef,
-    force: bool,
-    override_rate_limit: bool,
+    now: bool,
     include_failed: bool,
 ) -> Result<()> {
-    if override_rate_limit {
-        eprintln!("warning: --override-rate-limit is deprecated; use --force instead");
-        tracing::warn!("deprecated flag --override-rate-limit used; treating as --force");
-    }
-    let force = force || override_rate_limit;
-
     let job = ReviewOps::new(config, db)
         .find_job(job_ref, Eligibility::retry(include_failed))
         .map_err(|err| with_retry_hint(err, include_failed))?;
@@ -3374,13 +3405,15 @@ async fn cmd_retry(
         &owned
     };
 
-    let outcome = ReviewOps::new(job_config, db).retry_job(&RetryRequest {
-        job: JobRef::Id(job.id.clone()),
-        force,
-        include_failed,
-        caller_executes: force,
-        approval: Approval::Granted,
-    })?;
+    let outcome = ReviewOps::new(job_config, db)
+        .retry_job(&RetryRequest {
+            job: JobRef::Id(job.id.clone()),
+            jump_queue: now,
+            include_failed,
+            caller_executes: now,
+            approval: Approval::Granted,
+        })
+        .map_err(|err| with_retry_now_hint(err, &job, now))?;
     if outcome.previous_status == JobStatus::Submitted
         && matches!(
             outcome.action,
@@ -3395,9 +3428,7 @@ async fn cmd_retry(
     match outcome.action {
         RetryAction::PollNow => {
             match reviewloop::worker::poll_job(job_config, db, &job.id).await? {
-                Attempt::Ran => {
-                    println!("Immediately polled job {} with rate-limit override", job.id)
-                }
+                Attempt::Ran => println!("Immediately polled job {}", job.id),
                 Attempt::NotClaimed => println!(
                     "Job {} is being polled by another reviewloop worker",
                     job.id
@@ -3406,24 +3437,80 @@ async fn cmd_retry(
         }
         RetryAction::SubmitNow => {
             match reviewloop::worker::submit_job(job_config, db, &job.id).await? {
-                Attempt::Ran => println!(
-                    "Immediately retried job {} with rate-limit override",
-                    job.id
-                ),
+                Attempt::Ran => println!("Immediately retried job {}", job.id),
                 Attempt::NotClaimed => println!(
                     "Job {} is being submitted by another reviewloop worker",
                     job.id
                 ),
             }
         }
-        RetryAction::PollScheduled | RetryAction::SubmissionQueued => {
-            println!("Retry scheduled for job {}", job.id);
-        }
+        RetryAction::SubmissionQueued => println!(
+            "Re-queued job {}: it joins the end of the queue and is submitted in turn",
+            job.id
+        ),
+        RetryAction::PollScheduled => println!(
+            "Retry scheduled for job {}: it is polled again on the polling schedule",
+            job.id
+        ),
         RetryAction::AwaitingApproval => {
             unreachable!("the CLI's retries are granted")
         }
     }
     print_project_worker(job_config, db);
+    Ok(())
+}
+
+/// `retry --all-failed`: re-queue the current project's failed jobs, then list
+/// the ones skipped and why.
+fn cmd_retry_all_failed(config: &Config, db: &Db) -> Result<()> {
+    let outcome = ReviewOps::new(config, db).retry_failed_jobs()?;
+    for retried in &outcome.retried {
+        let job = &retried.job;
+        match retried.action {
+            RetryAction::SubmissionQueued => println!(
+                "Re-queued job {} (paper {}): it joins the end of the queue and is submitted in turn",
+                job.job_id, job.paper_id
+            ),
+            RetryAction::PollScheduled => println!(
+                "Retry scheduled for job {} (paper {}): it is polled again on the polling schedule",
+                job.job_id, job.paper_id
+            ),
+            action => unreachable!("a granted retry without --now is never {action:?}"),
+        }
+    }
+    for skipped in &outcome.skipped {
+        let job = &skipped.job;
+        let reason = match &skipped.reason {
+            SkipReason::Superseded(newer) => format!(
+                "superseded by newer job {} ({})",
+                newer.job_id,
+                newer.status.as_str()
+            ),
+            SkipReason::Cancelled => "cancelled".to_string(),
+            SkipReason::NeedsManual => format!(
+                "it needs attention first, and its last error says how to recover: fix the cause and run `reviewloop retry --job-id {}`, or request a new review with `reviewloop submit --paper-id {} --force`",
+                job.job_id, job.paper_id
+            ),
+            SkipReason::Changed { message } => message.clone(),
+        };
+        println!(
+            "Skipped job {} (paper {}, {}): {reason}",
+            job.job_id,
+            job.paper_id,
+            job.status.as_str()
+        );
+    }
+    if outcome.retried.is_empty() && outcome.skipped.is_empty() {
+        println!("No failed jobs in project {}", config.project_id);
+    } else {
+        println!(
+            "Retried {} failed job(s) of project {}; skipped {}",
+            outcome.retried.len(),
+            config.project_id,
+            outcome.skipped.len()
+        );
+    }
+    print_project_worker(config, db);
     Ok(())
 }
 
@@ -3613,6 +3700,31 @@ fn with_retry_hint(err: OpError, include_failed: bool) -> anyhow::Error {
              hint: no active job for paper_id={paper_id}; \
              pass --include-failed to retry a previously-failed job"
         ),
+        _ => err.into(),
+    }
+}
+
+/// `retry --now` refused because the job cannot skip the queue
+/// ([`reviewloop::model::Job::can_jump_queue`]): a plain retry still works.
+fn with_retry_now_hint(err: OpError, job: &reviewloop::model::Job, now: bool) -> anyhow::Error {
+    match &err {
+        OpError::InvalidState {
+            operation: Operation::RetryJob,
+            ..
+        } if now && job.status != JobStatus::PendingApproval && !job.can_jump_queue() => {
+            let hint = if job.token.is_some() {
+                format!(
+                    "--now polls only a PROCESSING job; run `reviewloop retry --job-id {}` without it to poll this one again on the polling schedule",
+                    job.id
+                )
+            } else {
+                format!(
+                    "run `reviewloop retry --job-id {}` without --now to re-queue it at the end of the queue",
+                    job.id
+                )
+            };
+            anyhow!("{err}\nhint: {hint}")
+        }
         _ => err.into(),
     }
 }
@@ -4721,68 +4833,43 @@ mod tests {
         }
     }
 
-    mod force_flag {
-        /// `--override-rate-limit` is still accepted by the clap parser and
-        /// maps to the `override_rate_limit` field (backward compat).
+    mod retry_flags {
+        use crate::{Cli, Command};
+        use clap::Parser;
+
+        fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+            Cli::try_parse_from(
+                ["reviewloop", "retry", "--job-id", "some-job-id"]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            )
+        }
+
+        /// `--now` asks for the immediate attempt; without it the job queues.
         #[test]
-        fn override_rate_limit_alias_parses() {
-            use crate::{Cli, Command};
-            use clap::Parser;
-            let args = Cli::try_parse_from([
-                "reviewloop",
-                "retry",
-                "--job-id",
-                "some-job-id",
-                "--override-rate-limit",
-            ])
-            .expect("--override-rate-limit should still parse successfully");
-            match args.command {
-                Command::Retry {
-                    override_rate_limit,
-                    force,
-                    ..
-                } => {
-                    assert!(override_rate_limit, "override_rate_limit should be true");
-                    assert!(!force, "force should be false when only alias is passed");
+        fn retry_now_flag_parses() {
+            for (args, expected) in [(&["--now"][..], true), (&[][..], false)] {
+                match parse(args).expect("retry parses").command {
+                    Command::Retry { now, .. } => assert_eq!(now, expected, "{args:?}"),
+                    _ => panic!("expected Retry command"),
                 }
-                _ => panic!("expected Retry command"),
             }
         }
 
-        /// `--force` on retry sets the `force` field.
+        /// The old names of `--now` are gone, not aliased.
         #[test]
-        fn retry_force_flag_parses() {
-            use crate::{Cli, Command};
-            use clap::Parser;
-            let args =
-                Cli::try_parse_from(["reviewloop", "retry", "--job-id", "some-job-id", "--force"])
-                    .expect("--force should parse successfully");
-            match args.command {
-                Command::Retry {
-                    force,
-                    override_rate_limit,
-                    ..
-                } => {
-                    assert!(force, "force should be true");
-                    assert!(!override_rate_limit, "override_rate_limit should be false");
-                }
-                _ => panic!("expected Retry command"),
+        fn retry_rejects_force_and_override_rate_limit() {
+            for flag in ["--force", "--override-rate-limit"] {
+                let err = match parse(&[flag]) {
+                    Ok(_) => panic!("{flag} must be rejected"),
+                    Err(err) => err,
+                };
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::UnknownArgument,
+                    "{flag}: {err}"
+                );
             }
-        }
-
-        /// Deprecation warning is printed to stderr when --override-rate-limit is used.
-        #[test]
-        fn override_rate_limit_deprecation_warning_logic() {
-            // The actual eprintln! runs in cmd_retry. Here we verify that the
-            // combined force value is `true` when override_rate_limit is set,
-            // mirroring the logic in cmd_retry.
-            let force = false;
-            let override_rate_limit = true;
-            let effective_force = force || override_rate_limit;
-            assert!(
-                effective_force,
-                "override_rate_limit should make effective force = true"
-            );
         }
     }
 
@@ -5695,7 +5782,9 @@ mod tests {
         use reviewloop::model::{
             EventRecord, Job, JobPdf, JobStatus, NewJob, SubmitChannel, SubmitStage, WorkKind,
         };
+        use reviewloop::util::sha256_file;
         use serde_json::json;
+        use std::{fs, path::Path};
         use tempfile::TempDir;
 
         const PROJECT_ID: &str = "oss337-cli";
@@ -6045,9 +6134,9 @@ mod tests {
             assert_eq!(format!("{:?}", ctx.job(&job.id)), before);
         }
 
-        /// `retry` (with or without `--force`, or the deprecated alias) never requeues a
-        /// submission whose dispatch is in flight under a live lease.
-        async fn assert_retry_refuses_in_flight_submission(force: bool, override_rate_limit: bool) {
+        /// `retry` (with or without `--now`) never requeues a submission whose dispatch
+        /// is in flight under a live lease.
+        async fn assert_retry_refuses_in_flight_submission(now: bool) {
             let ctx = Ctx::new();
             let lease = ctx.dispatched_job("hash-in-flight", Utc::now());
             let job_id = lease.job.id.clone();
@@ -6057,16 +6146,9 @@ mod tests {
             assert_eq!(events_before, ["submit_dispatched"]);
 
             let job_ref = JobRef::Id(job_id.clone());
-            let err = cmd_retry(
-                &ctx.config,
-                &ctx.db,
-                &job_ref,
-                force,
-                override_rate_limit,
-                false,
-            )
-            .await
-            .expect_err("retry must not requeue an in-flight submission");
+            let err = cmd_retry(&ctx.config, &ctx.db, &job_ref, now, false)
+                .await
+                .expect_err("retry must not requeue an in-flight submission");
             let msg = err.to_string();
             assert!(
                 msg.contains(&format!("job {job_id} is being submitted right now")),
@@ -6087,17 +6169,12 @@ mod tests {
 
         #[tokio::test]
         async fn retry_refuses_in_flight_submission() {
-            assert_retry_refuses_in_flight_submission(false, false).await;
+            assert_retry_refuses_in_flight_submission(false).await;
         }
 
         #[tokio::test]
-        async fn retry_force_refuses_in_flight_submission() {
-            assert_retry_refuses_in_flight_submission(true, false).await;
-        }
-
-        #[tokio::test]
-        async fn retry_override_rate_limit_refuses_in_flight_submission() {
-            assert_retry_refuses_in_flight_submission(false, true).await;
+        async fn retry_now_refuses_in_flight_submission() {
+            assert_retry_refuses_in_flight_submission(true).await;
         }
 
         /// Once the dispatching worker's lease has lapsed, `retry` is the user's explicit
@@ -6108,11 +6185,11 @@ mod tests {
             let lease = ctx.dispatched_job("hash-stalled", Utc::now() - Duration::hours(2));
             let job_id = lease.job.id.clone();
 
+            let before = Utc::now();
             cmd_retry(
                 &ctx.config,
                 &ctx.db,
                 &JobRef::Id(job_id.clone()),
-                false,
                 false,
                 false,
             )
@@ -6125,13 +6202,175 @@ mod tests {
             assert_eq!(job.submit_stage, None);
             assert_eq!(job.lease_owner, None);
             assert_eq!(job.lease_expires_at, None);
-            assert_eq!(job.next_poll_at, None);
+            // The end of the queue: its place is the retry.
+            assert!(
+                job.next_poll_at
+                    .is_some_and(|at| before <= at && at <= Utc::now()),
+                "{:?}",
+                job.next_poll_at
+            );
             assert_eq!(job.last_error, None);
             assert_eq!(job.token, None);
             let events = ctx.events_for(&job_id);
             let last = events.last().expect("retried event");
             assert_eq!(last.event_type, "retried");
             assert_eq!(last.payload, json!({}));
+        }
+
+        /// `retry --now` polls a token-backed job in this process at once instead of
+        /// waiting for its schedule; the unreachable backend makes it a `poll_error`.
+        #[tokio::test]
+        async fn retry_now_polls_the_job_in_this_process() {
+            let ctx = Ctx::new();
+            let queued = ctx.create_job(JobStatus::Queued, "hash-now");
+            let scheduled = Utc::now() + Duration::hours(6);
+            ctx.db
+                .attach_token_to_job(&queued.id, "tok-now", scheduled)
+                .expect("attach_token_to_job");
+
+            cmd_retry(
+                &ctx.config,
+                &ctx.db,
+                &JobRef::Id(queued.id.clone()),
+                true,
+                false,
+            )
+            .await
+            .expect("retry --now");
+
+            let job = ctx.job(&queued.id);
+            assert_eq!(job.status, JobStatus::Processing);
+            assert_eq!(job.attempt, 1, "the immediate poll ran and failed once");
+            assert!(job.next_poll_at.is_some_and(|at| at < scheduled));
+            assert_eq!(
+                ctx.event_types_for(&queued.id),
+                ["manual_rate_limit_override", "poll_error"]
+            );
+        }
+
+        /// `retry --now` submits a job without a receipt in this process at once
+        /// instead of leaving it to the supervisor; the unreachable backend fails the
+        /// attempt.
+        #[tokio::test]
+        async fn retry_now_submits_the_job_in_this_process() {
+            let ctx = Ctx::new();
+            let pdf_path = Path::new(&ctx.config.core.state_dir).join("paper.pdf");
+            fs::write(&pdf_path, b"%PDF-1.4\n%%EOF\n").expect("write pdf");
+            let failed = ctx
+                .db
+                .create_job(&NewJob {
+                    project_id: PROJECT_ID.to_string(),
+                    paper_id: PAPER_ID.to_string(),
+                    backend: "stanford".to_string(),
+                    pdf: JobPdf::Unpinned {
+                        pdf_path: pdf_path.display().to_string(),
+                        pdf_hash: sha256_file(&pdf_path).expect("hash pdf"),
+                    },
+                    status: JobStatus::Failed,
+                    email: "test@example.com".to_string(),
+                    venue: None,
+                    review_options: Default::default(),
+                    git_tag: None,
+                    git_commit: None,
+                    next_poll_at: None,
+                })
+                .expect("create job");
+
+            cmd_retry(
+                &ctx.config,
+                &ctx.db,
+                &JobRef::Id(failed.id.clone()),
+                true,
+                false,
+            )
+            .await
+            .expect("retry --now");
+
+            let job = ctx.job(&failed.id);
+            assert_eq!(
+                job.attempt, 1,
+                "the immediate submission ran and failed once"
+            );
+            let events = ctx.event_types_for(&failed.id);
+            assert_eq!(
+                events.first().map(String::as_str),
+                Some("manual_rate_limit_override")
+            );
+            assert!(
+                events.iter().any(|event| event == "submit_dispatched"),
+                "{events:?}"
+            );
+        }
+
+        /// The CLI's retry is the user's own decision: it sends a job cancelled before
+        /// anyone approved it again, at the end of the queue, without a separate
+        /// approval.
+        #[tokio::test]
+        async fn retry_requeues_a_job_cancelled_while_pending_approval() {
+            let ctx = Ctx::new();
+            let pending = ctx.create_job(JobStatus::PendingApproval, "hash-cancelled");
+            ctx.db
+                .cancel_job(&pending.id, None, Utc::now())
+                .expect("cancel_job");
+
+            let before = Utc::now();
+            cmd_retry(
+                &ctx.config,
+                &ctx.db,
+                &JobRef::Id(pending.id.clone()),
+                false,
+                false,
+            )
+            .await
+            .expect("retry a cancelled job");
+
+            let job = ctx.job(&pending.id);
+            assert_eq!(job.status, JobStatus::Queued);
+            assert!(
+                job.next_poll_at
+                    .is_some_and(|at| before <= at && at <= Utc::now()),
+                "{:?}",
+                job.next_poll_at
+            );
+            assert_eq!(job.last_error, None);
+            let events = ctx.events_for(&pending.id);
+            let last = events.last().expect("retried event");
+            assert_eq!(last.event_type, "retried");
+            assert_eq!(last.payload, json!({}));
+        }
+
+        /// `--now` polls only a PROCESSING job; a timed-out job keeps its receipt, so
+        /// the refusal says to retry it without `--now`.
+        #[tokio::test]
+        async fn retry_now_refuses_a_timed_out_job_and_names_the_plain_retry() {
+            let ctx = Ctx::new();
+            let queued = ctx.create_job(JobStatus::Queued, "hash-timeout");
+            ctx.db
+                .attach_token_to_job(&queued.id, "tok-timeout", Utc::now())
+                .expect("attach_token_to_job");
+            ctx.db
+                .update_job_state(&queued.id, JobStatus::Timeout, None, Some(None), None)
+                .expect("time out");
+            let before = format!("{:?}", ctx.job(&queued.id));
+
+            let err = cmd_retry(
+                &ctx.config,
+                &ctx.db,
+                &JobRef::Id(queued.id.clone()),
+                true,
+                false,
+            )
+            .await
+            .expect_err("--now refuses a TIMEOUT job");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!(
+                    "hint: --now polls only a PROCESSING job; run `reviewloop retry --job-id {}` without it",
+                    queued.id
+                )),
+                "{msg}"
+            );
+            assert_eq!(format!("{:?}", ctx.job(&queued.id)), before);
         }
 
         #[test]
@@ -6147,7 +6386,7 @@ mod tests {
                 "{hint}"
             );
             assert!(
-                hint.contains(&format!("`reviewloop retry --job-id {id} --force`")),
+                hint.contains(&format!("`reviewloop retry --job-id {id} --now`")),
                 "{hint}"
             );
             assert!(

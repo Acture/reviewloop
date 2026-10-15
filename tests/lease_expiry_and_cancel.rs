@@ -542,7 +542,7 @@ fn forced_retry_revokes_dispatched_lease_and_late_receipt_is_only_logged() -> Re
         Duration::minutes(30)
     )?);
 
-    // `retry --force` style override while the request is in flight.
+    // A `retry` override while the request is in flight.
     ctx.other_handle().update_job_state_unchecked(
         &job.id,
         JobStatus::Queued,

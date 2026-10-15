@@ -67,19 +67,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (new code `config_unavailable` when it no longer loads). Agent requests
   start PENDING_APPROVAL until `approve_job` unless the server runs with
   `--approval granted`; they are recorded as `agent_request`. With approval
-  required, a `retry_job` that would send the manuscript again returns the
-  job to PENDING_APPROVAL (`RetryRequest.approval`, action
-  `awaiting_approval`), so nothing the agent requests or retries is sent
-  without `approve_job`, the first time or again (`watch_project` lets the
-  supervisor run the project's own triggers and queued jobs, ungated).
+  required, a `retry_job` that would send the manuscript again queues the job
+  only when its row proves it was approved before (`Job::proves_approval`:
+  QUEUED, SUBMITTED, PROCESSING, FAILED_NEEDS_MANUAL, TIMEOUT, or FAILED
+  other than by a cancel); a cancelled or hand-completed job goes back to
+  PENDING_APPROVAL (`RetryRequest.approval`, action `awaiting_approval`) for
+  `approve_job` (`watch_project` lets the supervisor run the project's own
+  triggers and queued jobs, ungated). `retry_job`'s `jump_queue` gives a
+  tokenless job back its creation-time place in the queue, cooldown cleared,
+  or makes a PROCESSING one due for a poll now, polled in turn with the other
+  due polls.
   Calls that name no project never drift from the startup project's file.
   stdout carries only MCP
   messages; the log goes to stderr. `tests/mcp_stdio.rs` drives the binary
   through an MCP client, validates every result against its schema, and
   carries a review from request to result through the supervisor against
   a mock provider.
-- `Db::get_review`, `Db::review_completed_at`, `Db::list_project_jobs` and
-  `Db::list_registered_projects` (read-only).
+- `Db::get_review`, `Db::review_completed_at`, `Db::list_project_jobs`,
+  `Db::list_failed_jobs_with_newer` and `Db::list_registered_projects`
+  (read-only).
 - **Stanford Agentic Reviewer contract** (`docs/providers/stanford.md`) — the
   `paperreview.ai` API as checked on 2026-10-09, with sanitized fixtures in
   `tests/fixtures/stanford/` marked observed or inferred, and the open
@@ -138,7 +144,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Local CSPaper usage** — after a CSPaper submission, `submit` and `run`
   print this machine's CSPaper reviews this month as completed, in progress
   and ended without a review, plus uncertain submissions (also ones cancelled
-  mid-upload or resubmitted with `retry --force`); `status` repeats it.
+  mid-upload or resubmitted with `retry`); `status` repeats it.
 - **`daemon install` key check** — warns when a CSPaper project's key is not
   in the global config: launchd does not pass the shell's
   `REVIEWLOOP_CSPAPER_API_KEY` to the daemon.
@@ -173,12 +179,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   supervisor's last pass. `submit`, `approve`, `retry`, `import-token` and
   `status` say whether anything will move the job without you, separately
   from its queue state.
+- **`reviewloop retry --all-failed`** — retries, oldest first, every FAILED
+  or TIMEOUT job of the current project that is the newest job of its paper
+  and backend, each as a plain `retry` does (the end of the queue, or, for a
+  job with a receipt token such as every TIMEOUT job, a poll on schedule), and
+  lists the jobs it skips with the reason: cancelled, FAILED_NEEDS_MANUAL (its
+  last error says how to recover: a fix and `retry --job-id`, or a new review)
+  or superseded by a newer job, which it names. CLI only
+  (`ReviewOps::retry_failed_jobs`); the MCP tools are unchanged.
 
 ### Changed
 
-- `Db::requeue` takes `needs_approval` and returns the status it wrote
-  (`Requeue::Requeued { status }`): the retry's approval decision is read
-  inside its transaction.
+- `Db::requeue` takes `approval_required` and a `QueuePlace` and returns the
+  status it wrote (`Requeue::Requeued { status }`): the retry's approval
+  decision is made inside its transaction from the job's row.
+- **Queue order** — queued jobs are submitted in the order they took their
+  place in the queue, `next_poll_at` or else `created_at`, instead of by
+  creation alone, so a retried old job no longer goes ahead of newer jobs
+  already waiting. `retry` and `approve` stamp `next_poll_at` with the
+  moment, putting the job at the end of the queue; `retry --now` gives it back
+  its creation-time place. A rate limit's cooldown end becomes the job's place
+  once it passes, and clearing a cooldown (`retry --now`, `submit --force` on a
+  sibling) puts the job back at its creation time. `submit --force` clears
+  only a sibling's future `next_poll_at` (a cooldown), and the widget and menu
+  bar no longer show a queued job's past one as overdue or polling.
 - `ReviewView.artifacts` no longer lists `review.json`: it is stored
   unredacted, and a CSPaper one holds the provider job id, which is the
   token. `raw` is the redacted review.
@@ -258,6 +282,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   unchanged except:
   - `retry` refuses a PENDING_APPROVAL job (approve it instead) rather than
     queueing it without approval.
+  - `retry --force` is `retry --now`: attempt the job once right away in the
+    `retry` process; without it the job joins the end of the queue for the
+    supervisor. As before, it polls only a PROCESSING job: a TIMEOUT or FAILED
+    job with a receipt token is retried without it, and the refusal now says
+    so. The deprecated `--override-rate-limit` alias is removed.
   - `retry` refuses a job whose registered config now declares another
     `project_id`. Before, a plain retry went ahead with that config and a
     forced one reset the job before failing in the worker.
@@ -367,6 +396,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Upgrade notes
 
+- Schema version 8 adds `jobs.polling_restarted_at`, the restart of a job's
+  review timeout by a retry (empty for existing rows).
 - Schema version 7 adds `projects.enabled`, `enabled_changed_at` and the
   health columns (`last_run_at`, `last_ok_at`, `last_error`,
   `last_error_at`), the single-row `supervisor` table, and the triggers that
@@ -398,7 +429,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `jobs.submit_stage` (migrated automatically from v1, v2 or v3).
 - Jobs left `SUBMITTED` by earlier versions are marked `UNCERTAIN` on the
   first tick and wait for reconciliation (token email, `import-token`,
-  `retry --force`, or `cancel`).
+  `retry`, or `cancel`).
 - New event types: `submit_dispatched`, `submit_outcome_unknown`,
   `submit_claim_expired`, `submit_claim_taken_over`,
   `submit_receipt_after_lease_lost`, `stale_result_rejected`.
@@ -429,6 +460,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   HOME check when a project outside HOME is loaded from the registry.
 - A missing PDF or provider setting of paper `main` in one project no longer
   silences the same warning for another project's paper `main`.
+- **A retried TIMEOUT job is polled again** — a plain `retry` (without
+  `--now`) of a job with a receipt token restarts its review timeout
+  (`jobs.polling_restarted_at`), so a timed-out job no longer times out again
+  at the next tick, before any poll. `started_at` keeps the receipt time,
+  which CSPaper usage is counted by.
+- The menu bar retries a job with a receipt token that is not PROCESSING
+  (every timed-out one) without `--now`, which refuses such a job, so it is
+  polled again on schedule instead of failing.
 
 - **Review tokens no longer leak into default output** — request errors are
   described without their URL (the Stanford review URL and the CSPaper job URL

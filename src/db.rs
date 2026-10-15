@@ -1,10 +1,10 @@
 use crate::{
     config::Config,
     model::{
-        EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, EventRecord, ExistingReason,
-        Job, JobStatus, NewJob, ProjectHealth, ProviderUsage, RegisteredProject, ReviewIdentity,
-        ReviewOptions, ReviewRecord, StatusView, SubmitChannel, SubmitStage, SupervisorRecord,
-        WorkKind,
+        CANCELLED_BY_USER, EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest,
+        EventRecord, ExistingReason, Job, JobStatus, NewJob, ProjectHealth, ProviderUsage,
+        RegisteredProject, ReviewIdentity, ReviewOptions, ReviewRecord, StatusView, SubmitChannel,
+        SubmitStage, SupervisorRecord, WorkKind,
     },
     util::{parse_rfc3339, to_rfc3339},
 };
@@ -22,7 +22,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PruneReport {
@@ -107,6 +107,25 @@ pub enum ReceiptWrite {
     StoredForRecovery,
     /// The lease was lost and the job could not take the token; only an event records it.
     Logged,
+}
+
+/// Where [`Db::requeue`] puts a job in the submission queue, which serves
+/// QUEUED jobs by `COALESCE(next_poll_at, created_at)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuePlace {
+    /// Behind every job already waiting: `next_poll_at` = now.
+    End,
+    /// Its original place, its creation time: `next_poll_at` NULL, which also
+    /// clears any cooldown.
+    Original,
+}
+
+/// The newest job of a paper and backend created after a given job, from
+/// [`Db::list_failed_jobs_with_newer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewerJob {
+    pub id: String,
+    pub status: JobStatus,
 }
 
 /// Outcome of [`Db::requeue`].
@@ -493,6 +512,9 @@ impl Db {
         .map_err(Into::into)
     }
 
+    /// QUEUED jobs due at `now` and not leased, in queue order: by when each took its
+    /// place, `next_poll_at` when set (a retry or approval stamps it; a rate limit
+    /// pushes it back), else `created_at`.
     pub fn list_ready_queued(
         &self,
         project_id: &str,
@@ -508,7 +530,7 @@ impl Db {
               AND status = ?2
               AND (next_poll_at IS NULL OR next_poll_at <= ?3)
               AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?3)
-            ORDER BY created_at ASC
+            ORDER BY COALESCE(next_poll_at, created_at) ASC, id ASC
             LIMIT ?4
             "#,
         )?;
@@ -540,7 +562,7 @@ impl Db {
               AND token IS NOT NULL
               AND (next_poll_at IS NULL OR next_poll_at <= ?3)
               AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?3)
-            ORDER BY COALESCE(next_poll_at, created_at) ASC
+            ORDER BY COALESCE(next_poll_at, created_at) ASC, id ASC
             LIMIT ?4
             "#,
         )?;
@@ -559,7 +581,7 @@ impl Db {
     /// Update job state, enforcing `JobStatus::can_transition` as a guard. Validation and
     /// write share one transaction. A status change revokes any work lease (the owner's
     /// premise no longer holds); a same-status bookkeeping update leaves it in place.
-    /// Use [`update_job_state_unchecked`] for deliberate user overrides (retry --force,
+    /// Use [`update_job_state_unchecked`] for deliberate user overrides (retry,
     /// complete) that legitimately move out of terminal states.
     pub fn update_job_state(
         &self,
@@ -602,8 +624,8 @@ impl Db {
 
     /// Update job state without enforcing the state-machine guard, revoking any work
     /// lease so an in-flight worker's result is rejected.
-    /// Use at CLI override sites (cmd_retry --force, cmd_complete) that deliberately move
-    /// jobs out of terminal or otherwise-restricted states.
+    /// Use at CLI override sites (cmd_complete) that deliberately move jobs out of
+    /// terminal or otherwise-restricted states.
     pub fn update_job_state_unchecked(
         &self,
         job_id: &str,
@@ -625,6 +647,39 @@ impl Db {
                 submit_stage: Some(None),
                 ..RowWrite::new(status, LeaseColumns::Clear)
             },
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Send a job holding a receipt token back to polling (user `retry`), from any
+    /// status: PROCESSING, attempt 0, `last_error` cleared, the next poll at
+    /// `next_poll_at`, any lease revoked. The review timeout restarts at `now`
+    /// (`polling_restarted_at`), so a TIMEOUT job is polled again instead of timing
+    /// out at the next tick; `started_at` keeps the receipt time.
+    pub fn restart_polling(
+        &self,
+        job_id: &str,
+        next_poll_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = begin_immediate(&mut conn)?;
+        let current = require_job(&tx, job_id)?;
+        write_row(
+            &tx,
+            &current,
+            RowWrite {
+                attempt: Some(0),
+                next_poll_at: Some(Some(next_poll_at)),
+                last_error: Some(None),
+                submit_stage: Some(None),
+                ..RowWrite::new(JobStatus::Processing, LeaseColumns::Clear)
+            },
+        )?;
+        tx.execute(
+            "UPDATE jobs SET polling_restarted_at = ?2 WHERE id = ?1",
+            params![job_id, to_rfc3339(now)],
         )?;
         tx.commit()?;
         Ok(())
@@ -680,18 +735,18 @@ impl Db {
     }
 
     /// Put a job back before submission for another attempt (user `retry`): attempt 0,
-    /// no cooldown, lease revoked, QUEUED. With `needs_approval`, an attempt that sends
-    /// the manuscript again (the row is not QUEUED) goes to PENDING_APPROVAL instead;
-    /// a row that was SUBMITTED keeps a `last_error` saying an earlier submission may
-    /// have reached the provider, for whoever approves it. Both refusals, and the
-    /// status, are read inside the transaction, so a caller's stale view cannot turn
-    /// into a duplicate or unapproved submission: a submission in flight (DISPATCHED
-    /// with a live lease) or one whose receipt has landed meanwhile (the job holds a
-    /// token) is left alone.
+    /// lease revoked, QUEUED at `place`. With `approval_required`, a job whose row does
+    /// not prove it was approved before ([`Job::proves_approval`]: a cancelled or
+    /// COMPLETED one) goes to PENDING_APPROVAL instead, with a note in `last_error` and
+    /// no `next_poll_at`. Both refusals, and the status, are read inside the
+    /// transaction, so a caller's stale view cannot turn into a duplicate or unapproved
+    /// submission: a submission in flight (DISPATCHED with a live lease) or one whose
+    /// receipt has landed meanwhile (the job holds a token) is left alone.
     pub fn requeue(
         &self,
         job_id: &str,
-        needs_approval: bool,
+        approval_required: bool,
+        place: QueuePlace,
         now: DateTime<Utc>,
     ) -> Result<Requeue> {
         let mut conn = self.connect()?;
@@ -706,23 +761,26 @@ impl Db {
                 expires_at: current.lease_expires_at.unwrap_or(now),
             });
         }
-        let status = if needs_approval && current.status != JobStatus::Queued {
-            JobStatus::PendingApproval
+        let (status, next_poll_at, last_error) = if approval_required && !current.proves_approval()
+        {
+            (
+                JobStatus::PendingApproval,
+                None,
+                Some("retried; awaiting approval to submit it again".to_string()),
+            )
         } else {
-            JobStatus::Queued
+            let next_poll_at = match place {
+                QueuePlace::End => Some(now),
+                QueuePlace::Original => None,
+            };
+            (JobStatus::Queued, next_poll_at, None)
         };
-        let last_error = (status == JobStatus::PendingApproval
-            && current.status == JobStatus::Submitted)
-            .then(|| {
-                "awaiting approval to submit again: an earlier submission may already have reached the provider"
-                    .to_string()
-            });
         write_row(
             &tx,
             &current,
             RowWrite {
                 attempt: Some(0),
-                next_poll_at: Some(None),
+                next_poll_at: Some(next_poll_at),
                 last_error: Some(last_error),
                 submit_stage: Some(None),
                 ..RowWrite::new(status, LeaseColumns::Clear)
@@ -1237,8 +1295,8 @@ impl Db {
         }
 
         let last_error = match reason {
-            Some(reason) => format!("cancelled by user: {reason}"),
-            None => "cancelled by user".to_string(),
+            Some(reason) => format!("{CANCELLED_BY_USER}: {reason}"),
+            None => CANCELLED_BY_USER.to_string(),
         };
         let lease_was_active = lease_is_live(&job, now);
         write_row(
@@ -1708,6 +1766,57 @@ impl Db {
         collect_rows(rows)
     }
 
+    /// A project's FAILED (cancelled ones included), FAILED_NEEDS_MANUAL and TIMEOUT jobs,
+    /// oldest first, each with the newest job of its paper and backend created after it,
+    /// in any status (`created_at` ties go to the greater id, as in newest-first lists).
+    pub fn list_failed_jobs_with_newer(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(Job, Option<NewerJob>)>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT j.*, n.id AS newer_id, n.status AS newer_status
+            FROM jobs j
+            LEFT JOIN jobs n ON n.id = (
+                SELECT later.id
+                FROM jobs later
+                WHERE later.project_id = j.project_id
+                  AND later.paper_id = j.paper_id
+                  AND later.backend = j.backend
+                  AND (later.created_at > j.created_at
+                       OR (later.created_at = j.created_at AND later.id > j.id))
+                ORDER BY later.created_at DESC, later.id DESC
+                LIMIT 1
+            )
+            WHERE j.project_id = ?1
+              AND j.status IN (?2, ?3, ?4)
+            ORDER BY j.created_at ASC, j.id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                JobStatus::Failed.as_str(),
+                JobStatus::FailedNeedsManual.as_str(),
+                JobStatus::Timeout.as_str(),
+            ],
+            |row| {
+                let newer = match row.get::<_, Option<String>>("newer_id")? {
+                    Some(id) => {
+                        let status: String = row.get("newer_status")?;
+                        let status = JobStatus::from_db(&status)
+                            .ok_or_else(|| conversion_error(format!("invalid status: {status}")))?;
+                        Some(NewerJob { id, status })
+                    }
+                    None => None,
+                };
+                Ok((map_job_row(row)?, newer))
+            },
+        )?;
+        collect_rows(rows)
+    }
+
     /// Fleet-wide: every active job across all projects.
     ///
     /// Used by `reviewloop-bar` to render a multi-project dashboard. Returned
@@ -1744,7 +1853,7 @@ impl Db {
     /// or when its history has a dispatch of unknown outcome that no receipt
     /// settled (a token arriving with no newer `submit_dispatched`): a
     /// `submit_outcome_unknown`, or a cancel while DISPATCHED. Cancel and
-    /// `retry --force` clear the stage but do not withdraw what the provider
+    /// `retry` clear the stage but do not withdraw what the provider
     /// may hold. History lasts as long as `retention.events_days`.
     ///
     /// `period` (`[start, end)`) keeps jobs accepted in it, or enqueued in it
@@ -1835,7 +1944,7 @@ impl Db {
                    venue, review_options, git_tag, git_commit, attempt, started_at, next_poll_at,
                    last_error, fallback_used, created_at, updated_at,
                    project_id, version_no, round_no, version_source, version_key,
-                   lease_owner, lease_expires_at, submit_stage
+                   lease_owner, lease_expires_at, submit_stage, polling_restarted_at
             FROM (
                 SELECT *,
                        ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY updated_at DESC) AS rn
@@ -2589,6 +2698,7 @@ fn create_tables_if_missing(conn: &Connection) -> Result<()> {
             version_key TEXT NOT NULL DEFAULT '',
             attempt INTEGER NOT NULL DEFAULT 0,
             started_at TEXT,
+            polling_restarted_at TEXT,
             next_poll_at TEXT,
             last_error TEXT,
             fallback_used INTEGER NOT NULL DEFAULT 0,
@@ -2697,6 +2807,7 @@ fn migrate_columns(conn: &Connection) -> Result<()> {
     ensure_column_exists(conn, "jobs", "submit_stage", "TEXT")?;
     ensure_column_exists(conn, "jobs", "snapshot_path", "TEXT")?;
     ensure_column_exists(conn, "jobs", "review_options", "TEXT")?;
+    ensure_column_exists(conn, "jobs", "polling_restarted_at", "TEXT")?;
     // Existing registrations stay disabled and undecided (enabled_changed_at NULL).
     ensure_column_exists(conn, "projects", "enabled", "INTEGER NOT NULL DEFAULT 0")?;
     for column in [
@@ -3264,6 +3375,7 @@ fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         version_key: row.get("version_key")?,
         attempt: row.get::<_, i64>("attempt")? as u32,
         started_at,
+        polling_restarted_at: optional_time(row, "polling_restarted_at")?,
         next_poll_at,
         last_error: row.get("last_error")?,
         fallback_used: row.get::<_, i64>("fallback_used")? == 1,

@@ -1054,7 +1054,7 @@ fn provider_usage_splits_cspaper_submissions_by_stage_across_projects() -> Resul
     let cancelled = ctx.create_cspaper_job("proj-a", JobStatus::Failed, "hash-h1", options())?;
     event(&cancelled, "submit_dispatched")?;
     event(&cancelled, "submit_outcome_unknown")?;
-    // Unknown outcome, then `retry --force` accepted: the first dispatch stays uncertain.
+    // Unknown outcome, then `retry` accepted: the first dispatch stays uncertain.
     let resent = accepted("proj-a", "hash-h2", "856f388c-0004")?;
     event(&resent, "submit_dispatched")?;
     event(&resent, "submit_outcome_unknown")?;

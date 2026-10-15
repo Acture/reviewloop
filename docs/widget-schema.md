@@ -19,12 +19,12 @@ it; no other command does.
 | `summary.active_count` | integer | required | Total active jobs across every project (`QUEUED`, `SUBMITTED`, and `PROCESSING`) before the `active_jobs` display cap is applied. |
 | `summary.failed_recent_24h` | integer | required | Count of the recent-failure result (the five newest non-cancelled `FAILED`, `FAILED_NEEDS_MANUAL`, or `TIMEOUT` jobs of each project) whose `updated_at` is in the last 24 hours. Excludes user cancellations (`last_error = 'cancelled by user'` or `last_error LIKE 'cancelled by user:%'`). |
 | `summary.completed_today` | integer | required | Jobs of every project completed since 00:00 UTC of the current calendar date, computed from `COMPLETED` jobs whose `updated_at` starts with today's UTC date. |
-| `active_jobs` | array (max 10) | required | Active jobs across every project. Rust orders by `next_poll_at` ascending with `null` first; equal poll times preserve database order. |
+| `active_jobs` | array (max 10) | required | Active jobs across every project. Rust orders by the stored `next_poll_at` ascending with `null` first (a queued job's place in the queue counts, although it is published as `null`); equal poll times preserve database order. |
 | `active_jobs[].project_id` | string | required | The job's project. |
 | `active_jobs[].paper_id` | string | required | Paper-id from project config. Unique only within a project: identify a row by `project_id` and `paper_id`. |
 | `active_jobs[].status` | string | required | One of `"QUEUED"`, `"SUBMITTED"`, `"PROCESSING"`. |
 | `active_jobs[].attempt` | integer | required | Number of attempts so far. |
-| `active_jobs[].next_poll_at` | RFC3339 UTC timestamp string | nullable | When the supervisor will next attempt this job. `null` when no poll is scheduled, including queued jobs. |
+| `active_jobs[].next_poll_at` | RFC3339 UTC timestamp string | nullable | When the supervisor will next attempt this job. `null` when no wait is scheduled, including queued jobs waiting their turn; a queued job has a value only while a rate-limit cooldown holds it back. |
 | `active_jobs[].started_at` | RFC3339 UTC timestamp string | nullable | When the current processing attempt started. `null` for jobs that have not started. |
 | `recent_failures` | array (max 5) | required | The newest non-cancelled failures across every project, ordered by `updated_at` descending. |
 | `recent_failures[].project_id` | string | required | The job's project. |

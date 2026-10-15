@@ -16,6 +16,7 @@
 
 use crate::{
     db::Db,
+    model::JobStatus,
     supervisor::{ProjectState, SupervisorState},
 };
 use anyhow::{Context, Result};
@@ -181,7 +182,13 @@ pub fn build_fleet(db: &Db, now: DateTime<Utc>) -> Result<WidgetState> {
             paper_id: j.paper_id.clone(),
             status: j.status.as_str().to_string(),
             attempt: j.attempt,
-            next_poll_at: j.next_poll_at.map(fmt_rfc3339),
+            // A QUEUED job's past next_poll_at is its place in the queue, not
+            // a wait: published as null, like a fresh job's, so it never
+            // reads as overdue.
+            next_poll_at: j
+                .next_poll_at
+                .filter(|at| j.status != JobStatus::Queued || *at > now)
+                .map(fmt_rfc3339),
             started_at: j.started_at.map(fmt_rfc3339),
         })
         .collect();
@@ -350,7 +357,7 @@ mod tests {
     use crate::{
         config::Config,
         db::Db,
-        model::{JobPdf, JobStatus, NewJob},
+        model::{JobPdf, NewJob},
     };
     use chrono::TimeZone;
     use std::path::Path;
@@ -485,6 +492,57 @@ mod tests {
         assert_eq!(
             state.projects[0].last_error.as_deref(),
             Some("pdf trigger: boom")
+        );
+    }
+
+    /// A QUEUED job's due `next_poll_at` is its place in the queue (a retry or an
+    /// approval stamps it), not a wait, so the widget never shows it as overdue; a
+    /// cooldown still in the future and a PROCESSING job's poll time are kept.
+    #[test]
+    fn a_queued_jobs_place_in_the_queue_is_no_poll_time() {
+        let db = make_db("widget-queue-place");
+        let now = Utc::now();
+        let job = |paper_id: &str, status: JobStatus, next_poll_at| {
+            let job = db
+                .create_job(&NewJob {
+                    project_id: "alpha".to_string(),
+                    paper_id: paper_id.to_string(),
+                    backend: "test".to_string(),
+                    pdf: JobPdf::Unpinned {
+                        pdf_path: "/dev/null".to_string(),
+                        pdf_hash: paper_id.to_string(),
+                    },
+                    status,
+                    email: "t@example.com".to_string(),
+                    venue: None,
+                    review_options: Default::default(),
+                    git_tag: None,
+                    git_commit: None,
+                    next_poll_at: None,
+                })
+                .expect("create_job");
+            db.reschedule(&job.id, None, Some(Some(next_poll_at)))
+                .expect("reschedule");
+        };
+        let earlier = now - chrono::Duration::minutes(5);
+        let later = now + chrono::Duration::minutes(5);
+        job("retried", JobStatus::Queued, earlier);
+        job("cooling", JobStatus::Queued, later);
+        job("polling", JobStatus::Processing, earlier);
+
+        let state = build_fleet(&db, now).expect("build");
+        let published: BTreeMap<&str, Option<&str>> = state
+            .active_jobs
+            .iter()
+            .map(|job| (job.paper_id.as_str(), job.next_poll_at.as_deref()))
+            .collect();
+        assert_eq!(
+            published,
+            BTreeMap::from([
+                ("retried", None),
+                ("cooling", Some(fmt_rfc3339(later).as_str())),
+                ("polling", Some(fmt_rfc3339(earlier).as_str())),
+            ])
         );
     }
 

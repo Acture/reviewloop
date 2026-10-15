@@ -1,9 +1,9 @@
-use super::{ops::CANCELLED_BY_USER, redact::redact_text};
+use super::redact::redact_text;
 use crate::{
     http::redact_url_paths,
     model::{
         ExistingReason, Job, JobStatus, NewJob, RegisteredProject, ReviewOptions, SubmitStage,
-        SupervisorRecord,
+        SupervisorRecord, is_cancellation,
     },
     supervisor::{ProjectState, SupervisorState, WorkerAvailability},
 };
@@ -65,7 +65,7 @@ pub enum JobPhase {
     /// PENDING_APPROVAL: waits for `approve_job`; nothing will be sent.
     AwaitingApproval,
     /// QUEUED: stored locally, not yet accepted by the provider. A worker
-    /// submits it when `next_poll_at` is due (or at its next tick when null).
+    /// submits it in turn once `next_poll_at` (if any) has passed.
     Queued,
     /// PROCESSING: the provider accepted the PDF; the worker polls for the
     /// review at `next_poll_at`. Also SUBMITTED: a submission in flight
@@ -93,12 +93,6 @@ impl JobPhase {
             }
         }
     }
-}
-
-fn is_cancellation(last_error: &str) -> bool {
-    last_error
-        .strip_prefix(CANCELLED_BY_USER)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
 }
 
 /// A review job without its provider token or submitter email.
@@ -150,10 +144,13 @@ pub struct JobView {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
-    /// QUEUED: earliest submission attempt. PROCESSING: next provider poll.
-    /// Null: no wait, a worker acts at its next tick; except for a SUBMITTED
-    /// job with an unknown outcome (UNCERTAIN), which nothing acts on
-    /// automatically.
+    /// QUEUED: the job's place in the queue, when it entered it (a retry or
+    /// approval sets it; null counts as `created_at`) or, after a rate limit,
+    /// the end of its cooldown; jobs are submitted in order of this time once
+    /// it has passed.
+    /// PROCESSING: next provider poll. Null otherwise: no wait, a worker acts
+    /// at its next tick; except for a SUBMITTED job with an unknown outcome
+    /// (UNCERTAIN), which nothing acts on automatically.
     pub next_poll_at: Option<DateTime<Utc>>,
 }
 
@@ -204,7 +201,8 @@ pub struct JobList {
     pub truncated: bool,
 }
 
-/// A job named by a paper reference that matched more than one job.
+/// A job by id and status: one of several a paper reference matched, or the
+/// job that superseded one `retry_failed_jobs` skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JobCandidate {
     pub job_id: String,
@@ -402,16 +400,23 @@ pub struct TransitionOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RetryAction {
-    /// PROCESSING with a token; polled when the first schedule step is due.
+    /// PROCESSING with a token, its review timeout restarted; polled when the
+    /// first schedule step is due.
     PollScheduled,
-    /// QUEUED without a token; submitted at the worker's next tick.
+    /// QUEUED without a token at the end of the queue; the supervisor
+    /// submits it in turn.
     SubmissionQueued,
-    /// Forced: PROCESSING with a token, due for a poll now.
+    /// `jump_queue`: PROCESSING with a token, due for a poll now (polled by
+    /// the caller with `caller_executes`).
     PollNow,
-    /// Forced: QUEUED without a token, due for submission now.
+    /// `jump_queue`: QUEUED without a token at its original place, its
+    /// creation time, with no cooldown (submitted by the caller with
+    /// `caller_executes`).
     SubmitNow,
-    /// PENDING_APPROVAL without a token: sending the manuscript again waits
-    /// for `approve_job` (`RetryRequest.approval` `Required`).
+    /// PENDING_APPROVAL without a token: the job's row does not prove it was
+    /// approved before (it was cancelled, or completed by hand), so sending
+    /// the manuscript again waits for `approve_job` (`RetryRequest.approval`
+    /// `Required`).
     AwaitingApproval,
 }
 
@@ -422,6 +427,42 @@ pub struct RetryOutcome {
     #[schemars(schema_with = "status_schema")]
     pub previous_status: JobStatus,
     pub action: RetryAction,
+}
+
+/// What `retry_failed_jobs` (`reviewloop retry --all-failed`) did with each of
+/// the project's FAILED, FAILED_NEEDS_MANUAL and TIMEOUT jobs, both lists
+/// oldest first. A CLI result, not part of the JSON contract.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FailedJobsRetry {
+    /// Retried as `retry_job` retries a job without `jump_queue`, with
+    /// approval granted: `submission_queued` or `poll_scheduled`.
+    pub retried: Vec<RetryOutcome>,
+    pub skipped: Vec<SkippedRetry>,
+}
+
+/// A job `retry_failed_jobs` left alone, as it was when selected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkippedRetry {
+    pub job: JobView,
+    pub reason: SkipReason,
+}
+
+/// Why `retry_failed_jobs` skipped a job; the first that applies.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SkipReason {
+    /// A job of the same paper and backend was created after it (the newest
+    /// such job, in any status).
+    Superseded(JobCandidate),
+    /// Cancelled by the user.
+    Cancelled,
+    /// FAILED_NEEDS_MANUAL: it needs attention first, and `last_error` says
+    /// how to recover (fix the cause and retry it by job id, or request a new
+    /// review); never retried in a batch.
+    NeedsManual,
+    /// The retry was refused because the job changed after it was selected:
+    /// its submission is in flight, a receipt token landed, or its status
+    /// moved on. The message says which.
+    Changed { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
