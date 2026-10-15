@@ -108,8 +108,8 @@ pub enum OpError {
         available: Vec<String>,
     },
 
-    /// Enabling would take a project's registration from another live
-    /// config, or give a config a second enabled project.
+    /// Watching would take a project's registration from another live
+    /// config, or give a config a second watched project.
     #[error("{message}")]
     ProjectConflict {
         project_id: String,
@@ -117,8 +117,8 @@ pub enum OpError {
         registered_path: Option<String>,
         /// The config the request named.
         requested_path: String,
-        /// The other project already enabled from `requested_path`.
-        enabled_as: Option<String>,
+        /// The other project already watched from `requested_path`.
+        watched_as: Option<String>,
         message: String,
     },
 
@@ -277,13 +277,13 @@ impl OpError {
                 "request one of the available sections, or the markdown part".to_string()
             }
             OpError::ProjectConflict {
-                enabled_as: Some(other),
+                watched_as: Some(other),
                 ..
             } => format!(
-                "disable project {other} first (`reviewloop project disable --project-id {other}`), then enable this one"
+                "unwatch project {other} first (`reviewloop project unwatch --project-id {other}`), then watch this one"
             ),
             OpError::ProjectConflict { .. } => {
-                "keep one copy per project_id, or move the registration here with `reviewloop project enable --replace` (enable_project with replace)".to_string()
+                "keep one copy per project_id, or move the registration here with `reviewloop project watch --replace` (watch_project with replace)".to_string()
             }
             OpError::ProjectNotRegistered { .. } => {
                 "check the id with list_projects; a project registers when its config is first loaded".to_string()
@@ -364,13 +364,13 @@ impl OpError {
                 project_id,
                 registered_path,
                 requested_path,
-                enabled_as,
+                watched_as,
                 ..
             } => json!({
                 "project_id": project_id,
                 "registered_path": registered_path,
                 "requested_path": requested_path,
-                "enabled_as": enabled_as,
+                "watched_as": watched_as,
             }),
             OpError::ProjectNotRegistered { project_id } => json!({ "project_id": project_id }),
         }

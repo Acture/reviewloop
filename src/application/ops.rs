@@ -1,6 +1,6 @@
 use super::{
     dto::{
-        JobCandidate, JobList, JobView, ManuscriptInput, PaperView, ProjectEnablement, ProjectView,
+        JobCandidate, JobList, JobView, ManuscriptInput, PaperView, ProjectView, ProjectWatch,
         ProjectWorkerView, RequestDisposition, RetryAction, RetryOutcome, ReviewArtifacts,
         ReviewRequestOutcome, ReviewSection, ReviewView, SupervisorView, TransitionOutcome,
         WorkerStatus,
@@ -9,8 +9,8 @@ use super::{
     operation::Operation,
     redact::redact_value,
     request::{
-        Approval, CancelRequest, DisableProjectRequest, Eligibility, EnableProjectRequest,
-        JobListQuery, JobRef, RetryRequest, ReviewPart, ReviewQuery, ReviewRequest,
+        Approval, CancelRequest, Eligibility, JobListQuery, JobRef, RetryRequest, ReviewPart,
+        ReviewQuery, ReviewRequest, UnwatchProjectRequest, WatchProjectRequest,
     },
 };
 use crate::{
@@ -25,7 +25,7 @@ use crate::{
         EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, Job, JobPdf, JobStatus,
         NewJob, SubmitStage,
     },
-    registry::{self, ConfigFileState, Disabled, EnableError},
+    registry::{self, ConfigFileState, Unwatched, WatchError},
     submission_input::prepare_input,
     supervisor::WorkerAvailability,
     util::compute_next_poll_at,
@@ -123,11 +123,8 @@ impl<'a> ReviewOps<'a> {
 
     /// Let the machine supervisor run this project from `config_path`. Never
     /// takes the registration from another live config unless `replace`, and
-    /// never gives one config two enabled projects.
-    pub fn enable_project(
-        &self,
-        request: &EnableProjectRequest,
-    ) -> Result<ProjectEnablement, OpError> {
+    /// never gives one config two watched projects.
+    pub fn watch_project(&self, request: &WatchProjectRequest) -> Result<ProjectWatch, OpError> {
         let project_id = require_project(self.config)?;
         let config_path =
             canonical_config_path(&request.config_path).map_err(|err| OpError::InvalidRequest {
@@ -144,7 +141,7 @@ impl<'a> ReviewOps<'a> {
                 ),
             });
         }
-        let enabled = registry::enable(
+        let watched = registry::watch(
             self.db,
             project_id,
             &config_path,
@@ -154,48 +151,48 @@ impl<'a> ReviewOps<'a> {
         .map_err(|err| {
             let message = err.to_string();
             match err {
-                EnableError::Conflict(conflict) => OpError::ProjectConflict {
+                WatchError::Conflict(conflict) => OpError::ProjectConflict {
                     message: format!(
                         "{message}, which still declares it; keep one copy per project_id, or move the registration here with --replace"
                     ),
                     project_id: conflict.project_id,
                     registered_path: Some(conflict.registered.display().to_string()),
                     requested_path: conflict.requested.display().to_string(),
-                    enabled_as: None,
+                    watched_as: None,
                 },
-                EnableError::FileEnabledAs {
+                WatchError::FileWatchedAs {
                     config_path,
-                    enabled_as,
+                    watched_as,
                 } => OpError::ProjectConflict {
                     project_id: project_id.to_string(),
                     registered_path: None,
                     requested_path: config_path.display().to_string(),
-                    enabled_as: Some(enabled_as),
+                    watched_as: Some(watched_as),
                     message,
                 },
-                EnableError::Concurrent { .. } => OpError::Internal(anyhow::anyhow!(message)),
-                EnableError::Internal(err) => OpError::Internal(err),
+                WatchError::Concurrent { .. } => OpError::Internal(anyhow::anyhow!(message)),
+                WatchError::Internal(err) => OpError::Internal(err),
             }
         })?;
         info!(
             project_id,
             config_path = %config_path.display(),
-            changed = !enabled.already,
-            "project enabled for the supervisor"
+            changed = !watched.already,
+            "project watched by the supervisor"
         );
-        self.enablement(
+        self.watch_outcome(
             project_id,
-            !enabled.already,
-            enabled.moved_from.map(|path| path.display().to_string()),
+            !watched.already,
+            watched.moved_from.map(|path| path.display().to_string()),
         )
     }
 
     /// Stop the machine supervisor from running a project (by default this
     /// one). Its jobs keep their state.
-    pub fn disable_project(
+    pub fn unwatch_project(
         &self,
-        request: &DisableProjectRequest,
-    ) -> Result<ProjectEnablement, OpError> {
+        request: &UnwatchProjectRequest,
+    ) -> Result<ProjectWatch, OpError> {
         let project_id = match request.project_id.as_deref().map(str::trim) {
             Some(id) if !id.is_empty() => id,
             Some(_) => {
@@ -206,25 +203,25 @@ impl<'a> ReviewOps<'a> {
             }
             None => require_project(self.config)?,
         };
-        let changed = match registry::disable(self.db, project_id, Utc::now())? {
-            Disabled::NotRegistered => {
+        let changed = match registry::unwatch(self.db, project_id, Utc::now())? {
+            Unwatched::NotRegistered => {
                 return Err(OpError::ProjectNotRegistered {
                     project_id: project_id.to_string(),
                 });
             }
-            Disabled::WasEnabled => true,
-            Disabled::AlreadyDisabled => false,
+            Unwatched::WasWatched => true,
+            Unwatched::AlreadyUnwatched => false,
         };
-        info!(project_id, changed, "project disabled for the supervisor");
-        self.enablement(project_id, changed, None)
+        info!(project_id, changed, "project unwatched by the supervisor");
+        self.watch_outcome(project_id, changed, None)
     }
 
-    fn enablement(
+    fn watch_outcome(
         &self,
         project_id: &str,
         changed: bool,
         moved_from: Option<String>,
-    ) -> Result<ProjectEnablement, OpError> {
+    ) -> Result<ProjectWatch, OpError> {
         let row = self.db.get_registered_project(project_id)?.ok_or_else(|| {
             OpError::ProjectNotRegistered {
                 project_id: project_id.to_string(),
@@ -240,7 +237,7 @@ impl<'a> ReviewOps<'a> {
                 last_error: row.health.last_error.as_deref().map(redact_url_paths),
             }),
         };
-        Ok(ProjectEnablement {
+        Ok(ProjectWatch {
             project: ProjectView::of(row, &self.config.project_id),
             changed,
             moved_from,

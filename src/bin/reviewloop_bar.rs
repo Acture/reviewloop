@@ -26,7 +26,7 @@
 //! ## Supervisor
 //!
 //! One machine-level supervisor (`reviewloop daemon run`, installed as the
-//! launchd agent `ai.reviewloop.daemon`) runs every enabled project. Its
+//! launchd agent `ai.reviewloop.daemon`) runs every watched project. Its
 //! pause is a persistent flag in the shared database, so the bar reads the
 //! supervisor's state from there; launchctl only tells whether the service
 //! is loaded, which "Resume" also repairs.

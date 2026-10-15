@@ -5,10 +5,10 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use reviewloop::{
     application::{
-        Approval, CancelRequest, DisableProjectRequest, Eligibility, EnableProjectRequest,
-        JobListQuery, JobPhase, JobRef, OpError, Operation, ProjectEnablement, RequestDisposition,
-        RequestOrigin, RetryAction, RetryOutcome, RetryRequest, ReviewOps, ReviewPart, ReviewQuery,
-        ReviewRequest, ReviewRequestOutcome,
+        Approval, CancelRequest, Eligibility, JobListQuery, JobPhase, JobRef, OpError, Operation,
+        ProjectWatch, RequestDisposition, RequestOrigin, RetryAction, RetryOutcome, RetryRequest,
+        ReviewOps, ReviewPart, ReviewQuery, ReviewRequest, ReviewRequestOutcome,
+        UnwatchProjectRequest, WatchProjectRequest,
     },
     artifact::write_review_artifacts,
     backend::{cspaper, provider_source},
@@ -271,7 +271,7 @@ fn list_projects_reports_registry_and_current_project() -> Result<()> {
     Ok(())
 }
 
-// ---- supervisor enablement (OSS-338) ----
+// ---- watched projects (OSS-338) ----
 
 impl Fixture {
     /// A `reviewloop.toml` in `dir` declaring `project_id`.
@@ -283,8 +283,8 @@ impl Fixture {
         Ok(path)
     }
 
-    fn enable(&self, config_path: &Path, replace: bool) -> Result<ProjectEnablement, OpError> {
-        self.ops().enable_project(&EnableProjectRequest {
+    fn watch(&self, config_path: &Path, replace: bool) -> Result<ProjectWatch, OpError> {
+        self.ops().watch_project(&WatchProjectRequest {
             config_path: config_path.to_path_buf(),
             replace,
         })
@@ -301,37 +301,37 @@ impl Fixture {
 }
 
 #[test]
-fn enable_and_disable_change_only_what_the_supervisor_runs() -> Result<()> {
+fn watch_and_unwatch_change_only_what_the_supervisor_runs() -> Result<()> {
     let fx = Fixture::new()?;
     let path = fx.project_file("repo", "project-ops")?;
     let job = fx.request(false, Approval::Granted)?.job;
 
-    let enabled = fx.enable(&path, false)?;
-    assert!(enabled.changed);
-    assert!(enabled.project.enabled);
-    assert_eq!(enabled.project.state, ProjectState::Pending);
+    let watched = fx.watch(&path, false)?;
+    assert!(watched.changed);
+    assert!(watched.project.watched);
+    assert_eq!(watched.project.state, ProjectState::Pending);
     assert_eq!(
-        enabled.project.config_path,
+        watched.project.config_path,
         fs::canonicalize(&path)?.display().to_string()
     );
     assert_eq!(
-        enabled.worker.project.expect("project").availability,
+        watched.worker.project.expect("project").availability,
         WorkerAvailability::SupervisorStopped
     );
     assert!(
-        !fx.enable(&path, false)?.changed,
-        "enabling twice changes nothing"
+        !fx.watch(&path, false)?.changed,
+        "watching twice changes nothing"
     );
 
-    let disabled = fx
+    let unwatched = fx
         .ops()
-        .disable_project(&DisableProjectRequest { project_id: None })?;
-    assert!(disabled.changed);
-    assert!(!disabled.project.enabled);
-    assert_eq!(fx.availability()?, WorkerAvailability::ProjectDisabled);
+        .unwatch_project(&UnwatchProjectRequest { project_id: None })?;
+    assert!(unwatched.changed);
+    assert!(!unwatched.project.watched);
+    assert_eq!(fx.availability()?, WorkerAvailability::ProjectUnwatched);
     assert!(
         !fx.ops()
-            .disable_project(&DisableProjectRequest { project_id: None })?
+            .unwatch_project(&UnwatchProjectRequest { project_id: None })?
             .changed
     );
     // Jobs are not touched.
@@ -340,13 +340,13 @@ fn enable_and_disable_change_only_what_the_supervisor_runs() -> Result<()> {
 }
 
 #[test]
-fn enable_never_takes_a_live_registration_without_replace() -> Result<()> {
+fn watch_never_takes_a_live_registration_without_replace() -> Result<()> {
     let fx = Fixture::new()?;
     let first = fx.project_file("first", "project-ops")?;
     let second = fx.project_file("second", "project-ops")?;
-    fx.enable(&first, false)?;
+    fx.watch(&first, false)?;
 
-    let err = fx.enable(&second, false).unwrap_err();
+    let err = fx.watch(&second, false).unwrap_err();
     assert_eq!(err.code(), "project_conflict", "{err}");
     let details = err.view().details;
     assert_eq!(
@@ -358,7 +358,7 @@ fn enable_never_takes_a_live_registration_without_replace() -> Result<()> {
         fs::canonicalize(&first)?.display().to_string()
     );
 
-    let moved = fx.enable(&second, true)?;
+    let moved = fx.watch(&second, true)?;
     assert_eq!(
         moved.moved_from,
         Some(fs::canonicalize(&first)?.display().to_string())
@@ -371,22 +371,22 @@ fn enable_never_takes_a_live_registration_without_replace() -> Result<()> {
 }
 
 #[test]
-fn enable_requires_the_config_to_declare_the_project() -> Result<()> {
+fn watch_requires_the_config_to_declare_the_project() -> Result<()> {
     let fx = Fixture::new()?;
     let other = fx.project_file("other", "someone-else")?;
-    let err = fx.enable(&other, false).unwrap_err();
+    let err = fx.watch(&other, false).unwrap_err();
     assert_eq!(err.code(), "invalid_request", "{err}");
-    let missing = fx.enable(&fx.tmp.path().join("missing/reviewloop.toml"), false);
+    let missing = fx.watch(&fx.tmp.path().join("missing/reviewloop.toml"), false);
     assert_eq!(missing.unwrap_err().code(), "invalid_request");
     Ok(())
 }
 
 #[test]
-fn disabling_an_unknown_project_is_reported() -> Result<()> {
+fn unwatching_an_unknown_project_is_reported() -> Result<()> {
     let fx = Fixture::new()?;
     let err = fx
         .ops()
-        .disable_project(&DisableProjectRequest {
+        .unwatch_project(&UnwatchProjectRequest {
             project_id: Some("nobody".into()),
         })
         .unwrap_err();
@@ -405,7 +405,7 @@ fn worker_status_follows_the_supervisor_and_the_project() -> Result<()> {
     assert_eq!(status.supervisor.state, SupervisorState::Stopped);
 
     let path = fx.project_file("repo", "project-ops")?;
-    fx.enable(&path, false)?;
+    fx.watch(&path, false)?;
     assert_eq!(fx.availability()?, WorkerAvailability::SupervisorStopped);
 
     let now = Utc::now();
@@ -1810,7 +1810,7 @@ fn every_error_code_is_documented_with_a_view() -> Result<()> {
             project_id: "p".into(),
             registered_path: Some("/a/reviewloop.toml".into()),
             requested_path: "/b/reviewloop.toml".into(),
-            enabled_as: None,
+            watched_as: None,
             message: "m".into(),
         },
         OpError::ProjectNotRegistered {

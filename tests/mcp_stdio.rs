@@ -89,12 +89,12 @@ const CONTRACT: [(&str, &[&str], Hints); 12] = [
         (true, false, true, false),
     ),
     (
-        "enable_project",
+        "watch_project",
         &["project_id", "replace"],
         (false, false, true, true),
     ),
     (
-        "disable_project",
+        "unwatch_project",
         &["project_id"],
         (false, false, true, false),
     ),
@@ -531,10 +531,10 @@ async fn an_agent_requests_approves_cancels_and_retries_a_review() -> Result<()>
     assert_eq!(approved["job"]["status"], "QUEUED");
     assert_eq!(approved["job"]["phase"], "queued");
 
-    // Registered by starting the server, never enabled.
+    // Registered by starting the server, never watched.
     let worker = session.ok("get_worker_status", json!({})).await?;
     assert_eq!(worker["supervisor"]["state"], "stopped");
-    assert_eq!(worker["project"]["availability"], "project_disabled");
+    assert_eq!(worker["project"]["availability"], "project_unwatched");
 
     let cancelled = session
         .ok(
@@ -561,22 +561,22 @@ async fn an_agent_requests_approves_cancels_and_retries_a_review() -> Result<()>
         .await?;
     assert_eq!(approved["job"]["status"], "QUEUED");
 
-    let enabled = session.ok("enable_project", json!({})).await?;
-    assert_eq!(enabled["project"]["enabled"], true);
-    assert_eq!(enabled["changed"], true);
+    let watched = session.ok("watch_project", json!({})).await?;
+    assert_eq!(watched["project"]["watched"], true);
+    assert_eq!(watched["changed"], true);
     assert_eq!(
-        enabled["project"]["config_path"],
+        watched["project"]["config_path"],
         repo.join("reviewloop.toml")
             .canonicalize()?
             .display()
             .to_string()
     );
     assert_eq!(
-        enabled["worker"]["project"]["availability"],
+        watched["worker"]["project"]["availability"],
         "supervisor_stopped"
     );
-    let disabled = session.ok("disable_project", json!({})).await?;
-    assert_eq!(disabled["project"]["enabled"], false);
+    let unwatched = session.ok("unwatch_project", json!({})).await?;
+    assert_eq!(unwatched["project"]["watched"], false);
     let projects = session.ok("list_projects", json!({})).await?;
     assert_eq!(projects["projects"][0]["project_id"], "thesis");
     assert_eq!(projects["projects"][0]["current"], true);
@@ -831,11 +831,11 @@ async fn an_unscoped_server_acts_on_registered_projects_by_id() -> Result<()> {
         .await?;
     assert_eq!(broken["code"], "config_unavailable");
     assert_eq!(broken["details"]["project_id"], "alpha");
-    // Disabling by id never needs the project's config.
-    let disabled = session
-        .ok("disable_project", json!({"project_id": "alpha"}))
+    // Unwatching by id never needs the project's config.
+    let unwatched = session
+        .ok("unwatch_project", json!({"project_id": "alpha"}))
         .await?;
-    assert_eq!(disabled["project"]["enabled"], false);
+    assert_eq!(unwatched["project"]["watched"], false);
     session
         .ok("list_papers", json!({"project_id": "beta"}))
         .await?;
@@ -871,10 +871,10 @@ async fn an_explicit_null_reads_as_an_omitted_argument() -> Result<()> {
         )
         .await?;
     assert_eq!(pending["code"], "invalid_state", "{pending}");
-    let enabled = session
-        .ok("enable_project", json!({"replace": null}))
+    let watched = session
+        .ok("watch_project", json!({"replace": null}))
         .await?;
-    assert_eq!(enabled["project"]["enabled"], true);
+    assert_eq!(watched["project"]["watched"], true);
     // Wrong types are still refused.
     let invalid = session
         .err(
@@ -1062,8 +1062,8 @@ async fn a_review_travels_from_request_to_result_through_the_supervisor() -> Res
         .as_str()
         .expect("job_id")
         .to_string();
-    session.ok("enable_project", json!({})).await?;
-    // Enabled, but not approved: nothing is sent.
+    session.ok("watch_project", json!({})).await?;
+    // Watched, but not approved: nothing is sent.
     tick().await?;
     assert!(backends.calls().is_empty(), "{:?}", backends.calls());
     let job = session.ok("get_job", json!({"job_id": job_id})).await?;
@@ -1150,14 +1150,14 @@ async fn a_scoped_server_never_reaches_another_projects_job() -> Result<()> {
     assert_eq!(jobs["jobs"], json!([]));
     let papers = in_alpha.ok("list_papers", json!({})).await?;
     assert_eq!(papers["project_id"], "alpha");
-    // Enabling another project leaves this server's default where it is.
-    let enabled = in_alpha
-        .ok("enable_project", json!({"project_id": "beta"}))
+    // Watching another project leaves this server's default where it is.
+    let watched = in_alpha
+        .ok("watch_project", json!({"project_id": "beta"}))
         .await?;
-    assert_eq!(enabled["project"]["project_id"], "beta");
-    assert_eq!(enabled["project"]["current"], false);
-    let enabled = in_alpha.ok("enable_project", json!({})).await?;
-    assert_eq!(enabled["project"]["current"], true);
+    assert_eq!(watched["project"]["project_id"], "beta");
+    assert_eq!(watched["project"]["current"], false);
+    let watched = in_alpha.ok("watch_project", json!({})).await?;
+    assert_eq!(watched["project"]["current"], true);
     in_alpha.close().await?;
     assert_eq!(
         machine.db()?.get_job(&job_id)?.expect("job").status,
@@ -1203,7 +1203,7 @@ async fn a_server_never_drifts_from_its_startup_project() -> Result<()> {
     for (tool, arguments) in [
         ("list_papers", json!({})),
         ("request_review", json!({"paper_id": "main"})),
-        ("enable_project", json!({})),
+        ("watch_project", json!({})),
     ] {
         let renamed = session.err(tool, arguments).await?;
         assert_eq!(renamed["code"], "config_unavailable", "{tool}: {renamed}");
@@ -1220,7 +1220,7 @@ async fn a_server_never_drifts_from_its_startup_project() -> Result<()> {
         ("get_job", json!({"job_id": job_id})),
         ("cancel_job", json!({"job_id": job_id})),
         ("list_papers", json!({})),
-        ("disable_project", json!({})),
+        ("unwatch_project", json!({})),
     ] {
         let gone = session.err(tool, arguments).await?;
         assert_eq!(gone["code"], "config_unavailable", "{tool}: {gone}");
@@ -1285,12 +1285,12 @@ async fn a_server_started_elsewhere_serves_the_project_of_its_config() -> Result
     fs::write(&config, project_toml("thesis", &["main", "second"]))?;
     let papers = session.ok("list_papers", json!({})).await?;
     assert_eq!(papers["papers"][1]["paper_id"], "second");
-    let enabled = session.ok("enable_project", json!({})).await?;
+    let watched = session.ok("watch_project", json!({})).await?;
     assert_eq!(
-        enabled["project"]["config_path"],
+        watched["project"]["config_path"],
         config.canonicalize()?.display().to_string()
     );
-    assert_eq!(enabled["project"]["current"], true);
+    assert_eq!(watched["project"]["current"], true);
     session.close().await
 }
 

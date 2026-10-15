@@ -178,9 +178,9 @@ pub struct CancelRequest {
     pub reason: Option<String>,
 }
 
-/// Enable the context's project for the machine supervisor.
+/// Watch the context's project: the machine supervisor runs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EnableProjectRequest {
+pub struct WatchProjectRequest {
     /// The `reviewloop.toml` the context config was loaded from; it must
     /// declare the context's project.
     pub config_path: std::path::PathBuf,
@@ -191,8 +191,8 @@ pub struct EnableProjectRequest {
 
 /// Stop the machine supervisor from running a project.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DisableProjectRequest {
-    /// The project to disable; `None` is the context's project. Its config
-    /// need not load, so a broken or deleted project can still be disabled.
+pub struct UnwatchProjectRequest {
+    /// The project to unwatch; `None` is the context's project. Its config
+    /// need not load, so a broken or deleted project can still be unwatched.
     pub project_id: Option<String>,
 }

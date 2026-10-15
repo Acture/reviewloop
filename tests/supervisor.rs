@@ -1,8 +1,8 @@
-//! OSS-338: the machine supervisor runs only explicitly enabled projects, a
-//! disabled project gets no new trigger jobs, one project's broken config
+//! OSS-338: the machine supervisor runs only explicitly watched projects, an
+//! unwatched project gets no new trigger jobs, one project's broken config
 //! fails alone, pause persists and stops all work, a restart settles the
 //! submissions a crash interrupted, a second supervisor is refused, and the
-//! one-time migration of a single-project install enables only its project.
+//! one-time migration of a single-project install watches only its project.
 
 mod common;
 
@@ -65,9 +65,9 @@ async fn tick(
         .expect("a machine-level tick failure")
 }
 
-fn enable(fleet: &Fleet, id: &str) {
-    registry::enable(&fleet.db, id, &fleet.config_path(id), false, Utc::now())
-        .expect("enable project");
+fn watch(fleet: &Fleet, id: &str) {
+    registry::watch(&fleet.db, id, &fleet.config_path(id), false, Utc::now())
+        .expect("watch project");
 }
 
 fn jobs_of(db: &Db, project_id: &str) -> Vec<reviewloop::model::Job> {
@@ -79,7 +79,7 @@ fn jobs_of(db: &Db, project_id: &str) -> Vec<reviewloop::model::Job> {
 }
 
 #[tokio::test]
-async fn only_enabled_projects_are_supervised() -> Result<()> {
+async fn only_watched_projects_are_supervised() -> Result<()> {
     let mut fleet = Fleet::new(&["alpha", "beta", "gamma"])?;
     fleet.set_budget(3, 3);
     let widget_dir = fleet.tmp.path().join("widget");
@@ -88,10 +88,10 @@ async fn only_enabled_projects_are_supervised() -> Result<()> {
     let backends = FleetBackends::new(accepting_backend());
     let load = || Ok(fleet.machine_config());
     let sup = supervisor(&fleet, &backends, &load);
-    // Loading a config registers a project; only `enable` makes it run.
+    // Loading a config registers a project; only `watch` makes it run.
     registry::register_seen(&fleet.db, "beta", &fleet.config_path("beta"), Utc::now())?;
-    enable(&fleet, "alpha");
-    enable(&fleet, "gamma");
+    watch(&fleet, "alpha");
+    watch(&fleet, "gamma");
     let jobs: Vec<_> = ["alpha", "beta", "gamma"]
         .into_iter()
         .map(|id| fleet.queue_job(id))
@@ -110,7 +110,7 @@ async fn only_enabled_projects_are_supervised() -> Result<()> {
         ))
     };
     assert_eq!(state("alpha")?, ProjectState::Ok);
-    assert_eq!(state("beta")?, ProjectState::Disabled);
+    assert_eq!(state("beta")?, ProjectState::Unwatched);
     assert_eq!(state("gamma")?, ProjectState::Ok);
 
     // The tick published one document for the whole machine.
@@ -118,54 +118,54 @@ async fn only_enabled_projects_are_supervised() -> Result<()> {
         serde_json::from_str(&fs::read_to_string(widget_dir.join("widget-state.json"))?)?;
     assert_eq!(widget["project_id"], "");
     assert_eq!(widget["summary"]["active_count"], 3);
-    let enabled: Vec<&str> = widget["projects"]
+    let watched: Vec<&str> = widget["projects"]
         .as_array()
         .expect("projects")
         .iter()
-        .filter(|project| project["enabled"] == true)
+        .filter(|project| project["watched"] == true)
         .map(|project| project["project_id"].as_str().expect("id"))
         .collect();
-    assert_eq!(enabled, ["alpha", "gamma"]);
+    assert_eq!(watched, ["alpha", "gamma"]);
     Ok(())
 }
 
-/// The acceptance check for disable: a changed PDF of a disabled project
-/// produces no new job; enabling it again picks the change up.
+/// The acceptance check for unwatch: a changed PDF of an unwatched project
+/// produces no new job; watching it again picks the change up.
 #[tokio::test]
-async fn disabling_a_project_stops_new_trigger_jobs() -> Result<()> {
-    let mut fleet = Fleet::new(&["watched"])?;
+async fn unwatching_a_project_stops_new_trigger_jobs() -> Result<()> {
+    let mut fleet = Fleet::new(&["thesis"])?;
     fleet.set_budget(1, 1);
     fs::write(
-        &fleet.project("watched").config_path,
-        fleet_project_toml("watched", true),
+        &fleet.project("thesis").config_path,
+        fleet_project_toml("thesis", true),
     )?;
     let backends = FleetBackends::new(accepting_backend());
     let load = || Ok(fleet.machine_config());
     let sup = supervisor(&fleet, &backends, &load);
     let mut memory = SupervisorMemory::default();
-    enable(&fleet, "watched");
+    watch(&fleet, "thesis");
 
     tick(&sup, &mut memory, 1).await;
     assert_eq!(
-        jobs_of(&fleet.db, "watched").len(),
+        jobs_of(&fleet.db, "thesis").len(),
         1,
         "the PDF trigger enqueued"
     );
 
-    registry::disable(&fleet.db, "watched", Utc::now())?;
-    let pdf = &fleet.project("watched").pdf_path;
+    registry::unwatch(&fleet.db, "thesis", Utc::now())?;
+    let pdf = &fleet.project("thesis").pdf_path;
     fs::write(pdf, "%PDF-1.4\n% revised\n%%EOF\n")?;
     tick(&sup, &mut memory, 2).await;
     tick(&sup, &mut memory, 3).await;
     assert_eq!(
-        jobs_of(&fleet.db, "watched").len(),
+        jobs_of(&fleet.db, "thesis").len(),
         1,
-        "a disabled project's trigger must not enqueue"
+        "an unwatched project's trigger must not enqueue"
     );
 
-    enable(&fleet, "watched");
+    watch(&fleet, "thesis");
     tick(&sup, &mut memory, 4).await;
-    assert_eq!(jobs_of(&fleet.db, "watched").len(), 2);
+    assert_eq!(jobs_of(&fleet.db, "thesis").len(), 2);
     Ok(())
 }
 
@@ -177,8 +177,8 @@ async fn a_broken_project_config_fails_alone_and_is_reported_once() -> Result<()
     let load = || Ok(fleet.machine_config());
     let sup = supervisor(&fleet, &backends, &load);
     let mut memory = SupervisorMemory::default();
-    enable(&fleet, "broken");
-    enable(&fleet, "healthy");
+    watch(&fleet, "broken");
+    watch(&fleet, "healthy");
     fleet.queue_job("broken")?;
     fleet.queue_job("healthy")?;
     // A machine-wide setting in a project file is refused by name.
@@ -240,7 +240,7 @@ async fn a_config_that_changed_its_project_id_is_not_run() -> Result<()> {
     let backends = FleetBackends::new(accepting_backend());
     let load = || Ok(fleet.machine_config());
     let sup = supervisor(&fleet, &backends, &load);
-    enable(&fleet, "old-id");
+    watch(&fleet, "old-id");
     fleet.queue_job("old-id")?;
     fs::write(
         &fleet.project("old-id").config_path,
@@ -265,7 +265,7 @@ async fn pause_persists_and_stops_triggers_and_providers() -> Result<()> {
     )?;
     let backends = FleetBackends::new(accepting_backend());
     let load = || Ok(fleet.machine_config());
-    enable(&fleet, "p");
+    watch(&fleet, "p");
     fleet.db.set_supervisor_paused(true, Utc::now())?;
 
     let sup = supervisor(&fleet, &backends, &load);
@@ -302,7 +302,7 @@ async fn a_restarted_supervisor_settles_interrupted_submissions() -> Result<()> 
     fleet.set_budget(1, 1);
     let backends = FleetBackends::new(accepting_backend());
     let load = || Ok(fleet.machine_config());
-    enable(&fleet, "p");
+    watch(&fleet, "p");
     let crashed_at = Utc::now() - SUBMIT_TTL - Duration::minutes(1);
 
     let dispatched = fleet.queue_job("p")?;
@@ -416,10 +416,10 @@ async fn a_database_supervised_from_another_state_dir_is_refused() -> Result<()>
     Ok(())
 }
 
-/// Enabling a project wakes a sleeping supervisor long before its next
+/// Watching a project wakes a sleeping supervisor long before its next
 /// scheduled tick; shutdown ends the loop.
 #[tokio::test]
-async fn enabling_wakes_the_supervisor_and_shutdown_stops_it() -> Result<()> {
+async fn watching_wakes_the_supervisor_and_shutdown_stops_it() -> Result<()> {
     let mut fleet = Fleet::new(&["p"])?;
     fleet.set_budget(1, 1);
     let backends = FleetBackends::new(accepting_backend());
@@ -440,7 +440,7 @@ async fn enabling_wakes_the_supervisor_and_shutdown_stops_it() -> Result<()> {
                     .is_ok_and(|record| record.last_tick_at.is_some())
             })
             .await;
-            enable(&fleet, "p");
+            watch(&fleet, "p");
             wait_until(|| {
                 load_job(&fleet.db, &job.id).is_ok_and(|job| job.status == JobStatus::Processing)
             })
@@ -482,9 +482,9 @@ async fn a_global_config_that_moves_the_database_stops_the_supervisor() -> Resul
 
 /// The acceptance check for migrating a single-project install: the bound
 /// project keeps running; no other registered project starts; an explicit
-/// later disable is never undone by the old plist's `--config`.
+/// later unwatch is never undone by the old plist's `--config`.
 #[test]
-fn migrating_a_single_project_install_enables_only_its_project() -> Result<()> {
+fn migrating_a_single_project_install_watches_only_its_project() -> Result<()> {
     let fleet = Fleet::new(&["bound", "other"])?;
     let machine = fleet.machine_config();
     registry::register_seen(&fleet.db, "other", &fleet.config_path("other"), Utc::now())?;
@@ -499,20 +499,20 @@ fn migrating_a_single_project_install_enables_only_its_project() -> Result<()> {
         (id.as_str(), adoption),
         (
             "bound",
-            LegacyAdoption::Enabled {
+            LegacyAdoption::Watched {
                 path: fleet.config_path("bound"),
                 moved_from: None
             }
         )
     );
-    let enabled: Vec<String> = fleet
+    let watched: Vec<String> = fleet
         .db
         .list_registered_projects()?
         .into_iter()
         .filter(|project| project.enabled)
         .map(|project| project.project_id)
         .collect();
-    assert_eq!(enabled, ["bound"]);
+    assert_eq!(watched, ["bound"]);
 
     let again = adopt_legacy_binding(
         &fleet.db,
@@ -520,17 +520,17 @@ fn migrating_a_single_project_install_enables_only_its_project() -> Result<()> {
         &fleet.project("bound").config_path,
         Utc::now(),
     )?;
-    assert_eq!(again.1, LegacyAdoption::AlreadyDecided { enabled: true });
-    registry::disable(&fleet.db, "bound", Utc::now())?;
-    let after_disable = adopt_legacy_binding(
+    assert_eq!(again.1, LegacyAdoption::AlreadyDecided { watched: true });
+    registry::unwatch(&fleet.db, "bound", Utc::now())?;
+    let after_unwatch = adopt_legacy_binding(
         &fleet.db,
         &machine,
         &fleet.project("bound").config_path,
         Utc::now(),
     )?;
     assert_eq!(
-        after_disable.1,
-        LegacyAdoption::AlreadyDecided { enabled: false }
+        after_unwatch.1,
+        LegacyAdoption::AlreadyDecided { watched: false }
     );
     Ok(())
 }
@@ -560,7 +560,7 @@ fn the_binding_wins_over_an_undecided_registration_of_another_clone() -> Result<
     )?;
     assert_eq!(
         adoption,
-        LegacyAdoption::Enabled {
+        LegacyAdoption::Watched {
             path: fleet.config_path("p"),
             moved_from: Some(clone_config.clone())
         }
@@ -571,7 +571,7 @@ fn the_binding_wins_over_an_undecided_registration_of_another_clone() -> Result<
 
     // Once decided, a binding to the other clone changes nothing.
     let (_, again) = adopt_legacy_binding(&fleet.db, &machine, &clone_config, Utc::now())?;
-    assert_eq!(again, LegacyAdoption::AlreadyDecided { enabled: true });
+    assert_eq!(again, LegacyAdoption::AlreadyDecided { watched: true });
     assert_eq!(
         fleet
             .db
@@ -697,7 +697,7 @@ fn a_binding_to_a_symlink_target_keeps_the_link() -> Result<()> {
     let (_, adoption) = adopt_legacy_binding(&fleet.db, &machine, &target, Utc::now())?;
     assert_eq!(
         adoption,
-        LegacyAdoption::Enabled {
+        LegacyAdoption::Watched {
             path: link.clone(),
             moved_from: None
         }
@@ -736,7 +736,7 @@ fn a_binding_that_is_a_link_wins_over_another_link_to_the_same_file() -> Result<
     let (_, adoption) = adopt_legacy_binding(&fleet.db, &machine, &second, Utc::now())?;
     assert_eq!(
         adoption,
-        LegacyAdoption::Enabled {
+        LegacyAdoption::Watched {
             path: second.clone(),
             moved_from: Some(first)
         }

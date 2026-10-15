@@ -1,5 +1,5 @@
 //! Schema migrations up to the current version: the lease columns (v4, OSS-337),
-//! review options (v5, OSS-353) and project enablement, the supervisor row and the
+//! review options (v5, OSS-353) and project watching (`projects.enabled`), the supervisor row and the
 //! registry guard triggers (v6-v7, OSS-338) land on older databases without disturbing existing rows,
 //! legacy SUBMITTED rows are settled as UNCERTAIN instead of being resubmitted, concurrent
 //! migrations do not collide, and the lease primitives work on a freshly created database.
@@ -1165,11 +1165,11 @@ fn build_v5_database(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Registry rows from before OSS-338 come through disabled and undecided:
-/// nothing starts running until someone enables it, and the one-time
-/// migration of a single-project daemon install may still enable its project.
+/// Registry rows from before OSS-338 come through unwatched and undecided:
+/// nothing starts running until someone watches it, and the one-time
+/// migration of a single-project daemon install may still watch its project.
 #[test]
-fn v5_database_keeps_registered_projects_disabled_and_undecided() -> Result<()> {
+fn v5_database_keeps_registered_projects_unwatched_and_undecided() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let path = tmp.path().join("reviewloop.db");
     build_v5_database(&path)?;
@@ -1244,7 +1244,7 @@ fn old_registry_upserts_still_work_on_a_v6_database() -> Result<()> {
 }
 
 /// A pre-OSS-338 binary on a v6 database: its registry upsert and stale-row
-/// delete become no-ops on an enabled project, so an explicit enable is
+/// delete become no-ops on an enabled project, so an explicit watch is
 /// never moved or dropped behind the supervisor's back. Disabled rows behave
 /// as that binary expects.
 #[test]

@@ -91,37 +91,37 @@ reviewloop paper add \
   --venue NeurIPS \
   --tag-trigger "custom-review/camera_ready/*"
 
-# let the machine supervisor run this project (once per project repo)
-reviewloop project enable
+# watch this project: the machine supervisor submits and polls for it (once per project repo)
+reviewloop project watch
 
 # install and start the supervisor (macOS, once per machine)
 reviewloop daemon install
 ```
 
 The supervisor runs every 30 seconds, handles triggers, submissions, polls, retries, token
-ingestion and retention pruning for every enabled project. Use `reviewloop daemon status`,
+ingestion and retention pruning for every watched project. Use `reviewloop daemon status`,
 `reviewloop status` and `reviewloop check` to monitor it.
 
-## Deployment model: one supervisor, explicitly enabled projects
+## Deployment model: one supervisor, explicitly watched projects
 
 One **supervisor** (`reviewloop daemon run`, installed on macOS as the launchd
-agent `ai.reviewloop.daemon`) runs every project you **enable** on the machine:
+agent `ai.reviewloop.daemon`) runs every project you **watch** on the machine:
 
-- **Enable explicitly.** Any command that loads a project's `reviewloop.toml`
+- **Watch explicitly.** Any command that loads a project's `reviewloop.toml`
   registers it (`reviewloop project list` shows the registry), but only
-  `reviewloop project enable` makes the supervisor run it: its git-tag and
+  `reviewloop project watch` makes the supervisor run it: its git-tag and
   PDF triggers, queue, polls, timeouts and recovery. `reviewloop project
-  disable` stops that; the project's jobs keep their state and explicit
+  unwatch` stops that; the project's jobs keep their state and explicit
   commands (`submit`, `check`, `retry`, …) still act on them.
 - **One registration per `project_id`.** Paths are stored canonical. A
   second clone or worktree declaring the same `project_id` never takes the
-  registration over silently: commands there print one note, and enabling it
-  needs `reviewloop project enable --replace`.
+  registration over silently: commands there print one note, and watching it
+  needs `reviewloop project watch --replace`.
 - **One supervisor per state dir.** A second `daemon run` on the same state
   directory (or database) is refused; a crashed one is replaced at once.
 - **One budget for the machine.** `core.max_submissions_per_tick` and
   `core.max_concurrency` are shared by every project and both providers, so
-  enabling more projects never adds provider load; projects take turns, and
+  watching more projects never adds provider load; projects take turns, and
   one project's broken config or failing request never stops the others
   (`reviewloop daemon status` shows each project's last error).
 - **Pause** (`reviewloop daemon pause`) is persistent: the service stays
@@ -138,8 +138,8 @@ agent `ai.reviewloop.daemon`) runs every project you **enable** on the machine:
   widget show all of them.
 
 Upgrading from a single-project install: the old launchd service passes
-`--config <project>`; the supervisor keeps that project enabled (unless you
-disabled it since) and enables nothing else. Run `reviewloop daemon install`
+`--config <project>`; the supervisor keeps that project watched (unless you
+unwatched it since) and watches nothing else. Run `reviewloop daemon install`
 once to rewrite the service.
 
 ## Installation
@@ -245,8 +245,8 @@ reviewloop paper add --paper-id <id> --path <pdf-or-build-artifact> [--backend <
 reviewloop paper watch --paper-id <id> --enabled <true|false>
 reviewloop paper remove --paper-id <id> [--purge-history]
 reviewloop project list [--json]
-reviewloop project enable [--project-id <id>] [--replace]
-reviewloop project disable [--project-id <id>]
+reviewloop project watch [--project-id <id>] [--replace]
+reviewloop project unwatch [--project-id <id>]
 reviewloop daemon run [--panel false]
 reviewloop daemon install [--start true]
 reviewloop daemon uninstall
@@ -272,6 +272,9 @@ reviewloop email logout [--account <account-id-or-email>]
 reviewloop self-update [--method auto|brew|cargo] [--yes] [--dry-run]
 reviewloop mcp [--approval required|granted]
 ```
+
+`paper watch` turns PDF-change watching on or off for one paper; `project watch`
+decides whether the machine supervisor runs the project at all.
 
 `paper add --agent-id <agent-id>` is an alias of `--venue`: for a `cspaper`
 paper the venue is the CSPaper review template (see [CSPaper Backend](#cspaper-backend)).
@@ -325,7 +328,7 @@ VS Code (`.vscode/mcp.json`):
   send it again waits for `approve_job` too. Start the server with
   `--approval granted` to queue them at once.
 - Tools only read and change local state; the supervisor (`reviewloop project
-  enable`, `reviewloop daemon install`) submits and polls. Failures come back
+  watch`, `reviewloop daemon install`) submits and polls. Failures come back
   as tool errors with a stable `code` and a `recovery` hint. Tokens are never
   returned.
 
@@ -341,10 +344,10 @@ The tools, their schemas and errors are specified in
 ## Runtime Model
 
 Supervisor tick interval: 30 seconds after the previous tick ends (pause,
-resume, enable and disable wake it within 2 seconds).
+resume, watch and unwatch wake it within 2 seconds).
 
-Each tick reloads the global config and every enabled project's config, then:
-1. Per enabled project, in turn: trigger scan (`git tags`, PDF hash changes),
+Each tick reloads the global config and every watched project's config, then:
+1. Per watched project, in turn: trigger scan (`git tags`, PDF hash changes),
    timeout marking, lease recovery (claims left behind by a crashed or killed
    worker)
 2. Optional Gmail OAuth + IMAP token ingestion, once for the machine
@@ -592,7 +595,7 @@ There is no global-overrides-project merge chain. Instead:
 - `--config /path/to/reviewloop.toml` explicitly points to a project config file
 - `reviewloop init` initializes the global config/data paths
 - `reviewloop init project --project-id <id>` initializes the current repo's project config
-- `reviewloop daemon install` installs the one machine-wide supervisor; `reviewloop project enable` (from the repo, or `--config`) chooses the projects it runs
+- `reviewloop daemon install` installs the one machine-wide supervisor; `reviewloop project watch` (from the repo, or `--config`) chooses the projects it runs
 - a project config cannot set machine-wide settings (`core.db_path`, `core.state_dir`, the provider budget, `[polling]`, `[retention]`, `[logging]`, `[imap]`, `[gmail_oauth]`): such a file is refused by name
 
 Project commands require a non-empty `project_id` in the project config. Jobs, events, dedupe, and status views are isolated inside the shared global DB by `project_id`.
@@ -669,7 +672,7 @@ desk_rejection_enabled = true       # the default
   wins. It is sent only in the `X-API-Key` header and kept out of job rows,
   events, job errors and archives. The launchd supervisor does not inherit
   your shell's environment, so it needs the key in the global config;
-  `reviewloop daemon install` warns, naming the enabled projects that use
+  `reviewloop daemon install` warns, naming the watched projects that use
   CSPaper, when it is missing there.
 - `base_url`: defaults to `https://cspaper.org`. It must be `https://` with a
   host (plain `http://` only for `localhost`, `127.0.0.1` or `[::1]`).

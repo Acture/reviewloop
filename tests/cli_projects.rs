@@ -1,5 +1,5 @@
 //! OSS-338 through the real CLI, in an isolated home, config dir and state
-//! dir: `project enable / disable / list`, the duplicate-clone conflict,
+//! dir: `project watch / unwatch / list`, the duplicate-clone conflict,
 //! `daemon status` and `daemon pause / resume` without a running supervisor,
 //! and the refusal of a machine-wide setting in a project file.
 
@@ -72,7 +72,7 @@ fn project<'a>(list: &'a Value, id: &str) -> &'a Value {
 }
 
 #[test]
-fn enable_disable_and_list_through_the_cli() -> Result<()> {
+fn watch_unwatch_and_list_through_the_cli() -> Result<()> {
     let machine = Machine::new()?;
     let repo = machine.repo("thesis", "thesis")?;
     let config = repo.join("reviewloop.toml").canonicalize()?;
@@ -80,34 +80,37 @@ fn enable_disable_and_list_through_the_cli() -> Result<()> {
     // Loading the config registers it, but nothing runs it yet.
     machine.ok(&repo, &["status"])?;
     let list = machine.json(&machine.root, &["project", "list", "--json"])?;
-    assert_eq!(project(&list, "thesis")["enabled"], false);
+    assert_eq!(project(&list, "thesis")["watched"], false);
     assert_eq!(list["supervisor"]["state"], "stopped");
 
-    let enabled = machine.ok(&repo, &["project", "enable"])?;
-    assert!(enabled.contains("Enabled project thesis"), "{enabled}");
-    assert!(enabled.contains("no supervisor is running"), "{enabled}");
+    let watched = machine.ok(&repo, &["project", "watch"])?;
+    assert!(watched.contains("Watching project thesis"), "{watched}");
+    assert!(watched.contains("no supervisor is running"), "{watched}");
     let list = machine.json(&machine.root, &["project", "list", "--json"])?;
     let thesis = project(&list, "thesis");
-    assert_eq!(thesis["enabled"], true);
+    assert_eq!(thesis["watched"], true);
     assert_eq!(thesis["state"], "pending");
     assert_eq!(thesis["config_path"], config.display().to_string());
 
-    let disabled = machine.ok(
+    let unwatched = machine.ok(
         &machine.root,
-        &["project", "disable", "--project-id", "thesis"],
+        &["project", "unwatch", "--project-id", "thesis"],
     )?;
-    assert!(disabled.contains("Disabled project thesis"), "{disabled}");
+    assert!(
+        unwatched.contains("No longer watching project thesis"),
+        "{unwatched}"
+    );
     let list = machine.json(&machine.root, &["project", "list", "--json"])?;
-    assert_eq!(project(&list, "thesis")["enabled"], false);
+    assert_eq!(project(&list, "thesis")["watched"], false);
 
-    // Enable by id from anywhere, once registered.
+    // Watch by id from anywhere, once registered.
     machine.ok(
         &machine.root,
-        &["project", "enable", "--project-id", "thesis"],
+        &["project", "watch", "--project-id", "thesis"],
     )?;
     let unknown = machine.run(
         &machine.root,
-        &["project", "disable", "--project-id", "nope"],
+        &["project", "unwatch", "--project-id", "nope"],
     )?;
     assert_eq!(unknown.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("not registered"));
@@ -115,13 +118,13 @@ fn enable_disable_and_list_through_the_cli() -> Result<()> {
 }
 
 /// Two clones declaring one project_id: the second never silently takes the
-/// registration; enabling it needs --replace.
+/// registration; watching it needs --replace.
 #[test]
 fn a_second_clone_is_reported_not_registered_over_the_first() -> Result<()> {
     let machine = Machine::new()?;
     let first = machine.repo("first", "paper")?;
     let second = machine.repo("second", "paper")?;
-    machine.ok(&first, &["project", "enable"])?;
+    machine.ok(&first, &["project", "watch"])?;
 
     let status = machine.run(&second, &["status"])?;
     assert!(status.status.success());
@@ -135,7 +138,7 @@ fn a_second_clone_is_reported_not_registered_over_the_first() -> Result<()> {
     );
     assert!(note.contains("registered at"), "{note}");
 
-    let refused = machine.run(&second, &["project", "enable"])?;
+    let refused = machine.run(&second, &["project", "watch"])?;
     assert_eq!(refused.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(stderr.contains("--replace"), "{stderr}");
@@ -149,7 +152,7 @@ fn a_second_clone_is_reported_not_registered_over_the_first() -> Result<()> {
             .to_string()
     );
 
-    let moved = machine.ok(&second, &["project", "enable", "--replace"])?;
+    let moved = machine.ok(&second, &["project", "watch", "--replace"])?;
     assert!(moved.contains("moved from"), "{moved}");
     let list = machine.json(&machine.root, &["project", "list", "--json"])?;
     assert_eq!(
@@ -167,7 +170,7 @@ fn a_second_clone_is_reported_not_registered_over_the_first() -> Result<()> {
 fn daemon_status_and_pause_work_without_a_running_supervisor() -> Result<()> {
     let machine = Machine::new()?;
     let repo = machine.repo("thesis", "thesis")?;
-    machine.ok(&repo, &["project", "enable"])?;
+    machine.ok(&repo, &["project", "watch"])?;
 
     let status = machine.json(&repo, &["daemon", "status", "--json"])?;
     assert_eq!(status["supervisor"]["state"], "stopped");
@@ -175,7 +178,7 @@ fn daemon_status_and_pause_work_without_a_running_supervisor() -> Result<()> {
         status["current_project"]["availability"],
         "supervisor_stopped"
     );
-    assert_eq!(project(&status, "thesis")["enabled"], true);
+    assert_eq!(project(&status, "thesis")["watched"], true);
     assert_eq!(status["budget"]["submissions_per_tick"], 1);
 
     let paused = machine.ok(&machine.root, &["daemon", "pause"])?;

@@ -223,8 +223,8 @@ pub struct ProjectView {
     pub last_seen_at: DateTime<Utc>,
     /// This is the project the operations were called for.
     pub current: bool,
-    /// The supervisor runs it (`enable_project`).
-    pub enabled: bool,
+    /// The supervisor runs it (`watch_project`).
+    pub watched: bool,
     pub state: ProjectState,
     /// The supervisor's last pass over it.
     pub last_run_at: Option<DateTime<Utc>>,
@@ -240,7 +240,7 @@ impl ProjectView {
             config_present: project.config_path.exists(),
             config_path: project.config_path.display().to_string(),
             last_seen_at: project.last_seen_at,
-            enabled: project.enabled,
+            watched: project.enabled,
             state: ProjectState::of(&project),
             last_run_at: project.health.last_run_at,
             last_ok_at: project.health.last_ok_at,
@@ -298,14 +298,14 @@ pub struct WorkerStatus {
     pub project: Option<ProjectWorkerView>,
 }
 
-/// The result of `enable_project` and `disable_project`.
+/// The result of `watch_project` and `unwatch_project`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct ProjectEnablement {
+pub struct ProjectWatch {
     pub project: ProjectView,
-    /// The call changed whether the supervisor runs the project (or, for an
-    /// enable, which config backs it).
+    /// The call changed whether the supervisor runs the project (or, for a
+    /// watch, which config backs it).
     pub changed: bool,
-    /// The config the registration pointed at before an enable moved it.
+    /// The config the registration pointed at before a watch moved it.
     pub moved_from: Option<String>,
     pub worker: WorkerStatus,
 }
@@ -321,6 +321,9 @@ pub struct PaperView {
     pub review_options: ReviewOptions,
     pub pdf_path: String,
     pub pdf_present: bool,
+    /// PDF-change watching (`reviewloop paper watch`): with the PDF trigger on
+    /// (`trigger.pdf.enabled`), a change to the PDF queues a review. Not
+    /// whether the supervisor runs the project; that is `ProjectView.watched`.
     pub watched: bool,
     pub tag_trigger: Option<String>,
 }

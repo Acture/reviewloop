@@ -1,10 +1,10 @@
 //! The machine-level supervisor: one long-running process per state directory
-//! runs every explicitly enabled project's triggers, review queue and lease
+//! runs every explicitly watched project's triggers, review queue and lease
 //! recovery through one fair, machine-wide provider budget
 //! ([`Scheduler`]).
 //!
-//! - **Enabled projects only.** A registered project is ignored until
-//!   `project enable`; a disabled one is ignored entirely (no triggers,
+//! - **Watched projects only.** A registered project is ignored until
+//!   `project watch`; an unwatched one is ignored entirely (no triggers,
 //!   submissions, polls, timeouts or recovery) while its jobs keep their
 //!   state for explicit CLI commands.
 //! - **One per state directory.** [`SupervisorLock`] holds an OS lock on
@@ -12,10 +12,10 @@
 //!   it when the process dies, so a restart never waits for a stale lock.
 //! - **Pause** is a persistent flag in the database: a paused supervisor
 //!   keeps its heartbeat but runs no triggers and contacts no provider, and a
-//!   restart stays paused. Pause, resume, enable and disable wake a sleeping
+//!   restart stays paused. Pause, resume, watch and unwatch wake a sleeping
 //!   supervisor within [`CONTROL_POLL`].
 //! - **Config changes** apply on the next tick: the global config and every
-//!   enabled project's `reviewloop.toml` are reloaded each tick. A project
+//!   watched project's `reviewloop.toml` are reloaded each tick. A project
 //!   whose config no longer loads is skipped and reports the error in its
 //!   health; the others keep running. A global config that moves the
 //!   database or state directory stops the supervisor, so its service
@@ -27,7 +27,7 @@ use crate::{
     model::{RegisteredProject, SupervisorRecord},
     notifier::NotificationKind,
     panel,
-    registry::{self, EnableError, same_config_file},
+    registry::{self, WatchError, same_config_file},
     widget_state,
     worker::{BackendFactory, RoundRobin, Scheduler, TickBudget, TickReport, fire_notification},
 };
@@ -55,8 +55,8 @@ pub const TICK_INTERVAL: StdDuration = StdDuration::from_secs(30);
 const HEARTBEAT_INTERVAL: StdDuration = StdDuration::from_secs(10);
 /// Without a heartbeat for this long, a supervisor is presumed gone.
 pub const HEARTBEAT_STALE_AFTER: Duration = Duration::seconds(60);
-/// How often a sleeping supervisor checks for pause, resume, enable and
-/// disable.
+/// How often a sleeping supervisor checks for pause, resume, watch and
+/// unwatch.
 pub const CONTROL_POLL: StdDuration = StdDuration::from_secs(2);
 const LOCK_FILE: &str = "supervisor.lock";
 
@@ -99,8 +99,8 @@ impl SupervisorState {
 #[serde(rename_all = "snake_case")]
 pub enum ProjectState {
     /// The supervisor ignores it.
-    Disabled,
-    /// Enabled, but no supervisor has run it yet.
+    Unwatched,
+    /// Watched, but no supervisor has run it yet.
     Pending,
     /// The last pass had no errors.
     Ok,
@@ -111,7 +111,7 @@ pub enum ProjectState {
 impl ProjectState {
     pub fn of(project: &RegisteredProject) -> Self {
         if !project.enabled {
-            Self::Disabled
+            Self::Unwatched
         } else if project.health.last_error.is_some() {
             Self::Error
         } else if project.health.last_run_at.is_some() {
@@ -123,7 +123,7 @@ impl ProjectState {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Disabled => "disabled",
+            Self::Unwatched => "unwatched",
             Self::Pending => "pending",
             Self::Ok => "ok",
             Self::Error => "error",
@@ -140,8 +140,8 @@ pub enum WorkerAvailability {
     Ready,
     /// No config of the project was ever loaded on this machine.
     ProjectNotRegistered,
-    /// Registered, but not enabled for the supervisor.
-    ProjectDisabled,
+    /// Registered, but not watched by the supervisor.
+    ProjectUnwatched,
     /// No supervisor is running.
     SupervisorStopped,
     /// The supervisor is paused.
@@ -160,7 +160,7 @@ impl WorkerAvailability {
             return Self::ProjectNotRegistered;
         };
         if !project.enabled {
-            return Self::ProjectDisabled;
+            return Self::ProjectUnwatched;
         }
         match SupervisorState::of(record, now) {
             SupervisorState::Stopped => Self::SupervisorStopped,
@@ -181,8 +181,8 @@ impl WorkerAvailability {
             Self::Ready => format!(
                 "the supervisor runs project {project_id}: queued jobs are submitted and submitted ones polled automatically"
             ),
-            Self::ProjectNotRegistered | Self::ProjectDisabled => format!(
-                "project {project_id} is not enabled, so nothing submits or polls its jobs automatically; enable it with `reviewloop project enable` in its repository"
+            Self::ProjectNotRegistered | Self::ProjectUnwatched => format!(
+                "project {project_id} is not watched, so nothing submits or polls its jobs automatically; watch it with `reviewloop project watch` in its repository"
             ),
             Self::SupervisorStopped => "no supervisor is running, so nothing submits or polls jobs automatically; start it with `reviewloop daemon install` (macOS) or `reviewloop daemon run`".to_string(),
             Self::SupervisorPaused => "the supervisor is paused, so nothing is submitted or polled until `reviewloop daemon resume`".to_string(),
@@ -244,23 +244,23 @@ impl SupervisorLock {
     }
 }
 
-/// The enabled projects whose configs loaded this tick, and those that did
+/// The watched projects whose configs loaded this tick, and those that did
 /// not (with the reason).
 #[derive(Debug, Default)]
-pub struct EnabledProjects {
+pub struct WatchedProjects {
     pub loaded: Vec<Config>,
     pub failed: Vec<(String, String)>,
 }
 
-/// Load every enabled project's config on `machine`'s settings.
-pub fn load_enabled_projects(db: &Db, machine: &MachineConfig) -> Result<EnabledProjects> {
-    let mut projects = EnabledProjects::default();
+/// Load every watched project's config on `machine`'s settings.
+pub fn load_watched_projects(db: &Db, machine: &MachineConfig) -> Result<WatchedProjects> {
+    let mut projects = WatchedProjects::default();
     for row in db
         .list_registered_projects()?
         .into_iter()
         .filter(|row| row.enabled)
     {
-        match load_enabled_project(machine, &row) {
+        match load_watched_project(machine, &row) {
             Ok(config) => projects.loaded.push(config),
             Err(err) => projects.failed.push((row.project_id, format!("{err:#}"))),
         }
@@ -268,27 +268,27 @@ pub fn load_enabled_projects(db: &Db, machine: &MachineConfig) -> Result<Enabled
     Ok(projects)
 }
 
-fn load_enabled_project(machine: &MachineConfig, row: &RegisteredProject) -> Result<Config> {
+fn load_watched_project(machine: &MachineConfig, row: &RegisteredProject) -> Result<Config> {
     let path = canonical_config_path(&row.config_path).with_context(|| {
         format!(
-            "config of enabled project {} is gone; enable the project from its new location with \
-             `reviewloop project enable`, or disable it with `reviewloop project disable --project-id {}`",
+            "config of watched project {} is gone; watch the project from its new location with \
+             `reviewloop project watch`, or unwatch it with `reviewloop project unwatch --project-id {}`",
             row.project_id, row.project_id
         )
     })?;
     let config = machine.project(&path)?;
     if config.project_id != row.project_id {
         return Err(anyhow!(
-            "{} now declares project {:?}, not {}; enable it under its new id with \
-             `reviewloop project enable`, and disable this one with \
-             `reviewloop project disable --project-id {}`",
+            "{} now declares project {:?}, not {}; watch it under its new id with \
+             `reviewloop project watch`, and unwatch this one with \
+             `reviewloop project unwatch --project-id {}`",
             path.display(),
             config.project_id,
             row.project_id,
             row.project_id
         ));
     }
-    // Enabling was explicit, so the project runs under the same validation
+    // Watching was explicit, so the project runs under the same validation
     // as the CLI in its repository (`MachineConfig::project`), not the
     // stricter checks for configs loaded on someone else's behalf.
     Ok(config)
@@ -297,22 +297,22 @@ fn load_enabled_project(machine: &MachineConfig, row: &RegisteredProject) -> Res
 /// What became of the project a single-project daemon install was bound to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LegacyAdoption {
-    /// Nobody had decided yet: it is enabled now, at `path` (the bound
+    /// Nobody had decided yet: it is watched now, at `path` (the bound
     /// config), and keeps running.
-    Enabled {
+    Watched {
         path: PathBuf,
         moved_from: Option<PathBuf>,
     },
-    /// Someone already enabled or disabled it; that decision stands.
-    AlreadyDecided { enabled: bool },
-    /// The bound config already backs another enabled project; nothing was
-    /// enabled.
+    /// Someone already watched or unwatched it; that decision stands.
+    AlreadyDecided { watched: bool },
+    /// The bound config already backs another watched project; nothing was
+    /// watched.
     Conflict(String),
 }
 
 /// Keep the project an old `daemon install --config <path>` bound the daemon
-/// to running under the supervisor: enable it at that config, unless someone
-/// already enabled or disabled it. The binding was explicit, so it also wins
+/// to running under the supervisor: watch it at that config, unless someone
+/// already watched or unwatched it. The binding was explicit, so it also wins
 /// over an undecided registration that last saw another clone of the
 /// project. Other registered projects stay as they are. Returns the project
 /// id with the outcome.
@@ -345,17 +345,17 @@ pub fn adopt_legacy_binding(
         }
         _ => bound,
     };
-    let adoption = match registry::enable_if_undecided(db, &project_id, &path, now) {
-        Ok(Some(enabled)) => LegacyAdoption::Enabled {
+    let adoption = match registry::watch_if_undecided(db, &project_id, &path, now) {
+        Ok(Some(watched)) => LegacyAdoption::Watched {
             path,
-            moved_from: enabled.moved_from,
+            moved_from: watched.moved_from,
         },
         Ok(None) => LegacyAdoption::AlreadyDecided {
-            enabled: db
+            watched: db
                 .get_registered_project(&project_id)?
                 .is_some_and(|row| row.enabled),
         },
-        Err(err @ EnableError::FileEnabledAs { .. }) => LegacyAdoption::Conflict(err.to_string()),
+        Err(err @ WatchError::FileWatchedAs { .. }) => LegacyAdoption::Conflict(err.to_string()),
         Err(err) => return Err(err.into()),
     };
     Ok((project_id, adoption))
@@ -499,7 +499,7 @@ impl Supervisor<'_> {
     }
 
     /// One tick: reload the machine config, then, unless paused, run every
-    /// enabled project and record its health. `Err` is a machine-level
+    /// watched project and record its health. `Err` is a machine-level
     /// failure (no project ran).
     pub async fn tick_once(
         &self,
@@ -517,8 +517,8 @@ impl Supervisor<'_> {
             return Ok(TickOutcome::Paused);
         }
 
-        let enabled = load_enabled_projects(self.db, &machine)?;
-        let configs: Vec<&Config> = enabled.loaded.iter().collect();
+        let watched = load_watched_projects(self.db, &machine)?;
+        let configs: Vec<&Config> = watched.loaded.iter().collect();
         let stop = || {
             stopping.load(Ordering::SeqCst)
                 || self
@@ -526,7 +526,7 @@ impl Supervisor<'_> {
                     .supervisor_record()
                     .map_or(true, |record| record.paused_at.is_some())
         };
-        // A project disabled mid-tick sends nothing more.
+        // A project unwatched mid-tick sends nothing more.
         let runs = |config: &Config| {
             self.db
                 .get_registered_project(&config.project_id)
@@ -542,8 +542,8 @@ impl Supervisor<'_> {
         let mut report = scheduler
             .tick(&machine.config, &configs, Some(number), &mut memory.turns)
             .await;
-        for (project_id, error) in enabled.failed {
-            error!(project_id, error = %error, "enabled project not loaded");
+        for (project_id, error) in watched.failed {
+            error!(project_id, error = %error, "watched project not loaded");
             report.projects.entry(project_id).or_default().push(error);
         }
 
@@ -552,7 +552,7 @@ impl Supervisor<'_> {
             let error = (!errors.is_empty()).then(|| errors.join("; "));
             self.db
                 .record_project_health(project_id, finished, error.as_deref())?;
-            let notifications = enabled
+            let notifications = watched
                 .loaded
                 .iter()
                 .find(|config| &config.project_id == project_id)
@@ -730,7 +730,7 @@ impl Supervisor<'_> {
             .unwrap_or_default()
     }
 
-    /// Sleep until the next tick, a pause/resume/enable/disable, or shutdown.
+    /// Sleep until the next tick, a pause/resume/watch/unwatch, or shutdown.
     async fn wait(&self, control: i64, stopping: &AtomicBool, wake: &Notify) {
         let deadline = tokio::time::Instant::now() + self.interval;
         loop {

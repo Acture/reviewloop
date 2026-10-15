@@ -364,7 +364,7 @@ async fn advance_job_times_out_an_overdue_review() -> Result<()> {
     Ok(())
 }
 
-/// A project disabled while a tick runs sends nothing more in that tick.
+/// A project unwatched while a tick runs sends nothing more in that tick.
 #[tokio::test]
 async fn a_project_that_stops_running_mid_tick_sends_nothing_more() -> Result<()> {
     let mut fleet = Fleet::new(&["kept", "dropped"])?;

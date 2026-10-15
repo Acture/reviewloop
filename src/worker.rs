@@ -338,7 +338,7 @@ pub struct Scheduler<'a> {
     /// rest of the tick (a pause or a shutdown request).
     pub stop: &'a dyn Fn() -> bool,
     /// Checked before each provider call for a project; `false` ends that
-    /// project's provider work for the tick (it was disabled meanwhile).
+    /// project's provider work for the tick (it was unwatched meanwhile).
     pub runs: &'a dyn Fn(&Config) -> bool,
 }
 

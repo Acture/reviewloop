@@ -20,11 +20,11 @@
 
 use crate::{
     application::{
-        Approval, CancelRequest, DisableProjectRequest, Eligibility, EnableProjectRequest,
-        ErrorView, JobList, JobListQuery, JobRef, JobView, MAX_JOB_LIST_LIMIT, OpError, PaperView,
-        ProjectEnablement, ProjectView, RequestOrigin, RetryOutcome, RetryRequest, ReviewOps,
-        ReviewPart, ReviewQuery, ReviewRequest, ReviewRequestOutcome, ReviewView,
-        TransitionOutcome, WorkerStatus,
+        Approval, CancelRequest, Eligibility, ErrorView, JobList, JobListQuery, JobRef, JobView,
+        MAX_JOB_LIST_LIMIT, OpError, PaperView, ProjectView, ProjectWatch, RequestOrigin,
+        RetryOutcome, RetryRequest, ReviewOps, ReviewPart, ReviewQuery, ReviewRequest,
+        ReviewRequestOutcome, ReviewView, TransitionOutcome, UnwatchProjectRequest,
+        WatchProjectRequest, WorkerStatus,
     },
     config::{Config, canonical_config_path},
     db::Db,
@@ -56,8 +56,8 @@ pub const GET_REVIEW: &str = "get_review";
 pub const APPROVE_JOB: &str = "approve_job";
 pub const RETRY_JOB: &str = "retry_job";
 pub const GET_WORKER_STATUS: &str = "get_worker_status";
-pub const ENABLE_PROJECT: &str = "enable_project";
-pub const DISABLE_PROJECT: &str = "disable_project";
+pub const WATCH_PROJECT: &str = "watch_project";
+pub const UNWATCH_PROJECT: &str = "unwatch_project";
 pub const CANCEL_JOB: &str = "cancel_job";
 
 /// Error code of a configuration the server could not load for a call. The
@@ -303,24 +303,23 @@ impl Inner {
                 let scope = self.scope(db, args.project_id.as_deref())?;
                 to_value(ReviewOps::new(&scope.config, db).get_worker_status()?)
             }
-            ENABLE_PROJECT => {
-                let args: EnableProjectArgs = parse(arguments)?;
+            WATCH_PROJECT => {
+                let args: WatchProjectArgs = parse(arguments)?;
                 let scope = self.scope(db, args.project_id.as_deref())?;
                 let Some(config_path) = scope.project_path else {
                     return Err(no_project_file(&scope.config));
                 };
-                let mut enablement =
-                    ReviewOps::new(&scope.config, db).enable_project(&EnableProjectRequest {
+                let mut watch =
+                    ReviewOps::new(&scope.config, db).watch_project(&WatchProjectRequest {
                         config_path,
                         replace: args.replace,
                     })?;
                 // `current` is the server's default project, as list_projects
                 // marks it, not the project the call named.
-                enablement.project.current =
-                    enablement.project.project_id == self.options.home_project_id;
-                to_value(enablement)
+                watch.project.current = watch.project.project_id == self.options.home_project_id;
+                to_value(watch)
             }
-            DISABLE_PROJECT => {
+            UNWATCH_PROJECT => {
                 let args: ProjectArgs = parse(arguments)?;
                 // By id, the project's own config need not load.
                 let config = match args.project_id {
@@ -328,7 +327,7 @@ impl Inner {
                     None => self.scope(db, None)?.config,
                 };
                 to_value(
-                    ReviewOps::new(&config, db).disable_project(&DisableProjectRequest {
+                    ReviewOps::new(&config, db).unwatch_project(&UnwatchProjectRequest {
                         project_id: args.project_id,
                     })?,
                 )
@@ -475,7 +474,7 @@ fn config_unavailable(
     }
 }
 
-/// `enable_project` for a context with no `reviewloop.toml` to register.
+/// `watch_project` for a context with no `reviewloop.toml` to register.
 fn no_project_file(config: &Config) -> ErrorView {
     if config.project_id.trim().is_empty() {
         return OpError::ProjectRequired.into();
@@ -706,7 +705,7 @@ struct RetryArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct EnableProjectArgs {
+struct WatchProjectArgs {
     /// A project from list_projects. Omit it for the project the server was
     /// started in.
     #[serde(default)]
@@ -853,12 +852,12 @@ fn tools(approval: Approval) -> Vec<Tool> {
         tool::<ProjectArgs, WorkerStatus>(
             GET_WORKER_STATUS,
             "Get worker status",
-            "Report the machine supervisor (running, paused or stopped) and whether it runs the project. Only availability `ready` means queued jobs move on their own; otherwise tell the user what to do: enable the project (`reviewloop project enable`), install or start the supervisor (`reviewloop daemon install`), or resume it (`reviewloop daemon resume`).",
+            "Report the machine supervisor (running, paused or stopped) and whether it runs the project. Only availability `ready` means queued jobs move on their own; otherwise tell the user what to do: watch the project (`reviewloop project watch`), install or start the supervisor (`reviewloop daemon install`), or resume it (`reviewloop daemon resume`).",
             READ_ONLY,
         ),
-        tool::<EnableProjectArgs, ProjectEnablement>(
-            ENABLE_PROJECT,
-            "Enable a project",
+        tool::<WatchProjectArgs, ProjectWatch>(
+            WATCH_PROJECT,
+            "Watch a project",
             "Let the machine supervisor run a project from its own reviewloop.toml: its queued jobs and polls, and its triggers. None of that waits for approve_job: jobs already QUEUED are sent, every review-* git tag not yet seen is submitted at the next tick (the git trigger is on by default), and with auto_submit_on_change so is every changed PDF. Ask the user first.",
             Hints {
                 read_only: false,
@@ -867,9 +866,9 @@ fn tools(approval: Approval) -> Vec<Tool> {
                 open_world: true,
             },
         ),
-        tool::<ProjectArgs, ProjectEnablement>(
-            DISABLE_PROJECT,
-            "Disable a project",
+        tool::<ProjectArgs, ProjectWatch>(
+            UNWATCH_PROJECT,
+            "Unwatch a project",
             "Stop the machine supervisor from running a project. Its jobs keep their state and nothing is cancelled; explicit calls still act on them.",
             Hints {
                 read_only: false,

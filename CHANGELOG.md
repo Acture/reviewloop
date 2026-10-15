@@ -70,7 +70,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   required, a `retry_job` that would send the manuscript again returns the
   job to PENDING_APPROVAL (`RetryRequest.approval`, action
   `awaiting_approval`), so nothing the agent requests or retries is sent
-  without `approve_job`, the first time or again (`enable_project` lets the
+  without `approve_job`, the first time or again (`watch_project` lets the
   supervisor run the project's own triggers and queued jobs, ungated).
   Calls that name no project never drift from the startup project's file.
   stdout carries only MCP
@@ -143,13 +143,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   in the global config: launchd does not pass the shell's
   `REVIEWLOOP_CSPAPER_API_KEY` to the daemon.
 
-- **Machine supervisor for explicitly enabled projects (OSS-338)** —
+- **Machine supervisor for explicitly watched projects (OSS-338)** —
   `reviewloop daemon run` (the launchd service on macOS) is one supervisor
   for the machine instead of a daemon bound to one project. It runs the
   triggers, queue, polls, timeouts and lease recovery of every project you
-  enable, and nothing else: loading a config only registers it.
-  - `reviewloop project list [--json]`, `project enable [--replace]
-    [--project-id]`, `project disable [--project-id]`.
+  watch, and nothing else: loading a config only registers it.
+  - `reviewloop project list [--json]`, `project watch [--replace]
+    [--project-id]`, `project unwatch [--project-id]`.
   - One supervisor per state dir (an OS lock on `supervisor.lock`, released
     with its process) and per database; a second one is refused naming the
     holder's pid.
@@ -162,14 +162,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - `daemon pause` / `daemon resume` set a persistent flag: the paused
     supervisor stays loaded but runs no triggers and contacts no provider, a
     request in flight finishes, and a restart stays paused. Pause, resume,
-    enable and disable take effect within 2 seconds; a project disabled
+    watch and unwatch take effect within 2 seconds; a project unwatched
     during a tick sends nothing more in it.
   - `daemon status [--json]` works on every platform: supervisor state from
     its heartbeat, the launchd service, the budget, every registered project
     with its health and active jobs, and jobs no supervisor runs.
 - **Worker availability** — the operations gain `get_worker_status`,
-  `enable_project` and `disable_project` (error codes `project_conflict`,
-  `project_not_registered`); `ProjectView` gains `enabled`, `state` and the
+  `watch_project` and `unwatch_project` (error codes `project_conflict`,
+  `project_not_registered`); `ProjectView` gains `watched`, `state` and the
   supervisor's last pass. `submit`, `approve`, `retry`, `import-token` and
   `status` say whether anything will move the job without you, separately
   from its queue state.
@@ -189,9 +189,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   project root). A second live
   config declaring a registered `project_id` (another clone or worktree) no
   longer takes the registration over: commands there print one note, and
-  `project enable --replace` moves it explicitly. A disabled registration
+  `project watch --replace` moves it explicitly. An unwatched registration
   still follows its project when the registered file is gone or now declares
-  another id; an enabled one never moves implicitly.
+  another id; a watched one never moves implicitly.
 - **Machine-wide settings are refused in `reviewloop.toml`** by name
   (`core.db_path`, `core.state_dir`, the provider budget, `[polling]`,
   `[retention]`, `[logging]`, `[imap]`, `[gmail_oauth]`), pointing at the
@@ -204,15 +204,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the tick's budgeted poll round instead of immediately.
 - **`reviewloop run` follows its job** — it no longer runs a full project
   tick every 5 seconds (triggers, every due job of the project, mailbox,
-  retention, widget). While a supervisor runs the project it only watches;
+  retention, widget). While a supervisor runs the project it only observes;
   otherwise it submits or polls its own job when the job's schedule makes it
   due, every 30 seconds, applies the review timeout to it, and settles leases
   a vanished worker left in the project.
 - **`daemon install`** installs the machine-wide service: it refuses
-  `--config`, keeps the project an older single-project install was bound to
-  enabled at that config (and enables nothing else; the binding also wins
-  over a registration that last saw another clone, unless someone already
-  enabled or disabled the project), and pins `XDG_CONFIG_HOME` /
+  `--config`, keeps watching, at that config, the project an older
+  single-project install was bound to (and watches nothing else; the binding
+  also wins over a registration that last saw another clone, unless someone
+  already watched or unwatched the project), and pins `XDG_CONFIG_HOME` /
   `REVIEWLOOP_STATE_DIR` when the shell sets them, so the service uses the
   same global config and database as the shell. `daemon status` warns when
   they differ.
@@ -370,11 +370,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Schema version 7 adds `projects.enabled`, `enabled_changed_at` and the
   health columns (`last_run_at`, `last_ok_at`, `last_error`,
   `last_error_at`), the single-row `supervisor` table, and the triggers that
-  guard enabled registrations. Existing registrations migrate disabled.
-- **Enable your projects.** After upgrading, the supervisor runs only enabled
+  guard watched registrations. Existing registrations migrate unwatched.
+- **Watch your projects.** After upgrading, the supervisor runs only watched
   projects. A launchd service installed by an earlier version (bound with
-  `--config`) keeps its project enabled on first start; run
-  `reviewloop project enable` in every other repository it should run, and
+  `--config`) keeps its project watched on first start; run
+  `reviewloop project watch` in every other repository it should run, and
   `reviewloop daemon install` once to rewrite the service.
 - **Less provider load with several projects.** The per-tick limits used to
   apply to each running daemon or `run` loop; they are now one budget for the
@@ -383,12 +383,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `daemon pause` no longer unloads the launchd service. A service paused by
   an earlier version is reloaded by `daemon resume` (when no supervisor is
   running elsewhere).
-- An older `reviewloop` on the same database can no longer move or delete an
-  enabled project's registration: triggers turn those writes into no-ops.
+- An older `reviewloop` on the same database can no longer move or delete a
+  watched project's registration: triggers turn those writes into no-ops.
 - `daemon status --json` changed shape: `supervisor`, `tick_health`,
   `service`, `budget`, `current_project`, `projects[]` (with `active_jobs`),
   `unregistered_active_jobs`, `gmail_oauth_status`, `proxy_health`.
-- New event types: `project_enabled`, `project_disabled`,
+- New event types: `project_watched`, `project_unwatched`,
   `supervisor_paused`, `supervisor_resumed`; `tick_failed` is written once
   per new error of a project (or of the machine, project `""`), and
   `gmail_oauth_refresh_failed` is machine-level (project `""`).

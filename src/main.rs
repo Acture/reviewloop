@@ -59,16 +59,16 @@ enum Command {
         #[command(subcommand)]
         command: PaperCommand,
     },
-    /// Manage the machine supervisor that runs every enabled project's
+    /// Manage the machine supervisor that runs every watched project's
     /// triggers, submissions and polls. Subcommands: run, install,
     /// uninstall, status, pause, resume.
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    /// Choose which projects the machine supervisor runs. Subcommands: list,
-    /// enable, disable. Loading a project's config registers it; only
-    /// `enable` makes the supervisor run it.
+    /// Choose which projects the machine supervisor watches. Subcommands:
+    /// list, watch, unwatch. Loading a project's config registers it; only
+    /// `watch` makes the supervisor submit and poll for it.
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
@@ -274,7 +274,7 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
-    /// Run the machine supervisor in the foreground: every enabled project,
+    /// Run the machine supervisor in the foreground: every watched project,
     /// until Ctrl+C. This is what the launchd service runs.
     Run {
         /// Repaint a status panel after every tick (only on a terminal).
@@ -290,9 +290,9 @@ enum DaemonCommand {
         panel: bool,
     },
     /// Install and optionally start the supervisor's launchd service
-    /// (macOS only). One service runs every enabled project; installing
-    /// keeps the project an older single-project install was bound to
-    /// enabled, and enables nothing else.
+    /// (macOS only). One service runs every watched project; installing
+    /// keeps watching the project an older single-project install was bound
+    /// to, and watches nothing else.
     Install {
         #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         start: bool,
@@ -321,10 +321,12 @@ enum ProjectCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Let the supervisor run this project: the reviewloop.toml found from
-    /// the current directory (or --config), or the registered project
-    /// --project-id. Takes effect within seconds.
-    Enable {
+    /// Have the machine supervisor run this project: it then runs the
+    /// project's triggers, submits its queued manuscripts to the review
+    /// providers (spending provider quota) and polls for the reviews. Targets
+    /// the reviewloop.toml found from the current directory (or --config), or
+    /// the registered project --project-id. Takes effect within seconds.
+    Watch {
         #[arg(long)]
         project_id: Option<String>,
         /// Move the registration to this config even though another config
@@ -332,9 +334,10 @@ enum ProjectCommand {
         #[arg(long, default_value_t = false)]
         replace: bool,
     },
-    /// Stop the supervisor from running this project (or --project-id).
-    /// Its jobs keep their state; explicit commands still act on them.
-    Disable {
+    /// Stop the supervisor from running this project (or --project-id): no
+    /// more triggers, submissions or polls for it. Its jobs keep their state;
+    /// explicit commands still act on them.
+    Unwatch {
         #[arg(long)]
         project_id: Option<String>,
     },
@@ -576,12 +579,12 @@ async fn run() -> Result<()> {
         },
         Command::Project { command } => match command {
             ProjectCommand::List { json } => cmd_project_list(config_override.as_deref(), json),
-            ProjectCommand::Enable {
+            ProjectCommand::Watch {
                 project_id,
                 replace,
-            } => cmd_project_enable(config_override.as_deref(), project_id.as_deref(), replace),
-            ProjectCommand::Disable { project_id } => {
-                cmd_project_disable(config_override.as_deref(), project_id.as_deref())
+            } => cmd_project_watch(config_override.as_deref(), project_id.as_deref(), replace),
+            ProjectCommand::Unwatch { project_id } => {
+                cmd_project_unwatch(config_override.as_deref(), project_id.as_deref())
             }
         },
         Command::Submit {
@@ -1227,15 +1230,15 @@ fn is_brew_formula_installed(formula: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Install the supervisor's launchd service. It runs every enabled
-/// project; an older install's single-project binding stays enabled.
+/// Install the supervisor's launchd service. It runs every watched
+/// project; an older install's single-project binding stays watched.
 fn cmd_daemon_install(config_override: Option<&Path>, start: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         if let Some(path) = config_override {
             anyhow::bail!(
                 "`daemon install` installs the machine-wide supervisor and takes no project config; \
-                 to have it run that project, enable it with `reviewloop --config {} project enable`",
+                 to have it run that project, watch it with `reviewloop --config {} project watch`",
                 path.display()
             );
         }
@@ -1283,19 +1286,19 @@ fn cmd_daemon_install(config_override: Option<&Path>, start: bool) -> Result<()>
             global_path.display(),
             db.path.display()
         );
-        let enabled = reviewloop::supervisor::load_enabled_projects(&db, &machine)?;
-        if enabled.loaded.is_empty() && enabled.failed.is_empty() {
+        let watched = reviewloop::supervisor::load_watched_projects(&db, &machine)?;
+        if watched.loaded.is_empty() && watched.failed.is_empty() {
             println!(
-                "- enabled projects: none yet; run `reviewloop project enable` in each project repository"
+                "- watched projects: none yet; run `reviewloop project watch` in each project repository"
             );
         }
-        for config in &enabled.loaded {
-            println!("- enabled project: {}", config.project_id);
+        for config in &watched.loaded {
+            println!("- watched project: {}", config.project_id);
         }
-        for (project_id, error) in &enabled.failed {
-            println!("- enabled project: {project_id} (does not load: {error})");
+        for (project_id, error) in &watched.failed {
+            println!("- watched project: {project_id} (does not load: {error})");
         }
-        if let Some(warning) = daemon_cspaper_key_warning(&enabled.loaded, &global_path)? {
+        if let Some(warning) = daemon_cspaper_key_warning(&watched.loaded, &global_path)? {
             println!("{warning}");
         }
         hint_current_project(&db);
@@ -1338,8 +1341,8 @@ fn cmd_daemon_install(config_override: Option<&Path>, start: bool) -> Result<()>
     }
 }
 
-/// Point at `project enable` when the current directory's project is not
-/// enabled yet.
+/// Point at `project watch` when the current directory's project is not
+/// watched yet.
 #[cfg(target_os = "macos")]
 fn hint_current_project(db: &Db) {
     let Ok(loaded) = Config::load_runtime_with_metadata(None, false) else {
@@ -1349,14 +1352,14 @@ fn hint_current_project(db: &Db) {
     if project_id.trim().is_empty() {
         return;
     }
-    let enabled = db
+    let watched = db
         .get_registered_project(&project_id)
         .ok()
         .flatten()
         .is_some_and(|project| project.enabled);
-    if !enabled {
+    if !watched {
         println!(
-            "note: project {project_id} (this directory) is not enabled; run `reviewloop project enable` to have the supervisor run it"
+            "note: project {project_id} (this directory) is not watched; run `reviewloop project watch` to have the supervisor run it"
         );
     }
 }
@@ -1367,9 +1370,9 @@ fn report_legacy_adoption(db: &Db, machine: &reviewloop::config::MachineConfig, 
     use reviewloop::supervisor::{LegacyAdoption, adopt_legacy_binding};
 
     match adopt_legacy_binding(db, machine, bound, Utc::now()) {
-        Ok((project_id, LegacyAdoption::Enabled { path, moved_from })) => {
+        Ok((project_id, LegacyAdoption::Watched { path, moved_from })) => {
             eprintln!(
-                "note: the daemon was installed for project {project_id} alone; the supervisor now runs every enabled project, and {project_id} is enabled at {}. Other registered projects stay disabled until `reviewloop project enable`.",
+                "note: the daemon was installed for project {project_id} alone; the supervisor now runs every watched project, and {project_id} is watched at {}. Other registered projects stay unwatched until `reviewloop project watch`.",
                 path.display()
             );
             if let Some(from) = moved_from {
@@ -1379,12 +1382,12 @@ fn report_legacy_adoption(db: &Db, machine: &reviewloop::config::MachineConfig, 
                 );
             }
         }
-        Ok((project_id, LegacyAdoption::AlreadyDecided { enabled })) => info!(
+        Ok((project_id, LegacyAdoption::AlreadyDecided { watched })) => info!(
             project_id,
-            enabled, "the daemon's --config names a project whose enablement is already decided"
+            watched, "the daemon's --config names a project whose watch is already decided"
         ),
         Ok((project_id, LegacyAdoption::Conflict(why))) => {
-            eprintln!("warning: not enabling project {project_id} for the supervisor: {why}")
+            eprintln!("warning: the supervisor does not watch project {project_id}: {why}")
         }
         Err(err) => eprintln!(
             "warning: the daemon was bound to {}, which no longer loads ({err:#}); the supervisor runs without it",
@@ -1419,7 +1422,7 @@ fn cmd_daemon_uninstall() -> Result<()> {
 
 /// Run the machine supervisor in the foreground until Ctrl+C or SIGTERM.
 /// `legacy_config` is the `--config` an old single-project launchd plist
-/// still passes: that project stays enabled unless someone already decided.
+/// still passes: that project stays watched unless someone already decided.
 async fn cmd_daemon_run(legacy_config: Option<&Path>, panel: bool) -> Result<()> {
     use reviewloop::supervisor::{Supervisor, TICK_INTERVAL};
 
@@ -1435,13 +1438,13 @@ async fn cmd_daemon_run(legacy_config: Option<&Path>, panel: bool) -> Result<()>
             "legacy single-file config found: the supervisor runs only projects with a reviewloop.toml; migrate it with `reviewloop config migrate-project --project-id <id>`"
         );
     }
-    let enabled = db
+    let watched = db
         .list_registered_projects()?
         .into_iter()
         .filter(|project| project.enabled)
         .count();
-    if enabled == 0 {
-        warn!("no project is enabled; the supervisor idles until `reviewloop project enable`");
+    if watched == 0 {
+        warn!("no project is watched; the supervisor idles until `reviewloop project watch`");
     }
 
     Supervisor {
@@ -1841,7 +1844,7 @@ fn cmd_project_list(config_override: Option<&Path>, as_json: bool) -> Result<()>
     println!("Supervisor: {}", worker.supervisor.state.as_str());
     if projects.is_empty() {
         println!(
-            "No registered projects. A project registers when a command loads its reviewloop.toml; enable it with `reviewloop project enable`."
+            "No registered projects. A project registers when a command loads its reviewloop.toml; watch it with `reviewloop project watch`."
         );
         return Ok(());
     }
@@ -1853,13 +1856,13 @@ fn cmd_project_list(config_override: Option<&Path>, as_json: bool) -> Result<()>
             ConfigFileState::Unreadable(why) => format!(" (unreadable: {why})"),
         };
         println!(
-            "{} {:<24} {:<9} {:<8} {}{file}",
+            "{} {:<24} {:<9} {:<9} {}{file}",
             if project.current { "*" } else { " " },
             project.project_id,
-            if project.enabled {
-                "enabled"
+            if project.watched {
+                "watched"
             } else {
-                "disabled"
+                "unwatched"
             },
             project.state.as_str(),
             project.config_path,
@@ -1873,7 +1876,7 @@ fn cmd_project_list(config_override: Option<&Path>, as_json: bool) -> Result<()>
 
 /// Let the supervisor run a project: this directory's (or --config), or a
 /// registered one by id.
-fn cmd_project_enable(
+fn cmd_project_watch(
     config_override: Option<&Path>,
     project_id: Option<&str>,
     replace: bool,
@@ -1904,7 +1907,7 @@ fn cmd_project_enable(
             let config = machine.project(&path)?;
             if config.project_id != project_id {
                 anyhow::bail!(
-                    "{} now declares project {:?}, not {project_id}; run `reviewloop project enable` there instead",
+                    "{} now declares project {:?}, not {project_id}; run `reviewloop project watch` there instead",
                     path.display(),
                     config.project_id
                 );
@@ -1913,17 +1916,20 @@ fn cmd_project_enable(
             (config, db, path)
         }
     };
-    let outcome = ReviewOps::new(&config, &db).enable_project(
-        &reviewloop::application::EnableProjectRequest {
+    let outcome = ReviewOps::new(&config, &db).watch_project(
+        &reviewloop::application::WatchProjectRequest {
             config_path,
             replace,
         },
     )?;
     let project = &outcome.project;
     if outcome.changed {
-        println!("Enabled project {} for the supervisor.", project.project_id);
+        println!(
+            "Watching project {}: the supervisor runs its triggers, submissions and polls.",
+            project.project_id
+        );
     } else {
-        println!("Project {} is already enabled.", project.project_id);
+        println!("Project {} is already watched.", project.project_id);
     }
     println!("- config: {}", project.config_path);
     if let Some(from) = &outcome.moved_from {
@@ -1952,7 +1958,7 @@ fn cmd_project_enable(
 
 /// Stop the supervisor from running a project. Works by id even when the
 /// project's config no longer loads.
-fn cmd_project_disable(config_override: Option<&Path>, project_id: Option<&str>) -> Result<()> {
+fn cmd_project_unwatch(config_override: Option<&Path>, project_id: Option<&str>) -> Result<()> {
     let (config, db) = match project_id {
         Some(_) => {
             let (machine, db) = load_machine_runtime(false)?;
@@ -1960,18 +1966,18 @@ fn cmd_project_disable(config_override: Option<&Path>, project_id: Option<&str>)
         }
         None => load_runtime(config_override, false, true)?,
     };
-    let outcome = ReviewOps::new(&config, &db).disable_project(
-        &reviewloop::application::DisableProjectRequest {
+    let outcome = ReviewOps::new(&config, &db).unwatch_project(
+        &reviewloop::application::UnwatchProjectRequest {
             project_id: project_id.map(str::to_string),
         },
     )?;
     if outcome.changed {
         println!(
-            "Disabled project {}: the supervisor no longer runs its triggers, submissions or polls. Its jobs keep their state; explicit commands still act on them.",
+            "No longer watching project {}: the supervisor stops running its triggers, submissions and polls. Its jobs keep their state; explicit commands still act on them.",
             outcome.project.project_id
         );
     } else {
-        println!("Project {} was not enabled.", outcome.project.project_id);
+        println!("Project {} was not watched.", outcome.project.project_id);
     }
     Ok(())
 }
@@ -2232,17 +2238,17 @@ fn print_daemon_status(status: &DaemonStatus) {
     );
 
     println!();
-    let enabled = status
+    let watched = status
         .projects
         .iter()
-        .filter(|(project, _)| project.enabled)
+        .filter(|(project, _)| project.watched)
         .count();
     println!(
-        "Projects: {enabled} enabled of {} registered",
+        "Projects: {watched} watched of {} registered",
         status.projects.len()
     );
     if status.projects.is_empty() {
-        println!("  none registered; run `reviewloop project enable` in a project repository");
+        println!("  none registered; run `reviewloop project watch` in a project repository");
     }
     for (project, jobs) in &status.projects {
         let marker = if project.current { "*" } else { " " };
@@ -2263,9 +2269,9 @@ fn print_daemon_status(status: &DaemonStatus) {
         if let Some(error) = &project.last_error {
             println!("    error: {error}");
         }
-        if project.state == ProjectState::Disabled && !jobs.is_empty() {
+        if project.state == ProjectState::Unwatched && !jobs.is_empty() {
             println!(
-                "    {} active job(s) wait: the supervisor does not run a disabled project",
+                "    {} active job(s) wait: the supervisor does not run an unwatched project",
                 jobs.len()
             );
         }
@@ -2378,7 +2384,7 @@ fn load_runtime_with_path(
     // Register this project's config path so fleet-wide commands (eg the
     // bar's "Retry now") can resolve `project_id -> config path` later
     // even when invoked from a directory without a reviewloop.toml.
-    // Registering never enables the project for the supervisor.
+    // Registering never makes the supervisor watch the project.
     if let Some(path) = project_path.as_deref()
         && !config.project_id.trim().is_empty()
     {
@@ -2394,8 +2400,8 @@ fn load_runtime_with_path(
 fn register_loaded_project(db: &Db, project_id: &str, config_path: &Path) {
     match reviewloop::registry::register_seen(db, project_id, config_path, Utc::now()) {
         Ok(reviewloop::registry::Registration::Kept(conflict)) => {
-            let hint = if conflict.registered_enabled {
-                "; the supervisor keeps using it (move it with `reviewloop project enable --replace`)"
+            let hint = if conflict.registered_watched {
+                "; the supervisor keeps using it (move it with `reviewloop project watch --replace`)"
             } else {
                 ""
             };
@@ -2761,7 +2767,7 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
     let mut uncertain_since: Option<std::time::Instant> = None;
 
     // Foreground loop: show the job every few seconds. While a supervisor
-    // runs this project it does the work and `run` only watches; otherwise
+    // runs this project it does the work and `run` only observes; otherwise
     // `run` moves this job alone, by its own schedule, at the supervisor's
     // cadence. Decided again every round, so a supervisor that stops or
     // starts mid-run is followed.
@@ -2781,7 +2787,7 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
                 }
                 if supervised {
                     eprintln!(
-                        "note: the supervisor runs this project; `run` only watches job {job_id}"
+                        "note: the supervisor runs this project; `run` only observes job {job_id}"
                     );
                 } else {
                     eprintln!(
@@ -3024,7 +3030,7 @@ async fn cmd_import_token(
 
 /// launchd starts the supervisor without the installing shell's
 /// environment, so a CSPaper key that only comes from the environment never
-/// reaches it. Names the enabled `projects` that would fail.
+/// reaches it. Names the watched `projects` that would fail.
 #[cfg(any(target_os = "macos", test))]
 fn daemon_cspaper_key_warning(projects: &[Config], global_path: &Path) -> Result<Option<String>> {
     let using: Vec<&str> = projects
@@ -3463,9 +3469,9 @@ fn load_effective_config_for_job(db: &Db, job: &reviewloop::model::Job) -> Resul
     match load_runtime_for_path(&config_path) {
         Ok(config) => Ok(config),
         Err(err) if error_chain_contains_not_found(&err) => {
-            // The next CLI call from the moved repo re-registers it there (a
-            // disabled registration follows a stale path; an enabled one
-            // keeps its explicit decision until `project enable` moves it).
+            // The next CLI call from the moved repo re-registers it there (an
+            // unwatched registration follows a stale path; a watched one
+            // keeps its explicit decision until `project watch` moves it).
             anyhow::bail!(
                 "project '{}' cannot be located — its config file used to be at {} but that path no longer exists.\n\n\
                  To fix:\n\
@@ -4671,7 +4677,7 @@ mod tests {
             let projects = json["projects"].as_array().unwrap();
             assert_eq!(projects.len(), 2);
             assert_eq!(projects[0]["project_id"], "idle");
-            assert_eq!(projects[0]["enabled"], false);
+            assert_eq!(projects[0]["watched"], false);
             assert_eq!(projects[1]["project_id"], "proj");
             assert_eq!(projects[1]["state"], "error");
             assert_eq!(projects[1]["last_error"], "pdf trigger: gone");

@@ -2052,7 +2052,7 @@ impl Db {
             &tx,
             Some(project_id),
             None,
-            "project_enabled",
+            "project_watched",
             &json!({ "config_path": config_path }),
         )?;
         tx.commit()?;
@@ -2080,7 +2080,7 @@ impl Db {
         )?;
         bump_control_version(&tx)?;
         if was_enabled {
-            insert_event(&tx, Some(project_id), None, "project_disabled", &json!({}))?;
+            insert_event(&tx, Some(project_id), None, "project_unwatched", &json!({}))?;
         }
         tx.commit()?;
         Ok(Some(was_enabled))
@@ -3192,7 +3192,7 @@ fn map_supervisor_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SupervisorRec
     })
 }
 
-/// Wake a sleeping supervisor: pause, resume, enable and disable all call this
+/// Wake a sleeping supervisor: pause, resume, watch and unwatch all call this
 /// inside their own transaction.
 fn bump_control_version(conn: &Connection) -> Result<()> {
     conn.execute(

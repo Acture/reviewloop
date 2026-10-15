@@ -855,11 +855,12 @@ pub struct RegisteredProject {
     pub project_id: String,
     pub config_path: std::path::PathBuf,
     pub last_seen_at: DateTime<Utc>,
-    /// Only an explicit `project enable` (or the one-time migration of a
-    /// single-project daemon install) sets this; loading a config never does.
+    /// The supervisor watches the project. Only an explicit `project watch`
+    /// (or the one-time migration of a single-project daemon install) sets
+    /// this; loading a config never does.
     pub enabled: bool,
     /// When `enabled` was last decided; `None` means never, which is the only
-    /// state the legacy install migration may enable.
+    /// state the legacy install migration may watch.
     pub enabled_changed_at: Option<DateTime<Utc>>,
     pub health: ProjectHealth,
 }
@@ -878,7 +879,7 @@ pub struct ProjectHealth {
 /// here so it survives restarts; the rest is written by the running supervisor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SupervisorRecord {
-    /// Bumped by every pause, resume, enable and disable, so a sleeping
+    /// Bumped by every pause, resume, watch and unwatch, so a sleeping
     /// supervisor notices them before its next scheduled tick.
     pub control_version: i64,
     pub paused_at: Option<DateTime<Utc>>,

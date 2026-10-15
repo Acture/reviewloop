@@ -43,8 +43,8 @@ it; no other command does.
 | `supervisor.paused_at` | RFC3339 UTC timestamp string | nullable | When `reviewloop daemon pause` paused it; `null` when not paused. |
 | `projects` | array | required | Every registered project, ordered by `project_id`. |
 | `projects[].project_id` | string | required | The project. |
-| `projects[].enabled` | boolean | required | Whether the supervisor runs it (`reviewloop project enable`). |
-| `projects[].state` | string | required | `"disabled"`, `"pending"` (enabled, not run yet), `"ok"` or `"error"`. |
+| `projects[].watched` | boolean | required | Whether the supervisor runs it (`reviewloop project watch`). |
+| `projects[].state` | string | required | `"unwatched"`, `"pending"` (watched, not run yet), `"ok"` or `"error"`. |
 | `projects[].active_count` | integer | required | Its active jobs. |
 | `projects[].last_run_at` | RFC3339 UTC timestamp string | nullable | The supervisor's last pass over it. |
 | `projects[].last_ok_at` | RFC3339 UTC timestamp string | nullable | Its last pass without errors. |
@@ -99,7 +99,7 @@ multi-project supervisor (OSS-338). They are additive, so the version stays 1.
   "projects": [
     {
       "project_id": "thesis",
-      "enabled": true,
+      "watched": true,
       "state": "ok",
       "active_count": 2,
       "last_run_at": "2026-05-06T11:59:50Z",

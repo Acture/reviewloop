@@ -115,7 +115,7 @@ pub struct WidgetSupervisor {
 #[derive(Debug, Serialize)]
 pub struct WidgetProject {
     pub project_id: String,
-    pub enabled: bool,
+    pub watched: bool,
     pub state: ProjectState,
     pub active_count: usize,
     pub last_run_at: Option<String>,
@@ -222,7 +222,7 @@ pub fn build_fleet(db: &Db, now: DateTime<Utc>) -> Result<WidgetState> {
         .context("failed to read the project registry")?
         .into_iter()
         .map(|project| WidgetProject {
-            enabled: project.enabled,
+            watched: project.enabled,
             state: ProjectState::of(&project),
             active_count: active_per_project
                 .get(project.project_id.as_str())
@@ -473,13 +473,13 @@ mod tests {
         let projects: Vec<(&str, bool, ProjectState, usize)> = state
             .projects
             .iter()
-            .map(|p| (p.project_id.as_str(), p.enabled, p.state, p.active_count))
+            .map(|p| (p.project_id.as_str(), p.watched, p.state, p.active_count))
             .collect();
         assert_eq!(
             projects,
             [
                 ("alpha", true, ProjectState::Error, 1),
-                ("beta", false, ProjectState::Disabled, 1),
+                ("beta", false, ProjectState::Unwatched, 1),
             ]
         );
         assert_eq!(
@@ -543,7 +543,7 @@ mod tests {
             },
             projects: vec![WidgetProject {
                 project_id: "thesis".to_string(),
-                enabled: true,
+                watched: true,
                 state: ProjectState::Ok,
                 active_count: 2,
                 last_run_at: Some(at(11, 59, 50)),
@@ -595,7 +595,7 @@ mod tests {
   "projects": [
     {
       "project_id": "thesis",
-      "enabled": true,
+      "watched": true,
       "state": "ok",
       "active_count": 2,
       "last_run_at": "2026-05-06T11:59:50Z",
