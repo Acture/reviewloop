@@ -23,7 +23,7 @@ use crate::{
     http::redact_url_paths,
     model::{
         EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, Job, JobPdf, JobStatus,
-        NewJob,
+        NewJob, SubmitStage,
     },
     registry::{self, ConfigFileState, Disabled, EnableError},
     submission_input::prepare_input,
@@ -509,10 +509,12 @@ impl<'a> ReviewOps<'a> {
     }
 
     /// Re-queue a job: a token-backed job goes back to polling, a tokenless
-    /// one back to submission. Every status but PENDING_APPROVAL may be
-    /// retried (that one needs `approve_job`); `force` is limited to the
-    /// statuses an immediate submit or poll can act on. Uses this config's
-    /// polling schedule, so the config must be the job's project.
+    /// one back to submission, or, when that would send the manuscript again
+    /// and [`RetryRequest::approval`] is `Required`, back to approval. Every
+    /// status but PENDING_APPROVAL may be retried (that one needs
+    /// `approve_job`); `force` is limited to the statuses an immediate submit
+    /// or poll can act on. Uses this config's polling schedule, so the config
+    /// must be the job's project.
     pub fn retry_job(&self, request: &RetryRequest) -> Result<RetryOutcome, OpError> {
         let job = self.find_job(&request.job, Eligibility::retry(request.include_failed))?;
         if job.project_id != self.config.project_id {
@@ -529,7 +531,6 @@ impl<'a> ReviewOps<'a> {
             );
             return Err(invalid_retry(&job, &message));
         }
-
         let action = match (request.force, job.token.is_some()) {
             (true, true) => {
                 if job.status != JobStatus::Processing {
@@ -557,55 +558,73 @@ impl<'a> ReviewOps<'a> {
                 )?;
                 RetryAction::PollNow
             }
-            (true, false) => {
-                if !matches!(
-                    job.status,
-                    JobStatus::Queued
-                        | JobStatus::Submitted
-                        | JobStatus::Failed
-                        | JobStatus::FailedNeedsManual
-                        | JobStatus::Timeout
-                ) {
+            (false, true) => {
+                let next = compute_next_poll_at(
+                    Utc::now(),
+                    &self.config.polling.schedule_minutes,
+                    0,
+                    self.config.polling.jitter_percent,
+                );
+                // user override: explicit retry may cross state-machine boundaries.
+                self.db.update_job_state_unchecked(
+                    &job.id,
+                    JobStatus::Processing,
+                    Some(0),
+                    Some(Some(next)),
+                    Some(None),
+                )?;
+                self.db
+                    .add_event(Some(&job.project_id), Some(&job.id), "retried", json!({}))?;
+                RetryAction::PollScheduled
+            }
+            (force, false) => {
+                if force
+                    && !matches!(
+                        job.status,
+                        JobStatus::Queued
+                            | JobStatus::Submitted
+                            | JobStatus::Failed
+                            | JobStatus::FailedNeedsManual
+                            | JobStatus::Timeout
+                    )
+                {
                     return Err(invalid_retry(
                         &job,
                         "--force for tokenless jobs only supports QUEUED/SUBMITTED/FAILED/FAILED_NEEDS_MANUAL/TIMEOUT",
                     ));
                 }
-                // user override: reset terminal job back to Queued for re-submission.
-                self.requeue(&job)?;
-                self.db.add_event(
-                    Some(&job.project_id),
-                    Some(&job.id),
-                    "manual_rate_limit_override",
-                    override_payload(&job, "submit"),
-                )?;
-                RetryAction::SubmitNow
-            }
-            (false, has_token) => {
-                let action = if has_token {
-                    let next = compute_next_poll_at(
-                        Utc::now(),
-                        &self.config.polling.schedule_minutes,
-                        0,
-                        self.config.polling.jitter_percent,
-                    );
-                    // user override: explicit retry may cross state-machine boundaries.
-                    self.db.update_job_state_unchecked(
-                        &job.id,
-                        JobStatus::Processing,
-                        Some(0),
-                        Some(Some(next)),
-                        Some(None),
+                // user override: explicit retry may cross state-machine
+                // boundaries. Sending the manuscript again may need approval.
+                let status = self.requeue(&job, request.approval == Approval::Required)?;
+                if status == JobStatus::PendingApproval {
+                    self.db.add_event(
+                        Some(&job.project_id),
+                        Some(&job.id),
+                        "retried",
+                        json!({
+                            "awaiting_approval": true,
+                            "previous_status": job.status.as_str(),
+                            "previous_submit_stage": job.submit_stage.map(SubmitStage::as_str),
+                        }),
                     )?;
-                    RetryAction::PollScheduled
+                    RetryAction::AwaitingApproval
+                } else if force {
+                    self.db.add_event(
+                        Some(&job.project_id),
+                        Some(&job.id),
+                        "manual_rate_limit_override",
+                        override_payload(&job, "submit"),
+                    )?;
+                    RetryAction::SubmitNow
                 } else {
-                    // user override: explicit retry may cross state-machine boundaries.
-                    self.requeue(&job)?;
+                    self.db.add_event(
+                        Some(&job.project_id),
+                        Some(&job.id),
+                        "retried",
+                        json!({}),
+                    )?;
                     RetryAction::SubmissionQueued
-                };
-                self.db
-                    .add_event(Some(&job.project_id), Some(&job.id), "retried", json!({}))?;
-                action
+                }
             }
         };
         info!(job_id = %job.id, paper_id = %job.paper_id, ?action, "job retried");
@@ -651,10 +670,11 @@ impl<'a> ReviewOps<'a> {
         self.transitioned(&Job { status, ..job })
     }
 
-    /// [`Db::requeue`] with its refusals as typed retry errors.
-    fn requeue(&self, job: &Job) -> Result<(), OpError> {
-        match self.db.requeue(&job.id, Utc::now())? {
-            Requeue::Requeued => Ok(()),
+    /// [`Db::requeue`] with its refusals as typed retry errors; the status the
+    /// job went back to.
+    fn requeue(&self, job: &Job, needs_approval: bool) -> Result<JobStatus, OpError> {
+        match self.db.requeue(&job.id, needs_approval, Utc::now())? {
+            Requeue::Requeued { status } => Ok(status),
             Requeue::InFlight { owner, expires_at } => Err(invalid_retry(
                 job,
                 &format!(
@@ -759,7 +779,6 @@ impl<'a> ReviewOps<'a> {
         };
         ReviewArtifacts {
             review_md: existing("review.md"),
-            review_json: existing("review.json"),
             dir: dir.exists().then(|| dir.display().to_string()),
         }
     }

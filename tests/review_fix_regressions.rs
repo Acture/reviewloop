@@ -404,7 +404,7 @@ fn requeue_refuses_dispatched_job_with_live_lease() -> Result<()> {
     let before = ctx.job(&job.id)?;
 
     assert_eq!(
-        ctx.db.requeue(&job.id, now + Duration::minutes(1))?,
+        ctx.db.requeue(&job.id, false, now + Duration::minutes(1))?,
         Requeue::InFlight {
             owner: lease.owner.clone(),
             expires_at: lease.expires_at,
@@ -445,7 +445,7 @@ fn requeue_revokes_a_claim_that_has_not_dispatched() -> Result<()> {
     let mut lease = claim_submit(&worker_db, &job.id, now)?;
     assert_eq!(ctx.job(&job.id)?.submit_stage, Some(SubmitStage::Claimed));
 
-    ctx.db.requeue(&job.id, now + Duration::minutes(1))?;
+    ctx.db.requeue(&job.id, false, now + Duration::minutes(1))?;
     let requeued = assert_requeued(&ctx, &job.id, now + Duration::minutes(1))?;
 
     // The old owner can no longer send anything.
@@ -484,7 +484,7 @@ fn requeue_resets_an_uncertain_submission() -> Result<()> {
     assert_eq!(parked.attempt, 3);
     assert!(parked.last_error.is_some());
 
-    ctx.db.requeue(&job.id, later)?;
+    ctx.db.requeue(&job.id, false, later)?;
     let requeued = assert_requeued(&ctx, &job.id, later)?;
     assert_eq!(requeued.token, None);
     assert_eq!(
@@ -505,12 +505,14 @@ fn requeue_accepts_a_dispatch_whose_lease_has_expired() -> Result<()> {
     // One second before expiry the lease is live; at expiry it is not.
     assert!(matches!(
         ctx.db
-            .requeue(&job.id, lease.expires_at - Duration::seconds(1))?,
+            .requeue(&job.id, false, lease.expires_at - Duration::seconds(1))?,
         Requeue::InFlight { .. }
     ));
     assert_eq!(
-        ctx.db.requeue(&job.id, lease.expires_at)?,
-        Requeue::Requeued
+        ctx.db.requeue(&job.id, false, lease.expires_at)?,
+        Requeue::Requeued {
+            status: JobStatus::Queued
+        }
     );
     assert_requeued(&ctx, &job.id, lease.expires_at)?;
 
@@ -560,9 +562,9 @@ fn requeue_resets_a_failed_job() -> Result<()> {
         Some("cancelled by user: wrong pdf")
     );
 
-    ctx.db.requeue(&job.id, now)?;
+    ctx.db.requeue(&job.id, false, now)?;
     assert_requeued(&ctx, &job.id, now)?;
-    assert!(ctx.db.requeue("no-such-job", now).is_err());
+    assert!(ctx.db.requeue("no-such-job", false, now).is_err());
     Ok(())
 }
 
@@ -629,7 +631,7 @@ async fn missing_fallback_script_fails_definitively_and_retry_reuses_fallback() 
         json!({ "reason": expected_error, "channel": "fallback" })
     );
 
-    ctx.db.requeue(&job.id, Utc::now())?;
+    ctx.db.requeue(&job.id, false, Utc::now())?;
     let requeued = assert_requeued(&ctx, &job.id, Utc::now())?;
     assert!(!requeued.fallback_used);
 

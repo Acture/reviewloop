@@ -42,7 +42,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and nothing is uploaded.
 
 - **`reviewloop::application`** — review operations shared by the CLI and
-  the upcoming MCP adapter: `ReviewOps` with `list_projects`,
+  the MCP server: `ReviewOps` with `list_projects`,
   `list_papers`, `request_review`, `get_job`, `list_jobs`, `get_review`,
   `approve_job`, `retry_job` and `cancel_job`. Operations are synchronous,
   never print, exit or contact the provider, return token-free DTOs and
@@ -53,6 +53,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`docs/review-operations.md`** — the operation contract: MCP tool
   names, request and result fields, job phases, retry semantics, error
   codes with recovery hints, and what later issues still own.
+- **`reviewloop mcp` (OSS-339)** — a standard stdio Model Context Protocol
+  server (official Rust SDK `rmcp`) exposing the twelve review operations as
+  tools with the contract's names. Each tool has an input schema, an
+  `outputSchema` generated from its result type, and read-only /
+  destructive / idempotent / open-world annotations; a result is
+  `structuredContent` plus the same JSON as text. Failures, malformed
+  arguments included (unless `arguments` is not an object: JSON-RPC
+  `-32601`), are tool errors carrying the `{code, message,
+  recovery, details}` JSON; an unknown tool is JSON-RPC `-32602`. Calls act
+  on the project of the server's directory or `--config`, or on any
+  registered project named by `project_id`, reloading the config every call
+  (new code `config_unavailable` when it no longer loads). Agent requests
+  start PENDING_APPROVAL until `approve_job` unless the server runs with
+  `--approval granted`; they are recorded as `agent_request`. With approval
+  required, a `retry_job` that would send the manuscript again returns the
+  job to PENDING_APPROVAL (`RetryRequest.approval`, action
+  `awaiting_approval`), so nothing the agent requests or retries is sent
+  without `approve_job`, the first time or again (`enable_project` lets the
+  supervisor run the project's own triggers and queued jobs, ungated).
+  Calls that name no project never drift from the startup project's file.
+  stdout carries only MCP
+  messages; the log goes to stderr. `tests/mcp_stdio.rs` drives the binary
+  through an MCP client, validates every result against its schema, and
+  carries a review from request to result through the supervisor against
+  a mock provider.
 - `Db::get_review`, `Db::review_completed_at`, `Db::list_project_jobs` and
   `Db::list_registered_projects` (read-only).
 - **Stanford Agentic Reviewer contract** (`docs/providers/stanford.md`) — the
@@ -151,6 +176,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `Db::requeue` takes `needs_approval` and returns the status it wrote
+  (`Requeue::Requeued { status }`): the retry's approval decision is read
+  inside its transaction.
+- `ReviewView.artifacts` no longer lists `review.json`: it is stored
+  unredacted, and a CSPaper one holds the provider job id, which is the
+  token. `raw` is the redacted review.
+- Logs written to stderr carry ANSI colours only when stderr is a terminal
+  (every command; MCP hosts file the server's stderr as a log).
 - **Registry (OSS-338)** — config paths are stored canonical (the directory
   resolved, so a symlinked `reviewloop.toml` keeps its own repository as the
   project root). A second live

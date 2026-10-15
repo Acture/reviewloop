@@ -206,6 +206,26 @@ enum Command {
     /// until terminal. Exit codes: 0=Completed, 2=terminal failure, 130=Ctrl+C.
     /// Email/OAuth is NOT required for this command.
     Run(RunArgs),
+    /// Serve the review operations to an AI agent as a Model Context Protocol
+    /// (MCP) server on stdin/stdout. Tools act on the project of the current
+    /// directory (or --config) unless a call names another registered
+    /// project. Logs go to stderr. See docs/review-operations.md.
+    Mcp(McpArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+struct McpArgs {
+    /// Whether an agent's review requests wait for `approve_job` before
+    /// anything is sent to the provider (`required`), or are queued for the
+    /// supervisor at once (`granted`).
+    #[arg(long, value_enum, default_value_t = McpApproval::Required)]
+    approval: McpApproval,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum McpApproval {
+    Required,
+    Granted,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -683,7 +703,32 @@ async fn run() -> Result<()> {
             dry_run,
         } => cmd_self_update(method, yes, dry_run),
         Command::Run(args) => cmd_run(config_override.as_deref(), &args).await,
+        Command::Mcp(args) => cmd_mcp(config_override.as_deref(), &args).await,
     }
+}
+
+/// `reviewloop mcp`: stdout carries MCP messages only, so every log line goes
+/// to stderr whatever `logging.output` says.
+async fn cmd_mcp(config_override: Option<&Path>, args: &McpArgs) -> Result<()> {
+    let (config, db, project_path) = load_runtime_with_path(config_override, true, false)?;
+    let options = reviewloop::mcp::ServerOptions {
+        // Pinned, so a call never moves on to another file (a parent
+        // directory's) when this one goes away.
+        config_override: project_path.or_else(|| config_override.map(Path::to_path_buf)),
+        home_project_id: config.project_id.clone(),
+        approval: match args.approval {
+            McpApproval::Required => Approval::Required,
+            McpApproval::Granted => Approval::Granted,
+        },
+    };
+    info!(
+        project_id = %config.project_id,
+        approval = ?options.approval,
+        "serving MCP on stdio"
+    );
+    reviewloop::mcp::ReviewLoopMcp::new(db, options)
+        .serve_stdio()
+        .await
 }
 
 fn cmd_init(config_override: Option<&Path>, args: &InitArgs) -> Result<()> {
@@ -3328,6 +3373,7 @@ async fn cmd_retry(
         force,
         include_failed,
         caller_executes: force,
+        approval: Approval::Granted,
     })?;
     if outcome.previous_status == JobStatus::Submitted
         && matches!(
@@ -3366,6 +3412,9 @@ async fn cmd_retry(
         }
         RetryAction::PollScheduled | RetryAction::SubmissionQueued => {
             println!("Retry scheduled for job {}", job.id);
+        }
+        RetryAction::AwaitingApproval => {
+            unreachable!("the CLI's retries are granted")
         }
     }
     print_project_worker(job_config, db);

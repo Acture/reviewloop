@@ -61,7 +61,7 @@ pub const CONTROL_POLL: StdDuration = StdDuration::from_secs(2);
 const LOCK_FILE: &str = "supervisor.lock";
 
 /// The supervisor as others see it, from the control row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SupervisorState {
     /// Alive and working.
@@ -95,7 +95,7 @@ impl SupervisorState {
 }
 
 /// One registered project as the supervisor last left it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectState {
     /// The supervisor ignores it.
@@ -133,7 +133,7 @@ impl ProjectState {
 
 /// Whether a project's queued and submitted jobs move without a caller
 /// running them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerAvailability {
     /// A running supervisor runs the project.

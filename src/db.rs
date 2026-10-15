@@ -112,7 +112,8 @@ pub enum ReceiptWrite {
 /// Outcome of [`Db::requeue`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Requeue {
-    Requeued,
+    /// Back before submission, in this status: QUEUED, or PENDING_APPROVAL.
+    Requeued { status: JobStatus },
     /// A worker is sending this job's submission right now.
     InFlight {
         owner: String,
@@ -678,12 +679,21 @@ impl Db {
         Ok(true)
     }
 
-    /// Put a job back to QUEUED for another submit attempt (user `retry`): attempt 0, no
-    /// cooldown or error, lease revoked. Both refusals are re-checked inside the
-    /// transaction, so a caller's stale view cannot turn into a duplicate submission:
-    /// a submission in flight (DISPATCHED with a live lease) or one whose receipt has
-    /// landed meanwhile (the job holds a token) is left alone.
-    pub fn requeue(&self, job_id: &str, now: DateTime<Utc>) -> Result<Requeue> {
+    /// Put a job back before submission for another attempt (user `retry`): attempt 0,
+    /// no cooldown, lease revoked, QUEUED. With `needs_approval`, an attempt that sends
+    /// the manuscript again (the row is not QUEUED) goes to PENDING_APPROVAL instead;
+    /// a row that was SUBMITTED keeps a `last_error` saying an earlier submission may
+    /// have reached the provider, for whoever approves it. Both refusals, and the
+    /// status, are read inside the transaction, so a caller's stale view cannot turn
+    /// into a duplicate or unapproved submission: a submission in flight (DISPATCHED
+    /// with a live lease) or one whose receipt has landed meanwhile (the job holds a
+    /// token) is left alone.
+    pub fn requeue(
+        &self,
+        job_id: &str,
+        needs_approval: bool,
+        now: DateTime<Utc>,
+    ) -> Result<Requeue> {
         let mut conn = self.connect()?;
         let tx = begin_immediate(&mut conn)?;
         let current = require_job(&tx, job_id)?;
@@ -696,19 +706,30 @@ impl Db {
                 expires_at: current.lease_expires_at.unwrap_or(now),
             });
         }
+        let status = if needs_approval && current.status != JobStatus::Queued {
+            JobStatus::PendingApproval
+        } else {
+            JobStatus::Queued
+        };
+        let last_error = (status == JobStatus::PendingApproval
+            && current.status == JobStatus::Submitted)
+            .then(|| {
+                "awaiting approval to submit again: an earlier submission may already have reached the provider"
+                    .to_string()
+            });
         write_row(
             &tx,
             &current,
             RowWrite {
                 attempt: Some(0),
                 next_poll_at: Some(None),
-                last_error: Some(None),
+                last_error: Some(last_error),
                 submit_stage: Some(None),
-                ..RowWrite::new(JobStatus::Queued, LeaseColumns::Clear)
+                ..RowWrite::new(status, LeaseColumns::Clear)
             },
         )?;
         tx.commit()?;
-        Ok(Requeue::Requeued)
+        Ok(Requeue::Requeued { status })
     }
 
     /// Attach a token obtained outside the worker (email ingestion, `import-token`) and

@@ -7,12 +7,12 @@ use reviewloop::{
     application::{
         Approval, CancelRequest, DisableProjectRequest, Eligibility, EnableProjectRequest,
         JobListQuery, JobPhase, JobRef, OpError, Operation, ProjectEnablement, RequestDisposition,
-        RequestOrigin, RetryAction, RetryRequest, ReviewOps, ReviewPart, ReviewQuery,
+        RequestOrigin, RetryAction, RetryOutcome, RetryRequest, ReviewOps, ReviewPart, ReviewQuery,
         ReviewRequest, ReviewRequestOutcome,
     },
     artifact::write_review_artifacts,
     backend::{cspaper, provider_source},
-    config::{CSPAPER_API_KEY_ENV, Config, PaperConfig, Redacted},
+    config::{CSPAPER_API_KEY_ENV, Config, PaperConfig, Redacted, RetentionConfig},
     db::Db,
     model::{EnqueueConflict, ExistingReason, Job, JobPdf, JobStatus, NewJob},
     supervisor::{ProjectState, SupervisorState, WorkerAvailability},
@@ -1204,13 +1204,9 @@ fn get_review_returns_requested_parts_without_the_token() -> Result<()> {
             .as_deref()
             .is_some_and(|p| p.ends_with("review.md"))
     );
-    assert!(
-        artifacts
-            .review_json
-            .as_deref()
-            .is_some_and(|p| p.ends_with("review.json"))
-    );
-    assert!(!serde_json::to_string(&summary)?.contains("meta.json"));
+    // Both may hold the token; `raw` is the redacted review.
+    let listed = serde_json::to_string(&summary)?;
+    assert!(!listed.contains("meta.json") && !listed.contains("review.json"));
 
     let markdown = fx.ops().get_review(&query(ReviewPart::Markdown))?;
     let text = markdown.markdown.as_deref().expect("markdown");
@@ -1257,6 +1253,7 @@ fn retry_requeues_a_tokenless_job_for_submission() -> Result<()> {
         force: false,
         include_failed: false,
         caller_executes: false,
+        approval: Approval::Granted,
     })?;
     assert_eq!(outcome.action, RetryAction::SubmissionQueued);
     assert_eq!(outcome.previous_status, JobStatus::Failed);
@@ -1279,6 +1276,7 @@ fn retry_reschedules_a_token_backed_job_for_polling() -> Result<()> {
         force: false,
         include_failed: false,
         caller_executes: false,
+        approval: Approval::Granted,
     })?;
     assert_eq!(outcome.action, RetryAction::PollScheduled);
     assert_eq!(outcome.job.status, JobStatus::Processing);
@@ -1297,6 +1295,7 @@ fn forced_retry_makes_the_job_due_now() -> Result<()> {
         force: true,
         include_failed: false,
         caller_executes: false,
+        approval: Approval::Granted,
     })?;
     assert_eq!(submit.action, RetryAction::SubmitNow);
     assert_eq!(submit.job.status, JobStatus::Queued);
@@ -1307,6 +1306,7 @@ fn forced_retry_makes_the_job_due_now() -> Result<()> {
         force: true,
         include_failed: false,
         caller_executes: false,
+        approval: Approval::Granted,
     })?;
     assert_eq!(poll.action, RetryAction::PollNow);
     assert!(poll.job.next_poll_at.is_some_and(|at| at <= Utc::now()));
@@ -1331,6 +1331,7 @@ fn forced_retry_rejects_statuses_it_cannot_act_on() -> Result<()> {
             force: true,
             include_failed: false,
             caller_executes: false,
+            approval: Approval::Granted,
         })
         .unwrap_err();
     assert_eq!(err.code(), "invalid_state");
@@ -1357,6 +1358,7 @@ fn retry_never_bypasses_approval() -> Result<()> {
                 force,
                 include_failed: false,
                 caller_executes: false,
+                approval: Approval::Granted,
             })
             .unwrap_err();
         assert_eq!(err.code(), "invalid_state");
@@ -1380,6 +1382,124 @@ fn retry_never_bypasses_approval() -> Result<()> {
     Ok(())
 }
 
+fn retry(fx: &Fixture, job: &Job, force: bool, approval: Approval) -> Result<JobStatus, OpError> {
+    fx.ops()
+        .retry_job(&RetryRequest {
+            job: JobRef::Id(job.id.clone()),
+            force,
+            include_failed: false,
+            caller_executes: false,
+            approval,
+        })
+        .map(|outcome| outcome.job.status)
+}
+
+fn cancel(fx: &Fixture, job: &Job) -> Result<()> {
+    fx.ops().cancel_job(&CancelRequest {
+        job: JobRef::Id(job.id.clone()),
+        reason: None,
+    })?;
+    Ok(())
+}
+
+/// With approval required, a retry that would send the manuscript again
+/// (no receipt, not QUEUED) returns the job to PENDING_APPROVAL, whatever its
+/// history: nothing about earlier approvals needs to survive.
+#[test]
+fn a_required_retry_that_resends_waits_for_approval() -> Result<()> {
+    let fx = Fixture::new()?;
+    // Cancelled before anyone approved it, even with its events pruned.
+    let pending = fx.job(JobStatus::PendingApproval, "a")?;
+    cancel(&fx, &pending)?;
+    fx.db.prune_retention(
+        &RetentionConfig::default(),
+        Utc::now() + Duration::days(365),
+    )?;
+    // Approved, then failed; or completed by hand without a receipt.
+    let failed = fx.job(JobStatus::Failed, "b")?;
+    let completed = fx.job(JobStatus::Completed, "c")?;
+    for (job, force) in [(&pending, false), (&failed, true), (&completed, false)] {
+        let outcome = retry_outcome(&fx, job, force)?;
+        assert_eq!(outcome.action, RetryAction::AwaitingApproval);
+        assert_eq!(outcome.job.status, JobStatus::PendingApproval);
+        assert_eq!(outcome.job.phase, JobPhase::AwaitingApproval);
+        assert_eq!(outcome.job.last_error, None);
+        // Only approve_job sends it.
+        let approved = fx.ops().approve_job(&JobRef::Id(job.id.clone()))?;
+        assert_eq!(approved.job.status, JobStatus::Queued);
+    }
+    let parked = |status: &str| {
+        json!({
+            "awaiting_approval": true,
+            "previous_status": status,
+            "previous_submit_stage": null,
+        })
+    };
+    assert_eq!(
+        fx.events("retried")?,
+        vec![parked("FAILED"), parked("FAILED"), parked("COMPLETED")]
+    );
+
+    // A submission whose outcome is unknown keeps that warning for whoever
+    // approves sending it again.
+    let uncertain = fx.job(JobStatus::Submitted, "d")?;
+    let outcome = retry_outcome(&fx, &uncertain, true)?;
+    assert_eq!(outcome.action, RetryAction::AwaitingApproval);
+    assert!(
+        outcome
+            .job
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("may already have reached the provider")),
+        "{:?}",
+        outcome.job.last_error
+    );
+    Ok(())
+}
+
+fn retry_outcome(fx: &Fixture, job: &Job, force: bool) -> Result<RetryOutcome, OpError> {
+    fx.ops().retry_job(&RetryRequest {
+        job: JobRef::Id(job.id.clone()),
+        force,
+        include_failed: false,
+        caller_executes: false,
+        approval: Approval::Required,
+    })
+}
+
+#[test]
+fn a_required_retry_that_sends_nothing_new_is_unchanged() -> Result<()> {
+    let fx = Fixture::new()?;
+    // A receipt: the retry polls.
+    let processing = fx.submitted_job("a")?;
+    assert_eq!(
+        retry(&fx, &processing, false, Approval::Required)?,
+        JobStatus::Processing
+    );
+    assert_eq!(
+        retry(&fx, &processing, true, Approval::Required)?,
+        JobStatus::Processing
+    );
+    // QUEUED: approved and not sent yet; the retry only resets its cooldown.
+    let queued = fx.job(JobStatus::Queued, "b")?;
+    assert_eq!(
+        retry(&fx, &queued, false, Approval::Required)?,
+        JobStatus::Queued
+    );
+    assert_eq!(
+        retry(&fx, &queued, true, Approval::Required)?,
+        JobStatus::Queued
+    );
+    // The CLI's retry is the user's own decision: it sends the job.
+    let pending = fx.job(JobStatus::PendingApproval, "c")?;
+    cancel(&fx, &pending)?;
+    assert_eq!(
+        retry(&fx, &pending, false, Approval::Granted)?,
+        JobStatus::Queued
+    );
+    Ok(())
+}
+
 #[test]
 fn forced_retry_executed_by_the_caller_keeps_the_poll_schedule() -> Result<()> {
     let fx = Fixture::new()?;
@@ -1389,6 +1509,7 @@ fn forced_retry_executed_by_the_caller_keeps_the_poll_schedule() -> Result<()> {
         force: true,
         include_failed: false,
         caller_executes: true,
+        approval: Approval::Granted,
     })?;
     assert_eq!(outcome.action, RetryAction::PollNow);
     let after = fx.db.get_job(&job.id)?.expect("job");
@@ -1409,6 +1530,7 @@ fn retry_refuses_a_job_from_another_projects_config() -> Result<()> {
             force: false,
             include_failed: false,
             caller_executes: false,
+            approval: Approval::Granted,
         })
         .unwrap_err();
     assert_eq!(err.code(), "project_mismatch");

@@ -38,7 +38,9 @@ regex = "1.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 reqwest-middleware = { version = "0.4", features = ["json", "multipart"] }
 http = "1"
+rmcp = { version = "3.5", default-features = false, features = ["server", "transport-io"] }
 rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
+schemars = { version = "1", features = ["chrono04"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
@@ -64,6 +66,9 @@ rfd = { version = "0.17", optional = true }
 
 [dev-dependencies]
 axum = "0.8"
+jsonschema = { version = "0.58", default-features = false }
+# An independent MCP client for the stdio server tests.
+rmcp = { version = "3.5", default-features = false, features = ["client", "transport-child-process"] }
 tempfile = "3.14"
 # Paused clock for timeout tests (`#[tokio::test(start_paused = true)]`).
 tokio = { version = "1.46", features = ["test-util"] }

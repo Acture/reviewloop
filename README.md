@@ -270,6 +270,7 @@ reviewloop cspaper usage [--json]
 reviewloop email switch --account <account-id-or-email>
 reviewloop email logout [--account <account-id-or-email>]
 reviewloop self-update [--method auto|brew|cargo] [--yes] [--dry-run]
+reviewloop mcp [--approval required|granted]
 ```
 
 `paper add --agent-id <agent-id>` is an alias of `--venue`: for a `cspaper`
@@ -291,6 +292,45 @@ new key for each new review round.
 - global config (`~/.config/reviewloop/config.toml`)
 - global data directory (database, artifacts, logs)
 - project-local configs
+
+## Agent Integration (MCP)
+
+`reviewloop mcp` is a standard stdio [Model Context Protocol](https://modelcontextprotocol.io)
+server, so an AI agent (Claude Code, Claude Desktop, VS Code, GitHub Copilot, …)
+can list papers, request reviews, follow jobs and read reviews as structured
+results:
+
+```bash
+claude mcp add reviewloop -- reviewloop mcp
+```
+
+Clients configured with an `mcpServers` map (Claude Desktop, Cursor, GitHub
+Copilot CLI):
+
+```json
+{ "mcpServers": { "reviewloop": { "command": "reviewloop", "args": ["mcp"] } } }
+```
+
+VS Code (`.vscode/mcp.json`):
+
+```json
+{ "servers": { "reviewloop": { "type": "stdio", "command": "reviewloop", "args": ["mcp"] } } }
+```
+
+- Calls act on the project of the server's working directory (or
+  `reviewloop --config <path> mcp`); every tool except `list_projects` also
+  takes a `project_id` from `list_projects`.
+- Agent requests wait in `PENDING_APPROVAL` until `approve_job`, so sending a
+  manuscript to the provider is a separate, visible step; a retry that would
+  send it again waits for `approve_job` too. Start the server with
+  `--approval granted` to queue them at once.
+- Tools only read and change local state; the supervisor (`reviewloop project
+  enable`, `reviewloop daemon install`) submits and polls. Failures come back
+  as tool errors with a stable `code` and a `recovery` hint. Tokens are never
+  returned.
+
+The tools, their schemas and errors are specified in
+[docs/review-operations.md](docs/review-operations.md#mcp-server).
 
 ## Exit Codes
 
@@ -882,7 +922,7 @@ Please keep it that way:
   (10 MiB, first 15 pages reviewed) and token handling are in
   [docs/providers/stanford.md](docs/providers/stanford.md)
 - Database: SQLite (global state path by default, supports `:memory:`)
-- Interface: CLI + daemon
+- Interface: CLI + daemon + stdio MCP server (`reviewloop mcp`)
 
 ## macOS Widget (preview)
 

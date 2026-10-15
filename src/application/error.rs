@@ -395,3 +395,9 @@ pub struct ErrorView {
     /// The variant's fields; `{}` when it has none.
     pub details: Value,
 }
+
+impl From<OpError> for ErrorView {
+    fn from(err: OpError) -> Self {
+        err.view()
+    }
+}

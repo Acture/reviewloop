@@ -164,6 +164,11 @@ pub struct RetryRequest {
     /// (`reviewloop retry --force`). A forced poll then leaves `next_poll_at`
     /// alone so a worker does not poll the same job concurrently.
     pub caller_executes: bool,
+    /// Whether a retry that sends the manuscript again (a tokenless job that
+    /// is not QUEUED) may queue it. `Granted` (the CLI): the retry is the
+    /// approval. `Required` (an agent whose sends need approval): the job
+    /// goes back to PENDING_APPROVAL for `approve_job`.
+    pub approval: Approval,
 }
 
 /// Cancel a non-terminal job locally. The provider is not contacted.

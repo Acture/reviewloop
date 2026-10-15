@@ -553,7 +553,7 @@ impl VersionSource {
 /// CSPaper's desk-rejection screening. Keys are the provider's option names.
 /// Empty for providers without such settings, which keeps their identity and
 /// stored rows unchanged.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct ReviewOptions(BTreeMap<String, String>);
 
@@ -709,7 +709,7 @@ pub struct EnqueueRequest {
     pub source: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExistingReason {
     /// The request key was already bound to this job.
