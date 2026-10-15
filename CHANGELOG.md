@@ -190,6 +190,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Paper watching matches project watching (CLI)** — `reviewloop paper
+  watch --paper-id <id>` turns a paper's PDF-change watching on and
+  `reviewloop paper unwatch --paper-id <id>` turns it off; `paper watch
+  --enabled` is removed (a set-true flag: `--enabled false` did not parse, and
+  turning watching off meant omitting it). `paper add --no-watch` and
+  `run --no-watch` register a paper unwatched; the `--watch` flag they replace
+  defaulted to true and could never be set to false. Papers stay watched by
+  default, stored as before in `paper_watch`. Both commands say what changed
+  or that nothing did, rewrite `reviewloop.toml` only on a change, and `paper
+  watch` notes when watching has no effect: the project's PDF trigger is off
+  (`trigger.pdf.enabled = false`), or nothing runs the project's triggers (the
+  `worker:` line `submit` prints).
 - `Db::requeue` takes `approval_required` and a `QueuePlace` and returns the
   status it wrote (`Requeue::Requeued { status }`): the retry's approval
   decision is made inside its transaction from the job's row.

@@ -1,9 +1,11 @@
 //! OSS-338 through the real CLI, in an isolated home, config dir and state
-//! dir: `project watch / unwatch / list`, the duplicate-clone conflict,
-//! `daemon status` and `daemon pause / resume` without a running supervisor,
-//! and the refusal of a machine-wide setting in a project file.
+//! dir: `project watch / unwatch / list`, `paper watch / unwatch` and
+//! `paper add --no-watch`, the duplicate-clone conflict, `daemon status` and
+//! `daemon pause / resume` without a running supervisor, and the refusal of a
+//! machine-wide setting in a project file.
 
 use anyhow::Result;
+use reviewloop::config::ProjectConfigFile;
 use serde_json::Value;
 use std::{
     fs,
@@ -62,6 +64,14 @@ impl Machine {
     }
 }
 
+/// The `paper_watch` entry of `paper` in the project file at `config`.
+fn paper_watch(config: &Path, paper: &str) -> Result<Option<bool>> {
+    Ok(ProjectConfigFile::load(config)?
+        .paper_watch
+        .get(paper)
+        .copied())
+}
+
 fn project<'a>(list: &'a Value, id: &str) -> &'a Value {
     list["projects"]
         .as_array()
@@ -114,6 +124,155 @@ fn watch_unwatch_and_list_through_the_cli() -> Result<()> {
     )?;
     assert_eq!(unknown.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("not registered"));
+    Ok(())
+}
+
+/// `paper watch` / `paper unwatch` flip the paper's `paper_watch` entry, say
+/// when nothing changed, and note when watching has no effect.
+#[test]
+fn paper_watch_and_unwatch_through_the_cli() -> Result<()> {
+    let machine = Machine::new()?;
+    let repo = machine.repo("thesis", "thesis")?;
+    let config = repo.join("reviewloop.toml");
+    machine.ok(
+        &repo,
+        &[
+            "paper",
+            "add",
+            "--paper-id",
+            "main",
+            "--pdf-path",
+            "paper/main.pdf",
+            "--no-submit-prompt",
+        ],
+    )?;
+    assert_eq!(paper_watch(&config, "main")?, Some(true));
+
+    let same = machine.ok(&repo, &["paper", "watch", "--paper-id", "main"])?;
+    assert!(same.contains("Paper main is already watched."), "{same}");
+    // Registered by that command, but the supervisor runs no trigger of it.
+    assert!(same.contains("project thesis is not watched"), "{same}");
+    assert!(!same.contains("PDF trigger of project"), "{same}");
+
+    let unwatched = machine.ok(&repo, &["paper", "unwatch", "--paper-id", "main"])?;
+    assert!(
+        unwatched.contains(
+            "No longer watching paper main: the PDF trigger no longer requests reviews of paper/main.pdf. Git tags and explicit commands still do."
+        ),
+        "{unwatched}"
+    );
+    assert!(!unwatched.contains("worker:"), "{unwatched}");
+    assert_eq!(paper_watch(&config, "main")?, Some(false));
+    let same = machine.ok(&repo, &["paper", "unwatch", "--paper-id", "main"])?;
+    assert!(same.contains("Paper main was not watched."), "{same}");
+    assert_eq!(paper_watch(&config, "main")?, Some(false));
+
+    machine.ok(&repo, &["project", "watch"])?;
+    let watched = machine.ok(&repo, &["paper", "watch", "--paper-id", "main"])?;
+    // The trigger compares the PDF with the paper's latest request, so an
+    // unchanged file of a paper without one is requested too
+    // (trigger::tests::pdf_trigger_enqueues_unchanged_pdf_once).
+    assert!(
+        watched.contains(
+            "Watching paper main: the PDF trigger requests a review whenever paper/main.pdf differs from the PDF of the paper's latest review request, or the paper has none; the current file may be requested on its next pass."
+        ),
+        "{watched}"
+    );
+    assert!(watched.contains("no supervisor is running"), "{watched}");
+    assert_eq!(paper_watch(&config, "main")?, Some(true));
+
+    // With the project's PDF trigger off, watching has no effect.
+    let mut file = ProjectConfigFile::load(&config)?;
+    file.trigger.pdf.enabled = false;
+    file.save(&config)?;
+    let off = machine.ok(&repo, &["paper", "watch", "--paper-id", "main"])?;
+    assert!(off.contains("Paper main is already watched."), "{off}");
+    assert!(
+        off.contains("the PDF trigger of project thesis is off (trigger.pdf.enabled = false)"),
+        "{off}"
+    );
+    let unwatched = machine.ok(&repo, &["paper", "unwatch", "--paper-id", "main"])?;
+    assert!(!unwatched.contains("PDF trigger of project"), "{unwatched}");
+
+    let unknown = machine.run(&repo, &["paper", "watch", "--paper-id", "nope"])?;
+    assert_eq!(unknown.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(stderr.contains("paper_id not found: nope"), "{stderr}");
+    Ok(())
+}
+
+/// `paper watch --enabled` is gone, not aliased: clap refuses it and the file
+/// keeps its setting.
+#[test]
+fn paper_watch_refuses_enabled() -> Result<()> {
+    let machine = Machine::new()?;
+    let repo = machine.repo("thesis", "thesis")?;
+    let config = repo.join("reviewloop.toml");
+    machine.ok(
+        &repo,
+        &[
+            "paper",
+            "add",
+            "--paper-id",
+            "main",
+            "--pdf-path",
+            "paper/main.pdf",
+            "--no-submit-prompt",
+        ],
+    )?;
+    for args in [
+        &["paper", "watch", "--paper-id", "main", "--enabled"][..],
+        &["paper", "watch", "--paper-id", "main", "--enabled", "false"][..],
+    ] {
+        let output = machine.run(&repo, args)?;
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unexpected argument '--enabled'"),
+            "{stderr}"
+        );
+    }
+    assert_eq!(paper_watch(&config, "main")?, Some(true));
+    Ok(())
+}
+
+/// `paper add --no-watch` registers the paper unwatched; without it the paper
+/// is watched.
+#[test]
+fn paper_add_no_watch_registers_the_paper_unwatched() -> Result<()> {
+    let machine = Machine::new()?;
+    let repo = machine.repo("thesis", "thesis")?;
+    let config = repo.join("reviewloop.toml");
+    let added = machine.ok(
+        &repo,
+        &[
+            "paper",
+            "add",
+            "--paper-id",
+            "draft",
+            "--pdf-path",
+            "paper/draft.pdf",
+            "--no-watch",
+            "--no-submit-prompt",
+        ],
+    )?;
+    assert!(added.contains("- PDF-change watching: off"), "{added}");
+    assert_eq!(paper_watch(&config, "draft")?, Some(false));
+
+    let added = machine.ok(
+        &repo,
+        &[
+            "paper",
+            "add",
+            "--paper-id",
+            "main",
+            "--pdf-path",
+            "paper/main.pdf",
+            "--no-submit-prompt",
+        ],
+    )?;
+    assert!(added.contains("- PDF-change watching: on"), "{added}");
+    assert_eq!(paper_watch(&config, "main")?, Some(true));
     Ok(())
 }
 

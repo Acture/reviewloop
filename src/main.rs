@@ -54,7 +54,7 @@ enum Command {
         command: ConfigCommand,
     },
     /// Manage papers tracked in the project config. Subcommands: add, watch,
-    /// remove.
+    /// unwatch, remove.
     Paper {
         #[command(subcommand)]
         command: PaperCommand,
@@ -376,8 +376,10 @@ enum PaperCommand {
         pdf_path: String,
         #[arg(long)]
         backend: Option<String>,
-        #[arg(long, default_value_t = true)]
-        watch: bool,
+        /// Register the paper without PDF-change watching; `paper watch`
+        /// turns it on later.
+        #[arg(long, default_value_t = false)]
+        no_watch: bool,
         #[arg(long)]
         tag_trigger: Option<String>,
         #[arg(long, default_value_t = false)]
@@ -390,12 +392,20 @@ enum PaperCommand {
         #[arg(long, visible_alias = "agent-id")]
         venue: Option<String>,
     },
-    /// Enable or disable PDF-change watching for an already-registered paper.
+    /// Watch a registered paper's PDF: while the supervisor runs the project
+    /// and its PDF trigger is on (`trigger.pdf.enabled`), each pass requests a
+    /// review when the PDF differs from the PDF of the paper's latest review
+    /// request, or the paper has none, so the current file may be requested
+    /// on the next pass. Papers are watched when registered.
     Watch {
         #[arg(long)]
         paper_id: String,
+    },
+    /// Stop watching a registered paper's PDF: the PDF trigger no longer
+    /// requests reviews of it. Git tags and explicit commands still do.
+    Unwatch {
         #[arg(long)]
-        enabled: bool,
+        paper_id: String,
     },
     /// Remove a paper from the project config. Use --purge-history to also
     /// delete all associated jobs and events from the DB.
@@ -501,9 +511,10 @@ struct RunArgs {
     /// Backend (defaults to project.default_backend, then "stanford").
     #[arg(long)]
     backend: Option<String>,
-    /// Enable PDF watching for the registered paper (default: true).
-    #[arg(long, default_value_t = true)]
-    watch: bool,
+    /// Register the paper without PDF-change watching. Applies only when
+    /// `run` registers the paper; `paper unwatch` changes a registered one.
+    #[arg(long, default_value_t = false)]
+    no_watch: bool,
     /// Tag trigger pattern for the paper.
     #[arg(long)]
     tag_trigger: Option<String>,
@@ -562,7 +573,7 @@ async fn run() -> Result<()> {
                     project_id,
                     pdf_path,
                     backend,
-                    watch,
+                    no_watch,
                     tag_trigger,
                     submit_now,
                     no_submit_prompt,
@@ -574,7 +585,7 @@ async fn run() -> Result<()> {
                         project_id: project_id.as_deref(),
                         pdf_path: &pdf_path,
                         backend: backend.as_deref(),
-                        watch,
+                        watched: !no_watch,
                         tag_trigger: tag_trigger.as_deref(),
                         submit_now,
                         no_submit_prompt,
@@ -586,8 +597,9 @@ async fn run() -> Result<()> {
                     }
                     Ok(())
                 }
-                PaperCommand::Watch { paper_id, enabled } => {
-                    cmd_paper_watch(&write_path, &paper_id, enabled)
+                PaperCommand::Watch { paper_id } => cmd_paper_watch(&write_path, &paper_id, true),
+                PaperCommand::Unwatch { paper_id } => {
+                    cmd_paper_watch(&write_path, &paper_id, false)
                 }
                 PaperCommand::Remove {
                     paper_id,
@@ -902,7 +914,8 @@ struct PaperAddOptions<'a> {
     /// User-provided backend on the CLI. When `None`, falls back to the
     /// project's `default_backend`, then to `Config::DEFAULT_BACKEND`.
     backend: Option<&'a str>,
-    watch: bool,
+    /// PDF-change watching for the new paper.
+    watched: bool,
     tag_trigger: Option<&'a str>,
     submit_now: bool,
     no_submit_prompt: bool,
@@ -960,7 +973,7 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
     });
     config
         .paper_watch
-        .insert(options.paper_id.to_string(), options.watch);
+        .insert(options.paper_id.to_string(), options.watched);
     match options
         .tag_trigger
         .map(str::trim)
@@ -984,7 +997,7 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
         .map(|cfg| cfg.state_dir().join("artifacts"))
         .unwrap_or_else(|_| std::path::PathBuf::from("~/.review_loop/artifacts"));
 
-    let watch_text = if options.watch { "enabled" } else { "disabled" };
+    let watch_text = if options.watched { "on" } else { "off" };
     let venue_text = options
         .venue
         .map(str::trim)
@@ -993,7 +1006,7 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
         .unwrap_or_else(|| "project default".to_string());
     if let Some(trigger) = options.tag_trigger {
         println!(
-            "Added paper {paper_id}.\n- backend: {backend}\n- venue: {venue_text}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- tag trigger: {trigger}\n- config: {}\n  artifacts will appear in: {}/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
+            "Added paper {paper_id}.\n- backend: {backend}\n- venue: {venue_text}\n- pdf path: {pdf_path}\n- PDF-change watching: {watch_text}\n- tag trigger: {trigger}\n- config: {}\n  artifacts will appear in: {}/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
             options.config_path.display(),
             artifacts_root.display(),
             paper_id = options.paper_id,
@@ -1002,7 +1015,7 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
         );
     } else {
         println!(
-            "Added paper {paper_id}.\n- backend: {backend}\n- venue: {venue_text}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- config: {}\n  artifacts will appear in: {}/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
+            "Added paper {paper_id}.\n- backend: {backend}\n- venue: {venue_text}\n- pdf path: {pdf_path}\n- PDF-change watching: {watch_text}\n- config: {}\n  artifacts will appear in: {}/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
             options.config_path.display(),
             artifacts_root.display(),
             paper_id = options.paper_id,
@@ -1026,18 +1039,50 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
     Ok(false)
 }
 
-fn cmd_paper_watch(config_path: &Path, paper_id: &str, enabled: bool) -> Result<()> {
+/// Turn PDF-change watching of a registered paper on (`watched`) or off. The
+/// file is rewritten only when that changes it.
+fn cmd_paper_watch(config_path: &Path, paper_id: &str, watched: bool) -> Result<()> {
     let mut config = load_existing_project_config(config_path)?;
-    if !config.papers.iter().any(|paper| paper.id == paper_id) {
-        anyhow::bail!("paper_id not found: {paper_id}");
+    let pdf_path = config
+        .papers
+        .iter()
+        .find(|paper| paper.id == paper_id)
+        .map(|paper| paper.pdf_path.clone())
+        .ok_or_else(|| anyhow!("paper_id not found: {paper_id}"))?;
+    let changed = config.is_paper_watched(paper_id) != watched;
+    if changed {
+        config.paper_watch.insert(paper_id.to_string(), watched);
+        config.save(config_path)?;
     }
-    config.paper_watch.insert(paper_id.to_string(), enabled);
-    config.save(config_path)?;
-    println!(
-        "Updated watch setting for paper {paper_id}: {}\n- config: {}",
-        if enabled { "enabled" } else { "disabled" },
-        config_path.display()
-    );
+    match (watched, changed) {
+        (true, true) => println!(
+            "Watching paper {paper_id}: the PDF trigger requests a review whenever {pdf_path} differs from the PDF of the paper's latest review request, or the paper has none; the current file may be requested on its next pass."
+        ),
+        (true, false) => println!("Paper {paper_id} is already watched."),
+        (false, true) => println!(
+            "No longer watching paper {paper_id}: the PDF trigger no longer requests reviews of {pdf_path}. Git tags and explicit commands still do."
+        ),
+        (false, false) => println!("Paper {paper_id} was not watched."),
+    }
+    println!("- config: {}", config_path.display());
+    if !watched {
+        return Ok(());
+    }
+    if !config.trigger.pdf.enabled {
+        println!(
+            "note: the PDF trigger of project {} is off (trigger.pdf.enabled = false), so watching requests no review until it is turned on",
+            config.project_id
+        );
+    }
+    // Whether the supervisor runs the project, and so its triggers. The file
+    // is already saved: failing to tell only costs the line.
+    match load_runtime(Some(config_path), false, true) {
+        Ok((runtime, db)) => print_project_worker(&runtime, &db),
+        Err(err) => eprintln!(
+            "warning: cannot tell whether the supervisor runs project {}: {err:#}",
+            config.project_id
+        ),
+    }
     Ok(())
 }
 
@@ -2741,7 +2786,7 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
                 project_id: None,
                 pdf_path: pdf_path_str,
                 backend: args.backend.as_deref(),
-                watch: args.watch,
+                watched: !args.no_watch,
                 tag_trigger: args.tag_trigger.as_deref(),
                 submit_now: false,
                 no_submit_prompt: true,
@@ -4869,6 +4914,95 @@ mod tests {
                     clap::error::ErrorKind::UnknownArgument,
                     "{flag}: {err}"
                 );
+            }
+        }
+    }
+
+    mod paper_watch_flags {
+        use crate::{Cli, Command, PaperCommand};
+        use clap::Parser;
+
+        fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+            Cli::try_parse_from(std::iter::once("reviewloop").chain(args.iter().copied()))
+        }
+
+        /// `paper watch` and `paper unwatch` take the paper id alone.
+        #[test]
+        fn paper_watch_and_unwatch_parse() {
+            let watch = parse(&["paper", "watch", "--paper-id", "main"]).expect("watch parses");
+            assert!(matches!(
+                watch.command,
+                Command::Paper {
+                    command: PaperCommand::Watch { paper_id }
+                } if paper_id == "main"
+            ));
+            let unwatch =
+                parse(&["paper", "unwatch", "--paper-id", "main"]).expect("unwatch parses");
+            assert!(matches!(
+                unwatch.command,
+                Command::Paper {
+                    command: PaperCommand::Unwatch { paper_id }
+                } if paper_id == "main"
+            ));
+        }
+
+        /// The old switches are gone, not aliased: `paper watch --enabled`
+        /// and `--watch` on `paper add` and `run`.
+        #[test]
+        fn old_watch_switches_are_rejected() {
+            for args in [
+                &["paper", "watch", "--paper-id", "main", "--enabled"][..],
+                &["paper", "watch", "--paper-id", "main", "--enabled", "false"][..],
+                &[
+                    "paper",
+                    "add",
+                    "--paper-id",
+                    "main",
+                    "--pdf-path",
+                    "main.pdf",
+                    "--watch",
+                ][..],
+                &["run", "main.pdf", "--watch"][..],
+            ] {
+                let err = match parse(args) {
+                    Ok(_) => panic!("{args:?} must be rejected"),
+                    Err(err) => err,
+                };
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::UnknownArgument,
+                    "{args:?}: {err}"
+                );
+            }
+        }
+
+        /// `--no-watch` registers the paper unwatched; without it, watched.
+        #[test]
+        fn no_watch_parses_on_paper_add_and_run() {
+            for (extra, expected) in [(&["--no-watch"][..], true), (&[][..], false)] {
+                let add = [
+                    &[
+                        "paper",
+                        "add",
+                        "--paper-id",
+                        "main",
+                        "--pdf-path",
+                        "main.pdf",
+                    ][..],
+                    extra,
+                ]
+                .concat();
+                match parse(&add).expect("paper add parses").command {
+                    Command::Paper {
+                        command: PaperCommand::Add { no_watch, .. },
+                    } => assert_eq!(no_watch, expected, "{add:?}"),
+                    _ => panic!("expected paper add"),
+                }
+                let run = [&["run", "main.pdf"][..], extra].concat();
+                match parse(&run).expect("run parses").command {
+                    Command::Run(args) => assert_eq!(args.no_watch, expected, "{run:?}"),
+                    _ => panic!("expected run"),
+                }
             }
         }
     }

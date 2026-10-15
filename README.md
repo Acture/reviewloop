@@ -69,7 +69,7 @@ Optional flags:
 reviewloop run paper/main.pdf \
   --paper-id main \        # override the default (filename stem)
   --backend stanford \     # override the default backend (stanford | cspaper)
-  --watch false \          # disable PDF-change watching for this paper
+  --no-watch \             # register the paper without PDF-change watching
   --tag-trigger "review-stanford/main/*" \  # custom tag trigger
   --quiet                  # suppress live status; print only the final line
 ```
@@ -240,9 +240,10 @@ Core commands:
 ```bash
 reviewloop init
 reviewloop init project --project-id <id> [--project-root <path>] [--force]
-reviewloop run <pdf-path> [--paper-id <id>] [--backend <backend>] [--watch true|false] [--tag-trigger "<pattern>"] [--quiet]
-reviewloop paper add --paper-id <id> --path <pdf-or-build-artifact> [--backend <backend>] [--venue <venue>] [--watch true|false] [--tag-trigger "<pattern>"] [--submit-now] [--no-submit-prompt]
-reviewloop paper watch --paper-id <id> --enabled <true|false>
+reviewloop run <pdf-path> [--paper-id <id>] [--backend <backend>] [--no-watch] [--tag-trigger "<pattern>"] [--quiet]
+reviewloop paper add --paper-id <id> --path <pdf-or-build-artifact> [--backend <backend>] [--venue <venue>] [--no-watch] [--tag-trigger "<pattern>"] [--submit-now] [--no-submit-prompt]
+reviewloop paper watch --paper-id <id>
+reviewloop paper unwatch --paper-id <id>
 reviewloop paper remove --paper-id <id> [--purge-history]
 reviewloop project list [--json]
 reviewloop project watch [--project-id <id>] [--replace]
@@ -274,8 +275,17 @@ reviewloop self-update [--method auto|brew|cargo] [--yes] [--dry-run]
 reviewloop mcp [--approval required|granted]
 ```
 
-`paper watch` turns PDF-change watching on or off for one paper; `project watch`
-decides whether the machine supervisor runs the project at all.
+`paper watch` / `paper unwatch` turn PDF-change watching on or off for one
+paper. On each pass the PDF trigger requests a review of a watched paper whose
+PDF differs from the PDF of its latest review request, or that has none
+(awaiting `approve` unless `trigger.pdf.auto_submit_on_change`): watching a
+paper, or watching it again after editing its PDF, can request the current
+file on the next pass. Papers are watched when registered; `--no-watch` on
+`paper add` or `run` registers one unwatched. That takes effect only while the
+project's PDF trigger is on (`trigger.pdf.enabled`, the default) and the
+supervisor runs the project, which `project watch` / `project unwatch` decide;
+`paper watch` says when either is off. Unwatching a paper leaves its git tags
+and explicit commands (`submit`, `run`) working.
 
 `paper add --agent-id <agent-id>` is an alias of `--venue`: for a `cspaper`
 paper the venue is the CSPaper review template (see [CSPaper Backend](#cspaper-backend)).
@@ -624,7 +634,7 @@ Paper registration:
 - add papers through `reviewloop paper add ...`
 - remove papers through `reviewloop paper remove --paper-id ...`
   - add `--purge-history` to also delete DB jobs/events/reviews and local artifacts for that paper
-- control PDF watcher per paper with `reviewloop paper watch ...`
+- turn PDF-change watching per paper on or off with `reviewloop paper watch --paper-id ...` / `reviewloop paper unwatch --paper-id ...` (stored in `paper_watch`)
 
 Safe defaults:
 - `core.max_concurrency = 2` (polls per tick, for the whole machine)

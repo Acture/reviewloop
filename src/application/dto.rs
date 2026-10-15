@@ -319,9 +319,11 @@ pub struct PaperView {
     pub review_options: ReviewOptions,
     pub pdf_path: String,
     pub pdf_present: bool,
-    /// PDF-change watching (`reviewloop paper watch`): with the PDF trigger on
-    /// (`trigger.pdf.enabled`), a change to the PDF queues a review. Not
-    /// whether the supervisor runs the project; that is `ProjectView.watched`.
+    /// PDF-change watching (`reviewloop paper watch` / `paper unwatch`): with
+    /// the PDF trigger on (`trigger.pdf.enabled`), each pass requests a review
+    /// when the PDF differs from the PDF of the paper's latest review request,
+    /// or the paper has none. Not whether the supervisor runs the project;
+    /// that is `ProjectView.watched`.
     pub watched: bool,
     pub tag_trigger: Option<String>,
 }
