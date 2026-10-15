@@ -6,8 +6,8 @@
 //! exit the process and never contact a review provider: submitting to and
 //! polling the provider stay with the caller (the CLI's immediate submit, the daemon's
 //! worker). Results are token-free DTOs that serialize to the JSON documented
-//! in `docs/review-operations.md`; failures are [`OpError`]s with a stable
-//! [`OpError::code`].
+//! in `docs/review-operations.md` (except the CLI-only [`FailedJobsRetry`]);
+//! failures are [`OpError`]s with a stable [`OpError::code`].
 //!
 //! The project a [`ReviewOps`] acts on is the `project_id` of its config. An
 //! empty `project_id` (no `reviewloop.toml`, as for the menu bar) leaves job-id
@@ -25,18 +25,16 @@ mod redact;
 mod request;
 
 pub use dto::{
-    JobCandidate, JobList, JobPhase, JobView, ManuscriptInput, PaperView, ProjectEnablement,
-    ProjectView, ProjectWorkerView, RequestDisposition, RetryAction, RetryOutcome, ReviewArtifacts,
-    ReviewRequestOutcome, ReviewSection, ReviewView, SupervisorView, TransitionOutcome,
-    WorkerStatus,
+    FailedJobsRetry, JobCandidate, JobList, JobPhase, JobView, ManuscriptInput, PaperView,
+    ProjectView, ProjectWatch, ProjectWorkerView, RequestDisposition, RetryAction, RetryOutcome,
+    ReviewArtifacts, ReviewRequestOutcome, ReviewSection, ReviewView, SkipReason, SkippedRetry,
+    SupervisorView, TransitionOutcome, WorkerStatus,
 };
 pub use error::{ErrorView, OpError};
 pub use operation::Operation;
-pub use ops::{
-    CANCELLED_BY_USER, DEFAULT_JOB_LIST_LIMIT, MAX_JOB_LIST_LIMIT, ReviewOps, require_project,
-};
+pub use ops::{DEFAULT_JOB_LIST_LIMIT, MAX_JOB_LIST_LIMIT, ReviewOps, require_project};
 pub use redact::{map_strings, redact_text, redact_value};
 pub use request::{
-    Approval, CancelRequest, DisableProjectRequest, Eligibility, EnableProjectRequest,
-    JobListQuery, JobRef, RequestOrigin, RetryRequest, ReviewPart, ReviewQuery, ReviewRequest,
+    Approval, CancelRequest, Eligibility, JobListQuery, JobRef, RequestOrigin, RetryRequest,
+    ReviewPart, ReviewQuery, ReviewRequest, UnwatchProjectRequest, WatchProjectRequest,
 };

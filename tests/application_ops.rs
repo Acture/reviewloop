@@ -5,14 +5,14 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use reviewloop::{
     application::{
-        Approval, CancelRequest, DisableProjectRequest, Eligibility, EnableProjectRequest,
-        JobListQuery, JobPhase, JobRef, OpError, Operation, ProjectEnablement, RequestDisposition,
-        RequestOrigin, RetryAction, RetryRequest, ReviewOps, ReviewPart, ReviewQuery,
-        ReviewRequest, ReviewRequestOutcome,
+        Approval, CancelRequest, Eligibility, JobCandidate, JobListQuery, JobPhase, JobRef,
+        OpError, Operation, ProjectWatch, RequestDisposition, RequestOrigin, RetryAction,
+        RetryOutcome, RetryRequest, ReviewOps, ReviewPart, ReviewQuery, ReviewRequest,
+        ReviewRequestOutcome, SkipReason, UnwatchProjectRequest, WatchProjectRequest,
     },
     artifact::write_review_artifacts,
     backend::{cspaper, provider_source},
-    config::{CSPAPER_API_KEY_ENV, Config, PaperConfig, Redacted},
+    config::{CSPAPER_API_KEY_ENV, Config, PaperConfig, Redacted, RetentionConfig},
     db::Db,
     model::{EnqueueConflict, ExistingReason, Job, JobPdf, JobStatus, NewJob},
     supervisor::{ProjectState, SupervisorState, WorkerAvailability},
@@ -271,7 +271,7 @@ fn list_projects_reports_registry_and_current_project() -> Result<()> {
     Ok(())
 }
 
-// ---- supervisor enablement (OSS-338) ----
+// ---- watched projects (OSS-338) ----
 
 impl Fixture {
     /// A `reviewloop.toml` in `dir` declaring `project_id`.
@@ -283,8 +283,8 @@ impl Fixture {
         Ok(path)
     }
 
-    fn enable(&self, config_path: &Path, replace: bool) -> Result<ProjectEnablement, OpError> {
-        self.ops().enable_project(&EnableProjectRequest {
+    fn watch(&self, config_path: &Path, replace: bool) -> Result<ProjectWatch, OpError> {
+        self.ops().watch_project(&WatchProjectRequest {
             config_path: config_path.to_path_buf(),
             replace,
         })
@@ -301,37 +301,37 @@ impl Fixture {
 }
 
 #[test]
-fn enable_and_disable_change_only_what_the_supervisor_runs() -> Result<()> {
+fn watch_and_unwatch_change_only_what_the_supervisor_runs() -> Result<()> {
     let fx = Fixture::new()?;
     let path = fx.project_file("repo", "project-ops")?;
     let job = fx.request(false, Approval::Granted)?.job;
 
-    let enabled = fx.enable(&path, false)?;
-    assert!(enabled.changed);
-    assert!(enabled.project.enabled);
-    assert_eq!(enabled.project.state, ProjectState::Pending);
+    let watched = fx.watch(&path, false)?;
+    assert!(watched.changed);
+    assert!(watched.project.watched);
+    assert_eq!(watched.project.state, ProjectState::Pending);
     assert_eq!(
-        enabled.project.config_path,
+        watched.project.config_path,
         fs::canonicalize(&path)?.display().to_string()
     );
     assert_eq!(
-        enabled.worker.project.expect("project").availability,
+        watched.worker.project.expect("project").availability,
         WorkerAvailability::SupervisorStopped
     );
     assert!(
-        !fx.enable(&path, false)?.changed,
-        "enabling twice changes nothing"
+        !fx.watch(&path, false)?.changed,
+        "watching twice changes nothing"
     );
 
-    let disabled = fx
+    let unwatched = fx
         .ops()
-        .disable_project(&DisableProjectRequest { project_id: None })?;
-    assert!(disabled.changed);
-    assert!(!disabled.project.enabled);
-    assert_eq!(fx.availability()?, WorkerAvailability::ProjectDisabled);
+        .unwatch_project(&UnwatchProjectRequest { project_id: None })?;
+    assert!(unwatched.changed);
+    assert!(!unwatched.project.watched);
+    assert_eq!(fx.availability()?, WorkerAvailability::ProjectUnwatched);
     assert!(
         !fx.ops()
-            .disable_project(&DisableProjectRequest { project_id: None })?
+            .unwatch_project(&UnwatchProjectRequest { project_id: None })?
             .changed
     );
     // Jobs are not touched.
@@ -340,13 +340,13 @@ fn enable_and_disable_change_only_what_the_supervisor_runs() -> Result<()> {
 }
 
 #[test]
-fn enable_never_takes_a_live_registration_without_replace() -> Result<()> {
+fn watch_never_takes_a_live_registration_without_replace() -> Result<()> {
     let fx = Fixture::new()?;
     let first = fx.project_file("first", "project-ops")?;
     let second = fx.project_file("second", "project-ops")?;
-    fx.enable(&first, false)?;
+    fx.watch(&first, false)?;
 
-    let err = fx.enable(&second, false).unwrap_err();
+    let err = fx.watch(&second, false).unwrap_err();
     assert_eq!(err.code(), "project_conflict", "{err}");
     let details = err.view().details;
     assert_eq!(
@@ -358,7 +358,7 @@ fn enable_never_takes_a_live_registration_without_replace() -> Result<()> {
         fs::canonicalize(&first)?.display().to_string()
     );
 
-    let moved = fx.enable(&second, true)?;
+    let moved = fx.watch(&second, true)?;
     assert_eq!(
         moved.moved_from,
         Some(fs::canonicalize(&first)?.display().to_string())
@@ -371,22 +371,22 @@ fn enable_never_takes_a_live_registration_without_replace() -> Result<()> {
 }
 
 #[test]
-fn enable_requires_the_config_to_declare_the_project() -> Result<()> {
+fn watch_requires_the_config_to_declare_the_project() -> Result<()> {
     let fx = Fixture::new()?;
     let other = fx.project_file("other", "someone-else")?;
-    let err = fx.enable(&other, false).unwrap_err();
+    let err = fx.watch(&other, false).unwrap_err();
     assert_eq!(err.code(), "invalid_request", "{err}");
-    let missing = fx.enable(&fx.tmp.path().join("missing/reviewloop.toml"), false);
+    let missing = fx.watch(&fx.tmp.path().join("missing/reviewloop.toml"), false);
     assert_eq!(missing.unwrap_err().code(), "invalid_request");
     Ok(())
 }
 
 #[test]
-fn disabling_an_unknown_project_is_reported() -> Result<()> {
+fn unwatching_an_unknown_project_is_reported() -> Result<()> {
     let fx = Fixture::new()?;
     let err = fx
         .ops()
-        .disable_project(&DisableProjectRequest {
+        .unwatch_project(&UnwatchProjectRequest {
             project_id: Some("nobody".into()),
         })
         .unwrap_err();
@@ -405,7 +405,7 @@ fn worker_status_follows_the_supervisor_and_the_project() -> Result<()> {
     assert_eq!(status.supervisor.state, SupervisorState::Stopped);
 
     let path = fx.project_file("repo", "project-ops")?;
-    fx.enable(&path, false)?;
+    fx.watch(&path, false)?;
     assert_eq!(fx.availability()?, WorkerAvailability::SupervisorStopped);
 
     let now = Utc::now();
@@ -599,6 +599,10 @@ fn forced_request_creates_a_job_and_clears_sibling_cooldowns() -> Result<()> {
         None,
     )?;
     let done = fx.job(JobStatus::Completed, "done-hash")?;
+    // A retried job: its due next_poll_at is its place in the queue.
+    let placed = fx.job(JobStatus::Queued, "placed-hash")?;
+    let place = Utc::now() - Duration::minutes(1);
+    fx.db.reschedule(&placed.id, Some(2), Some(Some(place)))?;
     let first = fx.request(false, Approval::Granted)?;
 
     let forced = fx.request(true, Approval::Granted)?;
@@ -609,6 +613,9 @@ fn forced_request_creates_a_job_and_clears_sibling_cooldowns() -> Result<()> {
     assert_eq!(stuck.status, JobStatus::Processing);
     assert_eq!(stuck.attempt, 0);
     assert_eq!(stuck.next_poll_at, None);
+    let placed = fx.db.get_job(&placed.id)?.expect("job");
+    assert_eq!(placed.attempt, 0);
+    assert_eq!(placed.next_poll_at, Some(place), "a place is no cooldown");
     let done_after = fx.db.get_job(&done.id)?.expect("job");
     assert_eq!(
         done_after.updated_at, done.updated_at,
@@ -616,7 +623,11 @@ fn forced_request_creates_a_job_and_clears_sibling_cooldowns() -> Result<()> {
     );
 
     let cleared = fx.events("force_clear_cooldown")?;
-    assert_eq!(cleared.len(), 2, "the stuck job and the first request");
+    assert_eq!(
+        cleared.len(),
+        3,
+        "the stuck job, the retried one and the first request"
+    );
     assert!(
         cleared
             .iter()
@@ -1204,13 +1215,9 @@ fn get_review_returns_requested_parts_without_the_token() -> Result<()> {
             .as_deref()
             .is_some_and(|p| p.ends_with("review.md"))
     );
-    assert!(
-        artifacts
-            .review_json
-            .as_deref()
-            .is_some_and(|p| p.ends_with("review.json"))
-    );
-    assert!(!serde_json::to_string(&summary)?.contains("meta.json"));
+    // Both may hold the token; `raw` is the redacted review.
+    let listed = serde_json::to_string(&summary)?;
+    assert!(!listed.contains("meta.json") && !listed.contains("review.json"));
 
     let markdown = fx.ops().get_review(&query(ReviewPart::Markdown))?;
     let text = markdown.markdown.as_deref().expect("markdown");
@@ -1252,17 +1259,27 @@ fn get_review_returns_requested_parts_without_the_token() -> Result<()> {
 fn retry_requeues_a_tokenless_job_for_submission() -> Result<()> {
     let fx = Fixture::new()?;
     let job = fx.job(JobStatus::Failed, "a")?;
+    let before = Utc::now();
     let outcome = fx.ops().retry_job(&RetryRequest {
         job: JobRef::Id(job.id.clone()),
-        force: false,
+        jump_queue: false,
         include_failed: false,
         caller_executes: false,
+        approval: Approval::Granted,
     })?;
     assert_eq!(outcome.action, RetryAction::SubmissionQueued);
     assert_eq!(outcome.previous_status, JobStatus::Failed);
     assert_eq!(outcome.job.status, JobStatus::Queued);
     assert_eq!(outcome.job.attempt, 0);
-    assert_eq!(outcome.job.next_poll_at, None);
+    // The end of the queue: its place is the retry.
+    assert!(
+        outcome
+            .job
+            .next_poll_at
+            .is_some_and(|at| before <= at && at <= Utc::now()),
+        "{:?}",
+        outcome.job.next_poll_at
+    );
     assert_eq!(fx.events("retried")?, vec![json!({})]);
     Ok(())
 }
@@ -1276,9 +1293,10 @@ fn retry_reschedules_a_token_backed_job_for_polling() -> Result<()> {
     let before = Utc::now();
     let outcome = fx.ops().retry_job(&RetryRequest {
         job: JobRef::Id(job.id.clone()),
-        force: false,
+        jump_queue: false,
         include_failed: false,
         caller_executes: false,
+        approval: Approval::Granted,
     })?;
     assert_eq!(outcome.action, RetryAction::PollScheduled);
     assert_eq!(outcome.job.status, JobStatus::Processing);
@@ -1288,25 +1306,83 @@ fn retry_reschedules_a_token_backed_job_for_polling() -> Result<()> {
     Ok(())
 }
 
+/// A timed-out job keeps its receipt, so a retry polls it again; the review
+/// timeout restarts at the retry instead of counting from the receipt, which
+/// would time the job out again at the next tick, before any poll.
 #[test]
-fn forced_retry_makes_the_job_due_now() -> Result<()> {
+fn a_retried_timed_out_job_is_polled_again_before_it_times_out_again() -> Result<()> {
+    let mut fx = Fixture::new()?;
+    fx.config.notifications.enabled = false;
+    let job = fx.submitted_job("a")?;
+    let set_column = |column: &str, at: chrono::DateTime<Utc>| -> Result<()> {
+        rusqlite::Connection::open(&fx.db.path)?.execute(
+            &format!("UPDATE jobs SET {column} = ?1 WHERE id = ?2"),
+            rusqlite::params![at.to_rfc3339(), job.id],
+        )?;
+        Ok(())
+    };
+    let received = Utc::now() - Duration::hours(49);
+    set_column("started_at", received)?;
+    reviewloop::worker::mark_timeouts(&fx.config, &fx.db)?;
+    assert_eq!(
+        fx.db.get_job(&job.id)?.expect("job").status,
+        JobStatus::Timeout
+    );
+
+    let before = Utc::now();
+    let outcome = fx.ops().retry_failed_jobs()?;
+    assert_eq!(outcome.retried.len(), 1);
+    assert_eq!(outcome.retried[0].action, RetryAction::PollScheduled);
+    reviewloop::worker::mark_timeouts(&fx.config, &fx.db)?;
+    let after = fx.db.get_job(&job.id)?.expect("job");
+    assert_eq!(after.status, JobStatus::Processing);
+    assert!(after.next_poll_at.is_some_and(|at| at > before));
+    assert!(
+        after
+            .polling_restarted_at
+            .is_some_and(|at| before <= at && at <= Utc::now()),
+        "{:?}",
+        after.polling_restarted_at
+    );
+    // The receipt time stays: CSPaper usage is counted by it.
+    assert_eq!(
+        after.started_at.map(|at| at.timestamp()),
+        Some(received.timestamp())
+    );
+
+    // The restarted timeout still applies.
+    set_column("polling_restarted_at", Utc::now() - Duration::hours(49))?;
+    reviewloop::worker::mark_timeouts(&fx.config, &fx.db)?;
+    assert_eq!(
+        fx.db.get_job(&job.id)?.expect("job").status,
+        JobStatus::Timeout
+    );
+    Ok(())
+}
+
+#[test]
+fn a_retry_that_jumps_the_queue_makes_the_job_due_now() -> Result<()> {
     let fx = Fixture::new()?;
     let failed = fx.job(JobStatus::FailedNeedsManual, "a")?;
     let submit = fx.ops().retry_job(&RetryRequest {
         job: JobRef::Id(failed.id.clone()),
-        force: true,
+        jump_queue: true,
         include_failed: false,
         caller_executes: false,
+        approval: Approval::Granted,
     })?;
     assert_eq!(submit.action, RetryAction::SubmitNow);
     assert_eq!(submit.job.status, JobStatus::Queued);
+    // Its original place, its creation time.
+    assert_eq!(submit.job.next_poll_at, None);
 
     let processing = fx.submitted_job("b")?;
     let poll = fx.ops().retry_job(&RetryRequest {
         job: JobRef::Id(processing.id.clone()),
-        force: true,
+        jump_queue: true,
         include_failed: false,
         caller_executes: false,
+        approval: Approval::Granted,
     })?;
     assert_eq!(poll.action, RetryAction::PollNow);
     assert!(poll.job.next_poll_at.is_some_and(|at| at <= Utc::now()));
@@ -1321,26 +1397,58 @@ fn forced_retry_makes_the_job_due_now() -> Result<()> {
 }
 
 #[test]
-fn forced_retry_rejects_statuses_it_cannot_act_on() -> Result<()> {
+fn a_retry_that_jumps_the_queue_rejects_statuses_it_cannot_act_on() -> Result<()> {
     let fx = Fixture::new()?;
     let completed = fx.job(JobStatus::Completed, "a")?;
     let err = fx
         .ops()
         .retry_job(&RetryRequest {
             job: JobRef::Id(completed.id.clone()),
-            force: true,
+            jump_queue: true,
             include_failed: false,
             caller_executes: false,
+            approval: Approval::Granted,
         })
         .unwrap_err();
     assert_eq!(err.code(), "invalid_state");
     assert_eq!(
         err.to_string(),
-        "--force for tokenless jobs only supports QUEUED/SUBMITTED/FAILED/FAILED_NEEDS_MANUAL/TIMEOUT"
+        "skipping the queue for a job without a receipt token only supports QUEUED/SUBMITTED/FAILED/FAILED_NEEDS_MANUAL/TIMEOUT"
+    );
+    assert_eq!(
+        err.recovery().as_deref(),
+        Some("retry without jump_queue, or check the job's status with get_job")
     );
     assert_eq!(
         fx.db.get_job(&completed.id)?.expect("job").status,
         JobStatus::Completed
+    );
+
+    // A timed-out job keeps its receipt: only a plain retry polls it again.
+    let timed_out = fx.submitted_job("b")?;
+    fx.db
+        .update_job_state(&timed_out.id, JobStatus::Timeout, None, Some(None), None)?;
+    let err = fx
+        .ops()
+        .retry_job(&RetryRequest {
+            job: JobRef::Id(timed_out.id.clone()),
+            jump_queue: true,
+            include_failed: false,
+            caller_executes: false,
+            approval: Approval::Granted,
+        })
+        .unwrap_err();
+    assert_eq!(err.code(), "invalid_state");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "job {} has a receipt token and is TIMEOUT: skipping the queue only polls a PROCESSING job",
+            timed_out.id
+        )
+    );
+    assert_eq!(
+        fx.db.get_job(&timed_out.id)?.expect("job").status,
+        JobStatus::Timeout
     );
     Ok(())
 }
@@ -1349,14 +1457,15 @@ fn forced_retry_rejects_statuses_it_cannot_act_on() -> Result<()> {
 fn retry_never_bypasses_approval() -> Result<()> {
     let fx = Fixture::new()?;
     let pending = fx.job(JobStatus::PendingApproval, "a")?;
-    for force in [false, true] {
+    for jump_queue in [false, true] {
         let err = fx
             .ops()
             .retry_job(&RetryRequest {
                 job: JobRef::Id(pending.id.clone()),
-                force,
+                jump_queue,
                 include_failed: false,
                 caller_executes: false,
+                approval: Approval::Granted,
             })
             .unwrap_err();
         assert_eq!(err.code(), "invalid_state");
@@ -1380,15 +1489,188 @@ fn retry_never_bypasses_approval() -> Result<()> {
     Ok(())
 }
 
+fn retry(
+    fx: &Fixture,
+    job: &Job,
+    jump_queue: bool,
+    approval: Approval,
+) -> Result<JobStatus, OpError> {
+    fx.ops()
+        .retry_job(&RetryRequest {
+            job: JobRef::Id(job.id.clone()),
+            jump_queue,
+            include_failed: false,
+            caller_executes: false,
+            approval,
+        })
+        .map(|outcome| outcome.job.status)
+}
+
+fn cancel(fx: &Fixture, job: &Job) -> Result<()> {
+    fx.ops().cancel_job(&CancelRequest {
+        job: JobRef::Id(job.id.clone()),
+        reason: None,
+    })?;
+    Ok(())
+}
+
+/// With approval required, a retry that sends the manuscript again queues the
+/// job directly when its row proves an earlier approval (it is QUEUED or in a
+/// status only reached after QUEUED), and otherwise (cancelled, completed by
+/// hand) returns it to PENDING_APPROVAL, with `jump_queue` or not. Only the row
+/// decides: events may be gone.
 #[test]
-fn forced_retry_executed_by_the_caller_keeps_the_poll_schedule() -> Result<()> {
+fn a_required_retry_resends_only_jobs_whose_row_proves_approval() -> Result<()> {
+    let fx = Fixture::new()?;
+    // Cancelled before anyone approved it, or after approval while queued,
+    // with their events pruned.
+    let pending = fx.job(JobStatus::PendingApproval, "a")?;
+    cancel(&fx, &pending)?;
+    let queued = fx.job(JobStatus::Queued, "b")?;
+    cancel(&fx, &queued)?;
+    let jumping = fx.job(JobStatus::PendingApproval, "h")?;
+    cancel(&fx, &jumping)?;
+    fx.db.prune_retention(
+        &RetentionConfig::default(),
+        Utc::now() + Duration::days(365),
+    )?;
+
+    // Approved, then failed at the provider, timed out, or refused for good.
+    let failed = fx.job(JobStatus::Queued, "c")?;
+    fx.db.update_job_state(
+        &failed.id,
+        JobStatus::Failed,
+        Some(1),
+        None,
+        Some(Some("primary submit error: upstream 502".to_string())),
+    )?;
+    let failed = fx.db.get_job(&failed.id)?.expect("job");
+    let timed_out = fx.job(JobStatus::Timeout, "d")?;
+    let needs_manual = fx.job(JobStatus::FailedNeedsManual, "e")?;
+    // A submission whose outcome is unknown, retried ahead of the queue.
+    let uncertain = fx.job(JobStatus::Submitted, "f")?;
+    for (job, jump_queue, action) in [
+        (&failed, false, RetryAction::SubmissionQueued),
+        (&timed_out, false, RetryAction::SubmissionQueued),
+        (&needs_manual, false, RetryAction::SubmissionQueued),
+        (&uncertain, true, RetryAction::SubmitNow),
+    ] {
+        let outcome = retry_outcome(&fx, job, jump_queue)?;
+        assert_eq!(outcome.action, action, "{:?}", job.status);
+        assert_eq!(outcome.previous_status, job.status);
+        assert_eq!(outcome.job.status, JobStatus::Queued, "{:?}", job.status);
+        assert_eq!(outcome.job.last_error, None);
+    }
+
+    // Completed by hand without a receipt.
+    let completed = fx.job(JobStatus::Completed, "g")?;
+    for job in [&pending, &queued, &completed] {
+        let outcome = retry_outcome(&fx, job, false)?;
+        assert_eq!(outcome.action, RetryAction::AwaitingApproval);
+        assert_eq!(outcome.job.status, JobStatus::PendingApproval);
+        assert_eq!(outcome.job.phase, JobPhase::AwaitingApproval);
+        assert_eq!(
+            outcome.job.last_error.as_deref(),
+            Some("retried; awaiting approval to submit it again")
+        );
+        assert_eq!(outcome.job.next_poll_at, None);
+        // Only approve_job sends it.
+        let approved = fx.ops().approve_job(&JobRef::Id(job.id.clone()))?;
+        assert_eq!(approved.job.status, JobStatus::Queued);
+        assert_eq!(approved.job.last_error, None);
+    }
+    // Skipping the queue does not skip the approval.
+    let outcome = retry_outcome(&fx, &jumping, true)?;
+    assert_eq!(outcome.action, RetryAction::AwaitingApproval);
+    assert_eq!(outcome.job.status, JobStatus::PendingApproval);
+    assert_eq!(
+        outcome.job.last_error.as_deref(),
+        Some("retried; awaiting approval to submit it again")
+    );
+    assert_eq!(outcome.job.next_poll_at, None);
+    // Only the uncertain job's retry skipped the queue.
+    let skipped_queue: Vec<_> = fx
+        .events("manual_rate_limit_override")?
+        .into_iter()
+        .map(|payload| payload["previous_status"].clone())
+        .collect();
+    assert_eq!(skipped_queue, [json!("SUBMITTED")]);
+    let parked = |status: &str| {
+        json!({
+            "awaiting_approval": true,
+            "previous_status": status,
+            "previous_submit_stage": null,
+        })
+    };
+    let retried = fx.events("retried")?;
+    assert_eq!(
+        retried,
+        vec![
+            json!({}),
+            json!({}),
+            json!({}),
+            parked("FAILED"),
+            parked("FAILED"),
+            parked("COMPLETED"),
+            parked("FAILED"),
+        ]
+    );
+    Ok(())
+}
+
+fn retry_outcome(fx: &Fixture, job: &Job, jump_queue: bool) -> Result<RetryOutcome, OpError> {
+    fx.ops().retry_job(&RetryRequest {
+        job: JobRef::Id(job.id.clone()),
+        jump_queue,
+        include_failed: false,
+        caller_executes: false,
+        approval: Approval::Required,
+    })
+}
+
+#[test]
+fn a_required_retry_that_sends_nothing_new_is_unchanged() -> Result<()> {
+    let fx = Fixture::new()?;
+    // A receipt: the retry polls.
+    let processing = fx.submitted_job("a")?;
+    assert_eq!(
+        retry(&fx, &processing, false, Approval::Required)?,
+        JobStatus::Processing
+    );
+    assert_eq!(
+        retry(&fx, &processing, true, Approval::Required)?,
+        JobStatus::Processing
+    );
+    // QUEUED: approved and not sent yet; the retry only resets its cooldown.
+    let queued = fx.job(JobStatus::Queued, "b")?;
+    assert_eq!(
+        retry(&fx, &queued, false, Approval::Required)?,
+        JobStatus::Queued
+    );
+    assert_eq!(
+        retry(&fx, &queued, true, Approval::Required)?,
+        JobStatus::Queued
+    );
+    // The CLI's retry is the user's own decision: it sends the job.
+    let pending = fx.job(JobStatus::PendingApproval, "c")?;
+    cancel(&fx, &pending)?;
+    assert_eq!(
+        retry(&fx, &pending, false, Approval::Granted)?,
+        JobStatus::Queued
+    );
+    Ok(())
+}
+
+#[test]
+fn a_retry_executed_by_the_caller_keeps_the_poll_schedule() -> Result<()> {
     let fx = Fixture::new()?;
     let job = fx.submitted_job("a")?;
     let outcome = fx.ops().retry_job(&RetryRequest {
         job: JobRef::Id(job.id.clone()),
-        force: true,
+        jump_queue: true,
         include_failed: false,
         caller_executes: true,
+        approval: Approval::Granted,
     })?;
     assert_eq!(outcome.action, RetryAction::PollNow);
     let after = fx.db.get_job(&job.id)?.expect("job");
@@ -1406,9 +1688,10 @@ fn retry_refuses_a_job_from_another_projects_config() -> Result<()> {
     let err = ReviewOps::new(&config, &fx.db)
         .retry_job(&RetryRequest {
             job: JobRef::Id(foreign.id.clone()),
-            force: false,
+            jump_queue: false,
             include_failed: false,
             caller_executes: false,
+            approval: Approval::Granted,
         })
         .unwrap_err();
     assert_eq!(err.code(), "project_mismatch");
@@ -1431,6 +1714,290 @@ fn retry_refuses_a_job_from_another_projects_config() -> Result<()> {
     assert_eq!(
         fx.db.get_job(&foreign.id)?.expect("job").status,
         JobStatus::Failed
+    );
+    Ok(())
+}
+
+// ---- queue placement ----
+
+/// Created rows take their `created_at` from the wall clock; keep them apart.
+fn tick() {
+    std::thread::sleep(std::time::Duration::from_millis(5));
+}
+
+/// The QUEUED jobs in the order the supervisor submits them.
+fn queue_order(fx: &Fixture) -> Result<Vec<String>> {
+    Ok(fx
+        .db
+        .list_ready_queued(&fx.config.project_id, 100, Utc::now())?
+        .into_iter()
+        .map(|job| job.id)
+        .collect())
+}
+
+#[test]
+fn a_retried_job_joins_the_end_of_the_queue() -> Result<()> {
+    let fx = Fixture::new()?;
+    let old = fx.job(JobStatus::Failed, "old")?;
+    tick();
+    let waiting = fx.job(JobStatus::Queued, "waiting")?;
+    tick();
+    assert_eq!(
+        retry(&fx, &old, false, Approval::Granted)?,
+        JobStatus::Queued
+    );
+    assert_eq!(queue_order(&fx)?, [waiting.id, old.id]);
+    Ok(())
+}
+
+#[test]
+fn an_approved_job_queues_behind_the_jobs_already_waiting() -> Result<()> {
+    let fx = Fixture::new()?;
+    let pending = fx.job(JobStatus::PendingApproval, "pending")?;
+    tick();
+    let waiting = fx.job(JobStatus::Queued, "waiting")?;
+    tick();
+    let approved = fx.ops().approve_job(&JobRef::Id(pending.id.clone()))?;
+    assert!(approved.job.next_poll_at.is_some_and(|at| at <= Utc::now()));
+    assert_eq!(queue_order(&fx)?, [waiting.id, pending.id]);
+    Ok(())
+}
+
+/// Jumping the queue puts a job back at its creation time, ahead of newer
+/// jobs, and clears a cooldown that held it back.
+#[test]
+fn a_retry_that_jumps_the_queue_takes_the_jobs_original_place() -> Result<()> {
+    let fx = Fixture::new()?;
+    let failed = fx.job(JobStatus::Failed, "failed")?;
+    tick();
+    let cooling = fx.job(JobStatus::Queued, "cooling")?;
+    fx.db.update_job_state(
+        &cooling.id,
+        JobStatus::Queued,
+        Some(2),
+        Some(Some(Utc::now() + Duration::hours(1))),
+        Some(Some("rate limited".to_string())),
+    )?;
+    tick();
+    let waiting = fx.job(JobStatus::Queued, "waiting")?;
+    tick();
+    assert_eq!(queue_order(&fx)?, std::slice::from_ref(&waiting.id));
+
+    for job in [&failed, &cooling] {
+        assert_eq!(retry(&fx, job, true, Approval::Granted)?, JobStatus::Queued);
+    }
+    assert_eq!(queue_order(&fx)?, [failed.id, cooling.id, waiting.id]);
+    Ok(())
+}
+
+// ---- batch retry ----
+
+/// A job of this project for `paper` on `backend`, created in `status` a tick
+/// after the previous one.
+fn paper_job(
+    fx: &Fixture,
+    paper: &str,
+    backend: &str,
+    status: JobStatus,
+    hash: &str,
+) -> Result<Job> {
+    tick();
+    fx.db.create_job(&NewJob {
+        project_id: fx.config.project_id.clone(),
+        paper_id: paper.to_string(),
+        backend: backend.to_string(),
+        pdf: JobPdf::Unpinned {
+            pdf_path: fx.config.papers[0].pdf_path.clone(),
+            pdf_hash: hash.to_string(),
+        },
+        status,
+        email: "test@example.edu".to_string(),
+        venue: None,
+        review_options: Default::default(),
+        git_tag: None,
+        git_commit: None,
+        next_poll_at: None,
+    })
+}
+
+/// `retry --all-failed` retries the newest job of each paper and backend when
+/// it FAILED (other than by a cancel) or timed out, and reports every other
+/// failed job of the project with the reason it was left alone.
+#[test]
+fn retry_failed_jobs_retries_the_newest_failed_job_of_each_paper_and_backend() -> Result<()> {
+    use JobStatus::*;
+    let fx = Fixture::new()?;
+    // Superseded by a newer job of the same paper and backend, in any status.
+    let before_completed = paper_job(&fx, "a", "stanford", Failed, "a1")?;
+    let completed = paper_job(&fx, "a", "stanford", Completed, "a2")?;
+    let before_queued = paper_job(&fx, "b", "stanford", Timeout, "b1")?;
+    let queued = paper_job(&fx, "b", "stanford", Queued, "b2")?;
+    // Paper a on another backend is a line of its own.
+    let other_backend = paper_job(&fx, "a", cspaper::BACKEND, Failed, "a3")?;
+    let cancelled = paper_job(&fx, "c", "stanford", Queued, "c1")?;
+    cancel(&fx, &cancelled)?;
+    let cancelled = fx.db.get_job(&cancelled.id)?.expect("job");
+    let needs_manual = paper_job(&fx, "d", "stanford", FailedNeedsManual, "d1")?;
+    let timed_out = paper_job(&fx, "main", "stanford", Timeout, "main1")?;
+    // Another project's later job of the same paper supersedes nothing here,
+    // and is not retried.
+    tick();
+    let foreign = fx.insert_job("other-project", Failed, "foreign")?;
+    // Failed after the provider accepted it: the retry polls.
+    let with_token = paper_job(&fx, "f", "stanford", Queued, "f1")?;
+    fx.db
+        .attach_token_to_job(&with_token.id, TOKEN, Utc::now() + Duration::hours(1))?;
+    fx.db.update_job_state(
+        &with_token.id,
+        Failed,
+        Some(3),
+        Some(None),
+        Some(Some("poll error: upstream 502".to_string())),
+    )?;
+
+    let outcome = fx.ops().retry_failed_jobs()?;
+    let retried: Vec<_> = outcome
+        .retried
+        .iter()
+        .map(|retried| {
+            (
+                retried.job.job_id.clone(),
+                retried.previous_status,
+                retried.action,
+                retried.job.status,
+            )
+        })
+        .collect();
+    assert_eq!(
+        retried,
+        [
+            (
+                other_backend.id.clone(),
+                Failed,
+                RetryAction::SubmissionQueued,
+                Queued
+            ),
+            (
+                timed_out.id.clone(),
+                Timeout,
+                RetryAction::SubmissionQueued,
+                Queued
+            ),
+            (
+                with_token.id.clone(),
+                Failed,
+                RetryAction::PollScheduled,
+                Processing
+            ),
+        ]
+    );
+    let skipped: Vec<_> = outcome
+        .skipped
+        .iter()
+        .map(|skipped| (skipped.job.job_id.clone(), skipped.reason.clone()))
+        .collect();
+    let superseded_by = |job: &Job| {
+        SkipReason::Superseded(JobCandidate {
+            job_id: job.id.clone(),
+            status: job.status,
+        })
+    };
+    assert_eq!(
+        skipped,
+        [
+            (before_completed.id.clone(), superseded_by(&completed)),
+            (before_queued.id.clone(), superseded_by(&queued)),
+            (cancelled.id.clone(), SkipReason::Cancelled),
+            (needs_manual.id.clone(), SkipReason::NeedsManual),
+        ]
+    );
+
+    // Skipped and other jobs are left as they were.
+    for job in [
+        &before_completed,
+        &completed,
+        &before_queued,
+        &queued,
+        &cancelled,
+        &needs_manual,
+        &foreign,
+    ] {
+        let after = fx.db.get_job(&job.id)?.expect("job");
+        assert_eq!(
+            (after.status, after.updated_at),
+            (job.status, job.updated_at),
+            "{}",
+            job.paper_id
+        );
+    }
+    // Paper main's retry records the plain `retried` event.
+    assert_eq!(fx.events("retried")?, [json!({})]);
+
+    let err = ReviewOps::new(&unscoped(&fx.config), &fx.db)
+        .retry_failed_jobs()
+        .unwrap_err();
+    assert_eq!(err.code(), "project_required");
+    Ok(())
+}
+
+/// Retried jobs join the end of the queue behind the jobs already waiting,
+/// in the order they were created.
+#[test]
+fn retry_failed_jobs_queues_the_retried_jobs_behind_the_waiting_ones_oldest_first() -> Result<()> {
+    let fx = Fixture::new()?;
+    let older = paper_job(&fx, "a", "stanford", JobStatus::Failed, "a")?;
+    let newer = paper_job(&fx, "b", "stanford", JobStatus::Timeout, "b")?;
+    let waiting = paper_job(&fx, "c", "stanford", JobStatus::Queued, "c")?;
+    tick();
+    let outcome = fx.ops().retry_failed_jobs()?;
+    assert_eq!(outcome.retried.len(), 2);
+    assert!(outcome.skipped.is_empty());
+    assert_eq!(queue_order(&fx)?, [waiting.id, older.id, newer.id]);
+    Ok(())
+}
+
+/// A selected job that `retry_job` refuses, here because a worker is sending
+/// it right now, is skipped with the refusal; the batch goes on.
+#[test]
+fn retry_failed_jobs_skips_a_job_being_submitted_and_retries_the_rest() -> Result<()> {
+    let fx = Fixture::new()?;
+    let in_flight = paper_job(&fx, "a", "stanford", JobStatus::Failed, "a")?;
+    rusqlite::Connection::open(&fx.db.path)?.execute(
+        "UPDATE jobs SET submit_stage = 'DISPATCHED', lease_owner = 'w1', lease_expires_at = ?1 WHERE id = ?2",
+        rusqlite::params![(Utc::now() + Duration::hours(1)).to_rfc3339(), in_flight.id],
+    )?;
+    let in_flight = fx.db.get_job(&in_flight.id)?.expect("job");
+    let later = paper_job(&fx, "b", "stanford", JobStatus::Failed, "b")?;
+
+    let outcome = fx.ops().retry_failed_jobs()?;
+    let retried: Vec<_> = outcome
+        .retried
+        .iter()
+        .map(|retried| (retried.job.job_id.clone(), retried.action))
+        .collect();
+    assert_eq!(retried, [(later.id, RetryAction::SubmissionQueued)]);
+    let [skipped] = outcome.skipped.as_slice() else {
+        panic!("one skip expected: {:?}", outcome.skipped);
+    };
+    assert_eq!(skipped.job.job_id, in_flight.id);
+    let SkipReason::Changed { message } = &skipped.reason else {
+        panic!("not a race: {:?}", skipped.reason);
+    };
+    assert!(
+        message.contains(&format!(
+            "job {} is being submitted right now",
+            in_flight.id
+        )),
+        "{message}"
+    );
+    let after = fx.db.get_job(&in_flight.id)?.expect("job");
+    assert_eq!(
+        (after.status, after.updated_at, after.lease_owner),
+        (
+            JobStatus::Failed,
+            in_flight.updated_at,
+            Some("w1".to_string())
+        )
     );
     Ok(())
 }
@@ -1688,7 +2255,7 @@ fn every_error_code_is_documented_with_a_view() -> Result<()> {
             project_id: "p".into(),
             registered_path: Some("/a/reviewloop.toml".into()),
             requested_path: "/b/reviewloop.toml".into(),
-            enabled_as: None,
+            watched_as: None,
             message: "m".into(),
         },
         OpError::ProjectNotRegistered {

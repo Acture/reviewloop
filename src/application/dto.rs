@@ -1,13 +1,14 @@
-use super::{ops::CANCELLED_BY_USER, redact::redact_text};
+use super::redact::redact_text;
 use crate::{
     http::redact_url_paths,
     model::{
         ExistingReason, Job, JobStatus, NewJob, RegisteredProject, ReviewOptions, SubmitStage,
-        SupervisorRecord,
+        SupervisorRecord, is_cancellation,
     },
     supervisor::{ProjectState, SupervisorState, WorkerAvailability},
 };
 use chrono::{DateTime, Utc};
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
@@ -24,19 +25,52 @@ fn stage_str<S: Serializer>(stage: &Option<SubmitStage>, serializer: S) -> Resul
     }
 }
 
+/// Every [`JobStatus`] in its database spelling, as [`status_str`] writes it.
+const JOB_STATUSES: [JobStatus; 8] = [
+    JobStatus::PendingApproval,
+    JobStatus::Queued,
+    JobStatus::Submitted,
+    JobStatus::Processing,
+    JobStatus::Completed,
+    JobStatus::Failed,
+    JobStatus::FailedNeedsManual,
+    JobStatus::Timeout,
+];
+
+/// The schema of a field written by [`status_str`].
+fn status_schema(_: &mut SchemaGenerator) -> Schema {
+    let values: Vec<&str> = JOB_STATUSES.iter().map(|status| status.as_str()).collect();
+    json_schema!({ "type": "string", "enum": values })
+}
+
+/// The schema of a field written by [`stage_str`].
+fn stage_schema(_: &mut SchemaGenerator) -> Schema {
+    let values: Vec<Value> = [
+        SubmitStage::Claimed,
+        SubmitStage::Dispatched,
+        SubmitStage::Uncertain,
+    ]
+    .iter()
+    .map(|stage| Value::from(stage.as_str()))
+    .chain([Value::Null])
+    .collect();
+    json_schema!({ "type": ["string", "null"], "enum": values })
+}
+
 /// Where a job stands, folded from its status for callers that only need to
 /// know what happens next.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobPhase {
     /// PENDING_APPROVAL: waits for `approve_job`; nothing will be sent.
     AwaitingApproval,
     /// QUEUED: stored locally, not yet accepted by the provider. A worker
-    /// submits it when `next_poll_at` is due (or at its next tick when null).
+    /// submits it in turn once `next_poll_at` (if any) has passed.
     Queued,
     /// PROCESSING: the provider accepted the PDF; the worker polls for the
-    /// review at `next_poll_at`. Also the legacy SUBMITTED status, which no
-    /// current worker writes or resumes.
+    /// review at `next_poll_at`. Also SUBMITTED: a submission in flight
+    /// (`submit_stage` DISPATCHED) or with an unknown outcome (UNCERTAIN,
+    /// never resubmitted automatically; see `last_error`).
     Submitted,
     /// COMPLETED: the review is stored.
     Completed,
@@ -61,20 +95,15 @@ impl JobPhase {
     }
 }
 
-fn is_cancellation(last_error: &str) -> bool {
-    last_error
-        .strip_prefix(CANCELLED_BY_USER)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
-}
-
 /// A review job without its provider token or submitter email.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct JobView {
     pub job_id: String,
     pub project_id: String,
     pub paper_id: String,
     pub backend: String,
     #[serde(serialize_with = "status_str")]
+    #[schemars(schema_with = "status_schema")]
     pub status: JobStatus,
     pub phase: JobPhase,
     pub terminal: bool,
@@ -108,14 +137,20 @@ pub struct JobView {
     /// DISPATCHED (the request may be in flight) or UNCERTAIN (the provider may have
     /// it but no receipt was saved; never resubmitted automatically). Null otherwise.
     #[serde(serialize_with = "stage_str")]
+    #[schemars(schema_with = "stage_schema")]
     pub submit_stage: Option<SubmitStage>,
     /// The last failure, with the job's token replaced by `[redacted]`.
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
-    /// QUEUED: earliest submission attempt. SUBMITTED/PROCESSING: next
-    /// provider poll. Null: no wait; a worker acts at its next tick.
+    /// QUEUED: the job's place in the queue, when it entered it (a retry or
+    /// approval sets it; null counts as `created_at`) or, after a rate limit,
+    /// the end of its cooldown; jobs are submitted in order of this time once
+    /// it has passed.
+    /// PROCESSING: next provider poll. Null otherwise: no wait, a worker acts
+    /// at its next tick; except for a SUBMITTED job with an unknown outcome
+    /// (UNCERTAIN), which nothing acts on automatically.
     pub next_poll_at: Option<DateTime<Utc>>,
 }
 
@@ -159,14 +194,15 @@ impl JobView {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct JobList {
     pub jobs: Vec<JobView>,
     /// More jobs matched than `limit`; only the newest are returned.
     pub truncated: bool,
 }
 
-/// A job named by a paper reference that matched more than one job.
+/// A job by id and status: one of several a paper reference matched, or the
+/// job that superseded one `retry_failed_jobs` skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JobCandidate {
     pub job_id: String,
@@ -176,7 +212,7 @@ pub struct JobCandidate {
 
 /// A project from the registry the CLI keeps of every `reviewloop.toml` it
 /// has loaded, with whether the supervisor runs it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct ProjectView {
     pub project_id: String,
     pub config_path: String,
@@ -185,8 +221,8 @@ pub struct ProjectView {
     pub last_seen_at: DateTime<Utc>,
     /// This is the project the operations were called for.
     pub current: bool,
-    /// The supervisor runs it (`enable_project`).
-    pub enabled: bool,
+    /// The supervisor runs it (`watch_project`).
+    pub watched: bool,
     pub state: ProjectState,
     /// The supervisor's last pass over it.
     pub last_run_at: Option<DateTime<Utc>>,
@@ -202,7 +238,7 @@ impl ProjectView {
             config_present: project.config_path.exists(),
             config_path: project.config_path.display().to_string(),
             last_seen_at: project.last_seen_at,
-            enabled: project.enabled,
+            watched: project.enabled,
             state: ProjectState::of(&project),
             last_run_at: project.health.last_run_at,
             last_ok_at: project.health.last_ok_at,
@@ -213,7 +249,7 @@ impl ProjectView {
 }
 
 /// The machine supervisor as the database records it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct SupervisorView {
     pub state: SupervisorState,
     pub pid: Option<u32>,
@@ -244,7 +280,7 @@ impl SupervisorView {
 
 /// Whether the context project's queued and submitted jobs move without a
 /// caller running them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct ProjectWorkerView {
     pub project_id: String,
     pub availability: WorkerAvailability,
@@ -253,27 +289,27 @@ pub struct ProjectWorkerView {
 }
 
 /// The supervisor, and what it means for the context project.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct WorkerStatus {
     pub supervisor: SupervisorView,
     /// `null` for an unscoped context.
     pub project: Option<ProjectWorkerView>,
 }
 
-/// The result of `enable_project` and `disable_project`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ProjectEnablement {
+/// The result of `watch_project` and `unwatch_project`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ProjectWatch {
     pub project: ProjectView,
-    /// The call changed whether the supervisor runs the project (or, for an
-    /// enable, which config backs it).
+    /// The call changed whether the supervisor runs the project (or, for a
+    /// watch, which config backs it).
     pub changed: bool,
-    /// The config the registration pointed at before an enable moved it.
+    /// The config the registration pointed at before a watch moved it.
     pub moved_from: Option<String>,
     pub worker: WorkerStatus,
 }
 
 /// A paper configured in the project's `reviewloop.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct PaperView {
     pub paper_id: String,
     pub backend: String,
@@ -283,13 +319,18 @@ pub struct PaperView {
     pub review_options: ReviewOptions,
     pub pdf_path: String,
     pub pdf_present: bool,
+    /// PDF-change watching (`reviewloop paper watch` / `paper unwatch`): with
+    /// the PDF trigger on (`trigger.pdf.enabled`), each pass requests a review
+    /// when the PDF differs from the PDF of the paper's latest review request,
+    /// or the paper has none. Not whether the supervisor runs the project;
+    /// that is `ProjectView.watched`.
     pub watched: bool,
     pub tag_trigger: Option<String>,
 }
 
 /// What a request asked to review: the snapshot of the paper's PDF taken for
 /// it and the review identity that decides coverage.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct ManuscriptInput {
     pub paper_id: String,
     /// The paper's configured PDF the snapshot was copied from.
@@ -327,7 +368,7 @@ impl ManuscriptInput {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestDisposition {
     /// A new job was stored.
@@ -338,7 +379,7 @@ pub enum RequestDisposition {
     Existing,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct ReviewRequestOutcome {
     pub disposition: RequestDisposition,
     /// Why an `existing` job was returned: `request_replay` or `covered`.
@@ -349,52 +390,102 @@ pub struct ReviewRequestOutcome {
 }
 
 /// The job after an approve or cancel, with the status it left.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct TransitionOutcome {
     pub job: JobView,
     #[serde(serialize_with = "status_str")]
+    #[schemars(schema_with = "status_schema")]
     pub previous_status: JobStatus,
 }
 
 /// What a retry left for the worker (or an immediate caller) to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RetryAction {
-    /// PROCESSING with a token; polled when the first schedule step is due.
+    /// PROCESSING with a token, its review timeout restarted; polled when the
+    /// first schedule step is due.
     PollScheduled,
-    /// QUEUED without a token; submitted at the worker's next tick.
+    /// QUEUED without a token at the end of the queue; the supervisor
+    /// submits it in turn.
     SubmissionQueued,
-    /// Forced: PROCESSING with a token, due for a poll now.
+    /// `jump_queue`: PROCESSING with a token, due for a poll now (polled by
+    /// the caller with `caller_executes`).
     PollNow,
-    /// Forced: QUEUED without a token, due for submission now.
+    /// `jump_queue`: QUEUED without a token at its original place, its
+    /// creation time, with no cooldown (submitted by the caller with
+    /// `caller_executes`).
     SubmitNow,
+    /// PENDING_APPROVAL without a token: the job's row does not prove it was
+    /// approved before (it was cancelled, or completed by hand), so sending
+    /// the manuscript again waits for `approve_job` (`RetryRequest.approval`
+    /// `Required`).
+    AwaitingApproval,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct RetryOutcome {
     pub job: JobView,
     #[serde(serialize_with = "status_str")]
+    #[schemars(schema_with = "status_schema")]
     pub previous_status: JobStatus,
     pub action: RetryAction,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// What `retry_failed_jobs` (`reviewloop retry --all-failed`) did with each of
+/// the project's FAILED, FAILED_NEEDS_MANUAL and TIMEOUT jobs, both lists
+/// oldest first. A CLI result, not part of the JSON contract.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FailedJobsRetry {
+    /// Retried as `retry_job` retries a job without `jump_queue`, with
+    /// approval granted: `submission_queued` or `poll_scheduled`.
+    pub retried: Vec<RetryOutcome>,
+    pub skipped: Vec<SkippedRetry>,
+}
+
+/// A job `retry_failed_jobs` left alone, as it was when selected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkippedRetry {
+    pub job: JobView,
+    pub reason: SkipReason,
+}
+
+/// Why `retry_failed_jobs` skipped a job; the first that applies.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SkipReason {
+    /// A job of the same paper and backend was created after it (the newest
+    /// such job, in any status).
+    Superseded(JobCandidate),
+    /// Cancelled by the user.
+    Cancelled,
+    /// FAILED_NEEDS_MANUAL: it needs attention first, and `last_error` says
+    /// how to recover (fix the cause and retry it by job id, or request a new
+    /// review); never retried in a batch.
+    NeedsManual,
+    /// The retry was refused because the job changed after it was selected:
+    /// its submission is in flight, a receipt token landed, or its status
+    /// moved on. The message says which.
+    Changed { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct ReviewSection {
     pub name: String,
     pub text: String,
 }
 
-/// Review files on disk. `meta.json` is never listed: it stores the token.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// Review files on disk. `review.json` (the stored review, unredacted: a
+/// CSPaper one holds the provider job id, which is the token) and
+/// `meta.json` (stores the token) are never listed; `ReviewView.raw` is the
+/// redacted review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct ReviewArtifacts {
     pub dir: Option<String>,
     pub review_md: Option<String>,
-    pub review_json: Option<String>,
 }
 
 /// A stored review. `markdown`, `section` and `raw` are filled according to
 /// the requested part; every text is token-redacted.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct ReviewView {
     pub job: JobView,
     pub completed_at: DateTime<Utc>,

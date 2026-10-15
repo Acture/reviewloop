@@ -4,7 +4,8 @@
 //!    before a worker dispatched it can no longer become a transition that revokes the
 //!    in-flight submission.
 //! 2. `Db::pull_poll_forward` only moves a PROCESSING job's next poll earlier.
-//! 3. `Db::requeue` refuses a submission in flight and otherwise resets the row.
+//! 3. `Db::requeue` refuses a submission in flight and otherwise resets the row, placing
+//!    the job at the end of the queue.
 //! 4. A missing fallback script is a definitive failure that clears `fallback_used`, so
 //!    a retry dispatches the fallback again.
 //! 5. A receipt stored for recovery sets `started_at`.
@@ -24,8 +25,8 @@ use common::{
 use reviewloop::{
     backend::BackendError,
     db::{
-        CancelOutcome, ClaimTiming, Db, JobChange, Lease, LeaseRecovery, LeaseWrite, ReceiptWrite,
-        Requeue,
+        CancelOutcome, ClaimTiming, Db, JobChange, Lease, LeaseRecovery, LeaseWrite, QueuePlace,
+        ReceiptWrite, Requeue,
     },
     model::{Job, JobStatus, SubmitChannel, SubmitStage, WorkKind},
     worker::{self, Attempt},
@@ -117,7 +118,7 @@ fn assert_requeued(ctx: &Ctx, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
     let job = ctx.job(job_id)?;
     assert_eq!(job.status, JobStatus::Queued);
     assert_eq!(job.attempt, 0);
-    assert_eq!(job.next_poll_at, None);
+    assert_eq!(job.next_poll_at, Some(now), "the end of the queue");
     assert_eq!(job.last_error, None);
     assert_eq!(job.submit_stage, None);
     assert_no_lease(&job);
@@ -404,7 +405,8 @@ fn requeue_refuses_dispatched_job_with_live_lease() -> Result<()> {
     let before = ctx.job(&job.id)?;
 
     assert_eq!(
-        ctx.db.requeue(&job.id, now + Duration::minutes(1))?,
+        ctx.db
+            .requeue(&job.id, false, QueuePlace::End, now + Duration::minutes(1))?,
         Requeue::InFlight {
             owner: lease.owner.clone(),
             expires_at: lease.expires_at,
@@ -445,7 +447,8 @@ fn requeue_revokes_a_claim_that_has_not_dispatched() -> Result<()> {
     let mut lease = claim_submit(&worker_db, &job.id, now)?;
     assert_eq!(ctx.job(&job.id)?.submit_stage, Some(SubmitStage::Claimed));
 
-    ctx.db.requeue(&job.id, now + Duration::minutes(1))?;
+    ctx.db
+        .requeue(&job.id, false, QueuePlace::End, now + Duration::minutes(1))?;
     let requeued = assert_requeued(&ctx, &job.id, now + Duration::minutes(1))?;
 
     // The old owner can no longer send anything.
@@ -484,7 +487,7 @@ fn requeue_resets_an_uncertain_submission() -> Result<()> {
     assert_eq!(parked.attempt, 3);
     assert!(parked.last_error.is_some());
 
-    ctx.db.requeue(&job.id, later)?;
+    ctx.db.requeue(&job.id, false, QueuePlace::End, later)?;
     let requeued = assert_requeued(&ctx, &job.id, later)?;
     assert_eq!(requeued.token, None);
     assert_eq!(
@@ -504,13 +507,20 @@ fn requeue_accepts_a_dispatch_whose_lease_has_expired() -> Result<()> {
 
     // One second before expiry the lease is live; at expiry it is not.
     assert!(matches!(
-        ctx.db
-            .requeue(&job.id, lease.expires_at - Duration::seconds(1))?,
+        ctx.db.requeue(
+            &job.id,
+            false,
+            QueuePlace::End,
+            lease.expires_at - Duration::seconds(1)
+        )?,
         Requeue::InFlight { .. }
     ));
     assert_eq!(
-        ctx.db.requeue(&job.id, lease.expires_at)?,
-        Requeue::Requeued
+        ctx.db
+            .requeue(&job.id, false, QueuePlace::End, lease.expires_at)?,
+        Requeue::Requeued {
+            status: JobStatus::Queued
+        }
     );
     assert_requeued(&ctx, &job.id, lease.expires_at)?;
 
@@ -560,9 +570,13 @@ fn requeue_resets_a_failed_job() -> Result<()> {
         Some("cancelled by user: wrong pdf")
     );
 
-    ctx.db.requeue(&job.id, now)?;
+    ctx.db.requeue(&job.id, false, QueuePlace::End, now)?;
     assert_requeued(&ctx, &job.id, now)?;
-    assert!(ctx.db.requeue("no-such-job", now).is_err());
+    assert!(
+        ctx.db
+            .requeue("no-such-job", false, QueuePlace::End, now)
+            .is_err()
+    );
     Ok(())
 }
 
@@ -629,8 +643,9 @@ async fn missing_fallback_script_fails_definitively_and_retry_reuses_fallback() 
         json!({ "reason": expected_error, "channel": "fallback" })
     );
 
-    ctx.db.requeue(&job.id, Utc::now())?;
-    let requeued = assert_requeued(&ctx, &job.id, Utc::now())?;
+    let at = Utc::now();
+    ctx.db.requeue(&job.id, false, QueuePlace::End, at)?;
+    let requeued = assert_requeued(&ctx, &job.id, at)?;
     assert!(!requeued.fallback_used);
 
     // The primary is rejected again, and the fallback is dispatched again.

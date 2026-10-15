@@ -1,12 +1,12 @@
 //! Project registry rules: which `reviewloop.toml` backs each `project_id`,
 //! and which projects the machine supervisor runs.
 //!
-//! Loading a config registers it but never enables it. A registration only
-//! moves to another file implicitly when the project is disabled and its
+//! Loading a config registers it but never watches it. A registration only
+//! moves to another file implicitly when the project is unwatched and its
 //! registered file is gone or now declares another project; a second live
 //! file declaring the same `project_id` (another clone, a worktree) is a
-//! conflict, never a silent overwrite. Only `project enable` (with
-//! `--replace` for a live conflict) moves an enabled project.
+//! conflict, never a silent overwrite. Only `project watch` (with
+//! `--replace` for a live conflict) moves a watched project.
 
 pub use crate::config::canonical_config_path;
 use crate::{db::Db, model::RegisteredProject};
@@ -74,14 +74,14 @@ pub fn same_config_file(a: &Path, b: &Path) -> bool {
 #[error(
     "project {project_id} is registered at {}{}, not {}",
     .registered.display(),
-    if *.registered_enabled { " (enabled)" } else { "" },
+    if *.registered_watched { " (watched)" } else { "" },
     .requested.display()
 )]
 pub struct RegistryConflict {
     pub project_id: String,
     pub registered: PathBuf,
     pub requested: PathBuf,
-    pub registered_enabled: bool,
+    pub registered_watched: bool,
     pub registered_state: ConfigFileState,
 }
 
@@ -90,7 +90,7 @@ pub struct RegistryConflict {
 pub enum Registration {
     Inserted,
     Refreshed,
-    /// The disabled registration pointed at a stale file and now points here.
+    /// The unwatched registration pointed at a stale file and now points here.
     Repointed {
         from: PathBuf,
     },
@@ -133,25 +133,25 @@ fn conflict(row: &RegisteredProject, requested: &Path, state: ConfigFileState) -
         project_id: row.project_id.clone(),
         registered: row.config_path.clone(),
         requested: requested.to_path_buf(),
-        registered_enabled: row.enabled,
+        registered_watched: row.enabled,
         registered_state: state,
     }
 }
 
-/// Why `project enable` refused.
+/// Why `project watch` refused.
 #[derive(Debug, thiserror::Error)]
-pub enum EnableError {
+pub enum WatchError {
     /// Another live config declares the same `project_id`.
     #[error(transparent)]
     Conflict(RegistryConflict),
-    /// This file already backs another enabled project.
+    /// This file already backs another watched project.
     #[error(
-        "{} is enabled as project {enabled_as}; disable it first with `reviewloop project disable --project-id {enabled_as}`",
+        "{} is watched as project {watched_as}; unwatch it first with `reviewloop project unwatch --project-id {watched_as}`",
         .config_path.display()
     )]
-    FileEnabledAs {
+    FileWatchedAs {
         config_path: PathBuf,
-        enabled_as: String,
+        watched_as: String,
     },
     /// Another process changed the registration while this one checked it.
     #[error("the registration of project {project_id} changed concurrently; run the command again")]
@@ -160,45 +160,45 @@ pub enum EnableError {
     Internal(#[from] anyhow::Error),
 }
 
-/// What [`enable`] changed.
+/// What [`watch`] changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Enabled {
-    /// It was already enabled at this file; nothing but `last_seen_at` changed.
+pub struct Watched {
+    /// It was already watched at this file; nothing but `last_seen_at` changed.
     pub already: bool,
     /// The registration this replaced, when it pointed at another file.
     pub moved_from: Option<PathBuf>,
 }
 
-/// Enable `project_id` at `config_path` (canonical, already loaded and
+/// Watch `project_id` at `config_path` (canonical, already loaded and
 /// validated by the caller). `replace` moves a registration whose file is
-/// still live; a stale one moves either way, since enabling is explicit.
-pub fn enable(
+/// still live; a stale one moves either way, since watching is explicit.
+pub fn watch(
     db: &Db,
     project_id: &str,
     config_path: &Path,
     replace: bool,
     now: DateTime<Utc>,
-) -> Result<Enabled, EnableError> {
-    enable_with(db, project_id, config_path, replace, false, now)
+) -> Result<Watched, WatchError> {
+    watch_with(db, project_id, config_path, replace, false, now)
 }
 
-/// [`enable`] with `replace`, but only while nobody has enabled or disabled
+/// [`watch`] with `replace`, but only while nobody has watched or unwatched
 /// the project: what an old single-project install's binding may do. `None`
 /// when a decision exists (checked in the same transaction as the write).
-pub fn enable_if_undecided(
+pub fn watch_if_undecided(
     db: &Db,
     project_id: &str,
     config_path: &Path,
     now: DateTime<Utc>,
-) -> Result<Option<Enabled>, EnableError> {
+) -> Result<Option<Watched>, WatchError> {
     if db
         .get_registered_project(project_id)?
         .is_some_and(|row| row.enabled_changed_at.is_some())
     {
         return Ok(None);
     }
-    match enable_with(db, project_id, config_path, true, true, now) {
-        Err(EnableError::Concurrent { .. })
+    match watch_with(db, project_id, config_path, true, true, now) {
+        Err(WatchError::Concurrent { .. })
             if db
                 .get_registered_project(project_id)?
                 .is_some_and(|row| row.enabled_changed_at.is_some()) =>
@@ -209,34 +209,34 @@ pub fn enable_if_undecided(
     }
 }
 
-fn enable_with(
+fn watch_with(
     db: &Db,
     project_id: &str,
     config_path: &Path,
     replace: bool,
     undecided_only: bool,
     now: DateTime<Utc>,
-) -> Result<Enabled, EnableError> {
+) -> Result<Watched, WatchError> {
     let projects = db.list_registered_projects()?;
     if let Some(other) = projects.iter().find(|row| {
         row.enabled
             && row.project_id != project_id
             && same_config_file(&row.config_path, config_path)
     }) {
-        return Err(EnableError::FileEnabledAs {
+        return Err(WatchError::FileWatchedAs {
             config_path: config_path.to_path_buf(),
-            enabled_as: other.project_id.clone(),
+            watched_as: other.project_id.clone(),
         });
     }
     let existing = projects.iter().find(|row| row.project_id == project_id);
-    // Already enabled here: nothing to decide, and its health stays.
+    // Already watched here: nothing to decide, and its health stays.
     if let Some(row) = existing
         && row.enabled
         && !undecided_only
         && same_config_file(&row.config_path, config_path)
     {
         db.touch_project_registration(project_id, &row.config_path, config_path, now)?;
-        return Ok(Enabled {
+        return Ok(Watched {
             already: true,
             moved_from: None,
         });
@@ -247,35 +247,35 @@ fn enable_with(
     {
         let state = ConfigFileState::probe(&row.config_path);
         if state.backs(project_id) && !replace {
-            return Err(EnableError::Conflict(conflict(row, config_path, state)));
+            return Err(WatchError::Conflict(conflict(row, config_path, state)));
         }
         moved_from = Some(row.config_path.clone());
     }
     let expected = existing.map(|row| row.config_path.as_path());
     if !db.enable_project(project_id, config_path, expected, undecided_only, now)? {
-        return Err(EnableError::Concurrent {
+        return Err(WatchError::Concurrent {
             project_id: project_id.to_string(),
         });
     }
-    Ok(Enabled {
+    Ok(Watched {
         already: existing.is_some_and(|row| row.enabled) && moved_from.is_none(),
         moved_from,
     })
 }
 
-/// What [`disable`] found.
+/// What [`unwatch`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Disabled {
+pub enum Unwatched {
     NotRegistered,
-    WasEnabled,
-    AlreadyDisabled,
+    WasWatched,
+    AlreadyUnwatched,
 }
 
-pub fn disable(db: &Db, project_id: &str, now: DateTime<Utc>) -> Result<Disabled> {
+pub fn unwatch(db: &Db, project_id: &str, now: DateTime<Utc>) -> Result<Unwatched> {
     Ok(match db.disable_project(project_id, now)? {
-        None => Disabled::NotRegistered,
-        Some(true) => Disabled::WasEnabled,
-        Some(false) => Disabled::AlreadyDisabled,
+        None => Unwatched::NotRegistered,
+        Some(true) => Unwatched::WasWatched,
+        Some(false) => Unwatched::AlreadyUnwatched,
     })
 }
 
@@ -312,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn registering_never_enables() {
+    fn registering_never_watches() {
         let fx = Fixture::new();
         let path = fx.config("a", "p");
         assert_eq!(
@@ -345,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_disabled_registration_follows_the_project() {
+    fn a_stale_unwatched_registration_follows_the_project() {
         let fx = Fixture::new();
         let old = fx.config("old", "p");
         register_seen(&fx.db, "p", &old, Utc::now()).unwrap();
@@ -368,97 +368,97 @@ mod tests {
     }
 
     #[test]
-    fn an_enabled_registration_never_moves_implicitly() {
+    fn a_watched_registration_never_moves_implicitly() {
         let fx = Fixture::new();
         let old = fx.config("old", "p");
-        enable(&fx.db, "p", &old, false, Utc::now()).unwrap();
+        watch(&fx.db, "p", &old, false, Utc::now()).unwrap();
         fs::remove_file(&old).unwrap();
         let new = fx.config("new", "p");
 
         let Registration::Kept(conflict) = register_seen(&fx.db, "p", &new, Utc::now()).unwrap()
         else {
-            panic!("an enabled project moves only through `project enable`");
+            panic!("a watched project moves only through `project watch`");
         };
-        assert!(conflict.registered_enabled);
+        assert!(conflict.registered_watched);
         assert_eq!(conflict.registered_state, ConfigFileState::Missing);
         assert_eq!(fx.row("p").config_path, old);
 
-        // Enabling at the new file moves it, since the old one is gone.
-        let enabled = enable(&fx.db, "p", &new, false, Utc::now()).unwrap();
-        assert_eq!(enabled.moved_from, Some(old));
+        // Watching at the new file moves it, since the old one is gone.
+        let watched = watch(&fx.db, "p", &new, false, Utc::now()).unwrap();
+        assert_eq!(watched.moved_from, Some(old));
         assert_eq!(fx.row("p").config_path, new);
     }
 
     #[test]
-    fn enabling_over_a_live_duplicate_needs_replace() {
+    fn watching_over_a_live_duplicate_needs_replace() {
         let fx = Fixture::new();
         let first = fx.config("first", "p");
         let second = fx.config("second", "p");
-        enable(&fx.db, "p", &first, false, Utc::now()).unwrap();
+        watch(&fx.db, "p", &first, false, Utc::now()).unwrap();
 
-        let err = enable(&fx.db, "p", &second, false, Utc::now()).unwrap_err();
-        assert!(matches!(err, EnableError::Conflict(_)), "{err}");
+        let err = watch(&fx.db, "p", &second, false, Utc::now()).unwrap_err();
+        assert!(matches!(err, WatchError::Conflict(_)), "{err}");
         assert_eq!(fx.row("p").config_path, first);
 
-        let enabled = enable(&fx.db, "p", &second, true, Utc::now()).unwrap();
-        assert_eq!(enabled.moved_from, Some(first));
+        let watched = watch(&fx.db, "p", &second, true, Utc::now()).unwrap();
+        assert_eq!(watched.moved_from, Some(first));
         let row = fx.row("p");
         assert_eq!(row.config_path, second);
         assert!(row.enabled);
     }
 
     #[test]
-    fn one_file_backs_at_most_one_enabled_project() {
+    fn one_file_backs_at_most_one_watched_project() {
         let fx = Fixture::new();
         let path = fx.config("a", "old-id");
-        enable(&fx.db, "old-id", &path, false, Utc::now()).unwrap();
+        watch(&fx.db, "old-id", &path, false, Utc::now()).unwrap();
         fs::write(&path, "project_id = \"new-id\"\n").unwrap();
 
-        let err = enable(&fx.db, "new-id", &path, false, Utc::now()).unwrap_err();
+        let err = watch(&fx.db, "new-id", &path, false, Utc::now()).unwrap_err();
         assert!(
-            matches!(&err, EnableError::FileEnabledAs { enabled_as, .. } if enabled_as == "old-id"),
+            matches!(&err, WatchError::FileWatchedAs { watched_as, .. } if watched_as == "old-id"),
             "{err}"
         );
-        disable(&fx.db, "old-id", Utc::now()).unwrap();
-        enable(&fx.db, "new-id", &path, false, Utc::now()).unwrap();
+        unwatch(&fx.db, "old-id", Utc::now()).unwrap();
+        watch(&fx.db, "new-id", &path, false, Utc::now()).unwrap();
     }
 
     #[test]
-    fn enable_reports_an_already_enabled_project_and_keeps_its_health() {
+    fn watch_reports_an_already_watched_project_and_keeps_its_health() {
         let fx = Fixture::new();
         let path = fx.config("a", "p");
         assert!(
-            !enable(&fx.db, "p", &path, false, Utc::now())
+            !watch(&fx.db, "p", &path, false, Utc::now())
                 .unwrap()
                 .already
         );
         fx.db.record_project_health("p", Utc::now(), None).unwrap();
         let before = fx.row("p");
         assert!(
-            enable(&fx.db, "p", &path, false, Utc::now())
+            watch(&fx.db, "p", &path, false, Utc::now())
                 .unwrap()
                 .already
         );
         let after = fx.row("p");
         assert_eq!(
             after.health, before.health,
-            "a no-op enable keeps the last pass"
+            "a no-op watch keeps the last pass"
         );
         assert_eq!(after.enabled_changed_at, before.enabled_changed_at);
     }
 
     #[test]
-    fn disable_records_an_explicit_decision() {
+    fn unwatch_records_an_explicit_decision() {
         let fx = Fixture::new();
         assert_eq!(
-            disable(&fx.db, "p", Utc::now()).unwrap(),
-            Disabled::NotRegistered
+            unwatch(&fx.db, "p", Utc::now()).unwrap(),
+            Unwatched::NotRegistered
         );
         let path = fx.config("a", "p");
         register_seen(&fx.db, "p", &path, Utc::now()).unwrap();
         assert_eq!(
-            disable(&fx.db, "p", Utc::now()).unwrap(),
-            Disabled::AlreadyDisabled
+            unwatch(&fx.db, "p", Utc::now()).unwrap(),
+            Unwatched::AlreadyUnwatched
         );
         // Decided now, so the legacy install migration leaves it alone.
         assert!(fx.row("p").enabled_changed_at.is_some());
@@ -466,15 +466,15 @@ mod tests {
     }
 
     #[test]
-    fn enable_and_disable_wake_the_supervisor() {
+    fn watch_and_unwatch_wake_the_supervisor() {
         let fx = Fixture::new();
         let path = fx.config("a", "p");
         let before = fx.db.supervisor_record().unwrap().control_version;
-        enable(&fx.db, "p", &path, false, Utc::now()).unwrap();
-        let enabled = fx.db.supervisor_record().unwrap().control_version;
-        assert!(enabled > before);
-        disable(&fx.db, "p", Utc::now()).unwrap();
-        assert!(fx.db.supervisor_record().unwrap().control_version > enabled);
+        watch(&fx.db, "p", &path, false, Utc::now()).unwrap();
+        let watched = fx.db.supervisor_record().unwrap().control_version;
+        assert!(watched > before);
+        unwatch(&fx.db, "p", Utc::now()).unwrap();
+        assert!(fx.db.supervisor_record().unwrap().control_version > watched);
     }
 
     #[test]

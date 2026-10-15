@@ -1,6 +1,6 @@
 use crate::config::Config;
 use anyhow::{Context, Result, anyhow};
-use std::{path::PathBuf, sync::OnceLock};
+use std::{io::IsTerminal, path::PathBuf, sync::OnceLock};
 use tracing::dispatcher;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::filter::LevelFilter;
@@ -35,9 +35,12 @@ pub fn init_logging(config: &Config, force_stderr: bool) -> Result<()> {
                 .map_err(|e| anyhow!(e.to_string()))?;
         }
         "stderr" => {
+            // Colours only for a terminal: an MCP host, for one, files the
+            // server's stderr as its log.
             tracing_subscriber::fmt()
                 .with_max_level(level)
                 .with_target(true)
+                .with_ansi(std::io::stderr().is_terminal())
                 .with_writer(std::io::stderr)
                 .try_init()
                 .map_err(|e| anyhow!(e.to_string()))?;

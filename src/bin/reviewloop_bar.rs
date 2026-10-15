@@ -26,7 +26,7 @@
 //! ## Supervisor
 //!
 //! One machine-level supervisor (`reviewloop daemon run`, installed as the
-//! launchd agent `ai.reviewloop.daemon`) runs every enabled project. Its
+//! launchd agent `ai.reviewloop.daemon`) runs every watched project. Its
 //! pause is a persistent flag in the shared database, so the bar reads the
 //! supervisor's state from there; launchctl only tells whether the service
 //! is loaded, which "Resume" also repairs.
@@ -341,12 +341,15 @@ fn format_job_label(job: &Job) -> String {
 
 fn format_job_label_at(job: &Job, now: DateTime<Utc>) -> String {
     let status = job.status.as_str();
-    let poll_info = job.next_poll_at.map(|next| {
+    let poll_info = job.next_poll_at.and_then(|next| {
         let secs = next.signed_duration_since(now).num_seconds();
         if secs > 0 {
-            format!("in {secs}s")
+            Some(format!("in {secs}s"))
+        } else if job.status == JobStatus::Queued {
+            // A QUEUED job's due next_poll_at is its place in the queue.
+            None
         } else {
-            "polling…".to_string()
+            Some("polling…".to_string())
         }
     });
 
@@ -399,8 +402,11 @@ enum ClickAction {
     OpenJobArtifacts(PathBuf),
     /// Open the shared log for a job (same file, different entry point).
     OpenJobLog(PathBuf),
-    /// Retry a specific job (active or failed).
-    RetryJob(String),
+    /// Retry a specific job (active or failed); `now` adds `--now` (see [`retry_action`]).
+    RetryJob {
+        job_id: String,
+        now: bool,
+    },
     /// Cancel an active job (QUEUED / SUBMITTED / PROCESSING).
     CancelJob(String),
     /// Open a native file picker and submit the chosen PDF.
@@ -408,6 +414,16 @@ enum ClickAction {
     PauseDaemon,
     ResumeDaemon,
     Quit,
+}
+
+/// Retry `job` right away (`--now`) when it can skip the queue; a job with a
+/// receipt token that is not PROCESSING (every TIMEOUT job) cannot, so it is
+/// retried plainly and polled again on schedule.
+fn retry_action(job: &Job) -> ClickAction {
+    ClickAction::RetryJob {
+        job_id: job.id.clone(),
+        now: job.can_jump_queue(),
+    }
 }
 
 // ── Menu signature (rebuild throttling) ──────────────────────────────────────
@@ -596,10 +612,7 @@ fn rebuild_menu(
                 let _ = project_sub.append(&job_sub);
 
                 let job_artifacts = artifacts_dir.join(&job.id);
-                click_map.insert(
-                    retry_item.id().clone(),
-                    ClickAction::RetryJob(job.id.clone()),
-                );
+                click_map.insert(retry_item.id().clone(), retry_action(job));
                 click_map.insert(
                     cancel_item.id().clone(),
                     ClickAction::CancelJob(job.id.clone()),
@@ -627,7 +640,7 @@ fn rebuild_menu(
                 for job in &group.failed {
                     let label = format_failed_job_label(job);
                     let item = MenuItem::new(&label, true, None);
-                    click_map.insert(item.id().clone(), ClickAction::RetryJob(job.id.clone()));
+                    click_map.insert(item.id().clone(), retry_action(job));
                     let _ = project_sub.append(&item);
                 }
             }
@@ -732,17 +745,17 @@ fn execute_action(
         ClickAction::OpenLog(path) | ClickAction::OpenJobLog(path) => {
             open_log(path);
         }
-        ClickAction::RetryJob(job_id) => {
-            tracing::info!("bar: retry job {job_id}");
+        ClickAction::RetryJob { job_id, now } => {
+            tracing::info!("bar: retry job {job_id} (now: {now})");
             let job_id = job_id.clone();
+            let now = *now;
             let la = Arc::clone(last_action);
             std::thread::spawn(move || {
-                run_action_cmd(
-                    &["retry", "--job-id", &job_id, "--force"],
-                    None,
-                    "Retry",
-                    &la,
-                );
+                let mut args = vec!["retry", "--job-id", &job_id];
+                if now {
+                    args.push("--now");
+                }
+                run_action_cmd(&args, None, "Retry", &la);
             });
         }
         ClickAction::CancelJob(job_id) => {
@@ -930,6 +943,7 @@ mod tests {
             git_commit: None,
             attempt,
             started_at: None,
+            polling_restarted_at: None,
             next_poll_at: None,
             last_error: None,
             fallback_used: false,
@@ -973,6 +987,24 @@ mod tests {
         assert_eq!(truncate_chars(s, 4), "abcd…");
     }
 
+    /// `retry --now` refuses a job with a receipt token that is not PROCESSING,
+    /// so the menu retries such a job without it.
+    #[test]
+    fn retry_action_adds_now_only_for_jobs_that_can_skip_the_queue() {
+        let failed = job("p", "j1", JobStatus::Failed, 1);
+        let mut timed_out = job("p", "j2", JobStatus::Timeout, 0);
+        timed_out.token = Some("tok".to_string());
+        let mut processing = job("p", "j3", JobStatus::Processing, 0);
+        processing.token = Some("tok".to_string());
+        for (job, expected) in [(&failed, true), (&timed_out, false), (&processing, true)] {
+            let ClickAction::RetryJob { job_id, now } = retry_action(job) else {
+                panic!("not a retry");
+            };
+            assert_eq!(job_id, job.id);
+            assert_eq!(now, expected, "{:?}", job.status);
+        }
+    }
+
     #[test]
     fn project_key_collapses_blank_ids_to_legacy() {
         let blank = job("", "j1", JobStatus::Queued, 0);
@@ -996,6 +1028,9 @@ mod tests {
 
         let mut queued = job("p", "j2", JobStatus::Queued, 0);
         queued.paper_id = "rebuttal".to_string();
+        assert_eq!(format_job_label_at(&queued, now), "rebuttal (QUEUED)");
+        // A retried or approved job's place in the queue is no poll.
+        queued.next_poll_at = Some(now - ChronoDuration::seconds(5));
         assert_eq!(format_job_label_at(&queued, now), "rebuttal (QUEUED)");
     }
 

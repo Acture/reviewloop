@@ -285,7 +285,7 @@ async fn crash_after_dispatch_parks_uncertain_and_is_never_resubmitted() -> Resu
         "lost its lease",
         owner.as_str(),
         "import-token",
-        "--force",
+        "--now",
         "cancel",
     ] {
         assert!(

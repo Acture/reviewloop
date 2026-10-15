@@ -338,7 +338,7 @@ pub struct Scheduler<'a> {
     /// rest of the tick (a pause or a shutdown request).
     pub stop: &'a dyn Fn() -> bool,
     /// Checked before each provider call for a project; `false` ends that
-    /// project's provider work for the tick (it was disabled meanwhile).
+    /// project's provider work for the tick (it was unwatched meanwhile).
     pub runs: &'a dyn Fn(&Config) -> bool,
 }
 
@@ -726,12 +726,12 @@ fn pinned_input(config: &Config, db: &Db, job: &Job) -> Result<Option<PathBuf>> 
             Ok(Some(input.snapshot_path))
         }
         JobInput::Blocked { reason } => {
-            // Retry with --force so resubmission follows the restore at once:
+            // Retry with --now so resubmission follows the restore at once:
             // a PDF watcher that sees the restored file first enqueues it as a
             // new job, which makes the retry unnecessary.
             let message = format!(
                 "submission blocked: {reason}; expected sha256 {hash}. Recover by restoring that \
-                 version at {source} and immediately running `reviewloop retry --job-id {id} --force` \
+                 version at {source} and immediately running `reviewloop retry --job-id {id} --now` \
                  (skip the retry if the PDF watcher has already enqueued the restored file), or \
                  review the current file instead with `reviewloop submit --paper-id {paper}`",
                 hash = job.pdf_hash,
@@ -1645,9 +1645,14 @@ pub fn mark_timeouts(config: &Config, db: &Db) -> Result<()> {
     Ok(())
 }
 
-/// Move a PROCESSING job whose review timeout has passed to TIMEOUT.
+/// Move a PROCESSING job whose review timeout has passed to TIMEOUT. The
+/// timeout counts from the latest retry that sent the job back to polling, else
+/// from its receipt.
 fn time_out_if_overdue(config: &Config, db: &Db, job: &Job, now: DateTime<Utc>) -> Result<()> {
-    let reference_start = job.started_at.unwrap_or(job.created_at);
+    let reference_start = job
+        .polling_restarted_at
+        .or(job.started_at)
+        .unwrap_or(job.created_at);
     if job.status != JobStatus::Processing || now - reference_start < review_timeout(config) {
         return Ok(());
     }

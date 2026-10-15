@@ -33,13 +33,13 @@ pub fn render_supervisor_panel(
     );
     println!();
 
-    let (enabled, disabled): (Vec<_>, Vec<_>) =
+    let (watched, unwatched): (Vec<_>, Vec<_>) =
         projects.iter().partition(|project| project.enabled);
-    println!("Projects ({} enabled)", enabled.len());
-    if enabled.is_empty() {
-        println!("- none: run `reviewloop project enable` in a project repo");
+    println!("Projects ({} watched)", watched.len());
+    if watched.is_empty() {
+        println!("- none: run `reviewloop project watch` in a project repo");
     }
-    for project in &enabled {
+    for project in &watched {
         let counts = db.status_counts(&project.project_id)?;
         let count = |status: &str| counts.get(status).copied().unwrap_or(0);
         let failed = count("FAILED") + count("FAILED_NEEDS_MANUAL") + count("TIMEOUT");
@@ -58,8 +58,8 @@ pub fn render_supervisor_panel(
             println!("    error: {error}");
         }
     }
-    if !disabled.is_empty() {
-        println!("({} registered project(s) disabled)", disabled.len());
+    if !unwatched.is_empty() {
+        println!("({} registered project(s) unwatched)", unwatched.len());
     }
     println!();
 

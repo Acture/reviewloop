@@ -317,7 +317,7 @@ impl Config {
     }
 
     pub fn is_paper_watched(&self, paper_id: &str) -> bool {
-        self.paper_watch.get(paper_id).copied().unwrap_or(true)
+        paper_watched(&self.paper_watch, paper_id)
     }
 
     pub fn set_paper_watch(&mut self, paper_id: &str, enabled: bool) {
@@ -996,6 +996,15 @@ impl ProjectConfigFile {
         }
         Ok(())
     }
+
+    pub fn is_paper_watched(&self, paper_id: &str) -> bool {
+        paper_watched(&self.paper_watch, paper_id)
+    }
+}
+
+/// PDF-change watching of `paper_id`: on unless `paper_watch` turns it off.
+fn paper_watched(paper_watch: &BTreeMap<String, bool>, paper_id: &str) -> bool {
+    paper_watch.get(paper_id).copied().unwrap_or(true)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

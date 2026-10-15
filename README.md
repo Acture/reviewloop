@@ -69,7 +69,7 @@ Optional flags:
 reviewloop run paper/main.pdf \
   --paper-id main \        # override the default (filename stem)
   --backend stanford \     # override the default backend (stanford | cspaper)
-  --watch false \          # disable PDF-change watching for this paper
+  --no-watch \             # register the paper without PDF-change watching
   --tag-trigger "review-stanford/main/*" \  # custom tag trigger
   --quiet                  # suppress live status; print only the final line
 ```
@@ -91,37 +91,37 @@ reviewloop paper add \
   --venue NeurIPS \
   --tag-trigger "custom-review/camera_ready/*"
 
-# let the machine supervisor run this project (once per project repo)
-reviewloop project enable
+# watch this project: the machine supervisor submits and polls for it (once per project repo)
+reviewloop project watch
 
 # install and start the supervisor (macOS, once per machine)
 reviewloop daemon install
 ```
 
 The supervisor runs every 30 seconds, handles triggers, submissions, polls, retries, token
-ingestion and retention pruning for every enabled project. Use `reviewloop daemon status`,
+ingestion and retention pruning for every watched project. Use `reviewloop daemon status`,
 `reviewloop status` and `reviewloop check` to monitor it.
 
-## Deployment model: one supervisor, explicitly enabled projects
+## Deployment model: one supervisor, explicitly watched projects
 
 One **supervisor** (`reviewloop daemon run`, installed on macOS as the launchd
-agent `ai.reviewloop.daemon`) runs every project you **enable** on the machine:
+agent `ai.reviewloop.daemon`) runs every project you **watch** on the machine:
 
-- **Enable explicitly.** Any command that loads a project's `reviewloop.toml`
+- **Watch explicitly.** Any command that loads a project's `reviewloop.toml`
   registers it (`reviewloop project list` shows the registry), but only
-  `reviewloop project enable` makes the supervisor run it: its git-tag and
+  `reviewloop project watch` makes the supervisor run it: its git-tag and
   PDF triggers, queue, polls, timeouts and recovery. `reviewloop project
-  disable` stops that; the project's jobs keep their state and explicit
+  unwatch` stops that; the project's jobs keep their state and explicit
   commands (`submit`, `check`, `retry`, …) still act on them.
 - **One registration per `project_id`.** Paths are stored canonical. A
   second clone or worktree declaring the same `project_id` never takes the
-  registration over silently: commands there print one note, and enabling it
-  needs `reviewloop project enable --replace`.
+  registration over silently: commands there print one note, and watching it
+  needs `reviewloop project watch --replace`.
 - **One supervisor per state dir.** A second `daemon run` on the same state
   directory (or database) is refused; a crashed one is replaced at once.
 - **One budget for the machine.** `core.max_submissions_per_tick` and
   `core.max_concurrency` are shared by every project and both providers, so
-  enabling more projects never adds provider load; projects take turns, and
+  watching more projects never adds provider load; projects take turns, and
   one project's broken config or failing request never stops the others
   (`reviewloop daemon status` shows each project's last error).
 - **Pause** (`reviewloop daemon pause`) is persistent: the service stays
@@ -138,8 +138,8 @@ agent `ai.reviewloop.daemon`) runs every project you **enable** on the machine:
   widget show all of them.
 
 Upgrading from a single-project install: the old launchd service passes
-`--config <project>`; the supervisor keeps that project enabled (unless you
-disabled it since) and enables nothing else. Run `reviewloop daemon install`
+`--config <project>`; the supervisor keeps that project watched (unless you
+unwatched it since) and watches nothing else. Run `reviewloop daemon install`
 once to rewrite the service.
 
 ## Installation
@@ -240,13 +240,14 @@ Core commands:
 ```bash
 reviewloop init
 reviewloop init project --project-id <id> [--project-root <path>] [--force]
-reviewloop run <pdf-path> [--paper-id <id>] [--backend <backend>] [--watch true|false] [--tag-trigger "<pattern>"] [--quiet]
-reviewloop paper add --paper-id <id> --path <pdf-or-build-artifact> [--backend <backend>] [--venue <venue>] [--watch true|false] [--tag-trigger "<pattern>"] [--submit-now] [--no-submit-prompt]
-reviewloop paper watch --paper-id <id> --enabled <true|false>
+reviewloop run <pdf-path> [--paper-id <id>] [--backend <backend>] [--no-watch] [--tag-trigger "<pattern>"] [--quiet]
+reviewloop paper add --paper-id <id> --path <pdf-or-build-artifact> [--backend <backend>] [--venue <venue>] [--no-watch] [--tag-trigger "<pattern>"] [--submit-now] [--no-submit-prompt]
+reviewloop paper watch --paper-id <id>
+reviewloop paper unwatch --paper-id <id>
 reviewloop paper remove --paper-id <id> [--purge-history]
 reviewloop project list [--json]
-reviewloop project enable [--project-id <id>] [--replace]
-reviewloop project disable [--project-id <id>]
+reviewloop project watch [--project-id <id>] [--replace]
+reviewloop project unwatch [--project-id <id>]
 reviewloop daemon run [--panel false]
 reviewloop daemon install [--start true]
 reviewloop daemon uninstall
@@ -259,7 +260,8 @@ reviewloop approve --job-id <job-id>
 reviewloop import-token (--paper-id main | --job-id <job-id>) --token <token> [--source email]
 reviewloop check [--job-id <job-id> | --paper-id <paper-id>] [--all-processing]
 reviewloop status [--paper-id main] [--json] [--show-token] [--active]
-reviewloop retry --job-id <job-id> [--force]  # (was --override-rate-limit, deprecated since vNext)
+reviewloop retry (--job-id <job-id> | --paper-id <id> [--include-failed]) [--now]
+reviewloop retry --all-failed
 reviewloop complete --job-id <job-id> [--summary-text <text> | --summary-url <url> | --empty-summary] [--score <value>]
 reviewloop config init
 reviewloop config init project --project-id <id> [--project-root <path>] [--force]
@@ -270,7 +272,20 @@ reviewloop cspaper usage [--json]
 reviewloop email switch --account <account-id-or-email>
 reviewloop email logout [--account <account-id-or-email>]
 reviewloop self-update [--method auto|brew|cargo] [--yes] [--dry-run]
+reviewloop mcp [--approval required|granted]
 ```
+
+`paper watch` / `paper unwatch` turn PDF-change watching on or off for one
+paper. On each pass the PDF trigger requests a review of a watched paper whose
+PDF differs from the PDF of its latest review request, or that has none
+(awaiting `approve` unless `trigger.pdf.auto_submit_on_change`): watching a
+paper, or watching it again after editing its PDF, can request the current
+file on the next pass. Papers are watched when registered; `--no-watch` on
+`paper add` or `run` registers one unwatched. That takes effect only while the
+project's PDF trigger is on (`trigger.pdf.enabled`, the default) and the
+supervisor runs the project, which `project watch` / `project unwatch` decide;
+`paper watch` says when either is off. Unwatching a paper leaves its git tags
+and explicit commands (`submit`, `run`) working.
 
 `paper add --agent-id <agent-id>` is an alias of `--venue`: for a `cspaper`
 paper the venue is the CSPaper review template (see [CSPaper Backend](#cspaper-backend)).
@@ -287,10 +302,67 @@ key returns the job it first resolved to, even after that job has finished
 venue or review options fails with a conflict naming the existing job. Use a
 new key for each new review round.
 
+`retry` re-queues a failed or stalled job. By default the job joins the end of
+the queue and the supervisor submits it in turn, within the machine's
+submission budget; a job the provider already accepted (it has a receipt
+token) is polled again on the polling schedule instead, its review timeout
+restarted. `--now` attempts the submission or poll once, right away, in the
+`retry` process itself, clearing any cooldown; it polls only a `PROCESSING`
+job, so retry a `TIMEOUT` or `FAILED` job that has a receipt token without it.
+`approve` also puts a job at the end of the queue.
+`retry --all-failed` retries, oldest first, every `FAILED` or `TIMEOUT` job of
+the current project that is the newest job of its paper and backend, each the
+default way: jobs without a receipt token join the end of the queue in their
+order, and jobs with one (every `TIMEOUT` job) are polled again on schedule.
+It lists the jobs it skips with the reason: cancelled, `FAILED_NEEDS_MANUAL`
+(its last error says how to recover: fix the cause and `retry --job-id`, or
+request a new review with `submit --force`), or superseded by a newer job of
+the same paper and backend, which it names.
+
 `self-update` only replaces the executable. It does not delete:
 - global config (`~/.config/reviewloop/config.toml`)
 - global data directory (database, artifacts, logs)
 - project-local configs
+
+## Agent Integration (MCP)
+
+`reviewloop mcp` is a standard stdio [Model Context Protocol](https://modelcontextprotocol.io)
+server, so an AI agent (Claude Code, Claude Desktop, VS Code, GitHub Copilot, …)
+can list papers, request reviews, follow jobs and read reviews as structured
+results:
+
+```bash
+claude mcp add reviewloop -- reviewloop mcp
+```
+
+Clients configured with an `mcpServers` map (Claude Desktop, Cursor, GitHub
+Copilot CLI):
+
+```json
+{ "mcpServers": { "reviewloop": { "command": "reviewloop", "args": ["mcp"] } } }
+```
+
+VS Code (`.vscode/mcp.json`):
+
+```json
+{ "servers": { "reviewloop": { "type": "stdio", "command": "reviewloop", "args": ["mcp"] } } }
+```
+
+- Calls act on the project of the server's working directory (or
+  `reviewloop --config <path> mcp`); every tool except `list_projects` also
+  takes a `project_id` from `list_projects`.
+- Agent requests wait in `PENDING_APPROVAL` until `approve_job`, so sending a
+  manuscript to the provider is a separate, visible step. A retry queues a job
+  that was approved and then failed, timed out or stalled again directly; a
+  cancelled or hand-completed job waits for `approve_job` again. Start the
+  server with `--approval granted` to queue requests at once.
+- Tools only read and change local state; the supervisor (`reviewloop project
+  watch`, `reviewloop daemon install`) submits and polls. Failures come back
+  as tool errors with a stable `code` and a `recovery` hint. Tokens are never
+  returned.
+
+The tools, their schemas and errors are specified in
+[docs/review-operations.md](docs/review-operations.md#mcp-server).
 
 ## Exit Codes
 
@@ -301,10 +373,10 @@ new key for each new review round.
 ## Runtime Model
 
 Supervisor tick interval: 30 seconds after the previous tick ends (pause,
-resume, enable and disable wake it within 2 seconds).
+resume, watch and unwatch wake it within 2 seconds).
 
-Each tick reloads the global config and every enabled project's config, then:
-1. Per enabled project, in turn: trigger scan (`git tags`, PDF hash changes),
+Each tick reloads the global config and every watched project's config, then:
+1. Per watched project, in turn: trigger scan (`git tags`, PDF hash changes),
    timeout marking, lease recovery (claims left behind by a crashed or killed
    worker)
 2. Optional Gmail OAuth + IMAP token ingestion, once for the machine
@@ -341,7 +413,7 @@ The submit stage is persisted before anything is sent:
   provider gives an idempotency guarantee. `reviewloop status` shows the
   reason; settle it by letting email ingestion attach the token (Stanford
   only), running `reviewloop import-token --job-id <id> --token <token>`,
-  resubmitting explicitly with `reviewloop retry --job-id <id> --force`, or
+  resubmitting explicitly with `reviewloop retry --job-id <id> --now`, or
   `reviewloop cancel --job-id <id>`. CSPaper sends no email; see
   [Reconciling an uncertain CSPaper submission](#reconciling-an-uncertain-cspaper-submission).
 
@@ -552,7 +624,7 @@ There is no global-overrides-project merge chain. Instead:
 - `--config /path/to/reviewloop.toml` explicitly points to a project config file
 - `reviewloop init` initializes the global config/data paths
 - `reviewloop init project --project-id <id>` initializes the current repo's project config
-- `reviewloop daemon install` installs the one machine-wide supervisor; `reviewloop project enable` (from the repo, or `--config`) chooses the projects it runs
+- `reviewloop daemon install` installs the one machine-wide supervisor; `reviewloop project watch` (from the repo, or `--config`) chooses the projects it runs
 - a project config cannot set machine-wide settings (`core.db_path`, `core.state_dir`, the provider budget, `[polling]`, `[retention]`, `[logging]`, `[imap]`, `[gmail_oauth]`): such a file is refused by name
 
 Project commands require a non-empty `project_id` in the project config. Jobs, events, dedupe, and status views are isolated inside the shared global DB by `project_id`.
@@ -562,7 +634,7 @@ Paper registration:
 - add papers through `reviewloop paper add ...`
 - remove papers through `reviewloop paper remove --paper-id ...`
   - add `--purge-history` to also delete DB jobs/events/reviews and local artifacts for that paper
-- control PDF watcher per paper with `reviewloop paper watch ...`
+- turn PDF-change watching per paper on or off with `reviewloop paper watch --paper-id ...` / `reviewloop paper unwatch --paper-id ...` (stored in `paper_watch`)
 
 Safe defaults:
 - `core.max_concurrency = 2` (polls per tick, for the whole machine)
@@ -629,7 +701,7 @@ desk_rejection_enabled = true       # the default
   wins. It is sent only in the `X-API-Key` header and kept out of job rows,
   events, job errors and archives. The launchd supervisor does not inherit
   your shell's environment, so it needs the key in the global config;
-  `reviewloop daemon install` warns, naming the enabled projects that use
+  `reviewloop daemon install` warns, naming the watched projects that use
   CSPaper, when it is missing there.
 - `base_url`: defaults to `https://cspaper.org`. It must be `https://` with a
   host (plain `http://` only for `localhost`, `127.0.0.1` or `[::1]`).
@@ -722,7 +794,7 @@ machine's reviews this month, from the local database across projects), and
 reviews into completed, in progress and ended without a review, and lists
 uncertain submissions separately: jobs parked `UNCERTAIN`, and jobs whose
 submission outcome was unknown before they were cancelled (also while their
-upload was in flight) or resubmitted with `retry --force`. The latter are known
+upload was in flight) or resubmitted with `retry`. The latter are known
 from job events, kept for `retention.events_days` (default 30).
 
 ### Errors and outcomes
@@ -746,7 +818,7 @@ Polling:
 | `COMPLETED` | `COMPLETED`, artifacts written | Read the review. |
 | `FAILED` | `FAILED_NEEDS_MANUAL` with CSPaper's `failed_reason`, and a notification | Polling again gives the same answer, so `retry` does not help: request a new review with `reviewloop submit --paper-id <paper> --force` (`--force` because an earlier review of the same manuscript would otherwise be returned instead). |
 | 404 / 410 (unknown job, or one owned by another organisation's key) | `FAILED` (`invalid token`) | Check the job id and the key's organisation. A `FAILED` job cannot take a new token, so attach the right one to a new job: `reviewloop import-token --paper-id <paper> --token <cspaper job_id>`. |
-| 401 / 403, 429, 5xx, or an unexpected payload | stays `PROCESSING`, polled again on the schedule (429: after `Retry-After`) | Fix the key if it was refused; the job times out after `core.review_timeout_hours` otherwise. |
+| 401 / 403, 429, 5xx, or an unexpected payload | stays `PROCESSING`, polled again on the schedule (429: after `Retry-After`) | Fix the key if it was refused; the job times out after `core.review_timeout_hours` otherwise, and `reviewloop retry --job-id <job>` then polls it again with the timeout restarted. |
 
 ### Reconciling an uncertain CSPaper submission
 
@@ -760,7 +832,7 @@ exit code 2, and no email will settle it. Settle it by hand:
 2. If it is there, attach its job id:
    `reviewloop import-token --job-id <id> --token <cspaper job_id>`.
    ReviewLoop polls it at once and continues normally.
-3. If it is not there, resubmit with `reviewloop retry --job-id <id> --force`.
+3. If it is not there, resubmit with `reviewloop retry --job-id <id> --now`.
    This may create a duplicate review if CSPaper did receive the first one.
 4. Or stop tracking it with `reviewloop cancel --job-id <id>`; a review
    CSPaper already created is not withdrawn.
@@ -882,7 +954,7 @@ Please keep it that way:
   (10 MiB, first 15 pages reviewed) and token handling are in
   [docs/providers/stanford.md](docs/providers/stanford.md)
 - Database: SQLite (global state path by default, supports `:memory:`)
-- Interface: CLI + daemon
+- Interface: CLI + daemon + stdio MCP server (`reviewloop mcp`)
 
 ## macOS Widget (preview)
 

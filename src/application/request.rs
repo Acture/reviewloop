@@ -153,17 +153,29 @@ pub struct ReviewQuery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryRequest {
     pub job: JobRef,
-    /// Make the job due now instead of following the polling schedule. The
-    /// caller may then submit or poll it immediately; otherwise the worker
-    /// does at its next tick.
-    pub force: bool,
+    /// Skip the queue. A job without a receipt token takes its original place
+    /// (its creation time) instead of joining the end of the queue, with any
+    /// cooldown cleared; a PROCESSING job with one is due for a poll now
+    /// instead of on the polling schedule. Refused for a job that cannot skip
+    /// the queue ([`crate::model::Job::can_jump_queue`]). Without it, a
+    /// tokenless job joins the end of the queue and a token-backed one is
+    /// polled on schedule, its review timeout restarted.
+    pub jump_queue: bool,
     /// Let a paper reference also match FAILED, FAILED_NEEDS_MANUAL and
     /// TIMEOUT jobs.
     pub include_failed: bool,
-    /// With `force`, the caller submits or polls the job itself right away
-    /// (`reviewloop retry --force`). A forced poll then leaves `next_poll_at`
+    /// With `jump_queue`, the caller submits or polls the job itself right
+    /// away (`reviewloop retry --now`). A poll then leaves `next_poll_at`
     /// alone so a worker does not poll the same job concurrently.
     pub caller_executes: bool,
+    /// Whether a retry that sends the manuscript again (a tokenless job) may
+    /// queue it. `Granted` (the CLI): the retry is the approval. `Required`
+    /// (an agent whose sends need approval): the job is queued only when its
+    /// row proves it was approved before (QUEUED, SUBMITTED, PROCESSING,
+    /// FAILED_NEEDS_MANUAL, TIMEOUT, or FAILED other than by a cancel);
+    /// otherwise (cancelled, COMPLETED) it goes back to PENDING_APPROVAL for
+    /// `approve_job`.
+    pub approval: Approval,
 }
 
 /// Cancel a non-terminal job locally. The provider is not contacted.
@@ -173,9 +185,9 @@ pub struct CancelRequest {
     pub reason: Option<String>,
 }
 
-/// Enable the context's project for the machine supervisor.
+/// Watch the context's project: the machine supervisor runs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EnableProjectRequest {
+pub struct WatchProjectRequest {
     /// The `reviewloop.toml` the context config was loaded from; it must
     /// declare the context's project.
     pub config_path: std::path::PathBuf,
@@ -186,8 +198,8 @@ pub struct EnableProjectRequest {
 
 /// Stop the machine supervisor from running a project.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DisableProjectRequest {
-    /// The project to disable; `None` is the context's project. Its config
-    /// need not load, so a broken or deleted project can still be disabled.
+pub struct UnwatchProjectRequest {
+    /// The project to unwatch; `None` is the context's project. Its config
+    /// need not load, so a broken or deleted project can still be unwatched.
     pub project_id: Option<String>,
 }

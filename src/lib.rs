@@ -8,6 +8,7 @@ pub mod email_account;
 pub mod fallback;
 pub mod http;
 pub mod logging;
+pub mod mcp;
 pub mod model;
 pub mod notifier;
 pub mod oauth;

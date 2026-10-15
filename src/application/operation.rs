@@ -12,8 +12,8 @@ pub enum Operation {
     RetryJob,
     CancelJob,
     GetWorkerStatus,
-    EnableProject,
-    DisableProject,
+    WatchProject,
+    UnwatchProject,
 }
 
 impl Operation {
@@ -28,8 +28,8 @@ impl Operation {
         Operation::RetryJob,
         Operation::CancelJob,
         Operation::GetWorkerStatus,
-        Operation::EnableProject,
-        Operation::DisableProject,
+        Operation::WatchProject,
+        Operation::UnwatchProject,
     ];
 
     /// The MCP tool name, which is also the name of the
@@ -46,8 +46,8 @@ impl Operation {
             Operation::RetryJob => "retry_job",
             Operation::CancelJob => "cancel_job",
             Operation::GetWorkerStatus => "get_worker_status",
-            Operation::EnableProject => "enable_project",
-            Operation::DisableProject => "disable_project",
+            Operation::WatchProject => "watch_project",
+            Operation::UnwatchProject => "unwatch_project",
         }
     }
 

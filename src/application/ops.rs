@@ -1,16 +1,16 @@
 use super::{
     dto::{
-        JobCandidate, JobList, JobView, ManuscriptInput, PaperView, ProjectEnablement, ProjectView,
-        ProjectWorkerView, RequestDisposition, RetryAction, RetryOutcome, ReviewArtifacts,
-        ReviewRequestOutcome, ReviewSection, ReviewView, SupervisorView, TransitionOutcome,
-        WorkerStatus,
+        FailedJobsRetry, JobCandidate, JobList, JobView, ManuscriptInput, PaperView, ProjectView,
+        ProjectWatch, ProjectWorkerView, RequestDisposition, RetryAction, RetryOutcome,
+        ReviewArtifacts, ReviewRequestOutcome, ReviewSection, ReviewView, SkipReason, SkippedRetry,
+        SupervisorView, TransitionOutcome, WorkerStatus,
     },
     error::OpError,
     operation::Operation,
     redact::redact_value,
     request::{
-        Approval, CancelRequest, DisableProjectRequest, Eligibility, EnableProjectRequest,
-        JobListQuery, JobRef, RetryRequest, ReviewPart, ReviewQuery, ReviewRequest,
+        Approval, CancelRequest, Eligibility, JobListQuery, JobRef, RetryRequest, ReviewPart,
+        ReviewQuery, ReviewRequest, UnwatchProjectRequest, WatchProjectRequest,
     },
 };
 use crate::{
@@ -18,14 +18,14 @@ use crate::{
     backend::input::{InputVerdict, input_policy},
     config::canonical_config_path,
     config::{Config, PaperConfig},
-    db::{CancelOutcome, Db, Requeue},
+    db::{CancelOutcome, Db, NewerJob, QueuePlace, Requeue},
     email_account::resolve_submission_email,
     http::redact_url_paths,
     model::{
         EnqueueConflict, EnqueueMode, EnqueueOutcome, EnqueueRequest, Job, JobPdf, JobStatus,
-        NewJob,
+        NewJob, SubmitStage, is_cancellation,
     },
-    registry::{self, ConfigFileState, Disabled, EnableError},
+    registry::{self, ConfigFileState, Unwatched, WatchError},
     submission_input::prepare_input,
     supervisor::WorkerAvailability,
     util::compute_next_poll_at,
@@ -49,9 +49,6 @@ fn check_provider_settings(config: &Config, paper: &PaperConfig) -> Result<(), O
     }
 }
 
-/// `last_error` prefix of a cancelled job. The widget and the failure lists
-/// in [`Db`] filter on it.
-pub const CANCELLED_BY_USER: &str = "cancelled by user";
 pub const DEFAULT_JOB_LIST_LIMIT: usize = 50;
 pub const MAX_JOB_LIST_LIMIT: usize = 200;
 
@@ -123,11 +120,8 @@ impl<'a> ReviewOps<'a> {
 
     /// Let the machine supervisor run this project from `config_path`. Never
     /// takes the registration from another live config unless `replace`, and
-    /// never gives one config two enabled projects.
-    pub fn enable_project(
-        &self,
-        request: &EnableProjectRequest,
-    ) -> Result<ProjectEnablement, OpError> {
+    /// never gives one config two watched projects.
+    pub fn watch_project(&self, request: &WatchProjectRequest) -> Result<ProjectWatch, OpError> {
         let project_id = require_project(self.config)?;
         let config_path =
             canonical_config_path(&request.config_path).map_err(|err| OpError::InvalidRequest {
@@ -144,7 +138,7 @@ impl<'a> ReviewOps<'a> {
                 ),
             });
         }
-        let enabled = registry::enable(
+        let watched = registry::watch(
             self.db,
             project_id,
             &config_path,
@@ -154,48 +148,48 @@ impl<'a> ReviewOps<'a> {
         .map_err(|err| {
             let message = err.to_string();
             match err {
-                EnableError::Conflict(conflict) => OpError::ProjectConflict {
+                WatchError::Conflict(conflict) => OpError::ProjectConflict {
                     message: format!(
                         "{message}, which still declares it; keep one copy per project_id, or move the registration here with --replace"
                     ),
                     project_id: conflict.project_id,
                     registered_path: Some(conflict.registered.display().to_string()),
                     requested_path: conflict.requested.display().to_string(),
-                    enabled_as: None,
+                    watched_as: None,
                 },
-                EnableError::FileEnabledAs {
+                WatchError::FileWatchedAs {
                     config_path,
-                    enabled_as,
+                    watched_as,
                 } => OpError::ProjectConflict {
                     project_id: project_id.to_string(),
                     registered_path: None,
                     requested_path: config_path.display().to_string(),
-                    enabled_as: Some(enabled_as),
+                    watched_as: Some(watched_as),
                     message,
                 },
-                EnableError::Concurrent { .. } => OpError::Internal(anyhow::anyhow!(message)),
-                EnableError::Internal(err) => OpError::Internal(err),
+                WatchError::Concurrent { .. } => OpError::Internal(anyhow::anyhow!(message)),
+                WatchError::Internal(err) => OpError::Internal(err),
             }
         })?;
         info!(
             project_id,
             config_path = %config_path.display(),
-            changed = !enabled.already,
-            "project enabled for the supervisor"
+            changed = !watched.already,
+            "project watched by the supervisor"
         );
-        self.enablement(
+        self.watch_outcome(
             project_id,
-            !enabled.already,
-            enabled.moved_from.map(|path| path.display().to_string()),
+            !watched.already,
+            watched.moved_from.map(|path| path.display().to_string()),
         )
     }
 
     /// Stop the machine supervisor from running a project (by default this
     /// one). Its jobs keep their state.
-    pub fn disable_project(
+    pub fn unwatch_project(
         &self,
-        request: &DisableProjectRequest,
-    ) -> Result<ProjectEnablement, OpError> {
+        request: &UnwatchProjectRequest,
+    ) -> Result<ProjectWatch, OpError> {
         let project_id = match request.project_id.as_deref().map(str::trim) {
             Some(id) if !id.is_empty() => id,
             Some(_) => {
@@ -206,25 +200,25 @@ impl<'a> ReviewOps<'a> {
             }
             None => require_project(self.config)?,
         };
-        let changed = match registry::disable(self.db, project_id, Utc::now())? {
-            Disabled::NotRegistered => {
+        let changed = match registry::unwatch(self.db, project_id, Utc::now())? {
+            Unwatched::NotRegistered => {
                 return Err(OpError::ProjectNotRegistered {
                     project_id: project_id.to_string(),
                 });
             }
-            Disabled::WasEnabled => true,
-            Disabled::AlreadyDisabled => false,
+            Unwatched::WasWatched => true,
+            Unwatched::AlreadyUnwatched => false,
         };
-        info!(project_id, changed, "project disabled for the supervisor");
-        self.enablement(project_id, changed, None)
+        info!(project_id, changed, "project unwatched by the supervisor");
+        self.watch_outcome(project_id, changed, None)
     }
 
-    fn enablement(
+    fn watch_outcome(
         &self,
         project_id: &str,
         changed: bool,
         moved_from: Option<String>,
-    ) -> Result<ProjectEnablement, OpError> {
+    ) -> Result<ProjectWatch, OpError> {
         let row = self.db.get_registered_project(project_id)?.ok_or_else(|| {
             OpError::ProjectNotRegistered {
                 project_id: project_id.to_string(),
@@ -240,7 +234,7 @@ impl<'a> ReviewOps<'a> {
                 last_error: row.health.last_error.as_deref().map(redact_url_paths),
             }),
         };
-        Ok(ProjectEnablement {
+        Ok(ProjectWatch {
             project: ProjectView::of(row, &self.config.project_id),
             changed,
             moved_from,
@@ -483,7 +477,7 @@ impl<'a> ReviewOps<'a> {
         Ok(view)
     }
 
-    /// Move a PENDING_APPROVAL job to QUEUED.
+    /// Move a PENDING_APPROVAL job to QUEUED, at the end of the queue.
     pub fn approve_job(&self, job: &JobRef) -> Result<TransitionOutcome, OpError> {
         require_project(self.config)?;
         let job = self.find_job(job, Eligibility::APPROVE)?;
@@ -500,21 +494,106 @@ impl<'a> ReviewOps<'a> {
             });
         }
 
-        self.db
-            .update_job_state(&job.id, JobStatus::Queued, None, Some(None), Some(None))?;
+        // Approval is when the job takes its place: behind the jobs already queued.
+        self.db.update_job_state(
+            &job.id,
+            JobStatus::Queued,
+            None,
+            Some(Some(Utc::now())),
+            Some(None),
+        )?;
         self.db
             .add_event(None, Some(&job.id), "approved", json!({}))?;
         info!(job_id = %job.id, paper_id = %job.paper_id, "job approved");
         self.transitioned(&job)
     }
 
-    /// Re-queue a job: a token-backed job goes back to polling, a tokenless
-    /// one back to submission. Every status but PENDING_APPROVAL may be
-    /// retried (that one needs `approve_job`); `force` is limited to the
-    /// statuses an immediate submit or poll can act on. Uses this config's
+    /// Re-queue a job: a token-backed job goes back to polling (without
+    /// `jump_queue`, its review timeout restarted), a tokenless one back to
+    /// submission at the end of the queue (with `jump_queue`, at its original
+    /// place), or, when [`RetryRequest::approval`] is `Required` and its row
+    /// does not prove an earlier approval ([`Job::proves_approval`]), back to
+    /// approval. Every status but PENDING_APPROVAL may be retried (that one
+    /// needs `approve_job`); `jump_queue` is limited to the jobs an immediate
+    /// submit or poll can act on ([`Job::can_jump_queue`]). Uses this config's
     /// polling schedule, so the config must be the job's project.
     pub fn retry_job(&self, request: &RetryRequest) -> Result<RetryOutcome, OpError> {
         let job = self.find_job(&request.job, Eligibility::retry(request.include_failed))?;
+        self.retry_found(job, request)
+    }
+
+    /// Retry every FAILED and TIMEOUT job of this project that is the newest
+    /// job of its paper and backend (no job of that paper and backend was
+    /// created after it, in any status), oldest first, each as
+    /// [`Self::retry_job`] retries it without `jump_queue` and with approval
+    /// granted: a tokenless job joins the end of the queue, so the retried
+    /// ones keep their relative order behind the jobs already waiting, and a
+    /// token-backed one (every timed-out job) is polled on schedule, its review
+    /// timeout restarted. Skipped, with the first reason that applies: a
+    /// superseded job, a cancelled one, and a FAILED_NEEDS_MANUAL one, which
+    /// needs attention first (its `last_error` says how to recover) and is
+    /// never retried in a batch. A retry refused because the job changed after
+    /// it was selected ([`OpError::InvalidState`]) is a skip too; any other
+    /// error ends the batch. `reviewloop retry --all-failed`; not an MCP tool.
+    pub fn retry_failed_jobs(&self) -> Result<FailedJobsRetry, OpError> {
+        let project_id = require_project(self.config)?;
+        let mut retried = Vec::new();
+        let mut skipped = Vec::new();
+        for (job, newer) in self.db.list_failed_jobs_with_newer(project_id)? {
+            let reason = match skip_reason(&job, newer) {
+                Some(reason) => reason,
+                None => match self.retry_selected(&job) {
+                    Ok(outcome) => {
+                        retried.push(outcome);
+                        continue;
+                    }
+                    Err(OpError::InvalidState {
+                        operation: Operation::RetryJob,
+                        message,
+                        ..
+                    }) => SkipReason::Changed { message },
+                    Err(err) => return Err(err),
+                },
+            };
+            skipped.push(SkippedRetry {
+                job: self.view(&job)?,
+                reason,
+            });
+        }
+        info!(
+            project_id,
+            retried = retried.len(),
+            skipped = skipped.len(),
+            "failed jobs retried"
+        );
+        Ok(FailedJobsRetry { retried, skipped })
+    }
+
+    /// [`Self::retry_found`] for a job [`Self::retry_failed_jobs`] selected,
+    /// re-read so that a job whose status changed since is refused.
+    fn retry_selected(&self, selected: &Job) -> Result<RetryOutcome, OpError> {
+        let job = self.job_by_id(&selected.id)?;
+        if job.status != selected.status {
+            let message = format!(
+                "job {} is now {} (it was {} when selected)",
+                job.id,
+                job.status.as_str(),
+                selected.status.as_str()
+            );
+            return Err(invalid_retry(&job, &message));
+        }
+        let request = RetryRequest {
+            job: JobRef::Id(job.id.clone()),
+            jump_queue: false,
+            include_failed: true,
+            caller_executes: false,
+            approval: Approval::Granted,
+        };
+        self.retry_found(job, &request)
+    }
+
+    /// [`Self::retry_job`] for `job`, which `request.job` resolved to.
+    fn retry_found(&self, job: Job, request: &RetryRequest) -> Result<RetryOutcome, OpError> {
         if job.project_id != self.config.project_id {
             return Err(OpError::ProjectMismatch {
                 job_id: job.id,
@@ -529,15 +608,20 @@ impl<'a> ReviewOps<'a> {
             );
             return Err(invalid_retry(&job, &message));
         }
-
-        let action = match (request.force, job.token.is_some()) {
+        if request.jump_queue && !job.can_jump_queue() {
+            let message = if job.token.is_some() {
+                format!(
+                    "job {} has a receipt token and is {}: skipping the queue only polls a PROCESSING job",
+                    job.id,
+                    job.status.as_str()
+                )
+            } else {
+                "skipping the queue for a job without a receipt token only supports QUEUED/SUBMITTED/FAILED/FAILED_NEEDS_MANUAL/TIMEOUT".to_string()
+            };
+            return Err(invalid_retry(&job, &message));
+        }
+        let action = match (request.jump_queue, job.token.is_some()) {
             (true, true) => {
-                if job.status != JobStatus::Processing {
-                    return Err(invalid_retry(
-                        &job,
-                        "--force for token-backed jobs only supports PROCESSING jobs",
-                    ));
-                }
                 // A caller polling right away must not also make the job due
                 // for a worker; poll_job reschedules it either way.
                 if !request.caller_executes {
@@ -557,55 +641,58 @@ impl<'a> ReviewOps<'a> {
                 )?;
                 RetryAction::PollNow
             }
-            (true, false) => {
-                if !matches!(
-                    job.status,
-                    JobStatus::Queued
-                        | JobStatus::Submitted
-                        | JobStatus::Failed
-                        | JobStatus::FailedNeedsManual
-                        | JobStatus::Timeout
-                ) {
-                    return Err(invalid_retry(
-                        &job,
-                        "--force for tokenless jobs only supports QUEUED/SUBMITTED/FAILED/FAILED_NEEDS_MANUAL/TIMEOUT",
-                    ));
-                }
-                // user override: reset terminal job back to Queued for re-submission.
-                self.requeue(&job)?;
-                self.db.add_event(
-                    Some(&job.project_id),
-                    Some(&job.id),
-                    "manual_rate_limit_override",
-                    override_payload(&job, "submit"),
-                )?;
-                RetryAction::SubmitNow
-            }
-            (false, has_token) => {
-                let action = if has_token {
-                    let next = compute_next_poll_at(
-                        Utc::now(),
-                        &self.config.polling.schedule_minutes,
-                        0,
-                        self.config.polling.jitter_percent,
-                    );
-                    // user override: explicit retry may cross state-machine boundaries.
-                    self.db.update_job_state_unchecked(
-                        &job.id,
-                        JobStatus::Processing,
-                        Some(0),
-                        Some(Some(next)),
-                        Some(None),
-                    )?;
-                    RetryAction::PollScheduled
-                } else {
-                    // user override: explicit retry may cross state-machine boundaries.
-                    self.requeue(&job)?;
-                    RetryAction::SubmissionQueued
-                };
+            (false, true) => {
+                let now = Utc::now();
+                let next = compute_next_poll_at(
+                    now,
+                    &self.config.polling.schedule_minutes,
+                    0,
+                    self.config.polling.jitter_percent,
+                );
+                // user override: explicit retry may cross state-machine boundaries.
+                self.db.restart_polling(&job.id, next, now)?;
                 self.db
                     .add_event(Some(&job.project_id), Some(&job.id), "retried", json!({}))?;
-                action
+                RetryAction::PollScheduled
+            }
+            (jump_queue, false) => {
+                // user override: explicit retry may cross state-machine
+                // boundaries. Sending the manuscript again may need approval.
+                let place = if jump_queue {
+                    QueuePlace::Original
+                } else {
+                    QueuePlace::End
+                };
+                let status = self.requeue(&job, request.approval == Approval::Required, place)?;
+                if status == JobStatus::PendingApproval {
+                    self.db.add_event(
+                        Some(&job.project_id),
+                        Some(&job.id),
+                        "retried",
+                        json!({
+                            "awaiting_approval": true,
+                            "previous_status": job.status.as_str(),
+                            "previous_submit_stage": job.submit_stage.map(SubmitStage::as_str),
+                        }),
+                    )?;
+                    RetryAction::AwaitingApproval
+                } else if jump_queue {
+                    self.db.add_event(
+                        Some(&job.project_id),
+                        Some(&job.id),
+                        "manual_rate_limit_override",
+                        override_payload(&job, "submit"),
+                    )?;
+                    RetryAction::SubmitNow
+                } else {
+                    self.db.add_event(
+                        Some(&job.project_id),
+                        Some(&job.id),
+                        "retried",
+                        json!({}),
+                    )?;
+                    RetryAction::SubmissionQueued
+                }
             }
         };
         info!(job_id = %job.id, paper_id = %job.paper_id, ?action, "job retried");
@@ -651,10 +738,19 @@ impl<'a> ReviewOps<'a> {
         self.transitioned(&Job { status, ..job })
     }
 
-    /// [`Db::requeue`] with its refusals as typed retry errors.
-    fn requeue(&self, job: &Job) -> Result<(), OpError> {
-        match self.db.requeue(&job.id, Utc::now())? {
-            Requeue::Requeued => Ok(()),
+    /// [`Db::requeue`] with its refusals as typed retry errors; the status the
+    /// job went back to.
+    fn requeue(
+        &self,
+        job: &Job,
+        approval_required: bool,
+        place: QueuePlace,
+    ) -> Result<JobStatus, OpError> {
+        match self
+            .db
+            .requeue(&job.id, approval_required, place, Utc::now())?
+        {
+            Requeue::Requeued { status } => Ok(status),
             Requeue::InFlight { owner, expires_at } => Err(invalid_retry(
                 job,
                 &format!(
@@ -759,25 +855,28 @@ impl<'a> ReviewOps<'a> {
         };
         ReviewArtifacts {
             review_md: existing("review.md"),
-            review_json: existing("review.json"),
             dir: dir.exists().then(|| dir.display().to_string()),
         }
     }
 
-    /// Reset `attempt` and clear `next_poll_at` on the paper's other QUEUED,
-    /// SUBMITTED and PROCESSING jobs so they do not wait behind their
-    /// cooldowns. Only runs after a forced request created `created`, so a
-    /// replayed request never clears cooldowns.
+    /// Reset `attempt` on the paper's other QUEUED, SUBMITTED and PROCESSING
+    /// jobs and clear a `next_poll_at` still in the future, so they do not
+    /// wait behind their cooldowns. A due one is kept: on a QUEUED job it is
+    /// the job's place in the queue. Only runs after a forced request created
+    /// `created`, so a replayed request never clears cooldowns.
     fn clear_sibling_cooldowns(
         &self,
         created: &Job,
         request: &ReviewRequest,
     ) -> Result<(), OpError> {
+        let now = Utc::now();
         let siblings = self
             .db
             .list_active_jobs_for_paper(&created.project_id, &created.paper_id)?;
         for sibling in siblings.into_iter().filter(|job| job.id != created.id) {
-            self.db.reschedule(&sibling.id, Some(0), Some(None))?;
+            let cooldown = sibling.next_poll_at.is_some_and(|at| at > now);
+            self.db
+                .reschedule(&sibling.id, Some(0), cooldown.then_some(None))?;
             self.db.add_event(
                 Some(&created.project_id),
                 Some(&sibling.id),
@@ -790,6 +889,24 @@ impl<'a> ReviewOps<'a> {
             )?;
         }
         Ok(())
+    }
+}
+
+/// Why [`ReviewOps::retry_failed_jobs`] leaves a selected job alone, if it does.
+fn skip_reason(job: &Job, newer: Option<NewerJob>) -> Option<SkipReason> {
+    if let Some(newer) = newer {
+        Some(SkipReason::Superseded(JobCandidate {
+            job_id: newer.id,
+            status: newer.status,
+        }))
+    } else if job.status == JobStatus::Failed
+        && job.last_error.as_deref().is_some_and(is_cancellation)
+    {
+        Some(SkipReason::Cancelled)
+    } else if job.status == JobStatus::FailedNeedsManual {
+        Some(SkipReason::NeedsManual)
+    } else {
+        None
     }
 }
 

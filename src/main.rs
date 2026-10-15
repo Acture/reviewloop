@@ -2,8 +2,8 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use reviewloop::application::{
-    Approval, CancelRequest, Eligibility, JobRef, OpError, RequestOrigin, RetryAction,
-    RetryRequest, ReviewOps, ReviewRequest, require_project,
+    Approval, CancelRequest, Eligibility, JobRef, OpError, Operation, RequestOrigin, RetryAction,
+    RetryRequest, ReviewOps, ReviewRequest, SkipReason, require_project,
 };
 use reviewloop::artifact::write_review_artifacts;
 use reviewloop::backend::ProviderSource;
@@ -54,21 +54,21 @@ enum Command {
         command: ConfigCommand,
     },
     /// Manage papers tracked in the project config. Subcommands: add, watch,
-    /// remove.
+    /// unwatch, remove.
     Paper {
         #[command(subcommand)]
         command: PaperCommand,
     },
-    /// Manage the machine supervisor that runs every enabled project's
+    /// Manage the machine supervisor that runs every watched project's
     /// triggers, submissions and polls. Subcommands: run, install,
     /// uninstall, status, pause, resume.
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    /// Choose which projects the machine supervisor runs. Subcommands: list,
-    /// enable, disable. Loading a project's config registers it; only
-    /// `enable` makes the supervisor run it.
+    /// Choose which projects the machine supervisor watches. Subcommands:
+    /// list, watch, unwatch. Loading a project's config registers it; only
+    /// `watch` makes the supervisor submit and poll for it.
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
@@ -145,8 +145,17 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
-    /// Re-queue a failed or stalled job for another attempt. Use --force to
-    /// clear any cooldown. Accepts --job-id or --paper-id.
+    /// Re-queue a failed or stalled job for another attempt. Accepts --job-id
+    /// or --paper-id, or --all-failed for the project's latest failed jobs.
+    ///
+    /// By default the job joins the end of the queue and the machine
+    /// supervisor submits it in turn, within the machine's submission budget;
+    /// a job the provider already accepted (it has a receipt token) is polled
+    /// again on the polling schedule instead, its review timeout restarted.
+    /// With --now, this command attempts the submission or poll once, right
+    /// away, in this process, clearing any cooldown. --now polls only a
+    /// PROCESSING job: retry a TIMEOUT or FAILED job that has a receipt token
+    /// without it.
     ///
     /// When using --paper-id, only active jobs (QUEUED, SUBMITTED, PROCESSING)
     /// are matched by default. This avoids ambiguity when multiple failed jobs
@@ -154,18 +163,25 @@ enum Command {
     /// --include-failed to also consider FAILED, FAILED_NEEDS_MANUAL, and TIMEOUT
     /// jobs. If multiple failed jobs match, you'll get a candidate list and must
     /// use --job-id to pick one explicitly.
+    ///
+    /// --all-failed retries, oldest first, every FAILED or TIMEOUT job of the
+    /// current project that is the newest job of its paper and backend, each
+    /// the default way (no --now). It skips, and lists with the reason,
+    /// cancelled jobs, FAILED_NEEDS_MANUAL jobs (their last error says how to
+    /// recover: a fix and a retry by --job-id, or a new review) and jobs
+    /// superseded by a newer job.
     Retry {
         #[command(flatten)]
-        job_ref: JobOrPaperRef,
-        /// Force immediate retry, clearing any pending cooldown / rate-limit wait.
-        #[arg(long, default_value_t = false)]
-        force: bool,
-        /// Deprecated alias for --force. Will be removed in a future release.
-        #[arg(long, default_value_t = false, hide = true)]
-        override_rate_limit: bool,
+        target: RetryTarget,
+        /// Attempt the job once right away, in this process, instead of
+        /// joining the end of the queue; clears any cooldown. A job with a
+        /// receipt token is polled only while PROCESSING: retry a TIMEOUT or
+        /// FAILED one without --now.
+        #[arg(long, default_value_t = false, conflicts_with = "all_failed")]
+        now: bool,
         /// Also consider FAILED, FAILED_NEEDS_MANUAL, and TIMEOUT jobs when
         /// resolving --paper-id. By default only active jobs are matched.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, conflicts_with = "all_failed")]
         include_failed: bool,
     },
     /// Mark a job as completed and optionally attach a summary or score.
@@ -206,6 +222,26 @@ enum Command {
     /// until terminal. Exit codes: 0=Completed, 2=terminal failure, 130=Ctrl+C.
     /// Email/OAuth is NOT required for this command.
     Run(RunArgs),
+    /// Serve the review operations to an AI agent as a Model Context Protocol
+    /// (MCP) server on stdin/stdout. Tools act on the project of the current
+    /// directory (or --config) unless a call names another registered
+    /// project. Logs go to stderr. See docs/review-operations.md.
+    Mcp(McpArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+struct McpArgs {
+    /// Whether an agent's review requests wait for `approve_job` before
+    /// anything is sent to the provider (`required`), or are queued for the
+    /// supervisor at once (`granted`).
+    #[arg(long, value_enum, default_value_t = McpApproval::Required)]
+    approval: McpApproval,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum McpApproval {
+    Required,
+    Granted,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -254,7 +290,7 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
-    /// Run the machine supervisor in the foreground: every enabled project,
+    /// Run the machine supervisor in the foreground: every watched project,
     /// until Ctrl+C. This is what the launchd service runs.
     Run {
         /// Repaint a status panel after every tick (only on a terminal).
@@ -270,9 +306,9 @@ enum DaemonCommand {
         panel: bool,
     },
     /// Install and optionally start the supervisor's launchd service
-    /// (macOS only). One service runs every enabled project; installing
-    /// keeps the project an older single-project install was bound to
-    /// enabled, and enables nothing else.
+    /// (macOS only). One service runs every watched project; installing
+    /// keeps watching the project an older single-project install was bound
+    /// to, and watches nothing else.
     Install {
         #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         start: bool,
@@ -301,10 +337,12 @@ enum ProjectCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Let the supervisor run this project: the reviewloop.toml found from
-    /// the current directory (or --config), or the registered project
-    /// --project-id. Takes effect within seconds.
-    Enable {
+    /// Have the machine supervisor run this project: it then runs the
+    /// project's triggers, submits its queued manuscripts to the review
+    /// providers (spending provider quota) and polls for the reviews. Targets
+    /// the reviewloop.toml found from the current directory (or --config), or
+    /// the registered project --project-id. Takes effect within seconds.
+    Watch {
         #[arg(long)]
         project_id: Option<String>,
         /// Move the registration to this config even though another config
@@ -312,9 +350,10 @@ enum ProjectCommand {
         #[arg(long, default_value_t = false)]
         replace: bool,
     },
-    /// Stop the supervisor from running this project (or --project-id).
-    /// Its jobs keep their state; explicit commands still act on them.
-    Disable {
+    /// Stop the supervisor from running this project (or --project-id): no
+    /// more triggers, submissions or polls for it. Its jobs keep their state;
+    /// explicit commands still act on them.
+    Unwatch {
         #[arg(long)]
         project_id: Option<String>,
     },
@@ -337,8 +376,10 @@ enum PaperCommand {
         pdf_path: String,
         #[arg(long)]
         backend: Option<String>,
-        #[arg(long, default_value_t = true)]
-        watch: bool,
+        /// Register the paper without PDF-change watching; `paper watch`
+        /// turns it on later.
+        #[arg(long, default_value_t = false)]
+        no_watch: bool,
         #[arg(long)]
         tag_trigger: Option<String>,
         #[arg(long, default_value_t = false)]
@@ -351,12 +392,20 @@ enum PaperCommand {
         #[arg(long, visible_alias = "agent-id")]
         venue: Option<String>,
     },
-    /// Enable or disable PDF-change watching for an already-registered paper.
+    /// Watch a registered paper's PDF: while the supervisor runs the project
+    /// and its PDF trigger is on (`trigger.pdf.enabled`), each pass requests a
+    /// review when the PDF differs from the PDF of the paper's latest review
+    /// request, or the paper has none, so the current file may be requested
+    /// on the next pass. Papers are watched when registered.
     Watch {
         #[arg(long)]
         paper_id: String,
+    },
+    /// Stop watching a registered paper's PDF: the PDF trigger no longer
+    /// requests reviews of it. Git tags and explicit commands still do.
+    Unwatch {
         #[arg(long)]
-        enabled: bool,
+        paper_id: String,
     },
     /// Remove a paper from the project config. Use --purge-history to also
     /// delete all associated jobs and events from the DB.
@@ -425,6 +474,32 @@ impl JobOrPaperRef {
     }
 }
 
+/// Argument group for `retry`: exactly one of `--job-id`, `--paper-id` or
+/// `--all-failed`.
+#[derive(Debug, Args, Clone)]
+#[group(required = true, multiple = false)]
+struct RetryTarget {
+    #[arg(long)]
+    job_id: Option<String>,
+    #[arg(long)]
+    paper_id: Option<String>,
+    /// Retry every FAILED or TIMEOUT job of the current project that is the
+    /// newest job of its paper and backend.
+    #[arg(long)]
+    all_failed: bool,
+}
+
+impl RetryTarget {
+    /// The job to retry; `None` for `--all-failed`.
+    fn into_job_ref(self) -> Option<JobRef> {
+        match (self.job_id, self.paper_id) {
+            (Some(job_id), _) => Some(JobRef::Id(job_id)),
+            (None, Some(paper_id)) => Some(JobRef::Paper(paper_id)),
+            (None, None) => None,
+        }
+    }
+}
+
 /// Arguments for `reviewloop run <pdf-path>`.
 #[derive(Debug, Args)]
 struct RunArgs {
@@ -436,9 +511,10 @@ struct RunArgs {
     /// Backend (defaults to project.default_backend, then "stanford").
     #[arg(long)]
     backend: Option<String>,
-    /// Enable PDF watching for the registered paper (default: true).
-    #[arg(long, default_value_t = true)]
-    watch: bool,
+    /// Register the paper without PDF-change watching. Applies only when
+    /// `run` registers the paper; `paper unwatch` changes a registered one.
+    #[arg(long, default_value_t = false)]
+    no_watch: bool,
     /// Tag trigger pattern for the paper.
     #[arg(long)]
     tag_trigger: Option<String>,
@@ -497,7 +573,7 @@ async fn run() -> Result<()> {
                     project_id,
                     pdf_path,
                     backend,
-                    watch,
+                    no_watch,
                     tag_trigger,
                     submit_now,
                     no_submit_prompt,
@@ -509,7 +585,7 @@ async fn run() -> Result<()> {
                         project_id: project_id.as_deref(),
                         pdf_path: &pdf_path,
                         backend: backend.as_deref(),
-                        watch,
+                        watched: !no_watch,
                         tag_trigger: tag_trigger.as_deref(),
                         submit_now,
                         no_submit_prompt,
@@ -521,8 +597,9 @@ async fn run() -> Result<()> {
                     }
                     Ok(())
                 }
-                PaperCommand::Watch { paper_id, enabled } => {
-                    cmd_paper_watch(&write_path, &paper_id, enabled)
+                PaperCommand::Watch { paper_id } => cmd_paper_watch(&write_path, &paper_id, true),
+                PaperCommand::Unwatch { paper_id } => {
+                    cmd_paper_watch(&write_path, &paper_id, false)
                 }
                 PaperCommand::Remove {
                     paper_id,
@@ -556,12 +633,12 @@ async fn run() -> Result<()> {
         },
         Command::Project { command } => match command {
             ProjectCommand::List { json } => cmd_project_list(config_override.as_deref(), json),
-            ProjectCommand::Enable {
+            ProjectCommand::Watch {
                 project_id,
                 replace,
-            } => cmd_project_enable(config_override.as_deref(), project_id.as_deref(), replace),
-            ProjectCommand::Disable { project_id } => {
-                cmd_project_disable(config_override.as_deref(), project_id.as_deref())
+            } => cmd_project_watch(config_override.as_deref(), project_id.as_deref(), replace),
+            ProjectCommand::Unwatch { project_id } => {
+                cmd_project_unwatch(config_override.as_deref(), project_id.as_deref())
             }
         },
         Command::Submit {
@@ -618,21 +695,15 @@ async fn run() -> Result<()> {
             cmd_cancel(&config, &db, &job_ref.into_job_ref(), reason.as_deref())
         }
         Command::Retry {
-            job_ref,
-            force,
-            override_rate_limit,
+            target,
+            now,
             include_failed,
         } => {
             let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
-            cmd_retry(
-                &config,
-                &db,
-                &job_ref.into_job_ref(),
-                force,
-                override_rate_limit,
-                include_failed,
-            )
-            .await
+            match target.into_job_ref() {
+                Some(job_ref) => cmd_retry(&config, &db, &job_ref, now, include_failed).await,
+                None => cmd_retry_all_failed(&config, &db),
+            }
         }
         Command::Complete {
             job_ref,
@@ -683,7 +754,32 @@ async fn run() -> Result<()> {
             dry_run,
         } => cmd_self_update(method, yes, dry_run),
         Command::Run(args) => cmd_run(config_override.as_deref(), &args).await,
+        Command::Mcp(args) => cmd_mcp(config_override.as_deref(), &args).await,
     }
+}
+
+/// `reviewloop mcp`: stdout carries MCP messages only, so every log line goes
+/// to stderr whatever `logging.output` says.
+async fn cmd_mcp(config_override: Option<&Path>, args: &McpArgs) -> Result<()> {
+    let (config, db, project_path) = load_runtime_with_path(config_override, true, false)?;
+    let options = reviewloop::mcp::ServerOptions {
+        // Pinned, so a call never moves on to another file (a parent
+        // directory's) when this one goes away.
+        config_override: project_path.or_else(|| config_override.map(Path::to_path_buf)),
+        home_project_id: config.project_id.clone(),
+        approval: match args.approval {
+            McpApproval::Required => Approval::Required,
+            McpApproval::Granted => Approval::Granted,
+        },
+    };
+    info!(
+        project_id = %config.project_id,
+        approval = ?options.approval,
+        "serving MCP on stdio"
+    );
+    reviewloop::mcp::ReviewLoopMcp::new(db, options)
+        .serve_stdio()
+        .await
 }
 
 fn cmd_init(config_override: Option<&Path>, args: &InitArgs) -> Result<()> {
@@ -818,7 +914,8 @@ struct PaperAddOptions<'a> {
     /// User-provided backend on the CLI. When `None`, falls back to the
     /// project's `default_backend`, then to `Config::DEFAULT_BACKEND`.
     backend: Option<&'a str>,
-    watch: bool,
+    /// PDF-change watching for the new paper.
+    watched: bool,
     tag_trigger: Option<&'a str>,
     submit_now: bool,
     no_submit_prompt: bool,
@@ -876,7 +973,7 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
     });
     config
         .paper_watch
-        .insert(options.paper_id.to_string(), options.watch);
+        .insert(options.paper_id.to_string(), options.watched);
     match options
         .tag_trigger
         .map(str::trim)
@@ -900,7 +997,7 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
         .map(|cfg| cfg.state_dir().join("artifacts"))
         .unwrap_or_else(|_| std::path::PathBuf::from("~/.review_loop/artifacts"));
 
-    let watch_text = if options.watch { "enabled" } else { "disabled" };
+    let watch_text = if options.watched { "on" } else { "off" };
     let venue_text = options
         .venue
         .map(str::trim)
@@ -909,7 +1006,7 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
         .unwrap_or_else(|| "project default".to_string());
     if let Some(trigger) = options.tag_trigger {
         println!(
-            "Added paper {paper_id}.\n- backend: {backend}\n- venue: {venue_text}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- tag trigger: {trigger}\n- config: {}\n  artifacts will appear in: {}/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
+            "Added paper {paper_id}.\n- backend: {backend}\n- venue: {venue_text}\n- pdf path: {pdf_path}\n- PDF-change watching: {watch_text}\n- tag trigger: {trigger}\n- config: {}\n  artifacts will appear in: {}/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
             options.config_path.display(),
             artifacts_root.display(),
             paper_id = options.paper_id,
@@ -918,7 +1015,7 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
         );
     } else {
         println!(
-            "Added paper {paper_id}.\n- backend: {backend}\n- venue: {venue_text}\n- pdf path: {pdf_path}\n- watch: {watch_text}\n- config: {}\n  artifacts will appear in: {}/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
+            "Added paper {paper_id}.\n- backend: {backend}\n- venue: {venue_text}\n- pdf path: {pdf_path}\n- PDF-change watching: {watch_text}\n- config: {}\n  artifacts will appear in: {}/<job-id>/ once a review completes\n  next: run 'reviewloop submit --paper-id {paper_id}' or 'reviewloop run {pdf_path}' to trigger a review",
             options.config_path.display(),
             artifacts_root.display(),
             paper_id = options.paper_id,
@@ -942,18 +1039,50 @@ fn cmd_paper_add(options: PaperAddOptions<'_>) -> Result<bool> {
     Ok(false)
 }
 
-fn cmd_paper_watch(config_path: &Path, paper_id: &str, enabled: bool) -> Result<()> {
+/// Turn PDF-change watching of a registered paper on (`watched`) or off. The
+/// file is rewritten only when that changes it.
+fn cmd_paper_watch(config_path: &Path, paper_id: &str, watched: bool) -> Result<()> {
     let mut config = load_existing_project_config(config_path)?;
-    if !config.papers.iter().any(|paper| paper.id == paper_id) {
-        anyhow::bail!("paper_id not found: {paper_id}");
+    let pdf_path = config
+        .papers
+        .iter()
+        .find(|paper| paper.id == paper_id)
+        .map(|paper| paper.pdf_path.clone())
+        .ok_or_else(|| anyhow!("paper_id not found: {paper_id}"))?;
+    let changed = config.is_paper_watched(paper_id) != watched;
+    if changed {
+        config.paper_watch.insert(paper_id.to_string(), watched);
+        config.save(config_path)?;
     }
-    config.paper_watch.insert(paper_id.to_string(), enabled);
-    config.save(config_path)?;
-    println!(
-        "Updated watch setting for paper {paper_id}: {}\n- config: {}",
-        if enabled { "enabled" } else { "disabled" },
-        config_path.display()
-    );
+    match (watched, changed) {
+        (true, true) => println!(
+            "Watching paper {paper_id}: the PDF trigger requests a review whenever {pdf_path} differs from the PDF of the paper's latest review request, or the paper has none; the current file may be requested on its next pass."
+        ),
+        (true, false) => println!("Paper {paper_id} is already watched."),
+        (false, true) => println!(
+            "No longer watching paper {paper_id}: the PDF trigger no longer requests reviews of {pdf_path}. Git tags and explicit commands still do."
+        ),
+        (false, false) => println!("Paper {paper_id} was not watched."),
+    }
+    println!("- config: {}", config_path.display());
+    if !watched {
+        return Ok(());
+    }
+    if !config.trigger.pdf.enabled {
+        println!(
+            "note: the PDF trigger of project {} is off (trigger.pdf.enabled = false), so watching requests no review until it is turned on",
+            config.project_id
+        );
+    }
+    // Whether the supervisor runs the project, and so its triggers. The file
+    // is already saved: failing to tell only costs the line.
+    match load_runtime(Some(config_path), false, true) {
+        Ok((runtime, db)) => print_project_worker(&runtime, &db),
+        Err(err) => eprintln!(
+            "warning: cannot tell whether the supervisor runs project {}: {err:#}",
+            config.project_id
+        ),
+    }
     Ok(())
 }
 
@@ -1182,15 +1311,15 @@ fn is_brew_formula_installed(formula: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Install the supervisor's launchd service. It runs every enabled
-/// project; an older install's single-project binding stays enabled.
+/// Install the supervisor's launchd service. It runs every watched
+/// project; an older install's single-project binding stays watched.
 fn cmd_daemon_install(config_override: Option<&Path>, start: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         if let Some(path) = config_override {
             anyhow::bail!(
                 "`daemon install` installs the machine-wide supervisor and takes no project config; \
-                 to have it run that project, enable it with `reviewloop --config {} project enable`",
+                 to have it run that project, watch it with `reviewloop --config {} project watch`",
                 path.display()
             );
         }
@@ -1238,19 +1367,19 @@ fn cmd_daemon_install(config_override: Option<&Path>, start: bool) -> Result<()>
             global_path.display(),
             db.path.display()
         );
-        let enabled = reviewloop::supervisor::load_enabled_projects(&db, &machine)?;
-        if enabled.loaded.is_empty() && enabled.failed.is_empty() {
+        let watched = reviewloop::supervisor::load_watched_projects(&db, &machine)?;
+        if watched.loaded.is_empty() && watched.failed.is_empty() {
             println!(
-                "- enabled projects: none yet; run `reviewloop project enable` in each project repository"
+                "- watched projects: none yet; run `reviewloop project watch` in each project repository"
             );
         }
-        for config in &enabled.loaded {
-            println!("- enabled project: {}", config.project_id);
+        for config in &watched.loaded {
+            println!("- watched project: {}", config.project_id);
         }
-        for (project_id, error) in &enabled.failed {
-            println!("- enabled project: {project_id} (does not load: {error})");
+        for (project_id, error) in &watched.failed {
+            println!("- watched project: {project_id} (does not load: {error})");
         }
-        if let Some(warning) = daemon_cspaper_key_warning(&enabled.loaded, &global_path)? {
+        if let Some(warning) = daemon_cspaper_key_warning(&watched.loaded, &global_path)? {
             println!("{warning}");
         }
         hint_current_project(&db);
@@ -1293,8 +1422,8 @@ fn cmd_daemon_install(config_override: Option<&Path>, start: bool) -> Result<()>
     }
 }
 
-/// Point at `project enable` when the current directory's project is not
-/// enabled yet.
+/// Point at `project watch` when the current directory's project is not
+/// watched yet.
 #[cfg(target_os = "macos")]
 fn hint_current_project(db: &Db) {
     let Ok(loaded) = Config::load_runtime_with_metadata(None, false) else {
@@ -1304,14 +1433,14 @@ fn hint_current_project(db: &Db) {
     if project_id.trim().is_empty() {
         return;
     }
-    let enabled = db
+    let watched = db
         .get_registered_project(&project_id)
         .ok()
         .flatten()
         .is_some_and(|project| project.enabled);
-    if !enabled {
+    if !watched {
         println!(
-            "note: project {project_id} (this directory) is not enabled; run `reviewloop project enable` to have the supervisor run it"
+            "note: project {project_id} (this directory) is not watched; run `reviewloop project watch` to have the supervisor run it"
         );
     }
 }
@@ -1322,9 +1451,9 @@ fn report_legacy_adoption(db: &Db, machine: &reviewloop::config::MachineConfig, 
     use reviewloop::supervisor::{LegacyAdoption, adopt_legacy_binding};
 
     match adopt_legacy_binding(db, machine, bound, Utc::now()) {
-        Ok((project_id, LegacyAdoption::Enabled { path, moved_from })) => {
+        Ok((project_id, LegacyAdoption::Watched { path, moved_from })) => {
             eprintln!(
-                "note: the daemon was installed for project {project_id} alone; the supervisor now runs every enabled project, and {project_id} is enabled at {}. Other registered projects stay disabled until `reviewloop project enable`.",
+                "note: the daemon was installed for project {project_id} alone; the supervisor now runs every watched project, and {project_id} is watched at {}. Other registered projects stay unwatched until `reviewloop project watch`.",
                 path.display()
             );
             if let Some(from) = moved_from {
@@ -1334,12 +1463,12 @@ fn report_legacy_adoption(db: &Db, machine: &reviewloop::config::MachineConfig, 
                 );
             }
         }
-        Ok((project_id, LegacyAdoption::AlreadyDecided { enabled })) => info!(
+        Ok((project_id, LegacyAdoption::AlreadyDecided { watched })) => info!(
             project_id,
-            enabled, "the daemon's --config names a project whose enablement is already decided"
+            watched, "the daemon's --config names a project whose watch is already decided"
         ),
         Ok((project_id, LegacyAdoption::Conflict(why))) => {
-            eprintln!("warning: not enabling project {project_id} for the supervisor: {why}")
+            eprintln!("warning: the supervisor does not watch project {project_id}: {why}")
         }
         Err(err) => eprintln!(
             "warning: the daemon was bound to {}, which no longer loads ({err:#}); the supervisor runs without it",
@@ -1374,7 +1503,7 @@ fn cmd_daemon_uninstall() -> Result<()> {
 
 /// Run the machine supervisor in the foreground until Ctrl+C or SIGTERM.
 /// `legacy_config` is the `--config` an old single-project launchd plist
-/// still passes: that project stays enabled unless someone already decided.
+/// still passes: that project stays watched unless someone already decided.
 async fn cmd_daemon_run(legacy_config: Option<&Path>, panel: bool) -> Result<()> {
     use reviewloop::supervisor::{Supervisor, TICK_INTERVAL};
 
@@ -1390,13 +1519,13 @@ async fn cmd_daemon_run(legacy_config: Option<&Path>, panel: bool) -> Result<()>
             "legacy single-file config found: the supervisor runs only projects with a reviewloop.toml; migrate it with `reviewloop config migrate-project --project-id <id>`"
         );
     }
-    let enabled = db
+    let watched = db
         .list_registered_projects()?
         .into_iter()
         .filter(|project| project.enabled)
         .count();
-    if enabled == 0 {
-        warn!("no project is enabled; the supervisor idles until `reviewloop project enable`");
+    if watched == 0 {
+        warn!("no project is watched; the supervisor idles until `reviewloop project watch`");
     }
 
     Supervisor {
@@ -1796,7 +1925,7 @@ fn cmd_project_list(config_override: Option<&Path>, as_json: bool) -> Result<()>
     println!("Supervisor: {}", worker.supervisor.state.as_str());
     if projects.is_empty() {
         println!(
-            "No registered projects. A project registers when a command loads its reviewloop.toml; enable it with `reviewloop project enable`."
+            "No registered projects. A project registers when a command loads its reviewloop.toml; watch it with `reviewloop project watch`."
         );
         return Ok(());
     }
@@ -1808,13 +1937,13 @@ fn cmd_project_list(config_override: Option<&Path>, as_json: bool) -> Result<()>
             ConfigFileState::Unreadable(why) => format!(" (unreadable: {why})"),
         };
         println!(
-            "{} {:<24} {:<9} {:<8} {}{file}",
+            "{} {:<24} {:<9} {:<9} {}{file}",
             if project.current { "*" } else { " " },
             project.project_id,
-            if project.enabled {
-                "enabled"
+            if project.watched {
+                "watched"
             } else {
-                "disabled"
+                "unwatched"
             },
             project.state.as_str(),
             project.config_path,
@@ -1828,7 +1957,7 @@ fn cmd_project_list(config_override: Option<&Path>, as_json: bool) -> Result<()>
 
 /// Let the supervisor run a project: this directory's (or --config), or a
 /// registered one by id.
-fn cmd_project_enable(
+fn cmd_project_watch(
     config_override: Option<&Path>,
     project_id: Option<&str>,
     replace: bool,
@@ -1859,7 +1988,7 @@ fn cmd_project_enable(
             let config = machine.project(&path)?;
             if config.project_id != project_id {
                 anyhow::bail!(
-                    "{} now declares project {:?}, not {project_id}; run `reviewloop project enable` there instead",
+                    "{} now declares project {:?}, not {project_id}; run `reviewloop project watch` there instead",
                     path.display(),
                     config.project_id
                 );
@@ -1868,17 +1997,20 @@ fn cmd_project_enable(
             (config, db, path)
         }
     };
-    let outcome = ReviewOps::new(&config, &db).enable_project(
-        &reviewloop::application::EnableProjectRequest {
+    let outcome = ReviewOps::new(&config, &db).watch_project(
+        &reviewloop::application::WatchProjectRequest {
             config_path,
             replace,
         },
     )?;
     let project = &outcome.project;
     if outcome.changed {
-        println!("Enabled project {} for the supervisor.", project.project_id);
+        println!(
+            "Watching project {}: the supervisor runs its triggers, submissions and polls.",
+            project.project_id
+        );
     } else {
-        println!("Project {} is already enabled.", project.project_id);
+        println!("Project {} is already watched.", project.project_id);
     }
     println!("- config: {}", project.config_path);
     if let Some(from) = &outcome.moved_from {
@@ -1907,7 +2039,7 @@ fn cmd_project_enable(
 
 /// Stop the supervisor from running a project. Works by id even when the
 /// project's config no longer loads.
-fn cmd_project_disable(config_override: Option<&Path>, project_id: Option<&str>) -> Result<()> {
+fn cmd_project_unwatch(config_override: Option<&Path>, project_id: Option<&str>) -> Result<()> {
     let (config, db) = match project_id {
         Some(_) => {
             let (machine, db) = load_machine_runtime(false)?;
@@ -1915,18 +2047,18 @@ fn cmd_project_disable(config_override: Option<&Path>, project_id: Option<&str>)
         }
         None => load_runtime(config_override, false, true)?,
     };
-    let outcome = ReviewOps::new(&config, &db).disable_project(
-        &reviewloop::application::DisableProjectRequest {
+    let outcome = ReviewOps::new(&config, &db).unwatch_project(
+        &reviewloop::application::UnwatchProjectRequest {
             project_id: project_id.map(str::to_string),
         },
     )?;
     if outcome.changed {
         println!(
-            "Disabled project {}: the supervisor no longer runs its triggers, submissions or polls. Its jobs keep their state; explicit commands still act on them.",
+            "No longer watching project {}: the supervisor stops running its triggers, submissions and polls. Its jobs keep their state; explicit commands still act on them.",
             outcome.project.project_id
         );
     } else {
-        println!("Project {} was not enabled.", outcome.project.project_id);
+        println!("Project {} was not watched.", outcome.project.project_id);
     }
     Ok(())
 }
@@ -2187,17 +2319,17 @@ fn print_daemon_status(status: &DaemonStatus) {
     );
 
     println!();
-    let enabled = status
+    let watched = status
         .projects
         .iter()
-        .filter(|(project, _)| project.enabled)
+        .filter(|(project, _)| project.watched)
         .count();
     println!(
-        "Projects: {enabled} enabled of {} registered",
+        "Projects: {watched} watched of {} registered",
         status.projects.len()
     );
     if status.projects.is_empty() {
-        println!("  none registered; run `reviewloop project enable` in a project repository");
+        println!("  none registered; run `reviewloop project watch` in a project repository");
     }
     for (project, jobs) in &status.projects {
         let marker = if project.current { "*" } else { " " };
@@ -2218,9 +2350,9 @@ fn print_daemon_status(status: &DaemonStatus) {
         if let Some(error) = &project.last_error {
             println!("    error: {error}");
         }
-        if project.state == ProjectState::Disabled && !jobs.is_empty() {
+        if project.state == ProjectState::Unwatched && !jobs.is_empty() {
             println!(
-                "    {} active job(s) wait: the supervisor does not run a disabled project",
+                "    {} active job(s) wait: the supervisor does not run an unwatched project",
                 jobs.len()
             );
         }
@@ -2333,7 +2465,7 @@ fn load_runtime_with_path(
     // Register this project's config path so fleet-wide commands (eg the
     // bar's "Retry now") can resolve `project_id -> config path` later
     // even when invoked from a directory without a reviewloop.toml.
-    // Registering never enables the project for the supervisor.
+    // Registering never makes the supervisor watch the project.
     if let Some(path) = project_path.as_deref()
         && !config.project_id.trim().is_empty()
     {
@@ -2349,8 +2481,8 @@ fn load_runtime_with_path(
 fn register_loaded_project(db: &Db, project_id: &str, config_path: &Path) {
     match reviewloop::registry::register_seen(db, project_id, config_path, Utc::now()) {
         Ok(reviewloop::registry::Registration::Kept(conflict)) => {
-            let hint = if conflict.registered_enabled {
-                "; the supervisor keeps using it (move it with `reviewloop project enable --replace`)"
+            let hint = if conflict.registered_watched {
+                "; the supervisor keeps using it (move it with `reviewloop project watch --replace`)"
             } else {
                 ""
             };
@@ -2654,7 +2786,7 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
                 project_id: None,
                 pdf_path: pdf_path_str,
                 backend: args.backend.as_deref(),
-                watch: args.watch,
+                watched: !args.no_watch,
                 tag_trigger: args.tag_trigger.as_deref(),
                 submit_now: false,
                 no_submit_prompt: true,
@@ -2716,7 +2848,7 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
     let mut uncertain_since: Option<std::time::Instant> = None;
 
     // Foreground loop: show the job every few seconds. While a supervisor
-    // runs this project it does the work and `run` only watches; otherwise
+    // runs this project it does the work and `run` only observes; otherwise
     // `run` moves this job alone, by its own schedule, at the supervisor's
     // cadence. Decided again every round, so a supervisor that stops or
     // starts mid-run is followed.
@@ -2736,7 +2868,7 @@ async fn cmd_run(config_override: Option<&Path>, args: &RunArgs) -> Result<()> {
                 }
                 if supervised {
                     eprintln!(
-                        "note: the supervisor runs this project; `run` only watches job {job_id}"
+                        "note: the supervisor runs this project; `run` only observes job {job_id}"
                     );
                 } else {
                     eprintln!(
@@ -2979,7 +3111,7 @@ async fn cmd_import_token(
 
 /// launchd starts the supervisor without the installing shell's
 /// environment, so a CSPaper key that only comes from the environment never
-/// reaches it. Names the enabled `projects` that would fail.
+/// reaches it. Names the watched `projects` that would fail.
 #[cfg(any(target_os = "macos", test))]
 fn daemon_cspaper_key_warning(projects: &[Config], global_path: &Path) -> Result<Option<String>> {
     let using: Vec<&str> = projects
@@ -3284,20 +3416,15 @@ fn format_elapsed(started: chrono::DateTime<Utc>, now: chrono::DateTime<Utc>) ->
     format!("{}d{}h", secs / 86_400, (secs % 86_400) / 3600)
 }
 
+/// `retry`: re-queue the job at the end of the queue, or with `now` attempt it
+/// right away in this process.
 async fn cmd_retry(
     config: &Config,
     db: &Db,
     job_ref: &JobRef,
-    force: bool,
-    override_rate_limit: bool,
+    now: bool,
     include_failed: bool,
 ) -> Result<()> {
-    if override_rate_limit {
-        eprintln!("warning: --override-rate-limit is deprecated; use --force instead");
-        tracing::warn!("deprecated flag --override-rate-limit used; treating as --force");
-    }
-    let force = force || override_rate_limit;
-
     let job = ReviewOps::new(config, db)
         .find_job(job_ref, Eligibility::retry(include_failed))
         .map_err(|err| with_retry_hint(err, include_failed))?;
@@ -3323,12 +3450,15 @@ async fn cmd_retry(
         &owned
     };
 
-    let outcome = ReviewOps::new(job_config, db).retry_job(&RetryRequest {
-        job: JobRef::Id(job.id.clone()),
-        force,
-        include_failed,
-        caller_executes: force,
-    })?;
+    let outcome = ReviewOps::new(job_config, db)
+        .retry_job(&RetryRequest {
+            job: JobRef::Id(job.id.clone()),
+            jump_queue: now,
+            include_failed,
+            caller_executes: now,
+            approval: Approval::Granted,
+        })
+        .map_err(|err| with_retry_now_hint(err, &job, now))?;
     if outcome.previous_status == JobStatus::Submitted
         && matches!(
             outcome.action,
@@ -3343,9 +3473,7 @@ async fn cmd_retry(
     match outcome.action {
         RetryAction::PollNow => {
             match reviewloop::worker::poll_job(job_config, db, &job.id).await? {
-                Attempt::Ran => {
-                    println!("Immediately polled job {} with rate-limit override", job.id)
-                }
+                Attempt::Ran => println!("Immediately polled job {}", job.id),
                 Attempt::NotClaimed => println!(
                     "Job {} is being polled by another reviewloop worker",
                     job.id
@@ -3354,21 +3482,80 @@ async fn cmd_retry(
         }
         RetryAction::SubmitNow => {
             match reviewloop::worker::submit_job(job_config, db, &job.id).await? {
-                Attempt::Ran => println!(
-                    "Immediately retried job {} with rate-limit override",
-                    job.id
-                ),
+                Attempt::Ran => println!("Immediately retried job {}", job.id),
                 Attempt::NotClaimed => println!(
                     "Job {} is being submitted by another reviewloop worker",
                     job.id
                 ),
             }
         }
-        RetryAction::PollScheduled | RetryAction::SubmissionQueued => {
-            println!("Retry scheduled for job {}", job.id);
+        RetryAction::SubmissionQueued => println!(
+            "Re-queued job {}: it joins the end of the queue and is submitted in turn",
+            job.id
+        ),
+        RetryAction::PollScheduled => println!(
+            "Retry scheduled for job {}: it is polled again on the polling schedule",
+            job.id
+        ),
+        RetryAction::AwaitingApproval => {
+            unreachable!("the CLI's retries are granted")
         }
     }
     print_project_worker(job_config, db);
+    Ok(())
+}
+
+/// `retry --all-failed`: re-queue the current project's failed jobs, then list
+/// the ones skipped and why.
+fn cmd_retry_all_failed(config: &Config, db: &Db) -> Result<()> {
+    let outcome = ReviewOps::new(config, db).retry_failed_jobs()?;
+    for retried in &outcome.retried {
+        let job = &retried.job;
+        match retried.action {
+            RetryAction::SubmissionQueued => println!(
+                "Re-queued job {} (paper {}): it joins the end of the queue and is submitted in turn",
+                job.job_id, job.paper_id
+            ),
+            RetryAction::PollScheduled => println!(
+                "Retry scheduled for job {} (paper {}): it is polled again on the polling schedule",
+                job.job_id, job.paper_id
+            ),
+            action => unreachable!("a granted retry without --now is never {action:?}"),
+        }
+    }
+    for skipped in &outcome.skipped {
+        let job = &skipped.job;
+        let reason = match &skipped.reason {
+            SkipReason::Superseded(newer) => format!(
+                "superseded by newer job {} ({})",
+                newer.job_id,
+                newer.status.as_str()
+            ),
+            SkipReason::Cancelled => "cancelled".to_string(),
+            SkipReason::NeedsManual => format!(
+                "it needs attention first, and its last error says how to recover: fix the cause and run `reviewloop retry --job-id {}`, or request a new review with `reviewloop submit --paper-id {} --force`",
+                job.job_id, job.paper_id
+            ),
+            SkipReason::Changed { message } => message.clone(),
+        };
+        println!(
+            "Skipped job {} (paper {}, {}): {reason}",
+            job.job_id,
+            job.paper_id,
+            job.status.as_str()
+        );
+    }
+    if outcome.retried.is_empty() && outcome.skipped.is_empty() {
+        println!("No failed jobs in project {}", config.project_id);
+    } else {
+        println!(
+            "Retried {} failed job(s) of project {}; skipped {}",
+            outcome.retried.len(),
+            config.project_id,
+            outcome.skipped.len()
+        );
+    }
+    print_project_worker(config, db);
     Ok(())
 }
 
@@ -3414,9 +3601,9 @@ fn load_effective_config_for_job(db: &Db, job: &reviewloop::model::Job) -> Resul
     match load_runtime_for_path(&config_path) {
         Ok(config) => Ok(config),
         Err(err) if error_chain_contains_not_found(&err) => {
-            // The next CLI call from the moved repo re-registers it there (a
-            // disabled registration follows a stale path; an enabled one
-            // keeps its explicit decision until `project enable` moves it).
+            // The next CLI call from the moved repo re-registers it there (an
+            // unwatched registration follows a stale path; a watched one
+            // keeps its explicit decision until `project watch` moves it).
             anyhow::bail!(
                 "project '{}' cannot be located — its config file used to be at {} but that path no longer exists.\n\n\
                  To fix:\n\
@@ -3558,6 +3745,31 @@ fn with_retry_hint(err: OpError, include_failed: bool) -> anyhow::Error {
              hint: no active job for paper_id={paper_id}; \
              pass --include-failed to retry a previously-failed job"
         ),
+        _ => err.into(),
+    }
+}
+
+/// `retry --now` refused because the job cannot skip the queue
+/// ([`reviewloop::model::Job::can_jump_queue`]): a plain retry still works.
+fn with_retry_now_hint(err: OpError, job: &reviewloop::model::Job, now: bool) -> anyhow::Error {
+    match &err {
+        OpError::InvalidState {
+            operation: Operation::RetryJob,
+            ..
+        } if now && job.status != JobStatus::PendingApproval && !job.can_jump_queue() => {
+            let hint = if job.token.is_some() {
+                format!(
+                    "--now polls only a PROCESSING job; run `reviewloop retry --job-id {}` without it to poll this one again on the polling schedule",
+                    job.id
+                )
+            } else {
+                format!(
+                    "run `reviewloop retry --job-id {}` without --now to re-queue it at the end of the queue",
+                    job.id
+                )
+            };
+            anyhow!("{err}\nhint: {hint}")
+        }
         _ => err.into(),
     }
 }
@@ -4622,7 +4834,7 @@ mod tests {
             let projects = json["projects"].as_array().unwrap();
             assert_eq!(projects.len(), 2);
             assert_eq!(projects[0]["project_id"], "idle");
-            assert_eq!(projects[0]["enabled"], false);
+            assert_eq!(projects[0]["watched"], false);
             assert_eq!(projects[1]["project_id"], "proj");
             assert_eq!(projects[1]["state"], "error");
             assert_eq!(projects[1]["last_error"], "pdf trigger: gone");
@@ -4666,68 +4878,132 @@ mod tests {
         }
     }
 
-    mod force_flag {
-        /// `--override-rate-limit` is still accepted by the clap parser and
-        /// maps to the `override_rate_limit` field (backward compat).
+    mod retry_flags {
+        use crate::{Cli, Command};
+        use clap::Parser;
+
+        fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+            Cli::try_parse_from(
+                ["reviewloop", "retry", "--job-id", "some-job-id"]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            )
+        }
+
+        /// `--now` asks for the immediate attempt; without it the job queues.
         #[test]
-        fn override_rate_limit_alias_parses() {
-            use crate::{Cli, Command};
-            use clap::Parser;
-            let args = Cli::try_parse_from([
-                "reviewloop",
-                "retry",
-                "--job-id",
-                "some-job-id",
-                "--override-rate-limit",
-            ])
-            .expect("--override-rate-limit should still parse successfully");
-            match args.command {
-                Command::Retry {
-                    override_rate_limit,
-                    force,
-                    ..
-                } => {
-                    assert!(override_rate_limit, "override_rate_limit should be true");
-                    assert!(!force, "force should be false when only alias is passed");
+        fn retry_now_flag_parses() {
+            for (args, expected) in [(&["--now"][..], true), (&[][..], false)] {
+                match parse(args).expect("retry parses").command {
+                    Command::Retry { now, .. } => assert_eq!(now, expected, "{args:?}"),
+                    _ => panic!("expected Retry command"),
                 }
-                _ => panic!("expected Retry command"),
             }
         }
 
-        /// `--force` on retry sets the `force` field.
+        /// The old names of `--now` are gone, not aliased.
         #[test]
-        fn retry_force_flag_parses() {
-            use crate::{Cli, Command};
-            use clap::Parser;
-            let args =
-                Cli::try_parse_from(["reviewloop", "retry", "--job-id", "some-job-id", "--force"])
-                    .expect("--force should parse successfully");
-            match args.command {
-                Command::Retry {
-                    force,
-                    override_rate_limit,
-                    ..
-                } => {
-                    assert!(force, "force should be true");
-                    assert!(!override_rate_limit, "override_rate_limit should be false");
-                }
-                _ => panic!("expected Retry command"),
+        fn retry_rejects_force_and_override_rate_limit() {
+            for flag in ["--force", "--override-rate-limit"] {
+                let err = match parse(&[flag]) {
+                    Ok(_) => panic!("{flag} must be rejected"),
+                    Err(err) => err,
+                };
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::UnknownArgument,
+                    "{flag}: {err}"
+                );
+            }
+        }
+    }
+
+    mod paper_watch_flags {
+        use crate::{Cli, Command, PaperCommand};
+        use clap::Parser;
+
+        fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+            Cli::try_parse_from(std::iter::once("reviewloop").chain(args.iter().copied()))
+        }
+
+        /// `paper watch` and `paper unwatch` take the paper id alone.
+        #[test]
+        fn paper_watch_and_unwatch_parse() {
+            let watch = parse(&["paper", "watch", "--paper-id", "main"]).expect("watch parses");
+            assert!(matches!(
+                watch.command,
+                Command::Paper {
+                    command: PaperCommand::Watch { paper_id }
+                } if paper_id == "main"
+            ));
+            let unwatch =
+                parse(&["paper", "unwatch", "--paper-id", "main"]).expect("unwatch parses");
+            assert!(matches!(
+                unwatch.command,
+                Command::Paper {
+                    command: PaperCommand::Unwatch { paper_id }
+                } if paper_id == "main"
+            ));
+        }
+
+        /// The old switches are gone, not aliased: `paper watch --enabled`
+        /// and `--watch` on `paper add` and `run`.
+        #[test]
+        fn old_watch_switches_are_rejected() {
+            for args in [
+                &["paper", "watch", "--paper-id", "main", "--enabled"][..],
+                &["paper", "watch", "--paper-id", "main", "--enabled", "false"][..],
+                &[
+                    "paper",
+                    "add",
+                    "--paper-id",
+                    "main",
+                    "--pdf-path",
+                    "main.pdf",
+                    "--watch",
+                ][..],
+                &["run", "main.pdf", "--watch"][..],
+            ] {
+                let err = match parse(args) {
+                    Ok(_) => panic!("{args:?} must be rejected"),
+                    Err(err) => err,
+                };
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::UnknownArgument,
+                    "{args:?}: {err}"
+                );
             }
         }
 
-        /// Deprecation warning is printed to stderr when --override-rate-limit is used.
+        /// `--no-watch` registers the paper unwatched; without it, watched.
         #[test]
-        fn override_rate_limit_deprecation_warning_logic() {
-            // The actual eprintln! runs in cmd_retry. Here we verify that the
-            // combined force value is `true` when override_rate_limit is set,
-            // mirroring the logic in cmd_retry.
-            let force = false;
-            let override_rate_limit = true;
-            let effective_force = force || override_rate_limit;
-            assert!(
-                effective_force,
-                "override_rate_limit should make effective force = true"
-            );
+        fn no_watch_parses_on_paper_add_and_run() {
+            for (extra, expected) in [(&["--no-watch"][..], true), (&[][..], false)] {
+                let add = [
+                    &[
+                        "paper",
+                        "add",
+                        "--paper-id",
+                        "main",
+                        "--pdf-path",
+                        "main.pdf",
+                    ][..],
+                    extra,
+                ]
+                .concat();
+                match parse(&add).expect("paper add parses").command {
+                    Command::Paper {
+                        command: PaperCommand::Add { no_watch, .. },
+                    } => assert_eq!(no_watch, expected, "{add:?}"),
+                    _ => panic!("expected paper add"),
+                }
+                let run = [&["run", "main.pdf"][..], extra].concat();
+                match parse(&run).expect("run parses").command {
+                    Command::Run(args) => assert_eq!(args.no_watch, expected, "{run:?}"),
+                    _ => panic!("expected run"),
+                }
+            }
         }
     }
 
@@ -5640,7 +5916,9 @@ mod tests {
         use reviewloop::model::{
             EventRecord, Job, JobPdf, JobStatus, NewJob, SubmitChannel, SubmitStage, WorkKind,
         };
+        use reviewloop::util::sha256_file;
         use serde_json::json;
+        use std::{fs, path::Path};
         use tempfile::TempDir;
 
         const PROJECT_ID: &str = "oss337-cli";
@@ -5990,9 +6268,9 @@ mod tests {
             assert_eq!(format!("{:?}", ctx.job(&job.id)), before);
         }
 
-        /// `retry` (with or without `--force`, or the deprecated alias) never requeues a
-        /// submission whose dispatch is in flight under a live lease.
-        async fn assert_retry_refuses_in_flight_submission(force: bool, override_rate_limit: bool) {
+        /// `retry` (with or without `--now`) never requeues a submission whose dispatch
+        /// is in flight under a live lease.
+        async fn assert_retry_refuses_in_flight_submission(now: bool) {
             let ctx = Ctx::new();
             let lease = ctx.dispatched_job("hash-in-flight", Utc::now());
             let job_id = lease.job.id.clone();
@@ -6002,16 +6280,9 @@ mod tests {
             assert_eq!(events_before, ["submit_dispatched"]);
 
             let job_ref = JobRef::Id(job_id.clone());
-            let err = cmd_retry(
-                &ctx.config,
-                &ctx.db,
-                &job_ref,
-                force,
-                override_rate_limit,
-                false,
-            )
-            .await
-            .expect_err("retry must not requeue an in-flight submission");
+            let err = cmd_retry(&ctx.config, &ctx.db, &job_ref, now, false)
+                .await
+                .expect_err("retry must not requeue an in-flight submission");
             let msg = err.to_string();
             assert!(
                 msg.contains(&format!("job {job_id} is being submitted right now")),
@@ -6032,17 +6303,12 @@ mod tests {
 
         #[tokio::test]
         async fn retry_refuses_in_flight_submission() {
-            assert_retry_refuses_in_flight_submission(false, false).await;
+            assert_retry_refuses_in_flight_submission(false).await;
         }
 
         #[tokio::test]
-        async fn retry_force_refuses_in_flight_submission() {
-            assert_retry_refuses_in_flight_submission(true, false).await;
-        }
-
-        #[tokio::test]
-        async fn retry_override_rate_limit_refuses_in_flight_submission() {
-            assert_retry_refuses_in_flight_submission(false, true).await;
+        async fn retry_now_refuses_in_flight_submission() {
+            assert_retry_refuses_in_flight_submission(true).await;
         }
 
         /// Once the dispatching worker's lease has lapsed, `retry` is the user's explicit
@@ -6053,11 +6319,11 @@ mod tests {
             let lease = ctx.dispatched_job("hash-stalled", Utc::now() - Duration::hours(2));
             let job_id = lease.job.id.clone();
 
+            let before = Utc::now();
             cmd_retry(
                 &ctx.config,
                 &ctx.db,
                 &JobRef::Id(job_id.clone()),
-                false,
                 false,
                 false,
             )
@@ -6070,13 +6336,175 @@ mod tests {
             assert_eq!(job.submit_stage, None);
             assert_eq!(job.lease_owner, None);
             assert_eq!(job.lease_expires_at, None);
-            assert_eq!(job.next_poll_at, None);
+            // The end of the queue: its place is the retry.
+            assert!(
+                job.next_poll_at
+                    .is_some_and(|at| before <= at && at <= Utc::now()),
+                "{:?}",
+                job.next_poll_at
+            );
             assert_eq!(job.last_error, None);
             assert_eq!(job.token, None);
             let events = ctx.events_for(&job_id);
             let last = events.last().expect("retried event");
             assert_eq!(last.event_type, "retried");
             assert_eq!(last.payload, json!({}));
+        }
+
+        /// `retry --now` polls a token-backed job in this process at once instead of
+        /// waiting for its schedule; the unreachable backend makes it a `poll_error`.
+        #[tokio::test]
+        async fn retry_now_polls_the_job_in_this_process() {
+            let ctx = Ctx::new();
+            let queued = ctx.create_job(JobStatus::Queued, "hash-now");
+            let scheduled = Utc::now() + Duration::hours(6);
+            ctx.db
+                .attach_token_to_job(&queued.id, "tok-now", scheduled)
+                .expect("attach_token_to_job");
+
+            cmd_retry(
+                &ctx.config,
+                &ctx.db,
+                &JobRef::Id(queued.id.clone()),
+                true,
+                false,
+            )
+            .await
+            .expect("retry --now");
+
+            let job = ctx.job(&queued.id);
+            assert_eq!(job.status, JobStatus::Processing);
+            assert_eq!(job.attempt, 1, "the immediate poll ran and failed once");
+            assert!(job.next_poll_at.is_some_and(|at| at < scheduled));
+            assert_eq!(
+                ctx.event_types_for(&queued.id),
+                ["manual_rate_limit_override", "poll_error"]
+            );
+        }
+
+        /// `retry --now` submits a job without a receipt in this process at once
+        /// instead of leaving it to the supervisor; the unreachable backend fails the
+        /// attempt.
+        #[tokio::test]
+        async fn retry_now_submits_the_job_in_this_process() {
+            let ctx = Ctx::new();
+            let pdf_path = Path::new(&ctx.config.core.state_dir).join("paper.pdf");
+            fs::write(&pdf_path, b"%PDF-1.4\n%%EOF\n").expect("write pdf");
+            let failed = ctx
+                .db
+                .create_job(&NewJob {
+                    project_id: PROJECT_ID.to_string(),
+                    paper_id: PAPER_ID.to_string(),
+                    backend: "stanford".to_string(),
+                    pdf: JobPdf::Unpinned {
+                        pdf_path: pdf_path.display().to_string(),
+                        pdf_hash: sha256_file(&pdf_path).expect("hash pdf"),
+                    },
+                    status: JobStatus::Failed,
+                    email: "test@example.com".to_string(),
+                    venue: None,
+                    review_options: Default::default(),
+                    git_tag: None,
+                    git_commit: None,
+                    next_poll_at: None,
+                })
+                .expect("create job");
+
+            cmd_retry(
+                &ctx.config,
+                &ctx.db,
+                &JobRef::Id(failed.id.clone()),
+                true,
+                false,
+            )
+            .await
+            .expect("retry --now");
+
+            let job = ctx.job(&failed.id);
+            assert_eq!(
+                job.attempt, 1,
+                "the immediate submission ran and failed once"
+            );
+            let events = ctx.event_types_for(&failed.id);
+            assert_eq!(
+                events.first().map(String::as_str),
+                Some("manual_rate_limit_override")
+            );
+            assert!(
+                events.iter().any(|event| event == "submit_dispatched"),
+                "{events:?}"
+            );
+        }
+
+        /// The CLI's retry is the user's own decision: it sends a job cancelled before
+        /// anyone approved it again, at the end of the queue, without a separate
+        /// approval.
+        #[tokio::test]
+        async fn retry_requeues_a_job_cancelled_while_pending_approval() {
+            let ctx = Ctx::new();
+            let pending = ctx.create_job(JobStatus::PendingApproval, "hash-cancelled");
+            ctx.db
+                .cancel_job(&pending.id, None, Utc::now())
+                .expect("cancel_job");
+
+            let before = Utc::now();
+            cmd_retry(
+                &ctx.config,
+                &ctx.db,
+                &JobRef::Id(pending.id.clone()),
+                false,
+                false,
+            )
+            .await
+            .expect("retry a cancelled job");
+
+            let job = ctx.job(&pending.id);
+            assert_eq!(job.status, JobStatus::Queued);
+            assert!(
+                job.next_poll_at
+                    .is_some_and(|at| before <= at && at <= Utc::now()),
+                "{:?}",
+                job.next_poll_at
+            );
+            assert_eq!(job.last_error, None);
+            let events = ctx.events_for(&pending.id);
+            let last = events.last().expect("retried event");
+            assert_eq!(last.event_type, "retried");
+            assert_eq!(last.payload, json!({}));
+        }
+
+        /// `--now` polls only a PROCESSING job; a timed-out job keeps its receipt, so
+        /// the refusal says to retry it without `--now`.
+        #[tokio::test]
+        async fn retry_now_refuses_a_timed_out_job_and_names_the_plain_retry() {
+            let ctx = Ctx::new();
+            let queued = ctx.create_job(JobStatus::Queued, "hash-timeout");
+            ctx.db
+                .attach_token_to_job(&queued.id, "tok-timeout", Utc::now())
+                .expect("attach_token_to_job");
+            ctx.db
+                .update_job_state(&queued.id, JobStatus::Timeout, None, Some(None), None)
+                .expect("time out");
+            let before = format!("{:?}", ctx.job(&queued.id));
+
+            let err = cmd_retry(
+                &ctx.config,
+                &ctx.db,
+                &JobRef::Id(queued.id.clone()),
+                true,
+                false,
+            )
+            .await
+            .expect_err("--now refuses a TIMEOUT job");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!(
+                    "hint: --now polls only a PROCESSING job; run `reviewloop retry --job-id {}` without it",
+                    queued.id
+                )),
+                "{msg}"
+            );
+            assert_eq!(format!("{:?}", ctx.job(&queued.id)), before);
         }
 
         #[test]
@@ -6092,7 +6520,7 @@ mod tests {
                 "{hint}"
             );
             assert!(
-                hint.contains(&format!("`reviewloop retry --job-id {id} --force`")),
+                hint.contains(&format!("`reviewloop retry --job-id {id} --now`")),
                 "{hint}"
             );
             assert!(
