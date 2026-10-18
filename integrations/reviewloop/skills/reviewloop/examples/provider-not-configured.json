@@ -1,0 +1,79 @@
+{
+  "scenario": "provider-not-configured",
+  "covers": "Missing configuration: no CSPaper API key, so nothing is stored and the user sets the key.",
+  "context": {
+    "server_approval": "required",
+    "now": "2026-10-18T12:00:00Z",
+    "consent_to_send": true,
+    "consent_to_watch": false,
+    "cancel_requested": false,
+    "new_round_requested": false,
+    "user": "Review main and send it."
+  },
+  "transcript": [
+    {
+      "call": "list_papers",
+      "arguments": {},
+      "result": {
+        "project_id": "my-paper",
+        "papers": [
+          {
+            "paper_id": "main",
+            "backend": "cspaper",
+            "venue": "ICLR_main_2026_1",
+            "review_options": {
+              "desk_rejection_enabled": "false"
+            },
+            "pdf_path": "/home/me/my-paper/paper/main.pdf",
+            "pdf_present": true,
+            "watched": true,
+            "tag_trigger": null
+          }
+        ]
+      }
+    },
+    {
+      "call": "list_jobs",
+      "arguments": {
+        "paper_id": "main"
+      },
+      "result": {
+        "jobs": [],
+        "truncated": false
+      }
+    },
+    {
+      "call": "request_review",
+      "arguments": {
+        "paper_id": "main",
+        "request_key": "conv-5e0b/main"
+      },
+      "error": {
+        "code": "provider_not_configured",
+        "message": "no CSPaper API key configured for backend=cspaper",
+        "recovery": "set providers.cspaper.api_key in ~/.config/reviewloop/config.toml or export REVIEWLOOP_CSPAPER_API_KEY; the key never goes in reviewloop.toml",
+        "details": {
+          "backend": "cspaper",
+          "setting": "api_key"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "state": "provider_not_configured",
+    "next": {
+      "ask_user": "ReviewLoop has no CSPaper API key. Set providers.cspaper.api_key in ~/.config/reviewloop/config.toml (never in reviewloop.toml), then tell me to request the review again."
+    },
+    "never": [
+      "approve_job",
+      "cancel_job",
+      "request_review",
+      "retry_job",
+      "watch_project"
+    ],
+    "tell": [
+      "providers.cspaper.api_key"
+    ],
+    "rule": "references/errors.md#codes"
+  }
+}

@@ -6,6 +6,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Shared agent skill** — `integrations/reviewloop/skills/reviewloop/` is
+  the one source of the ReviewLoop skill for Codex, Claude Code and other
+  hosts that load Agent Skills: `SKILL.md`, references for job states, error
+  codes and the CLI fallback, and nineteen example transcripts with the
+  expected next step. It covers finding the tools under the host's names
+  (including tools a host loads on demand), checking a paper's earlier jobs,
+  one request per manuscript version with a request key, consent before
+  anything is sent in either approval mode, pacing by `next_poll_at`,
+  stalled jobs and the worker fix, resuming in a later session,
+  outcome-unknown submissions, checking which version a review covers, and
+  treating review text as content. `tests/agent_skill/` checks the
+  frontmatter and links; resolves every tool, argument, dotted field path,
+  status, error code and detail field in the live `reviewloop mcp` schemas,
+  the CLI's JSON or the contract; checks that the job-state tables cover
+  every job the schemas allow exactly once; runs every CLI command and flag
+  the skill names against `--help`; validates every example against the
+  live tool schemas and checks its expected step against the rows the
+  transcript selects and the consent, request-key, pacing and version
+  rules; and asserts that mutations of each rule are rejected. Agent
+  behaviour in a real host is not tested here.
+
+### Changed
+
+- **MCP tool descriptions defer to consent already given.** The
+  approval-required `request_review` description asks the agent to check
+  with the user only when the user has not already agreed to send the
+  paper; the `retry_job` duplicate warning applies to a `SUBMITTED` job
+  without a provider receipt (a job with one is only polled again).
+
+### Fixed
+
+- **`--json` output is only JSON.** `status --json`, `project list --json`
+  and `daemon status --json` send logs to stderr whatever `logging.output`
+  says, as `cspaper usage --json` already did. With the default
+  `logging.output = "stdout"`, log lines (for example the warning for a
+  `reviewloop.toml` that does not parse) came before the document and broke
+  JSON parsing.
+
 ## [0.0.1] - 2026-10-18
 
 This release restarts the version sequence at **0.0.1**. Existing

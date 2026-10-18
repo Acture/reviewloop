@@ -1,0 +1,76 @@
+{
+  "scenario": "failed-retry",
+  "covers": "An ordinary retry reuses the existing job: a TIMEOUT job with a receipt is retried, which polls it again, not requested again.",
+  "context": {
+    "server_approval": "required",
+    "now": "2026-10-18T12:00:00Z",
+    "consent_to_send": true,
+    "consent_to_watch": false,
+    "cancel_requested": false,
+    "new_round_requested": false,
+    "user": "The review of main timed out. Try again.",
+    "remembered": {
+      "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10",
+      "request_key": "conv-7f3a/main",
+      "pdf_hash": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad"
+    }
+  },
+  "transcript": [
+    {
+      "call": "get_job",
+      "arguments": {
+        "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10"
+      },
+      "result": {
+        "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10",
+        "project_id": "my-paper",
+        "paper_id": "main",
+        "backend": "stanford",
+        "status": "TIMEOUT",
+        "phase": "failed",
+        "terminal": true,
+        "has_token": true,
+        "review_available": false,
+        "review_completed_at": null,
+        "attempt": 12,
+        "pdf_path": "/home/me/my-paper/paper/main.pdf",
+        "snapshot_path": "/home/me/.review_loop/snapshots/14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad/main.pdf",
+        "pdf_hash": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+        "venue": "ICLR",
+        "review_options": {},
+        "version_no": 1,
+        "round_no": 1,
+        "version_source": "pdf_hash",
+        "version_key": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+        "git_tag": null,
+        "git_commit": null,
+        "fallback_used": false,
+        "submit_stage": null,
+        "last_error": "review timed out",
+        "created_at": "2026-10-17T09:00:00.000000Z",
+        "updated_at": "2026-10-18T09:01:00.000000Z",
+        "started_at": "2026-10-17T09:01:00.000000Z",
+        "next_poll_at": null
+      }
+    }
+  ],
+  "expect": {
+    "state": "failed",
+    "next": {
+      "call": "retry_job",
+      "arguments": {
+        "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10"
+      }
+    },
+    "never": [
+      "approve_job",
+      "cancel_job",
+      "request_review",
+      "watch_project"
+    ],
+    "tell": [
+      "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10"
+    ],
+    "rule": "references/lifecycle.md#retry"
+  }
+}

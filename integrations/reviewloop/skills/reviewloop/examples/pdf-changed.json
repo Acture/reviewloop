@@ -1,0 +1,70 @@
+{
+  "scenario": "pdf-changed",
+  "covers": "The PDF changed after the first request: replaying the old key is a conflict, and the current version needs a new key.",
+  "context": {
+    "server_approval": "required",
+    "now": "2026-10-18T12:00:00Z",
+    "consent_to_send": true,
+    "consent_to_watch": false,
+    "cancel_requested": false,
+    "new_round_requested": false,
+    "user": "I revised main. Review the new version and send it.",
+    "remembered": {
+      "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10",
+      "request_key": "conv-7f3a/main",
+      "pdf_hash": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad"
+    }
+  },
+  "transcript": [
+    {
+      "call": "request_review",
+      "arguments": {
+        "paper_id": "main",
+        "request_key": "conv-7f3a/main"
+      },
+      "error": {
+        "code": "request_conflict",
+        "message": "request key \"conv-7f3a/main\" in project my-paper is already bound to job 5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10 with different content (pdf_hash: recorded 14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad, requested 1432c7b31269a6952282f513b38e1f7dbef5dd821fc8c11c8d77bcd04c29c50a; version_key: recorded 14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad, requested 1432c7b31269a6952282f513b38e1f7dbef5dd821fc8c11c8d77bcd04c29c50a); resend the original request to get that job back, or use a new request key to ask for a different review",
+        "recovery": "the manuscript or its settings changed since this key was used; read job 5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10 with get_job, or send a new request_key to review the current version",
+        "details": {
+          "project_id": "my-paper",
+          "request_key": "conv-7f3a/main",
+          "existing_job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10",
+          "mismatches": [
+            {
+              "field": "pdf_hash",
+              "recorded": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+              "requested": "1432c7b31269a6952282f513b38e1f7dbef5dd821fc8c11c8d77bcd04c29c50a"
+            },
+            {
+              "field": "version_key",
+              "recorded": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+              "requested": "1432c7b31269a6952282f513b38e1f7dbef5dd821fc8c11c8d77bcd04c29c50a"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "expect": {
+    "state": "request_conflict",
+    "next": {
+      "call": "request_review",
+      "arguments": {
+        "paper_id": "main",
+        "request_key": "conv-7f3a/main/v2"
+      }
+    },
+    "never": [
+      "approve_job",
+      "cancel_job",
+      "retry_job",
+      "watch_project"
+    ],
+    "tell": [
+      "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10",
+      "pdf_hash"
+    ],
+    "rule": "SKILL.md#3-request-once-and-remember-the-job"
+  }
+}

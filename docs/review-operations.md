@@ -2,7 +2,8 @@
 
 `reviewloop::application` implements the review operations that the CLI and
 the MCP server (`reviewloop mcp`, see [MCP server](#mcp-server)) use, and
-that the shared agent skill builds on. This
+that the [shared agent skill](../integrations/reviewloop/skills/reviewloop/SKILL.md)
+builds on. This
 document fixes the operation names, the request and result fields, the error
 codes and the lifecycle semantics those consumers MAY rely on. The Rust entry
 point is `ReviewOps::new(&config, &db)`; `tests/application_ops.rs` exercises
@@ -351,6 +352,8 @@ subprocess:
 ```bash
 # Claude Code
 claude mcp add reviewloop -- reviewloop mcp
+# Codex
+codex mcp add reviewloop -- reviewloop mcp
 ```
 
 ```json
@@ -417,7 +420,7 @@ agent cannot:
 
 | Flag | `request_review` creates | Next step |
 |---|---|---|
-| `--approval required` (default) | `PENDING_APPROVAL` | `approve_job`, which tool descriptions tell the agent to call only after the user agreed to send the manuscript to the provider. MCP clients that confirm tool calls ask the user for it separately. A `retry_job` that sends the manuscript again queues the job directly only when its row proves an earlier approval (it is QUEUED, or in a status only reached after QUEUED: sent, failed other than by a cancel, timed out, refused); a cancelled or hand-completed job goes back to PENDING_APPROVAL (`awaiting_approval`). So nothing the agent requests reaches the provider without `approve_job`, and nothing it retries is sent unless a job was approved before or is approved again. A retry of a SUBMITTED job with an unknown outcome (`submit_stage` UNCERTAIN) is queued at once and may duplicate a review the provider already holds, so the `retry_job` description tells the agent to ask the user before retrying a job `get_job` shows SUBMITTED. |
+| `--approval required` (default) | `PENDING_APPROVAL` | `approve_job`, which tool descriptions tell the agent to call only after the user agreed to send the manuscript to the provider; agreement the user already gave counts, so the agent does not ask again. MCP clients that confirm tool calls ask the user for it separately. A `retry_job` that sends the manuscript again queues the job directly only when its row proves an earlier approval (it is QUEUED, or in a status only reached after QUEUED: sent, failed other than by a cancel, timed out, refused); a cancelled or hand-completed job goes back to PENDING_APPROVAL (`awaiting_approval`). So nothing the agent requests reaches the provider without `approve_job`, and nothing it retries is sent unless a job was approved before or is approved again. A retry of a SUBMITTED job with an unknown outcome (`submit_stage` UNCERTAIN) is queued at once and may duplicate a review the provider already holds, so the `retry_job` description tells the agent to ask the user before retrying a job `get_job` shows SUBMITTED without a receipt (`has_token` false). |
 | `--approval granted` | `QUEUED` | None: the supervisor sends it at its next tick. |
 
 Requests are recorded with origin `Agent` (event source `agent_request`).

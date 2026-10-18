@@ -1,0 +1,75 @@
+{
+  "scenario": "in-flight",
+  "covers": "A SUBMITTED job a worker is sending right now: wait and check again, never retry it.",
+  "context": {
+    "server_approval": "required",
+    "now": "2026-10-18T12:00:00Z",
+    "consent_to_send": true,
+    "consent_to_watch": false,
+    "cancel_requested": false,
+    "new_round_requested": false,
+    "user": "Did main go out yet?",
+    "remembered": {
+      "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10",
+      "request_key": "conv-7f3a/main",
+      "pdf_hash": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad"
+    }
+  },
+  "transcript": [
+    {
+      "call": "get_job",
+      "arguments": {
+        "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10"
+      },
+      "result": {
+        "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10",
+        "project_id": "my-paper",
+        "paper_id": "main",
+        "backend": "stanford",
+        "status": "SUBMITTED",
+        "phase": "submitted",
+        "terminal": false,
+        "has_token": false,
+        "review_available": false,
+        "review_completed_at": null,
+        "attempt": 0,
+        "pdf_path": "/home/me/my-paper/paper/main.pdf",
+        "snapshot_path": "/home/me/.review_loop/snapshots/14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad/main.pdf",
+        "pdf_hash": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+        "venue": "ICLR",
+        "review_options": {},
+        "version_no": 1,
+        "round_no": 1,
+        "version_source": "pdf_hash",
+        "version_key": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+        "git_tag": null,
+        "git_commit": null,
+        "fallback_used": false,
+        "submit_stage": "DISPATCHED",
+        "last_error": null,
+        "created_at": "2026-10-18T11:59:10.000000Z",
+        "updated_at": "2026-10-18T11:59:40.000000Z",
+        "started_at": null,
+        "next_poll_at": "2026-10-18T11:59:30.000000Z"
+      }
+    }
+  ],
+  "expect": {
+    "state": "in-flight",
+    "next": {
+      "end_turn": true,
+      "check_again_at": "2026-10-18T12:00:30Z"
+    },
+    "never": [
+      "approve_job",
+      "cancel_job",
+      "request_review",
+      "retry_job",
+      "watch_project"
+    ],
+    "tell": [
+      "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10"
+    ],
+    "rule": "references/lifecycle.md#states"
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "scenario": "later-session-timeout",
+  "covers": "A later session asks for a review while the paper's newest job timed out with a receipt: offer to poll that job again instead of sending the manuscript again.",
+  "context": {
+    "server_approval": "required",
+    "now": "2026-10-18T12:00:00Z",
+    "consent_to_send": true,
+    "consent_to_watch": false,
+    "cancel_requested": false,
+    "new_round_requested": false,
+    "user": "Review main and send it."
+  },
+  "transcript": [
+    {
+      "call": "list_papers",
+      "arguments": {},
+      "result": {
+        "project_id": "my-paper",
+        "papers": [
+          {
+            "paper_id": "main",
+            "backend": "stanford",
+            "venue": "ICLR",
+            "review_options": {},
+            "pdf_path": "/home/me/my-paper/paper/main.pdf",
+            "pdf_present": true,
+            "watched": true,
+            "tag_trigger": null
+          }
+        ]
+      }
+    },
+    {
+      "call": "list_jobs",
+      "arguments": {
+        "paper_id": "main"
+      },
+      "result": {
+        "jobs": [
+          {
+            "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10",
+            "project_id": "my-paper",
+            "paper_id": "main",
+            "backend": "stanford",
+            "status": "TIMEOUT",
+            "phase": "failed",
+            "terminal": true,
+            "has_token": true,
+            "review_available": false,
+            "review_completed_at": null,
+            "attempt": 12,
+            "pdf_path": "/home/me/my-paper/paper/main.pdf",
+            "snapshot_path": "/home/me/.review_loop/snapshots/14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad/main.pdf",
+            "pdf_hash": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+            "venue": "ICLR",
+            "review_options": {},
+            "version_no": 1,
+            "round_no": 1,
+            "version_source": "pdf_hash",
+            "version_key": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+            "git_tag": null,
+            "git_commit": null,
+            "fallback_used": false,
+            "submit_stage": null,
+            "last_error": "review timed out",
+            "created_at": "2026-10-17T09:00:00.000000Z",
+            "updated_at": "2026-10-18T09:01:00.000000Z",
+            "started_at": "2026-10-17T09:01:00.000000Z",
+            "next_poll_at": null
+          }
+        ],
+        "truncated": false
+      }
+    }
+  ],
+  "expect": {
+    "state": "failed",
+    "next": {
+      "ask_user": "The provider already holds main from job 5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10, which timed out. Shall I poll that job again (it sends nothing), or send the manuscript again as a new request?"
+    },
+    "never": [
+      "approve_job",
+      "cancel_job",
+      "request_review",
+      "watch_project"
+    ],
+    "tell": [
+      "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10"
+    ],
+    "rule": "SKILL.md#3-request-once-and-remember-the-job"
+  }
+}
