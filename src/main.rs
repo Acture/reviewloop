@@ -687,7 +687,8 @@ async fn run() -> Result<()> {
             show_token,
             active,
         } => {
-            let (config, db) = load_runtime(config_override.as_deref(), false, false)?;
+            // JSON owns stdout, so logs go to stderr whatever logging.output says.
+            let (config, db) = load_runtime(config_override.as_deref(), json, false)?;
             cmd_status(&config, &db, paper_id.as_deref(), json, show_token, active)
         }
         Command::Cancel { job_ref, reason } => {
@@ -1949,7 +1950,8 @@ fn current_project_context(
 fn cmd_project_list(config_override: Option<&Path>, as_json: bool) -> Result<()> {
     use reviewloop::registry::ConfigFileState;
 
-    let (machine, db) = load_machine_runtime(false)?;
+    // JSON owns stdout, so logs go to stderr whatever logging.output says.
+    let (machine, db) = load_machine_runtime(as_json)?;
     let context = current_project_context(config_override, &machine, &db);
     let ops = ReviewOps::new(&context, &db);
     let projects = ops.list_projects()?;
@@ -2126,7 +2128,8 @@ fn print_project_worker(config: &Config, db: &Db) {
 
 /// Show the supervisor, its service, and every registered project.
 fn cmd_daemon_status(config_override: Option<&Path>, as_json: bool) -> Result<()> {
-    let (machine, db) = load_machine_runtime(false)?;
+    // JSON owns stdout, so logs go to stderr whatever logging.output says.
+    let (machine, db) = load_machine_runtime(as_json)?;
     let context = current_project_context(config_override, &machine, &db);
     #[cfg(target_os = "macos")]
     let service = launchd::probe()

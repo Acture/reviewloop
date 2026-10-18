@@ -1,0 +1,96 @@
+{
+  "scenario": "worker-not-ready",
+  "covers": "A job that stays QUEUED: the supervisor does not run the project and is stopped; the agent names both fixes and what watching would send, instead of watching the project itself.",
+  "context": {
+    "server_approval": "required",
+    "now": "2026-10-18T12:00:00Z",
+    "consent_to_send": true,
+    "consent_to_watch": false,
+    "cancel_requested": false,
+    "new_round_requested": false,
+    "user": "My review of main has been queued for an hour. What is wrong?",
+    "remembered": {
+      "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10",
+      "request_key": "conv-7f3a/main",
+      "pdf_hash": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad"
+    }
+  },
+  "transcript": [
+    {
+      "call": "get_job",
+      "arguments": {
+        "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10"
+      },
+      "result": {
+        "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10",
+        "project_id": "my-paper",
+        "paper_id": "main",
+        "backend": "stanford",
+        "status": "QUEUED",
+        "phase": "queued",
+        "terminal": false,
+        "has_token": false,
+        "review_available": false,
+        "review_completed_at": null,
+        "attempt": 0,
+        "pdf_path": "/home/me/my-paper/paper/main.pdf",
+        "snapshot_path": "/home/me/.review_loop/snapshots/14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad/main.pdf",
+        "pdf_hash": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+        "venue": "ICLR",
+        "review_options": {},
+        "version_no": 1,
+        "round_no": 1,
+        "version_source": "pdf_hash",
+        "version_key": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+        "git_tag": null,
+        "git_commit": null,
+        "fallback_used": false,
+        "submit_stage": null,
+        "last_error": null,
+        "created_at": "2026-10-18T10:57:30.000000Z",
+        "updated_at": "2026-10-18T10:58:00.000000Z",
+        "started_at": null,
+        "next_poll_at": "2026-10-18T10:58:00.000000Z"
+      }
+    },
+    {
+      "call": "get_worker_status",
+      "arguments": {},
+      "result": {
+        "supervisor": {
+          "state": "stopped",
+          "pid": null,
+          "version": null,
+          "started_at": null,
+          "heartbeat_at": null,
+          "last_tick_at": null,
+          "paused_at": null,
+          "last_tick_error": null
+        },
+        "project": {
+          "project_id": "my-paper",
+          "availability": "project_unwatched",
+          "last_error": null
+        }
+      }
+    }
+  ],
+  "expect": {
+    "state": "queued",
+    "next": {
+      "ask_user": "The supervisor does not run this project, and no supervisor is running. Watching the project (`reviewloop project watch`) also sends, without approval, every job already queued in my-paper for any paper, every review-* git tag not seen yet and, with auto_submit_on_change, every changed PDF. Then start the supervisor with `reviewloop daemon install`. Shall I watch it, or will you run these?"
+    },
+    "never": [
+      "watch_project",
+      "retry_job",
+      "request_review",
+      "approve_job",
+      "cancel_job"
+    ],
+    "tell": [
+      "reviewloop project watch",
+      "reviewloop daemon install"
+    ],
+    "rule": "references/lifecycle.md#worker-availability"
+  }
+}

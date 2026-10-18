@@ -338,12 +338,13 @@ the same paper and backend, which it names.
 ## Agent Integration (MCP)
 
 `reviewloop mcp` is a standard stdio [Model Context Protocol](https://modelcontextprotocol.io)
-server, so an AI agent (Claude Code, Claude Desktop, VS Code, GitHub Copilot, …)
+server, so an AI agent (Claude Code, Codex, Claude Desktop, VS Code, GitHub Copilot, …)
 can list papers, request reviews, follow jobs and read reviews as structured
 results:
 
 ```bash
-claude mcp add reviewloop -- reviewloop mcp
+claude mcp add reviewloop -- reviewloop mcp   # Claude Code
+codex mcp add reviewloop -- reviewloop mcp    # Codex
 ```
 
 Clients configured with an `mcpServers` map (Claude Desktop, Cursor, GitHub
@@ -374,6 +375,21 @@ VS Code (`.vscode/mcp.json`):
 
 The tools, their schemas and errors are specified in
 [docs/review-operations.md](docs/review-operations.md#mcp-server).
+
+### Agent skill
+
+[`integrations/reviewloop/skills/reviewloop/`](integrations/reviewloop/skills/reviewloop/SKILL.md)
+is the shared [Agent Skill](https://agentskills.io) for Codex, Claude Code
+and other hosts that load skills. It tells the agent when and how to use the
+tools: one request per manuscript version with a request key, the user's
+consent before a manuscript is sent, checks paced by `next_poll_at`, stalled
+jobs and the worker fix, resuming a job in a later session, submissions with
+an unknown outcome, saying which manuscript version a review covers, and a
+CLI fallback. Until host plugins package it, copy or symlink the directory
+into the host's skills directory, such as `~/.claude/skills/reviewloop`
+(Claude Code) or `~/.agents/skills/reviewloop` (Codex).
+`cargo test --test agent_skill` checks it against the live tool schemas and
+the CLI; it does not run an agent.
 
 ## Exit Codes
 

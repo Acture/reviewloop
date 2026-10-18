@@ -1,0 +1,131 @@
+{
+  "scenario": "covered-request",
+  "covers": "A new session asks again for an unchanged PDF: an earlier completed job covers it and is read instead of a new round.",
+  "context": {
+    "server_approval": "required",
+    "now": "2026-10-18T12:00:00Z",
+    "consent_to_send": false,
+    "consent_to_watch": false,
+    "cancel_requested": false,
+    "new_round_requested": false,
+    "user": "Get me a ReviewLoop review of main."
+  },
+  "transcript": [
+    {
+      "call": "list_jobs",
+      "arguments": {
+        "paper_id": "main"
+      },
+      "result": {
+        "jobs": [
+          {
+            "job_id": "2c9f7e15-0a4b-4d8e-9c36-71b2e4f5a608",
+            "project_id": "my-paper",
+            "paper_id": "main",
+            "backend": "stanford",
+            "status": "COMPLETED",
+            "phase": "completed",
+            "terminal": true,
+            "has_token": true,
+            "review_available": true,
+            "review_completed_at": "2026-10-18T10:40:12.000000Z",
+            "attempt": 3,
+            "pdf_path": "/home/me/my-paper/paper/main.pdf",
+            "snapshot_path": "/home/me/.review_loop/snapshots/14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad/main.pdf",
+            "pdf_hash": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+            "venue": "ICLR",
+            "review_options": {},
+            "version_no": 1,
+            "round_no": 1,
+            "version_source": "pdf_hash",
+            "version_key": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+            "git_tag": null,
+            "git_commit": null,
+            "fallback_used": false,
+            "submit_stage": null,
+            "last_error": null,
+            "created_at": "2026-10-18T09:00:00.000000Z",
+            "updated_at": "2026-10-18T10:40:12.000000Z",
+            "started_at": "2026-10-18T09:00:41.000000Z",
+            "next_poll_at": null
+          }
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "call": "request_review",
+      "arguments": {
+        "paper_id": "main",
+        "request_key": "conv-91c2/main"
+      },
+      "result": {
+        "disposition": "existing",
+        "reason": "covered",
+        "job": {
+          "job_id": "2c9f7e15-0a4b-4d8e-9c36-71b2e4f5a608",
+          "project_id": "my-paper",
+          "paper_id": "main",
+          "backend": "stanford",
+          "status": "COMPLETED",
+          "phase": "completed",
+          "terminal": true,
+          "has_token": true,
+          "review_available": true,
+          "review_completed_at": "2026-10-18T10:40:12.000000Z",
+          "attempt": 3,
+          "pdf_path": "/home/me/my-paper/paper/main.pdf",
+          "snapshot_path": "/home/me/.review_loop/snapshots/14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad/main.pdf",
+          "pdf_hash": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+          "venue": "ICLR",
+          "review_options": {},
+          "version_no": 1,
+          "round_no": 1,
+          "version_source": "pdf_hash",
+          "version_key": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+          "git_tag": null,
+          "git_commit": null,
+          "fallback_used": false,
+          "submit_stage": null,
+          "last_error": null,
+          "created_at": "2026-10-18T09:00:00.000000Z",
+          "updated_at": "2026-10-18T10:40:12.000000Z",
+          "started_at": "2026-10-18T09:00:41.000000Z",
+          "next_poll_at": null
+        },
+        "input": {
+          "paper_id": "main",
+          "pdf_path": "/home/me/my-paper/paper/main.pdf",
+          "snapshot_path": "/home/me/.review_loop/snapshots/14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad/main.pdf",
+          "pdf_hash": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+          "backend": "stanford",
+          "venue": "ICLR",
+          "review_options": {},
+          "version_source": "pdf_hash",
+          "version_key": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+          "notices": []
+        }
+      }
+    }
+  ],
+  "expect": {
+    "state": "completed",
+    "next": {
+      "call": "get_review",
+      "arguments": {
+        "job_id": "2c9f7e15-0a4b-4d8e-9c36-71b2e4f5a608",
+        "part": "summary"
+      }
+    },
+    "never": [
+      "approve_job",
+      "retry_job",
+      "cancel_job",
+      "watch_project"
+    ],
+    "tell": [
+      "2c9f7e15-0a4b-4d8e-9c36-71b2e4f5a608"
+    ],
+    "rule": "references/lifecycle.md#states"
+  }
+}

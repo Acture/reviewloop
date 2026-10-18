@@ -1,0 +1,76 @@
+{
+  "scenario": "receipt-saved",
+  "covers": "A SUBMITTED job whose receipt arrived late: retry_job only resumes polling and sends nothing, so it needs no consent.",
+  "context": {
+    "server_approval": "required",
+    "now": "2026-10-18T12:00:00Z",
+    "consent_to_send": false,
+    "consent_to_watch": false,
+    "cancel_requested": false,
+    "new_round_requested": false,
+    "user": "What is happening with my review of main?",
+    "remembered": {
+      "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10",
+      "request_key": "conv-7f3a/main",
+      "pdf_hash": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad"
+    }
+  },
+  "transcript": [
+    {
+      "call": "get_job",
+      "arguments": {
+        "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10"
+      },
+      "result": {
+        "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10",
+        "project_id": "my-paper",
+        "paper_id": "main",
+        "backend": "stanford",
+        "status": "SUBMITTED",
+        "phase": "submitted",
+        "terminal": false,
+        "has_token": true,
+        "review_available": false,
+        "review_completed_at": null,
+        "attempt": 0,
+        "pdf_path": "/home/me/my-paper/paper/main.pdf",
+        "snapshot_path": "/home/me/.review_loop/snapshots/14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad/main.pdf",
+        "pdf_hash": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+        "venue": "ICLR",
+        "review_options": {},
+        "version_no": 1,
+        "round_no": 1,
+        "version_source": "pdf_hash",
+        "version_key": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+        "git_tag": null,
+        "git_commit": null,
+        "fallback_used": false,
+        "submit_stage": "UNCERTAIN",
+        "last_error": "submission receipt arrived after the worker lost its lease; a receipt token is saved; run `reviewloop retry --job-id 5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10` to resume polling",
+        "created_at": "2026-10-18T11:19:40.000000Z",
+        "updated_at": "2026-10-18T11:52:30.000000Z",
+        "started_at": "2026-10-18T11:52:30.000000Z",
+        "next_poll_at": "2026-10-18T11:20:00.000000Z"
+      }
+    }
+  ],
+  "expect": {
+    "state": "receipt-saved",
+    "next": {
+      "call": "retry_job",
+      "arguments": {
+        "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10"
+      }
+    },
+    "never": [
+      "approve_job",
+      "cancel_job",
+      "request_review",
+      "watch_project"
+    ],
+    "tell": [
+      "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10"
+    ],
+    "rule": "references/lifecycle.md#states"
+  }
+}

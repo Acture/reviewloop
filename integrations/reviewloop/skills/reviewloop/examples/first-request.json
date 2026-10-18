@@ -1,0 +1,117 @@
+{
+  "scenario": "first-request",
+  "covers": "First submission when the user already agreed to send the paper: request with a key, then approve without asking again.",
+  "context": {
+    "server_approval": "required",
+    "now": "2026-10-18T12:00:00Z",
+    "consent_to_send": true,
+    "consent_to_watch": false,
+    "cancel_requested": false,
+    "new_round_requested": false,
+    "user": "Please get a ReviewLoop review of my paper main and send it to the reviewer."
+  },
+  "transcript": [
+    {
+      "call": "list_papers",
+      "arguments": {},
+      "result": {
+        "project_id": "my-paper",
+        "papers": [
+          {
+            "paper_id": "main",
+            "backend": "stanford",
+            "venue": "ICLR",
+            "review_options": {},
+            "pdf_path": "/home/me/my-paper/paper/main.pdf",
+            "pdf_present": true,
+            "watched": true,
+            "tag_trigger": null
+          }
+        ]
+      }
+    },
+    {
+      "call": "list_jobs",
+      "arguments": {
+        "paper_id": "main"
+      },
+      "result": {
+        "jobs": [],
+        "truncated": false
+      }
+    },
+    {
+      "call": "request_review",
+      "arguments": {
+        "paper_id": "main",
+        "request_key": "conv-7f3a/main"
+      },
+      "result": {
+        "disposition": "created",
+        "reason": null,
+        "job": {
+          "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10",
+          "project_id": "my-paper",
+          "paper_id": "main",
+          "backend": "stanford",
+          "status": "PENDING_APPROVAL",
+          "phase": "awaiting_approval",
+          "terminal": false,
+          "has_token": false,
+          "review_available": false,
+          "review_completed_at": null,
+          "attempt": 0,
+          "pdf_path": "/home/me/my-paper/paper/main.pdf",
+          "snapshot_path": "/home/me/.review_loop/snapshots/14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad/main.pdf",
+          "pdf_hash": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+          "venue": "ICLR",
+          "review_options": {},
+          "version_no": 1,
+          "round_no": 1,
+          "version_source": "pdf_hash",
+          "version_key": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+          "git_tag": null,
+          "git_commit": null,
+          "fallback_used": false,
+          "submit_stage": null,
+          "last_error": null,
+          "created_at": "2026-10-18T11:59:58.000000Z",
+          "updated_at": "2026-10-18T11:59:58.000000Z",
+          "started_at": null,
+          "next_poll_at": null
+        },
+        "input": {
+          "paper_id": "main",
+          "pdf_path": "/home/me/my-paper/paper/main.pdf",
+          "snapshot_path": "/home/me/.review_loop/snapshots/14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad/main.pdf",
+          "pdf_hash": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+          "backend": "stanford",
+          "venue": "ICLR",
+          "review_options": {},
+          "version_source": "pdf_hash",
+          "version_key": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+          "notices": []
+        }
+      }
+    }
+  ],
+  "expect": {
+    "state": "awaiting-approval",
+    "next": {
+      "call": "approve_job",
+      "arguments": {
+        "job_id": "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10"
+      }
+    },
+    "never": [
+      "request_review",
+      "retry_job",
+      "cancel_job",
+      "watch_project"
+    ],
+    "tell": [
+      "5b0b8f1e-3c55-4b3f-9a52-1d3f2b7c9e10"
+    ],
+    "rule": "SKILL.md#4-authorization"
+  }
+}
