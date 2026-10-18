@@ -3,6 +3,7 @@
 
 use super::{
     BackendError, ReviewBackend, ReviewFetchResult, SubmitReceipt, SubmitRequest, SubmitStep,
+    bounded_provider_text,
     input::{InputPolicy, upload_file_name},
     parse_retry_after,
 };
@@ -56,9 +57,9 @@ fn provider_detail(body: &str) -> String {
         detail: Value,
     }
     let Ok(ErrorBody { detail }) = serde_json::from_str::<ErrorBody>(body) else {
-        return body.trim().to_string();
+        return bounded_provider_text(body.trim());
     };
-    match detail {
+    let text = match detail {
         Value::String(message) => message,
         Value::Array(errors) => errors
             .iter()
@@ -90,7 +91,8 @@ fn provider_detail(body: &str) -> String {
             .collect::<Vec<_>>()
             .join("; "),
         other => other.to_string(),
-    }
+    };
+    bounded_provider_text(&text)
 }
 
 /// Why a request got no response, without its URL.
@@ -283,6 +285,7 @@ impl StanfordBackend {
         let body = reply
             .body
             .unwrap_or_else(|err| format!("unreadable body: {err}"));
+        let body = bounded_provider_text(&body);
         if reply.status.is_server_error() {
             return Err(BackendError::Server {
                 status: reply.status.as_u16(),
@@ -453,6 +456,20 @@ impl ReviewBackend for StanfordBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn provider_diagnostics_bound_raw_and_structured_unicode_text() {
+        let text = "界".repeat(10_000);
+        for body in [
+            text.clone(),
+            json!({"detail": text}).to_string(),
+            json!({"detail": [{"loc": ["body", "paper"], "msg": text}]}).to_string(),
+        ] {
+            let detail = provider_detail(&body);
+            assert!(detail.chars().count() <= 513);
+            assert!(detail.ends_with('…'));
+        }
+    }
+
     #[test]
     fn provider_detail_reads_messages_validation_lists_and_raw_bodies() {
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stanford");

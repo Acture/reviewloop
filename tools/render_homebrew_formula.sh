@@ -29,10 +29,12 @@ class ${formula_class} < Formula
   url "${source_url}"
   sha256 "${source_sha256}"
   license "${license_name}"
+  version_scheme 1
 
   livecheck do
     url :stable
     regex(/^v?(\\d+(?:\\.\\d+)+)$/i)
+    strategy :github_latest
   end
 
   depends_on "rust" => :build
@@ -58,7 +60,7 @@ class ${formula_class} < Formula
     config_path = testpath/".config/reviewloop/config.toml"
     assert_path_exists config_path
     assert_includes config_path.read, "[providers.stanford]"
-    config_path.write <<~TOML
+    config_path.atomic_write <<~TOML
       [logging]
       output = "stderr"
     TOML

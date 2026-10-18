@@ -16,6 +16,16 @@ use std::{
 };
 use thiserror::Error;
 
+/// Keep provider-controlled diagnostics bounded before storing or returning them.
+pub(crate) fn bounded_provider_text(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut quoted: String = chars.by_ref().take(512).collect();
+    if chars.next().is_some() {
+        quoted.push('…');
+    }
+    quoted
+}
+
 /// What the worker hands a backend. Everything that shapes the review comes
 /// from the job row, so the request matches the job's recorded identity.
 #[derive(Debug, Clone)]
