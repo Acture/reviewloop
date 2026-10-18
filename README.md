@@ -3,7 +3,7 @@
 [![CI](https://github.com/Acture/reviewloop/actions/workflows/ci.yml/badge.svg)](https://github.com/Acture/reviewloop/actions/workflows/ci.yml)
 [![Release](https://github.com/Acture/reviewloop/actions/workflows/release.yml/badge.svg)](https://github.com/Acture/reviewloop/actions/workflows/release.yml)
 [![Rust](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/github/license/Acture/reviewloop)](LICENSE)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 
 > A production-minded Rust CLI/daemon for AI paper review submission and retrieval: `paperreview.ai` (Stanford) and CSPaper Agentic Review.
 
@@ -144,36 +144,39 @@ once to rewrite the service.
 
 ## Installation
 
+Version numbering restarts at **0.0.1**. Earlier 0.1.x and 0.2.x releases remain
+historical releases. See the [release notes](docs/releases/0.0.1.md) for scope
+and upgrade details.
+The version reset does not reset databases or review history.
+
 ### Homebrew (recommended on macOS)
 
 ```bash
-# after public release
 brew tap acture/ac
 brew install reviewloop
 ```
 
-Upgrade:
-
-```bash
-reviewloop self-update --yes
-# or force Homebrew path
-reviewloop self-update --method brew --yes
-```
+Upgrade with `brew update && brew upgrade reviewloop` or
+`reviewloop self-update --method brew --yes`. The formula uses `version_scheme 1`
+so Homebrew recognizes the reset as an upgrade from historical 0.2.x versions.
 
 ### Cargo
 
 ```bash
-# after public release
-cargo install reviewloop
+cargo install reviewloop --version 0.0.1 --locked
 ```
 
 Upgrade:
 
 ```bash
-reviewloop self-update --yes
-# or force Cargo path
-reviewloop self-update --method cargo --yes
+cargo install reviewloop --version 0.0.1 --locked --force
 ```
+
+Pin the version during the reset: Cargo's default version selection still picks
+the numerically higher historical release. Starting with 0.0.1,
+`reviewloop self-update --method cargo --yes` instead reads GitHub's latest release
+and installs that exact version. Existing installations need the explicit command
+above once to get the new updater.
 
 ### Build From Source
 
@@ -226,6 +229,14 @@ without the GUI dependencies.
 > **Note:** The menu bar companion has no automated integration tests of
 > its GUI. Manual smoke-testing on macOS is the verification path; build it
 > with `cargo test --features bar --bin reviewloop-bar` for its unit tests.
+
+## CSPaper browser companion
+
+[CSPaper Review Manager](https://github.com/Acture/cspaper-review-manager) maintains
+review records on the logged-in CSPaper website. One TypeScript source builds a
+Chromium extension and a userscript, with selection, sequential deletion,
+per-record outcomes and coordination across tabs. It runs independently of the
+Rust CLI; CSPaper review submission is a separate backend integration.
 
 ## Command Surface
 
@@ -892,7 +903,7 @@ To enable it in the standard `pre-commit` framework:
 
 ### Release (`.github/workflows/release.yml`)
 
-On tag push like `v0.1.0`:
+On tag push like `v0.0.1`:
 1. Verify tag version matches `Cargo.toml`
 2. Run quality gates again
 3. Publish crate to crates.io
@@ -910,7 +921,7 @@ Runtime secrets (must be provided via env or `config.toml` at runtime — not ba
 
 Optional repo variables:
 - `HOMEBREW_TAP_REPO` (default: `Acture/homebrew-ac`)
-- `HOMEBREW_FORMULA_PATH` (default: `Formula/reviewloop.rb`)
+- `HOMEBREW_FORMULA_PATH` (default: `packaging/homebrew/Formula/reviewloop.rb`)
 
 ## Fallback Requirements
 
@@ -1005,7 +1016,8 @@ build details that may evolve.
 
 ## License
 
-[GPL-3.0](LICENSE)
+[GNU Affero General Public License, version 3 or any later version](LICENSE)
+(`AGPL-3.0-or-later`).
 
 ## IMAP support
 

@@ -3128,7 +3128,7 @@ dependencies = [
 
 [[package]]
 name = "reviewloop"
-version = "0.2.1"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",

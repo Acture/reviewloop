@@ -23,7 +23,8 @@
 //! a restart.
 
 use super::{
-    BackendError, ReviewBackend, ReviewFetchResult, SubmitReceipt, SubmitRequest, parse_retry_after,
+    BackendError, ReviewBackend, ReviewFetchResult, SubmitReceipt, SubmitRequest,
+    bounded_provider_text, parse_retry_after,
 };
 use crate::config::{CSPAPER_API_KEY_ENV, Config, CspaperProviderConfig, Redacted};
 use crate::http::{Redirects, describe_error};
@@ -46,8 +47,6 @@ pub const DESK_REJECTION_ENABLED: &str = "desk_rejection_enabled";
 const SUBMIT_PATH: &str = "/api/platform/review";
 const REVIEWS_PATH: &str = "/api/platform/reviews";
 const API_KEY_HEADER: &str = "X-API-Key";
-/// Provider text quoted into job errors and events is cut to this many chars.
-const MAX_QUOTED_CHARS: usize = 512;
 /// Retrying a job resends what it recorded at request time, so a corrected
 /// template needs a new request.
 const NEW_REVIEW_HINT: &str = "request a new review with `reviewloop submit --paper-id <paper>` (retrying this job resends what it recorded)";
@@ -99,11 +98,7 @@ impl CspaperBackend {
             Some(key) if !key.is_empty() => text.replace(key.as_str(), "[redacted]"),
             _ => text,
         };
-        let mut chars = text.chars();
-        let mut quoted: String = chars.by_ref().take(MAX_QUOTED_CHARS).collect();
-        if chars.next().is_some() {
-            quoted.push('…');
-        }
+        let quoted = bounded_provider_text(&text);
         if quoted.is_empty() {
             "<empty body>".to_string()
         } else {
@@ -286,10 +281,16 @@ impl ReviewBackend for CspaperBackend {
             };
         }
 
-        let payload = resp
+        let mut payload = resp
             .json::<Value>()
             .await
             .map_err(|e| BackendError::Schema(format!("invalid CSPaper job payload: {e}")))?;
+        if let Some(reason) = payload.pointer_mut("/data/failed_reason")
+            && let Some(text) = reason.as_str()
+            && !text.trim().is_empty()
+        {
+            *reason = Value::String(self.quote(text));
+        }
         interpret_job(token, payload)
     }
 }
@@ -726,13 +727,13 @@ fn interpret_job(token: &str, payload: Value) -> Result<ReviewFetchResult, Backe
             normalize_review(token, &payload).map(|raw_json| ReviewFetchResult::Ready { raw_json })
         }
         "FAILED" => Ok(ReviewFetchResult::Failed {
-            reason: data
-                .get("failed_reason")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|reason| !reason.is_empty())
-                .unwrap_or("CSPaper gave no reason")
-                .to_string(),
+            reason: bounded_provider_text(
+                data.get("failed_reason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or("CSPaper gave no reason"),
+            ),
         }),
         other => Err(BackendError::Schema(format!(
             "unknown CSPaper job status {other:?}"
@@ -1158,8 +1159,8 @@ mod tests {
             backend.quote("upstream said csp_live_SECRET is bad"),
             "upstream said [redacted] is bad"
         );
-        let long = "x".repeat(MAX_QUOTED_CHARS + 10);
-        assert_eq!(backend.quote(&long).chars().count(), MAX_QUOTED_CHARS + 1);
+        let long = "界".repeat(522);
+        assert_eq!(backend.quote(&long).chars().count(), 513);
         assert_eq!(backend.quote("  "), "<empty body>");
     }
 }

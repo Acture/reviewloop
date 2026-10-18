@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version to release (for example 0.1.1)
+        description: Version to release (for example 0.0.1)
         required: true
         type: string
       skip_crates_publish:
@@ -86,6 +86,8 @@ jobs:
             tag_name="${GITHUB_REF_NAME}"
           fi
 
+          test -f "docs/releases/${version}.md"
+
           {
             echo "crate_name=$crate_name"
             echo "version=$version"
@@ -94,6 +96,11 @@ jobs:
 
       - name: Release quality gates
         run: ./scripts/quality-gates.sh
+
+      - name: Verify crate packaging and CLI version
+        run: |
+          cargo package --locked
+          test "$(target/debug/reviewloop --version)" = "reviewloop ${{ steps.meta.outputs.version }}"
 
   publish-crates-io:
     name: Publish To crates.io
@@ -229,7 +236,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          formula_rel_path="${HOMEBREW_FORMULA_PATH:-Formula/${CRATE_NAME}.rb}"
+          formula_rel_path="${HOMEBREW_FORMULA_PATH:-packaging/homebrew/Formula/${CRATE_NAME}.rb}"
           formula_file="tap/${formula_rel_path}"
 
           bash tools/render_homebrew_formula.sh "$formula_file"
@@ -247,7 +254,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          formula_rel_path="${HOMEBREW_FORMULA_PATH:-Formula/${CRATE_NAME}.rb}"
+          formula_rel_path="${HOMEBREW_FORMULA_PATH:-packaging/homebrew/Formula/${CRATE_NAME}.rb}"
 
           cd tap
           git config user.name "github-actions[bot]"
@@ -272,11 +279,35 @@ jobs:
       - verify
       - publish-crates-io
       - update-homebrew-tap
+      - verify-homebrew
     environment: release
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Publish GitHub release notes
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.verify.outputs.tag_name }}
-          generate_release_notes: true
+          body_path: docs/releases/${{ needs.verify.outputs.version }}.md
+          make_latest: true
+
+  verify-homebrew:
+    name: Verify Homebrew Installation
+    runs-on: macos-latest
+    needs:
+      - verify
+      - update-homebrew-tap
+    env:
+      CARGO_BUILD_JOBS: 3
+      HOMEBREW_NO_AUTO_UPDATE: 1
+    steps:
+      - name: Install and test the published formula
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          brew tap acture/ac
+          brew install --build-from-source acture/ac/reviewloop
+          test "$(reviewloop --version)" = "reviewloop ${VERSION}"
+          brew test acture/ac/reviewloop

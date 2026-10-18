@@ -1032,6 +1032,30 @@ async fn provider_failure_needs_manual_and_is_never_polled_again() -> Result<()>
 }
 
 #[tokio::test]
+async fn provider_failure_diagnostics_are_bounded_and_redacted() -> Result<()> {
+    let ctx = TestContext::start().await?;
+    let job = ctx.submitted().await?;
+    let mut payload = job_body("review_failed.json", JOB_ID);
+    payload["data"]["failed_reason"] = json!(format!("{SECRET}: {}", "界".repeat(10_000)));
+    ctx.reply(POLL, Reply::json(StatusCode::OK, &payload));
+
+    assert_eq!(ctx.poll(&job.id).await?, Attempt::Ran);
+    let failed = ctx.job(&job.id)?;
+    assert_eq!(failed.status, JobStatus::FailedNeedsManual);
+    let last_error = diagnostic(&failed)?;
+    assert!(last_error.chars().count() < 1024);
+    assert!(last_error.contains("[redacted]"));
+    assert!(last_error.contains('…'));
+    let events = ctx.events(&job.id)?;
+    let reason = only_event(&events, "poll_provider_failed")["reason"]
+        .as_str()
+        .context("provider reason")?
+        .to_owned();
+    assert!(reason.chars().count() <= 513);
+    ctx.assert_secret_contained()
+}
+
+#[tokio::test]
 async fn poll_404_fails_with_invalid_token() -> Result<()> {
     let ctx = TestContext::start().await?;
     let job = ctx.submitted().await?;

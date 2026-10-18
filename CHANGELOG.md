@@ -6,7 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.0.1] - 2026-10-18
+
+This release restarts the version sequence at **0.0.1**. Existing
+release entries and tags retain their original version numbers and dates.
 
 ### Added
 
@@ -189,6 +192,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`ReviewOps::retry_failed_jobs`); the MCP tools are unchanged.
 
 ### Changed
+
+- **Version numbering restarts at 0.0.1** for the Rust package and macOS
+  companion bundles. Database schema versions and review history are unchanged.
+- **AGPL-3.0-or-later** is the project license, consistently declared in
+  Cargo metadata, the README and the license notice.
 
 - **Paper watching matches project watching (CLI)** — `reviewloop paper
   watch --paper-id <id>` turns a paper's PDF-change watching on and
@@ -408,6 +416,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Upgrade notes
 
+- **Version reset.** Select this release explicitly with
+  `cargo install reviewloop --version 0.0.1 --locked --force`. Unpinned Cargo
+  installation still selects the higher historical version. The Cargo
+  self-updater now selects GitHub's latest release explicitly; Homebrew uses
+  `version_scheme 1` so `brew upgrade` recognizes the new sequence.
+  Existing database migrations still
+  apply; the reset changes the product version, not the stored data.
 - Schema version 8 adds `jobs.polling_restarted_at`, the restart of a job's
   review timeout by a retry (empty for existing rows).
 - Schema version 7 adds `projects.enabled`, `enabled_changed_at` and the
@@ -464,6 +479,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   of the global config instead of resetting it.
 
 ### Fixed
+
+- Bound provider error diagnostics, including CSPaper failure reasons and
+  Stanford upload/poll errors, before they reach persisted jobs and agents.
+  CSPaper failure reasons also redact the configured API key.
+- Fix Homebrew's smoke test overwriting the initialized config file.
+- Expose the package version through `reviewloop --version`.
 
 - `reviewloop daemon run --panel false`, which `daemon install` writes into
   the launchd plist, parses again: `--panel` took no value, so the installed

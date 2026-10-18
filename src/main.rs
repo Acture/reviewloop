@@ -31,7 +31,7 @@ use std::{
 use tracing::{info, warn};
 
 #[derive(Debug, Parser)]
-#[command(name = "reviewloop")]
+#[command(name = "reviewloop", version)]
 #[command(about = "Automate paperreview.ai submission and retrieval workflows")]
 struct Cli {
     #[arg(long, value_name = "PATH")]
@@ -752,7 +752,7 @@ async fn run() -> Result<()> {
             method,
             yes,
             dry_run,
-        } => cmd_self_update(method, yes, dry_run),
+        } => cmd_self_update(method, yes, dry_run).await,
         Command::Run(args) => cmd_run(config_override.as_deref(), &args).await,
         Command::Mcp(args) => cmd_mcp(config_override.as_deref(), &args).await,
     }
@@ -1217,7 +1217,7 @@ fn cmd_config_migrate_project(
     Ok(())
 }
 
-fn cmd_self_update(method: UpdateMethod, yes: bool, dry_run: bool) -> Result<()> {
+async fn cmd_self_update(method: UpdateMethod, yes: bool, dry_run: bool) -> Result<()> {
     let exe = env::current_exe().context("failed to locate current executable path")?;
     let global_cfg = Config::global_config_path();
     let global_data = Config::global_data_dir();
@@ -1262,9 +1262,17 @@ fn cmd_self_update(method: UpdateMethod, yes: bool, dry_run: bool) -> Result<()>
             run_update_command("brew", &["upgrade", "reviewloop"], dry_run)?;
         }
         UpdateMethod::Cargo => {
+            let version = latest_release_version().await?;
             run_update_command(
                 "cargo",
-                &["install", "--locked", "reviewloop", "--force"],
+                &[
+                    "install",
+                    "--locked",
+                    "reviewloop",
+                    "--version",
+                    &version,
+                    "--force",
+                ],
                 dry_run,
             )?;
         }
@@ -1274,6 +1282,40 @@ fn cmd_self_update(method: UpdateMethod, yes: bool, dry_run: bool) -> Result<()>
         println!("Self-update finished.");
     }
     Ok(())
+}
+
+async fn latest_release_version() -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct Release {
+        tag_name: String,
+    }
+
+    let release = reqwest::Client::builder()
+        .user_agent(concat!("reviewloop/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?
+        .get("https://api.github.com/repos/Acture/reviewloop/releases/latest")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Release>()
+        .await?;
+    stable_release_version(&release.tag_name).map(str::to_owned)
+}
+
+fn stable_release_version(tag: &str) -> Result<&str> {
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    let parts: Vec<&str> = version.split('.').collect();
+    if parts.len() != 3
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || !part.bytes().all(|byte| byte.is_ascii_digit())
+                || (part.len() > 1 && part.starts_with('0'))
+        })
+    {
+        anyhow::bail!("GitHub latest release has an invalid stable version tag: {tag}");
+    }
+    Ok(version)
 }
 
 fn run_update_command(program: &str, args: &[&str], dry_run: bool) -> Result<()> {
@@ -4418,6 +4460,27 @@ mod tests {
     use tempfile::TempDir;
 
     static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn release_version_accepts_reset_and_rejects_non_version_tags() {
+        assert_eq!(super::stable_release_version("v0.0.1").unwrap(), "0.0.1");
+        assert_eq!(super::stable_release_version("0.2.1").unwrap(), "0.2.1");
+        for tag in ["", "latest", "--force", "v0.0.1-rc.1", "v0.0", "v00.0.1"] {
+            assert!(super::stable_release_version(tag).is_err(), "{tag}");
+        }
+    }
+
+    #[test]
+    fn cli_reports_the_package_version_without_loading_configuration() {
+        use clap::Parser;
+        let error = super::Cli::try_parse_from(["reviewloop", "--version"])
+            .expect_err("version flag exits before command dispatch");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            error.to_string().trim(),
+            concat!("reviewloop ", env!("CARGO_PKG_VERSION"))
+        );
+    }
 
     struct IsolatedConfigEnv {
         _guard: MutexGuard<'static, ()>,
