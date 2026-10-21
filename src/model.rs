@@ -537,8 +537,13 @@ impl Job {
             );
         }
         if self.backend == crate::backend::cspaper::BACKEND {
+            let (url, token) = if self.review_options.get("transport") == Some("web") {
+                ("https://cspaper.org/reviews", "web:<review-id>")
+            } else {
+                ("https://cspaper.org/platform/review", "<cspaper job_id>")
+            };
             return format!(
-                "not resubmitted automatically; CSPaper sends no email, so look for this paper in the CSPaper review list (https://cspaper.org/platform/review) and run `reviewloop import-token --job-id {} --token <cspaper job_id>`, or `reviewloop retry --job-id {} --now` to resubmit anyway (may duplicate), or `reviewloop cancel --job-id {}`",
+                "not resubmitted automatically; CSPaper sends no email, so look for this paper in the CSPaper review list ({url}) and run `reviewloop import-token --job-id {} --token {token}`, or `reviewloop retry --job-id {} --now` to resubmit anyway (may duplicate), or `reviewloop cancel --job-id {}`",
                 self.id, self.id, self.id
             );
         }

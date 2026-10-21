@@ -1760,7 +1760,7 @@ async fn missing_api_key_needs_manual_without_any_request() -> Result<()> {
         matches!(
             refused,
             OpError::ProviderNotConfigured {
-                setting: "api_key",
+                setting: "cookie",
                 ..
             }
         ),

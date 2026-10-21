@@ -12,7 +12,7 @@ use reviewloop::{
     },
     artifact::write_review_artifacts,
     backend::{cspaper, provider_source},
-    config::{CSPAPER_API_KEY_ENV, Config, PaperConfig, Redacted, RetentionConfig},
+    config::{Config, PaperConfig, Redacted, RetentionConfig},
     db::Db,
     model::{EnqueueConflict, ExistingReason, Job, JobPdf, JobStatus, NewJob},
     supervisor::{ProjectState, SupervisorState, WorkerAvailability},
@@ -759,7 +759,7 @@ fn cspaper_request_without_provider_settings_is_refused_before_enqueue() -> Resu
     let mut fx = Fixture::new()?;
     fx.add_cspaper_paper()?;
 
-    // The key is checked first, whether or not a template is configured.
+    // The session is checked first, whether or not a template is configured.
     for agent_id in [None, Some(AGENT_ID)] {
         fx.config.providers.cspaper.agent_id = agent_id.map(str::to_string);
         let err = fx.cspaper_request(Some("cs-1")).unwrap_err();
@@ -767,19 +767,19 @@ fn cspaper_request_without_provider_settings_is_refused_before_enqueue() -> Resu
         assert!(matches!(
             &err,
             OpError::ProviderNotConfigured {
-                setting: "api_key",
+                setting: "cookie",
                 ..
             }
         ));
         let view = err.view();
         assert_eq!(
             view.details,
-            json!({ "backend": "cspaper", "setting": "api_key" })
+            json!({ "backend": "cspaper", "setting": "cookie" })
         );
         assert!(
             view.recovery
                 .as_deref()
-                .is_some_and(|hint| hint.contains(CSPAPER_API_KEY_ENV)),
+                .is_some_and(|hint| hint.contains("cspaper login --cookie-file")),
             "{view:?}"
         );
     }

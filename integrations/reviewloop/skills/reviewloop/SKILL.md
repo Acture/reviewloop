@@ -46,6 +46,14 @@ and connecting are the user's steps.
 
 ## 2. Pick the project and the paper
 
+CSPaper normally uses the user's website Cookie. Login needs no API key or
+agent ID: give the user `reviewloop cspaper login --cookie-file <path>` and
+never ask them to paste the Cookie into chat. `reviewloop cspaper auth-status`
+checks it read-only; `reviewloop cspaper agents` lists review choices. The
+user selects a template by name with `reviewloop cspaper select --agent <name>`
+(and `--model <model>` when there are several). A template/model is a review
+choice, not a login credential. Organisation API keys remain optional.
+
 - Call `list_papers`. It acts on the project of the server's working
   directory. When that fails with `project_required`, or the user means
   another project, call `list_projects` and pass its `project_id` to every
@@ -121,7 +129,8 @@ ask again in this conversation, even where a tool description says to ask.
   `auto_submit_on_change`, every changed PDF; a yes to a question that leaves
   this out is not consent.
 - **Never do these yourself; give the user the command:** logging in
-  (`reviewloop email login`), setting API keys, installing, starting or
+  (`reviewloop email login`, `reviewloop cspaper login`), importing Cookies,
+  setting API keys or review defaults, installing, starting or
   resuming the supervisor (`reviewloop daemon install`,
   `reviewloop daemon run`, `reviewloop daemon resume`), editing
   `reviewloop.toml`, and importing a token (`reviewloop import-token`).

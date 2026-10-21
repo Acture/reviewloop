@@ -646,8 +646,8 @@ ReviewLoop uses two config files with separate responsibilities:
 - project config: `<repo-root>/reviewloop.toml`
 
 There is no global-overrides-project merge chain. Instead:
-- global config owns machine/user concerns such as `core.*`, `logging.*`, `polling.*`, `retention.*`, `imap.*`, `gmail_oauth.*`, Stanford provider connection defaults, and the CSPaper connection (`providers.cspaper.base_url` and `providers.cspaper.api_key`, which only the global config accepts)
-- project config owns repo concerns such as `project_id`, `papers`, `paper_watch`, `paper_tag_triggers`, `trigger.*`, Stanford venue, and the CSPaper review choices (`providers.cspaper.agent_id` and `providers.cspaper.desk_rejection_enabled`, which override the global defaults)
+- global config owns machine/user concerns such as `core.*`, `logging.*`, `polling.*`, `retention.*`, `imap.*`, `gmail_oauth.*`, Stanford provider connection defaults, and the CSPaper connection (`providers.cspaper.base_url`, `providers.cspaper.cookie` and `providers.cspaper.api_key`, which only the global config accepts)
+- project config owns repo concerns such as `project_id`, `papers`, `paper_watch`, `paper_tag_triggers`, `trigger.*`, Stanford venue, and the CSPaper review choices (`providers.cspaper.agent_id`, `providers.cspaper.model` and `providers.cspaper.desk_rejection_enabled`, which override the global defaults)
 - `--config /path/to/reviewloop.toml` explicitly points to a project config file
 - `reviewloop init` initializes the global config/data paths
 - `reviewloop init project --project-id <id>` initializes the current repo's project config
@@ -692,6 +692,8 @@ Safe defaults:
 
 `providers.cspaper` defaults (see [CSPaper Backend](#cspaper-backend)):
 - `base_url = "https://cspaper.org"` (global config only)
+- `cookie` unset (global config only, or `REVIEWLOOP_CSPAPER_COOKIE`); preferred for new jobs
+- `model` unset; selected with `reviewloop cspaper select`
 - `api_key` unset (global config only, or `REVIEWLOOP_CSPAPER_API_KEY`)
 - `agent_id` unset: there is no built-in review template
 - `desk_rejection_enabled = true`
@@ -702,14 +704,63 @@ Logging:
 
 ## CSPaper Backend
 
-`backend = "cspaper"` sends papers to the
+`backend = "cspaper"` supports a personal website session using a Cookie,
+and an optional organisation API key. Login requires no review template or
+agent ID. A configured Cookie takes priority for new jobs; each job pins
+its transport, template and model, and never falls back to another transport.
+
+### Personal website session (Cookie first)
+
+Log into <https://cspaper.org> in your browser. In DevTools → Network, reload
+the Reviews page and copy the **Cookie request header value** of its
+`/api/review/list` request into a local private file outside the repository.
+Use the complete value (including chunked session cookies), not `Set-Cookie`
+or an exported browser cookie database. Never put it in chat or a command argument.
+
+```sh
+reviewloop cspaper login --cookie-file /path/to/private/cspaper-cookie.txt
+reviewloop cspaper auth-status
+reviewloop cspaper agents
+reviewloop cspaper select --agent ARD-Review
+reviewloop paper add --paper-id main --path paper/main.pdf --backend cspaper
+reviewloop submit --paper-id main
+```
+
+`login` checks the session with a read-only list request, then saves it in
+the global config with mode `0600`. It does not submit a review or require
+an API key, agent ID or model. `auth-status` is also read-only. The session
+is not refreshed automatically: repeat login with a fresh Cookie when it expires.
+`REVIEWLOOP_CSPAPER_COOKIE` fills an unset Cookie for the current process;
+the installed supervisor needs the saved global value.
+
+`agents` lists personal review templates and models from the live catalogue.
+`select` accepts a unique name, abbreviation or exact ID. It selects the
+sole model automatically; otherwise pass `--model vendor/model`. The
+selection is saved as the machine default; project `providers.cspaper.model`
+(`vendor` and `model`) and `agent_id`, and a paper's `venue`, may override it.
+No dated template or model is built in. `select` does not submit anything.
+
+The web adapter uploads the pinned PDF to `/api/review/register/pdf` and
+polls `/api/review/<id>`. Its receipt is stored as `web:<id>`, so restarting
+or changing credentials cannot turn a website job into an organisation job.
+Cookie headers stay out of project files, jobs and archives. Templates that
+do not support disabling desk rejection reject that choice before upload.
+Web scores retain the provider's template-specific scale.
+
+The website contract and validation boundary are recorded in
+[CSPaper web transport](docs/providers/cspaper-web.md). Website endpoints
+are not a published stable API. ReviewLoop does not automate browser login.
+
+### Optional organisation API
+
+With no Cookie configured, `backend = "cspaper"` uses the
 [CSPaper Agentic Review](https://cspaper.org/platform/review) API. ReviewLoop
 uploads the job's pinned PDF snapshot with `POST /api/platform/review`, keeps
 the `job_id` CSPaper answers with as the job's token (so polling resumes after
 a restart), and polls `GET /api/platform/reviews/<job_id>` until the review is
 `COMPLETED` or `FAILED`.
 
-### Configuration
+#### API configuration
 
 The API key and the base URL are machine settings and live only in the global
 config:
@@ -774,7 +825,7 @@ reviewloop submit --paper-id main
 ```
 
 `submit`, `run` and `paper add --submit-now` refuse a CSPaper paper up front,
-queueing nothing, when no API key or no template is configured (error code
+queueing nothing, when no credential, template, or required web model is configured (error code
 `provider_not_configured`). Git tag and PDF change triggers skip such a paper
 and record one `provider_not_configured` event per paper and setting; a
 skipped tag stays unprocessed, so it enqueues once the setting exists.
@@ -787,6 +838,11 @@ token email on an uncertain CSPaper submission; it stops at once with exit
 code 2.
 
 ### Usage
+
+`cspaper usage` reports the organisation API account and requires its API
+key. Its monthly allowance is not a personal website credit balance.
+The separate local count includes both transports (`local_scope` in JSON);
+only the organisation's remote list is used for its monthly allowance.
 
 CSPaper bills organisation API keys by usage, not with credits: it sets the
 platform account up by hand and invoices monthly for the reviews actually run,
@@ -855,9 +911,11 @@ automatically. `reviewloop status` shows it, `reviewloop run` stops on it with
 exit code 2, and no email will settle it. Settle it by hand:
 
 1. Look for the paper in the CSPaper review list
-   (<https://cspaper.org/platform/review>).
+   (<https://cspaper.org/reviews> for Cookie jobs;
+   <https://cspaper.org/platform/review> for organisation jobs).
 2. If it is there, attach its job id:
-   `reviewloop import-token --job-id <id> --token <cspaper job_id>`.
+   `reviewloop import-token --job-id <id> --token web:<review-id>` for a Cookie
+   job, or `--token <cspaper job_id>` for an organisation job.
    ReviewLoop polls it at once and continues normally.
 3. If it is not there, resubmit with `reviewloop retry --job-id <id> --now`.
    This may create a duplicate review if CSPaper did receive the first one.
@@ -867,6 +925,11 @@ exit code 2, and no email will settle it. Settle it by hand:
 ### What is archived
 
 For each completed review, `<state_dir>/artifacts/<job-id>/` holds:
+
+Cookie reviews use the same three files: `review.json` includes `transport`
+(`web`), `provider_job_id`, `title`, `venue`, `content`, `result_summary`,
+`numerical_score` on its original scale, and the credential-scrubbed `provider_raw`.
+The following field details describe organisation API reviews:
 
 - `review.json`: the normalized review: `provider` (`"cspaper"`),
   `provider_job_id`, `title` (from `paper_meta.title`), `venue` and `agent_id`
@@ -889,11 +952,13 @@ a new review instead of returning the existing one, and replaying a
 `--request-key` after changing either is a conflict. CSPaper jobs always
 record `desk_rejection_enabled`, so leaving it unset and setting it to `true`
 are the same request.
+Cookie jobs also record `transport`, `model_vendor` and `model`; changing
+these changes the request identity. Retrying uses the recorded choices.
 
 ### Limitations
 
 - Uncertain submissions are not reconciled automatically.
-- The template is not checked before submission; an unknown one fails the job
+- Organisation API templates are not checked before submission; an unknown one fails the job
   with CSPaper's 400.
 - `core.max_concurrency` and `core.max_submissions_per_tick` are one budget
   for the machine, shared with Stanford jobs and every project, and the
@@ -934,6 +999,7 @@ Runtime secrets (must be provided via env or `config.toml` at runtime — not ba
 - `REVIEWLOOP_GMAIL_CLIENT_ID`
 - `REVIEWLOOP_GMAIL_CLIENT_SECRET`
 - `REVIEWLOOP_CSPAPER_API_KEY` (CSPaper backend; `providers.cspaper.api_key` in the global config wins when both are set)
+- `REVIEWLOOP_CSPAPER_COOKIE` (personal CSPaper web session; the saved global Cookie wins)
 
 Optional repo variables:
 - `HOMEBREW_TAP_REPO` (default: `Acture/homebrew-ac`)

@@ -39,9 +39,11 @@ Never request, approve or retry while waiting.
 
 A `PROCESSING` job keeps polling after a failed poll and stores the failure
 in `last_error`. Rate limits and provider server errors clear on their own
-schedule: report them and wait. A CSPaper key refused with 401 or 403 does
-not clear itself: tell the user to fix `providers.cspaper.api_key` in
-`~/.config/reviewloop/config.toml` before the review timeout ends the job.
+schedule: report them and wait. A CSPaper session/key refused with 401 or 403
+does not clear itself: tell the user to renew a web session with
+`reviewloop cspaper login --cookie-file <path>`, or fix `providers.cspaper.api_key`
+in `~/.config/reviewloop/config.toml` for an organisation API job, before the
+review timeout ends the job. Never change the transport of an existing job.
 The supervisor reads that file again at its next tick, so polling resumes on
 schedule without a restart.
 
@@ -58,18 +60,21 @@ the user these options and let them choose:
   job, it moves on to `processing` on its own: check again later. When there
   are several, or no ingestion, the user matches the email to the paper and
   runs `reviewloop import-token --job-id <job_id> --token <token>`.
-- `cspaper`: CSPaper sends no email. The user looks for the paper in the
-  CSPaper review list (https://cspaper.org/platform/review) and imports that
-  CSPaper job id the same way.
+- `cspaper`: CSPaper sends no email. For a Cookie job, the user looks in
+  https://cspaper.org/reviews and imports `web:<review-id>` with
+  `reviewloop import-token --job-id <job_id> --token web:<review-id>`.
+  For an organisation job they use https://cspaper.org/platform/review and
+  import the bare job id. Never substitute one transport's receipt for the other.
 - Resend anyway: `retry_job(job_id)` queues it again, which may create a
   duplicate review. Only when the user chooses this.
 - Give up: `cancel_job(job_id)`, only when the user chooses this.
 
 ## Needs manual
 
-- **Credentials refused at submission** (no CSPaper key, or a 401 / 403):
-  nothing reached the provider. After the user sets
-  `providers.cspaper.api_key` in `~/.config/reviewloop/config.toml`,
+- **Credentials refused at submission** (no CSPaper session/key, or a 401 / 403):
+  the request was rejected. After the user renews the Cookie with
+  `reviewloop cspaper login --cookie-file <path>`, or fixes the organisation
+  job's `providers.cspaper.api_key` in `~/.config/reviewloop/config.toml`,
   `retry_job` queues it again.
 - **The provider reported the review failed** (CSPaper), or a **terminal
   provider error** (`last_error` begins "terminal backend error"): the job

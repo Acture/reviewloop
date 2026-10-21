@@ -56,11 +56,13 @@ pub struct CspaperBackend {
     client: ClientWithMiddleware,
     base_url: String,
     api_key: Option<Redacted<String>>,
+    web: super::cspaper_web::CspaperWeb,
 }
 
 impl CspaperBackend {
     pub fn new(config: &CspaperProviderConfig, client: ClientWithMiddleware) -> Self {
         Self {
+            web: super::cspaper_web::CspaperWeb::new(config, client.clone()),
             client,
             base_url: config.base_url.trim_end_matches('/').to_string(),
             api_key: config.api_key.clone().filter(|key| !key.trim().is_empty()),
@@ -121,6 +123,15 @@ impl ReviewBackend for CspaperBackend {
     }
 
     async fn submit(&self, req: SubmitRequest) -> Result<SubmitReceipt, BackendError> {
+        match req.review_options.get("transport") {
+            Some("web") => return self.web.submit(req).await,
+            None => {}
+            Some(_) => {
+                return Err(BackendError::Rejected(
+                    "unknown CSPaper transport recorded on job".into(),
+                ));
+            }
+        }
         // Everything that can be refused locally is refused before sending.
         let agent_id = req
             .venue
@@ -238,6 +249,9 @@ impl ReviewBackend for CspaperBackend {
     }
 
     async fn fetch_review(&self, token: &str) -> Result<ReviewFetchResult, BackendError> {
+        if let Some(id) = token.strip_prefix(super::cspaper_web::TOKEN_PREFIX) {
+            return self.web.fetch_review(id).await;
+        }
         // The job id becomes a URL path segment; anything else (e.g. a mistyped
         // `import-token`) cannot name a CSPaper job.
         if !is_job_id(token) {
@@ -1148,11 +1162,14 @@ mod tests {
 
     #[test]
     fn quoted_errors_prefer_the_envelope_message_and_scrub_the_key() {
-        let backend = CspaperBackend {
-            client: reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build(),
-            base_url: "https://cspaper.org".into(),
+        let config = CspaperProviderConfig {
             api_key: Some(Redacted("csp_live_SECRET".into())),
+            ..CspaperProviderConfig::default()
         };
+        let backend = CspaperBackend::new(
+            &config,
+            reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build(),
+        );
         let forbidden = fixture("error_403.json").to_string();
         assert_eq!(backend.quote(&forbidden), "Invalid API Key");
         assert_eq!(

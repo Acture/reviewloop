@@ -1,6 +1,6 @@
 {
   "scenario": "provider-not-configured",
-  "covers": "Missing configuration: no CSPaper API key, so nothing is stored and the user sets the key.",
+  "covers": "Missing configuration: no CSPaper personal session, so nothing is stored and the user imports a Cookie locally.",
   "context": {
     "server_approval": "required",
     "now": "2026-10-18T12:00:00Z",
@@ -50,11 +50,11 @@
       },
       "error": {
         "code": "provider_not_configured",
-        "message": "no CSPaper API key configured for backend=cspaper",
-        "recovery": "set providers.cspaper.api_key in ~/.config/reviewloop/config.toml or export REVIEWLOOP_CSPAPER_API_KEY; the key never goes in reviewloop.toml",
+        "message": "no CSPaper session configured; run reviewloop cspaper login --cookie-file <path>",
+        "recovery": "run `reviewloop cspaper login --cookie-file <path>` to validate and save a personal web session; never put Cookies in reviewloop.toml or chat",
         "details": {
           "backend": "cspaper",
-          "setting": "api_key"
+          "setting": "cookie"
         }
       }
     }
@@ -62,7 +62,7 @@
   "expect": {
     "state": "provider_not_configured",
     "next": {
-      "ask_user": "ReviewLoop has no CSPaper API key. Set providers.cspaper.api_key in ~/.config/reviewloop/config.toml (never in reviewloop.toml), then tell me to request the review again."
+      "ask_user": "ReviewLoop has no CSPaper web session. Run `reviewloop cspaper login --cookie-file <path>` locally; never paste the Cookie into chat. Then tell me to request the review again."
     },
     "never": [
       "approve_job",
@@ -72,7 +72,7 @@
       "watch_project"
     ],
     "tell": [
-      "providers.cspaper.api_key"
+      "reviewloop cspaper login"
     ],
     "rule": "references/errors.md#codes"
   }
