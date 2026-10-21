@@ -390,16 +390,17 @@ impl Config {
         if paper.backend != cspaper::BACKEND {
             return None;
         }
-        if self
-            .providers
-            .cspaper
-            .api_key
-            .as_ref()
-            .is_none_or(|key| key.trim().is_empty())
+        let provider = &self.providers.cspaper;
+        if !provider.uses_cookie()
+            && provider
+                .api_key
+                .as_ref()
+                .is_none_or(|key| key.trim().is_empty())
         {
             return Some((
-                "api_key",
-                "no CSPaper API key configured for backend=cspaper".to_string(),
+                "cookie",
+                "no CSPaper session configured; run reviewloop cspaper login --cookie-file <path>"
+                    .to_string(),
             ));
         }
         if self.venue_for(paper).is_none() {
@@ -411,6 +412,13 @@ impl Config {
                 ),
             ));
         }
+        if provider.uses_cookie() && provider.model.is_none() {
+            return Some((
+                "model",
+                "no CSPaper web model selected; run reviewloop cspaper select --agent <name>"
+                    .to_string(),
+            ));
+        }
         None
     }
 
@@ -420,10 +428,22 @@ impl Config {
     /// explicitly, so an unset value and the provider default compare equal.
     pub fn review_options_for(&self, paper: &PaperConfig) -> ReviewOptions {
         match paper.backend.as_str() {
-            cspaper::BACKEND => ReviewOptions::default().with(
-                cspaper::DESK_REJECTION_ENABLED,
-                self.providers.cspaper.desk_rejection_enabled.to_string(),
-            ),
+            cspaper::BACKEND => {
+                let provider = &self.providers.cspaper;
+                let mut options = ReviewOptions::default().with(
+                    cspaper::DESK_REJECTION_ENABLED,
+                    provider.desk_rejection_enabled.to_string(),
+                );
+                if provider.uses_cookie() {
+                    options = options.with("transport", "web");
+                    if let Some(model) = &provider.model {
+                        options = options
+                            .with("model_vendor", &model.vendor)
+                            .with("model", &model.model);
+                    }
+                }
+                options
+            }
             _ => ReviewOptions::default(),
         }
     }
@@ -432,6 +452,10 @@ impl Config {
     /// the environment. Only the runtime loader calls this, so configs built
     /// in code never pick up the caller's environment.
     fn with_env_secrets(mut self) -> Self {
+        self.providers.cspaper.cookie = secret_or_env(
+            self.providers.cspaper.cookie.take(),
+            env::var(CSPAPER_COOKIE_ENV).ok(),
+        );
         self.providers.cspaper.api_key = secret_or_env(
             self.providers.cspaper.api_key.take(),
             env::var(CSPAPER_API_KEY_ENV).ok(),
@@ -571,6 +595,12 @@ impl Config {
                 cspaper: CspaperProviderConfig {
                     base_url: global.providers.cspaper.base_url,
                     api_key: secret_or_env(global.providers.cspaper.api_key, None),
+                    cookie: secret_or_env(global.providers.cspaper.cookie, None),
+                    model: project
+                        .providers
+                        .cspaper
+                        .model
+                        .or(global.providers.cspaper.model),
                     agent_id: non_blank(project.providers.cspaper.agent_id)
                         .or_else(|| non_blank(global.providers.cspaper.agent_id)),
                     desk_rejection_enabled: project
@@ -620,6 +650,8 @@ fn non_blank(value: Option<String>) -> Option<String> {
 /// Environment variable holding the CSPaper organisation API key when
 /// `providers.cspaper.api_key` is unset in the global config.
 pub const CSPAPER_API_KEY_ENV: &str = "REVIEWLOOP_CSPAPER_API_KEY";
+/// Cookie header for CSPaper's personal web session, used only on this machine.
+pub const CSPAPER_COOKIE_ENV: &str = "REVIEWLOOP_CSPAPER_COOKIE";
 
 /// A configured secret wins; the environment fills it only when the config
 /// leaves it blank (the same precedence as the Gmail client credentials).
@@ -1172,6 +1204,14 @@ fn line_and_column(raw: &str, offset: usize) -> Option<(usize, usize)> {
 /// a line the TOML parser would reject (an unquoted or unterminated key) is
 /// refused here too instead of being quoted by the parse error.
 fn refuse_project_api_key(path: &Path, raw: &str) -> Result<()> {
+    let cookie_line =
+        regex::Regex::new(r#"(?mi)^[^#\n]*\bcookie["']?\s*="#).expect("valid cookie regex");
+    if cookie_line.is_match(raw) {
+        return Err(anyhow!(
+            "project config {} holds a Cookie; remove it and use `reviewloop cspaper login --cookie-file <path>` to store the session in the global config",
+            path.display()
+        ));
+    }
     let key_line = regex::Regex::new(r#"(?m)^[^#\n]*\bapi_key["']?\s*=|csp_live_"#)
         .expect("valid api_key regex");
     let Some(found) = key_line.find(raw) else {
@@ -1702,6 +1742,10 @@ pub struct CspaperProviderConfig {
     /// runtime config may carry it.
     #[serde(skip)]
     pub api_key: Option<Redacted<String>>,
+    /// Personal web session. Never serialized from a runtime config.
+    #[serde(skip)]
+    pub cookie: Option<Redacted<String>>,
+    pub model: Option<CspaperModel>,
     /// Default review template (CSPaper `agent_id`), project value over
     /// global. A paper's `venue` overrides it; see [`Config::venue_for`].
     pub agent_id: Option<String>,
@@ -1717,11 +1761,29 @@ impl Default for CspaperProviderConfig {
         Self {
             base_url: global.base_url,
             api_key: None,
+            cookie: None,
+            model: None,
             agent_id: None,
             desk_rejection_enabled: global.desk_rejection_enabled,
             monthly_allowance: None,
         }
     }
+}
+
+impl CspaperProviderConfig {
+    /// New jobs prefer the personal web session; existing jobs pin their transport.
+    pub fn uses_cookie(&self) -> bool {
+        self.cookie
+            .as_ref()
+            .is_some_and(|cookie| !cookie.trim().is_empty())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CspaperModel {
+    pub vendor: String,
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1764,6 +1826,10 @@ pub struct GlobalCspaperProviderConfig {
     /// [`CSPAPER_API_KEY_ENV`] is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<Redacted<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookie: Option<Redacted<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<CspaperModel>,
     /// Default review template (`agent_id`, e.g. `ICLR_main_2026_1`). No
     /// built-in default: the template decides what the review means.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1785,6 +1851,8 @@ impl Default for GlobalCspaperProviderConfig {
         Self {
             base_url: "https://cspaper.org".to_string(),
             api_key: None,
+            cookie: None,
+            model: None,
             agent_id: None,
             desk_rejection_enabled: true,
             monthly_allowance: None,
@@ -1828,11 +1896,13 @@ pub struct ProjectProvidersConfig {
     pub cspaper: ProjectCspaperProviderConfig,
 }
 
-/// Per-project CSPaper review choices. Deliberately no `api_key` or
+/// Per-project CSPaper review choices. Deliberately no `cookie`, `api_key` or
 /// `base_url`: see [`GlobalCspaperProviderConfig`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectCspaperProviderConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<CspaperModel>,
     /// Overrides `global.providers.cspaper.agent_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
@@ -1843,7 +1913,7 @@ pub struct ProjectCspaperProviderConfig {
 
 impl ProjectCspaperProviderConfig {
     fn is_empty(&self) -> bool {
-        self.agent_id.is_none() && self.desk_rejection_enabled.is_none()
+        self.agent_id.is_none() && self.desk_rejection_enabled.is_none() && self.model.is_none()
     }
 }
 

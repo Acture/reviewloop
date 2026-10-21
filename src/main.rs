@@ -8,6 +8,7 @@ use reviewloop::application::{
 use reviewloop::artifact::write_review_artifacts;
 use reviewloop::backend::ProviderSource;
 use reviewloop::backend::cspaper;
+use reviewloop::backend::cspaper_web::{self, CspaperWeb};
 use reviewloop::config::{
     Config, GlobalConfigFile, LegacyConfig, PaperConfigFile, ProjectConfigFile,
     default_project_config_path,
@@ -440,6 +441,27 @@ enum EmailCommand {
 
 #[derive(Debug, Subcommand)]
 enum CspaperCommand {
+    /// Validate a personal web Cookie and save it in the machine config (no review submitted).
+    Login {
+        /// File containing the Cookie header value. Never pass the secret on the command line.
+        #[arg(long)]
+        cookie_file: PathBuf,
+    },
+    /// Check the saved web session without creating a review.
+    AuthStatus,
+    /// List personal web review templates and their models.
+    Agents {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Select a web review template by name and a model for future submissions.
+    Select {
+        #[arg(long)]
+        agent: String,
+        /// Model name or vendor/model; optional when the template has only one model.
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Reviews used per billing month (CSPaper invoices API keys monthly by
     /// usage): the organisation's reviews from every client, read from
     /// CSPaper's job list; how many this machine's reviewloop tracks; and what
@@ -743,6 +765,18 @@ async fn run() -> Result<()> {
             }
         }
         Command::Cspaper { command } => match command {
+            CspaperCommand::Login { cookie_file } => cmd_cspaper_login(&cookie_file).await,
+            CspaperCommand::AuthStatus => {
+                CspaperWeb::from_config(&Config::load_machine()?.config)?
+                    .check_session()
+                    .await?;
+                println!("CSPaper web session is valid. No review was submitted.");
+                Ok(())
+            }
+            CspaperCommand::Agents { json } => cmd_cspaper_agents(json).await,
+            CspaperCommand::Select { agent, model } => {
+                cmd_cspaper_select(&agent, model.as_deref()).await
+            }
             CspaperCommand::Usage { month, json } => {
                 // JSON owns stdout, so logs go to stderr whatever logging.output says.
                 let (config, db) = load_runtime(config_override.as_deref(), json, false)?;
@@ -2720,9 +2754,68 @@ async fn cmd_submit(
     print_provider_usage(db, &job.backend)
 }
 
-/// The organisation's CSPaper reviews in a billing month, from CSPaper's job
-/// list, split into this machine's reviewloop jobs and other clients, with
-/// what is left of the monthly allowance.
+/// Validate a user-supplied personal session before changing the saved credential.
+async fn cmd_cspaper_login(cookie_file: &Path) -> Result<()> {
+    let raw = fs::read_to_string(cookie_file).context("could not read the Cookie file")?;
+    let cookie = cspaper_web::normalize_cookie(&raw)?;
+    let mut machine = Config::load_machine()?;
+    machine.config.providers.cspaper.cookie = Some(reviewloop::config::Redacted(cookie.clone()));
+    CspaperWeb::from_config(&machine.config)?
+        .check_session()
+        .await?;
+    let path = machine
+        .global_path
+        .context("global config path is unavailable")?;
+    // Reload after the network request, preserving unrelated settings changed meanwhile.
+    let mut global = GlobalConfigFile::load(&path)?;
+    global.providers.cspaper.cookie = Some(reviewloop::config::Redacted(cookie));
+    global.save(&path)?;
+    println!(
+        "CSPaper web session validated and saved in {}. No review was submitted.",
+        path.display()
+    );
+    Ok(())
+}
+
+async fn cmd_cspaper_agents(as_json: bool) -> Result<()> {
+    let agents = CspaperWeb::from_config(&Config::load_machine()?.config)?
+        .agents()
+        .await?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&agents)?);
+    } else {
+        for agent in agents {
+            println!("{} — {} [{}]", agent.abbreviation, agent.name, agent.id);
+            for model in agent.llm {
+                println!("  {}/{}", model.vendor, model.model);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_cspaper_select(query: &str, model_query: Option<&str>) -> Result<()> {
+    let machine = Config::load_machine()?;
+    let agents = CspaperWeb::from_config(&machine.config)?.agents().await?;
+    let agent = cspaper_web::select_agent(&agents, query)?;
+    let model = agent.select_model(model_query)?;
+    let path = machine
+        .global_path
+        .context("global config path is unavailable")?;
+    let mut global = GlobalConfigFile::load(&path)?;
+    global.providers.cspaper.agent_id = Some(agent.id.clone());
+    global.providers.cspaper.model = Some(model.clone());
+    if !agent.supports_no_dra {
+        global.providers.cspaper.desk_rejection_enabled = true;
+    }
+    global.save(&path)?;
+    println!(
+        "Default web review: {} [{}], {}/{}. Project/paper overrides still apply. No review was submitted.",
+        agent.abbreviation, agent.id, model.vendor, model.model
+    );
+    Ok(())
+}
+
 async fn cmd_cspaper_usage(
     config: &Config,
     db: &Db,
@@ -2737,7 +2830,7 @@ async fn cmd_cspaper_usage(
     let listed = cspaper::CspaperBackend::from_config(config)?
         .list_jobs()
         .await
-        .context("failed to read CSPaper's job list")?;
+        .context("failed to read the organisation API job list; cspaper usage requires an organisation API key and does not report personal web credits")?;
     let report = cspaper::summarize(&listed, &db.provider_tokens(cspaper::BACKEND)?, month);
     let local = db.provider_usage(cspaper::BACKEND, Some(month.range()))?;
     let allowance = config.providers.cspaper.monthly_allowance;
@@ -2748,12 +2841,14 @@ async fn cmd_cspaper_usage(
             "monthly_allowance": allowance,
             "left": cspaper::allowance_left(&report, allowance),
             "local": local,
+            "local_scope": "all CSPaper transports; counts, not billed usage",
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
     println!("{}", cspaper::org_usage_report(&report, allowance));
     println!("{}", cspaper::usage_note(local, month));
+    println!("Local counts include website and organisation API jobs; they are not billed usage.");
     Ok(())
 }
 
@@ -3084,6 +3179,7 @@ async fn cmd_import_token(
         (None, None) => anyhow::bail!("import-token needs --job-id or --paper-id"),
     };
     if let Some(job) = existing {
+        validate_import_transport(&job.backend, &job.review_options, token)?;
         record_imported_token(db, &job.backend, token, source)?;
         db.attach_token_to_job(&job.id, token, Utc::now())?;
         db.add_event(
@@ -3100,6 +3196,7 @@ async fn cmd_import_token(
     let paper = config
         .find_paper(paper_id)
         .ok_or_else(|| OpError::paper_not_found(paper_id, config))?;
+    validate_import_transport(&paper.backend, &config.review_options_for(paper), token)?;
     record_imported_token(db, &paper.backend, token, source)?;
 
     let pdf_hash = if Path::new(&paper.pdf_path).exists() {
@@ -3169,16 +3266,16 @@ fn daemon_cspaper_key_warning(projects: &[Config], global_path: &Path) -> Result
         })
         .map(|config| config.project_id.as_str())
         .collect();
-    let key_in_file = GlobalConfigFile::load(global_path)?
-        .providers
-        .cspaper
-        .api_key
-        .is_some_and(|key| !key.trim().is_empty());
+    let provider = GlobalConfigFile::load(global_path)?.providers.cspaper;
+    let key_in_file = provider.api_key.is_some_and(|key| !key.trim().is_empty())
+        || provider
+            .cookie
+            .is_some_and(|cookie| !cookie.trim().is_empty());
     Ok((!using.is_empty() && !key_in_file).then(|| {
         format!(
-            "warning: project(s) {} use backend=cspaper but {} has no providers.cspaper.api_key; \
-             the supervisor does not inherit {} from this shell, so their CSPaper submissions \
-             would fail. Set the key in the global config.",
+            "warning: project(s) {} use backend=cspaper but {} has no providers.cspaper.cookie or providers.cspaper.api_key; \
+             the supervisor does not inherit {} or REVIEWLOOP_CSPAPER_COOKIE from this shell, so their CSPaper submissions \
+             would fail. Run reviewloop cspaper login --cookie-file <path> to save a web session in the global config.",
             using.join(", "),
             global_path.display(),
             reviewloop::config::CSPAPER_API_KEY_ENV
@@ -3188,6 +3285,21 @@ fn daemon_cspaper_key_warning(projects: &[Config], global_path: &Path) -> Result
 
 /// Imported tokens join the email-token ledger only for backends whose tokens
 /// arrive by email, where ingestion must recognise them as already seen.
+fn validate_import_transport(
+    backend: &str,
+    options: &reviewloop::model::ReviewOptions,
+    token: &str,
+) -> Result<()> {
+    if backend == cspaper::BACKEND {
+        let web = options.get("transport") == Some("web");
+        anyhow::ensure!(
+            web == token.starts_with(cspaper_web::TOKEN_PREFIX),
+            "receipt transport does not match the job: Cookie jobs require web:<review-id>; organisation API jobs require a bare job id"
+        );
+    }
+    Ok(())
+}
+
 fn record_imported_token(db: &Db, backend: &str, token: &str, source: &str) -> Result<()> {
     if reviewloop::backend::tokens_arrive_by_email(backend) {
         db.record_email_token(token, source, None)?;
@@ -5564,7 +5676,26 @@ mod tests {
                     .expect("check")
                     .is_none()
             );
+            global.providers.cspaper.api_key = None;
+            global.providers.cspaper.cookie = Some(Redacted("session=cookie_in_file".into()));
+            global.save(&path).expect("save");
+            assert!(
+                daemon_cspaper_key_warning(&[config_with("cspaper")], &path)
+                    .expect("check")
+                    .is_none()
+            );
         }
+    }
+
+    #[test]
+    fn cspaper_imports_cannot_switch_a_jobs_transport() {
+        use reviewloop::model::ReviewOptions;
+        let platform = ReviewOptions::default();
+        let web = ReviewOptions::default().with("transport", "web");
+        assert!(super::validate_import_transport("cspaper", &web, "web:review-id").is_ok());
+        assert!(super::validate_import_transport("cspaper", &web, "review-id").is_err());
+        assert!(super::validate_import_transport("cspaper", &platform, "review-id").is_ok());
+        assert!(super::validate_import_transport("cspaper", &platform, "web:review-id").is_err());
     }
 
     mod paper_add_venue {

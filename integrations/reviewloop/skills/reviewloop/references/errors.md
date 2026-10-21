@@ -6,7 +6,7 @@ people; `recovery` is ReviewLoop's suggested next step; `details` holds the
 fields named below. Act on the `code`, not on the wording of `message`.
 
 A step marked **user** changes configuration, credentials or services:
-tell the user the command and wait. Never paste or ask for an API key or
+tell the user the command and wait. Never paste or ask for a Cookie, API key or
 token in the conversation.
 
 ## Codes
@@ -22,7 +22,7 @@ token in the conversation.
 | `pdf_not_found` | The paper's PDF is missing at `details.path`. | Tell the user to build or restore it (**user**). Do not create or edit the manuscript. |
 | `input_rejected` | The provider would refuse this PDF (too large, or not a PDF). Nothing was stored. | Tell the user what `message` says to fix (**user**). |
 | `submitter_email_unavailable` | `stanford` needs a submitter email and none is set. | Tell the user to set `providers.stanford.email` in `~/.config/reviewloop/config.toml` or run `reviewloop email login` (**user**). |
-| `provider_not_configured` | The backend lacks a setting: `details.setting` `api_key` (no CSPaper key) or `agent_id` (no CSPaper review template). Nothing was stored. | `api_key`: tell the user to set `providers.cspaper.api_key` in `~/.config/reviewloop/config.toml` (never in `reviewloop.toml`) (**user**). `REVIEWLOOP_CSPAPER_API_KEY` counts only when that setting is blank and only in a process started with it, which an installed supervisor is not, so the file is the fix. `agent_id`: tell the user to set a review template, the paper's `venue` in `reviewloop.toml` (`--agent-id` of `reviewloop paper add` when registering it) or `providers.cspaper.agent_id` (**user**). A change to `config.toml` applies at the next call and at the supervisor's next tick. Then request again with the same key. |
+| `provider_not_configured` | The backend lacks a setting: `details.setting` `cookie` (no personal session), `model` (no web model) or `agent_id` (no review template). Nothing was stored. | Tell the user to run `reviewloop cspaper login --cookie-file <path>` for `cookie`; never paste Cookies into chat. For `agent_id` or `model`, list choices with `reviewloop cspaper agents` and tell the user to run `reviewloop cspaper select --agent <name>` (add `--model <model>` if needed) (**user**). The optional organisation API uses `providers.cspaper.api_key` and `providers.cspaper.agent_id` in the global config instead. Secrets never go in `reviewloop.toml`. Saved changes apply at the next call and supervisor tick; environment-only secrets do not reach an installed supervisor. Then request again with the same key. |
 | `request_conflict` | The `request_key` is bound to `details.existing_job_id`, but the PDF or settings changed since (`details.mismatches`). Nothing was stored. | Tell the user what changed and which job the old key belongs to. For the current version, send `request_review` with a new key; `get_job` on `details.existing_job_id` only when they ask about that job. |
 | `job_not_found` | No job with that id in this project. | Check the id; `list_jobs` (with the right `project_id`). |
 | `no_eligible_job` | A `paper_id` reference matched no job in a status the operation accepts. | `list_jobs`, then call again with a `job_id`. |

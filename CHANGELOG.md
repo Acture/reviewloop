@@ -10,6 +10,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **CSPaper personal Cookie sessions** — validate and save a website session
+  with `cspaper login --cookie-file`, check it with `auth-status`, list `agents`
+  and select a template/model by name. Web PDF submissions and result polling
+  pin their transport and choices, preserve uncertain outcomes, and never
+  fall back to organisation API billing. Login needs no API key or agent ID.
+
 - **Shared agent skill** — `integrations/reviewloop/skills/reviewloop/` is
   the one source of the ReviewLoop skill for Codex, Claude Code and other
   hosts that load Agent Skills: `SKILL.md`, references for job states, error

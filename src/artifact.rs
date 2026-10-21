@@ -82,14 +82,20 @@ pub fn render_summary_markdown(raw_json: &Value) -> String {
     if let Some(date) = raw_json.get("submission_date").and_then(Value::as_str) {
         out.push_str(&format!("- **Submitted**: {date}\n"));
     }
-    // The provider fits its score to ICLR 2025 reviews and only reports it for ICLR.
+    // Stanford reports an ICLR-calibrated score; CSPaper uses each template's scale.
     if let Some(score) = raw_json
         .get("numerical_score")
         .filter(|score| !score.is_null())
     {
-        out.push_str(&format!(
-            "- **Estimated Score**: {score}/10 (ICLR-calibrated)\n"
-        ));
+        if raw_json.get("provider").and_then(Value::as_str) == Some("cspaper") {
+            out.push_str(&format!(
+                "- **Provider Score**: {score} (template-specific scale)\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "- **Estimated Score**: {score}/10 (ICLR-calibrated)\n"
+            ));
+        }
     }
     out.push('\n');
 

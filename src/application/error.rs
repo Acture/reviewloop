@@ -241,8 +241,14 @@ impl OpError {
                 "set providers.cspaper.api_key in ~/.config/reviewloop/config.toml or export {}; the key never goes in reviewloop.toml",
                 crate::config::CSPAPER_API_KEY_ENV
             ),
+            OpError::ProviderNotConfigured { setting: "cookie", .. } => {
+                "run `reviewloop cspaper login --cookie-file <path>` to validate and save a personal web session; never put Cookies in reviewloop.toml or chat".to_string()
+            }
+            OpError::ProviderNotConfigured { setting: "model", .. } => {
+                "run `reviewloop cspaper agents`, then `reviewloop cspaper select --agent <name> --model <model>`; a template with one model selects it automatically".to_string()
+            }
             OpError::ProviderNotConfigured { .. } => {
-                "set providers.cspaper.agent_id in reviewloop.toml or ~/.config/reviewloop/config.toml, or the paper's venue (`reviewloop paper add --agent-id`), to a CSPaper agent_id such as ICLR_main_2026_1 (https://cspaper.org/platform/review lists them)".to_string()
+                "for Cookie sessions run `reviewloop cspaper agents` then `reviewloop cspaper select --agent <name>`; for the organisation API set providers.cspaper.agent_id or the paper's venue".to_string()
             }
             OpError::JobNotFound { .. } => {
                 "check the job_id; list_jobs shows this project's jobs".to_string()
