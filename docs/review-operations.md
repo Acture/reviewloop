@@ -350,16 +350,21 @@ tools over stdio, with the same names. An MCP client starts it as a
 subprocess:
 
 ```bash
-# Claude Code
-claude mcp add reviewloop -- reviewloop mcp
+# Claude Code. Use the absolute path from `command -v reviewloop`.
+claude mcp add reviewloop -- /opt/homebrew/bin/reviewloop mcp
 # Codex
-codex mcp add reviewloop -- reviewloop mcp
+codex mcp add reviewloop -- /opt/homebrew/bin/reviewloop mcp
 ```
+
+A GUI host does not inherit a terminal PATH. The sample path is the Apple
+Silicon Homebrew prefix. See [plugins](plugins.md) for the launcher, the
+Codex and Claude Code manifests, and uninstall. Remote HTTP MCP is not
+available.
 
 ```json
 {
   "mcpServers": {
-    "reviewloop": { "command": "reviewloop", "args": ["mcp"] }
+    "reviewloop": { "command": "/opt/homebrew/bin/reviewloop", "args": ["mcp"] }
   }
 }
 ```

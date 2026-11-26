@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "reviewloop": {
+      "command": "/opt/homebrew/bin/reviewloop",
+      "args": ["mcp"]
+    }
+  }
+}

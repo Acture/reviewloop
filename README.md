@@ -343,21 +343,27 @@ can list papers, request reviews, follow jobs and read reviews as structured
 results:
 
 ```bash
-claude mcp add reviewloop -- reviewloop mcp   # Claude Code
-codex mcp add reviewloop -- reviewloop mcp    # Codex
+claude mcp add reviewloop -- /opt/homebrew/bin/reviewloop mcp   # Claude Code
+codex mcp add reviewloop -- /opt/homebrew/bin/reviewloop mcp    # Codex
 ```
+
+Use the absolute path from `command -v reviewloop`. A GUI host does not
+inherit a terminal PATH. The sample path is the Apple Silicon Homebrew
+prefix. Remote HTTP MCP is not available; the server is local stdio.
+Host plugins and uninstall steps are in
+[docs/plugins.md](docs/plugins.md).
 
 Clients configured with an `mcpServers` map (Claude Desktop, Cursor, GitHub
 Copilot CLI):
 
 ```json
-{ "mcpServers": { "reviewloop": { "command": "reviewloop", "args": ["mcp"] } } }
+{ "mcpServers": { "reviewloop": { "command": "/opt/homebrew/bin/reviewloop", "args": ["mcp"] } } }
 ```
 
 VS Code (`.vscode/mcp.json`):
 
 ```json
-{ "servers": { "reviewloop": { "type": "stdio", "command": "reviewloop", "args": ["mcp"] } } }
+{ "servers": { "reviewloop": { "type": "stdio", "command": "/opt/homebrew/bin/reviewloop", "args": ["mcp"] } } }
 ```
 
 - Calls act on the project of the server's working directory (or
@@ -385,11 +391,15 @@ tools: one request per manuscript version with a request key, the user's
 consent before a manuscript is sent, checks paced by `next_poll_at`, stalled
 jobs and the worker fix, resuming a job in a later session, submissions with
 an unknown outcome, saying which manuscript version a review covers, and a
-CLI fallback. Until host plugins package it, copy or symlink the directory
-into the host's skills directory, such as `~/.claude/skills/reviewloop`
-(Claude Code) or `~/.agents/skills/reviewloop` (Codex).
+CLI fallback. The Codex and Claude Code plugin in
+[`integrations/reviewloop/`](integrations/reviewloop) packages this same
+directory; it is the only copy.
+[docs/plugins.md](docs/plugins.md) covers install and uninstall. Copying the
+directory to `~/.claude/skills/reviewloop` or `~/.agents/skills/reviewloop`
+still loads the skill without the plugin.
 `cargo test --test agent_skill` checks it against the live tool schemas and
-the CLI; it does not run an agent.
+the CLI; it does not run an agent. `cargo test --test plugin_pack` checks
+the package.
 
 ## Exit Codes
 

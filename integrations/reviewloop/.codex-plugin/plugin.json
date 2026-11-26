@@ -1,0 +1,27 @@
+{
+  "name": "reviewloop",
+  "version": "0.0.1",
+  "description": "Local ReviewLoop skill and stdio MCP server for requesting, following and reading AI paper reviews.",
+  "author": {
+    "name": "Acture",
+    "url": "https://github.com/Acture/reviewloop"
+  },
+  "homepage": "https://github.com/Acture/reviewloop",
+  "repository": "https://github.com/Acture/reviewloop",
+  "license": "AGPL-3.0-or-later",
+  "keywords": ["academic", "review", "mcp", "papers"],
+  "skills": "./skills/",
+  "mcpServers": "./mcp/codex.json",
+  "interface": {
+    "displayName": "ReviewLoop",
+    "shortDescription": "Request, follow and read local ReviewLoop paper-review jobs.",
+    "longDescription": "Packages the ReviewLoop skill and a local stdio MCP server. The server reads and updates the local job database. Sending a manuscript stays with the machine supervisor after an explicit approval.",
+    "developerName": "Acture",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive"],
+    "websiteURL": "https://github.com/Acture/reviewloop",
+    "defaultPrompt": [
+      "What is the status of my ReviewLoop review?"
+    ]
+  }
+}

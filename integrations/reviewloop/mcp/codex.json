@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "reviewloop": {
+      "command": "./bin/reviewloop-mcp"
+    }
+  }
+}
