@@ -1,0 +1,50 @@
+#!/bin/sh
+# Start the installed ReviewLoop binary as a local stdio MCP server.
+# GUI hosts often have a short PATH, so known install prefixes are checked
+# before PATH. REVIEWLOOP_BIN, when set, is the only candidate.
+# A remote HTTP MCP endpoint is not available.
+
+set -eu
+
+fail() {
+  printf 'reviewloop-mcp: %s\n' "$1" >&2
+  exit 1
+}
+
+supported='Supported builds are ReviewLoop 0.0.1 and later on the restarted release line, which provide `reviewloop mcp`. Historical 0.2.x builds do not. This launcher starts a local stdio server only. A remote HTTP MCP endpoint is not available.'
+
+install_hint='Install with `brew tap acture/ac && brew install reviewloop`, or `cargo install reviewloop --version 0.0.1 --locked` (pin the version: an unpinned Cargo install can still select historical 0.2.x).'
+
+if [ -n "${REVIEWLOOP_BIN:-}" ]; then
+  if [ ! -x "${REVIEWLOOP_BIN}" ]; then
+    fail "REVIEWLOOP_BIN is '${REVIEWLOOP_BIN}', which is missing or not executable. ${supported} ${install_hint}"
+  fi
+  bin=${REVIEWLOOP_BIN}
+else
+  bin=''
+  for candidate in \
+    "${HOME:-}/.cargo/bin/reviewloop" \
+    "${HOME:-}/.local/bin/reviewloop" \
+    /opt/homebrew/bin/reviewloop \
+    /usr/local/bin/reviewloop \
+    /home/linuxbrew/.linuxbrew/bin/reviewloop
+  do
+    if [ -n "${candidate}" ] && [ -x "${candidate}" ]; then
+      bin=${candidate}
+      break
+    fi
+  done
+  if [ -z "${bin}" ] && command -v reviewloop >/dev/null 2>&1; then
+    bin=$(command -v reviewloop)
+  fi
+  if [ -z "${bin}" ]; then
+    fail "reviewloop was not found under \$HOME/.cargo/bin, \$HOME/.local/bin, /opt/homebrew/bin, /usr/local/bin, /home/linuxbrew/.linuxbrew/bin, or PATH. A GUI host does not inherit a terminal PATH. Set REVIEWLOOP_BIN to the absolute path of the binary, or install it into one of those prefixes. ${supported} ${install_hint}"
+  fi
+fi
+
+if ! "${bin}" mcp --help >/dev/null 2>&1; then
+  version=$("${bin}" --version 2>/dev/null || printf 'unknown')
+  fail "found '${bin}' (${version}) but it does not provide the mcp command. ${supported} ${install_hint}"
+fi
+
+exec "${bin}" mcp "$@"

@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "reviewloop": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/reviewloop-mcp"
+    }
+  }
+}

@@ -10,6 +10,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Codex and Claude Code plugin package (OSS-341)** —
+  `integrations/reviewloop/` is the plugin root for both hosts. It keeps one
+  skill source (`skills/reviewloop/`) and a stdio launcher
+  (`bin/reviewloop-mcp`) that finds an installed `reviewloop` 0.0.1+ binary
+  without assuming a GUI host inherited a terminal PATH. `plugin.json` plus
+  `mcp.json` are the Agent Plugins package; `.claude-plugin/plugin.json` and
+  `.codex-plugin/plugin.json` are the host manifests. `scripts/package-plugin.sh`
+  copies the skill and fails when the copy differs. `tests/plugin_pack.rs`
+  checks manifests, the copy, the missing-binary error, and a stdio
+  `tools/list` smoke that does not request a review. Install and uninstall:
+  `docs/plugins.md`. A remote HTTP MCP endpoint is not part of this package.
+  Loading the plugin in the Claude Code or Codex GUI is still a manual check.
+
 - **CSPaper personal Cookie sessions** — validate and save a website session
   with `cspaper login --cookie-file`, check it with `auth-status`, list `agents`
   and select a template/model by name. Web PDF submissions and result polling
